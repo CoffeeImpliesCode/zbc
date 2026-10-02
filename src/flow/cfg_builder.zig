@@ -12,6 +12,7 @@ const tokens = @import("../ast/tokens.zig");
 const receiver_mod = @import("../model/method_names.zig");
 const model_mod = @import("../model/file_model.zig");
 const zls_resolver_mod = @import("../type_resolver.zig");
+const budget_mod = @import("../budget.zig");
 
 // CFG types re-bound for local convenience.
 const cfg_types = @import("cfg.zig");
@@ -26,6 +27,12 @@ const BasicBlock = cfg_types.BasicBlock;
 const Cfg = cfg_types.Cfg;
 const LocalInfo = cfg_types.LocalInfo;
 const InitHint = cfg_types.InitHint;
+const LoweringError = error{ OutOfMemory, AnalysisBudgetExceeded, SourceTooWide };
+
+/// Bounds on the per-expression walks below.  Named so the recorded
+/// diagnostic and the enforced check cannot drift apart.
+const max_classify_depth = 64;
+const max_boolean_unwind = 64;
 
 /// Known-stdlib noreturn callee chains.  Hoisted so both the
 /// call-site detector (calleeIsNoreturn) and the alias detector
@@ -118,20 +125,34 @@ pub fn lowerFunctionFullWithZls(
     // parsing retired, no fn opts out — inference always runs.
     const suppress_cb = false;
 
-    // Pull the containing type via the FileCache's FileModel so
-    // Self / @This() resolve inside param types and receiver-type
-    // lookups have a starting scope.
-    const self_type: ?[]const u8 = blk: {
-        const c = cache orelse break :blk null;
-        const model = c.fileModel() catch break :blk null;
-        const ti = model.containingTypeOf(fn_decl) orelse break :blk null;
-        break :blk ti.name;
-    };
-
     // Use line offsets from FileCache when available (built once per file);
     // otherwise build fresh and transfer ownership to the builder.
     const cached_offsets: ?[]const u32 = if (cache) |c| c.getLineOffsets() catch null else null;
     const line_offsets = cached_offsets orelse try buildLineOffsets(gpa, tree.source);
+    // Both numbers the borrow-walk budget diagnostic reports — the
+    // bound in force and the value the counter reached — are the
+    // whole-file AST node count in the `u32` that schema uses.  Convert
+    // it once, here where lowering can still return an error, so the
+    // walk never narrows unchecked: a tree with more than `maxInt(u32)`
+    // nodes cannot be described by that schema at all — it would need
+    // more source than the `u32` byte offsets `std.zig.Ast` addresses a
+    // file with — so lowering gives up rather than report a truncated
+    // count.
+    const node_budget = std.math.cast(u32, tree.nodes.len) orelse
+        return error.AnalysisBudgetExceeded;
+    // Every position the builder records is a byte offset into
+    // `tree.source` or a 1-indexed column on a line of it, so the file
+    // itself has to be addressable as a `u32`.  `FileCache.init`
+    // applies this bound, but a builder can be built without a cache,
+    // so lowering checks it instead of assuming it.
+    const source_len = std.math.cast(u32, tree.source.len) orelse
+        return error.SourceTooWide;
+    // The same margin `FileCache.init` keeps: a source of exactly
+    // `maxInt(u32)` bytes leaves no room for the 1-indexed column one
+    // past its last byte.
+    if (source_len == std.math.maxInt(u32)) return error.SourceTooWide;
+    var fn_name: budget_mod.NameBuf = .{};
+    if (fn_proto.name_token) |name_tok| fn_name.set(tree.tokenSlice(name_tok));
     var builder: Builder = .{
         .gpa = gpa,
         .tree = tree,
@@ -142,17 +163,43 @@ pub fn lowerFunctionFullWithZls(
         .is_noreturn_fn = is_noreturn_fn,
         .suppress_composite_borrow = suppress_cb,
         .fn_proto = fn_proto,
+        .fn_name = fn_name,
         .fn_body_last = tree.lastToken(body_node),
         .fn_body_first = tree.firstToken(body_node),
-        .self_type = self_type,
+        .self_type = null,
         .line_offsets = line_offsets,
         .owns_line_offsets = cached_offsets == null,
+        .node_budget = node_budget,
+        .source_len = source_len,
     };
     defer builder.tempDeinit();
+
+    // Pull the containing type via the FileCache's FileModel so
+    // `Self` / `*@This()` resolve inside param types and receiver-type
+    // lookups have a starting scope.  Read after the builder exists so
+    // an unreadable model is recorded like every other classification
+    // query: `self_type` stays unset, the declared / syntactic
+    // fallbacks take over, and the failure still leaves the builder
+    // for the entry point below to re-raise instead of being filed as
+    // "this fn is not a method".
+    if (cache) |c| {
+        builder.self_type = blk: {
+            const model = c.fileModel() catch |err| {
+                builder.noteResolutionError(err);
+                break :blk null;
+            };
+            const ti = model.containingTypeOf(fn_decl) orelse break :blk null;
+            break :blk ti.qualified_name;
+        };
+    }
 
     const entry_id = try builder.newBlock();
     var cur_block = entry_id;
     try builder.lowerFunctionBody(body_node, &cur_block);
+    if (builder.budget_failure) |failure| return budget_mod.fail(failure);
+    // A failed type resolution is not an answer, so it leaves the
+    // builder rather than silently weakening the escape check.
+    if (builder.resolution_error) |err| return err;
 
     return try builder.finalize(tree, fn_decl, entry_id);
 }
@@ -206,26 +253,6 @@ fn fnAllParamsAreComptime(tree: *const Ast, fn_proto: Ast.full.FnProto) bool {
     return true;
 }
 
-/// True iff `path` (a dotted field chain like "value_ptr.field" or
-/// just "ptr") starts with a segment whose name ends in `_ptr` (or
-/// is exactly `ptr`).  Pointer-name convention — stdlib's
-/// `GetOrPutResult.value_ptr: *V` / `.key_ptr: *K`, ArrayList's
-/// `.ptr`, etc.  A field chain whose head is such a name guarantees
-/// the borrow lifts out of any auto-deref, so `&local.<ptr_name>.X`
-/// is a borrow into caller- or heap-owned storage rather than a
-/// stack ref.
-fn fieldPathHasPointerName(path: []const u8) bool {
-    // Take the first dotted segment.
-    var end: usize = 0;
-    while (end < path.len and path[end] != '.') : (end += 1) {}
-    const seg = path[0..end];
-    if (std.mem.eql(u8, seg, "ptr")) return true;
-    if (std.mem.endsWith(u8, seg, "_ptr")) return true;
-    return false;
-}
-
-/// True iff the body tokens `[name_tok+1 .. last]` contain `<name>.*`
-/// somewhere — i.e. the local declared at `name_tok` is dereferenced
 /// Return the base type identifier of a field's declared type —
 /// strips `?`/`const`/`[]`/`*`/`[N]` wrappers and returns the last
 /// dotted-chain identifier.  Used to descend through field-type
@@ -269,70 +296,171 @@ fn baseTypeNameOfField(tree: *const Ast, field: *const model_mod.FieldInfo) ?[]c
     return last_name;
 }
 
-/// True iff `init_node` is a call expression whose final method
-/// name is one of the conventional pointer-yielding cast/accessor
-/// names — `as`, `cast`, `ptrCast`, `getPtr`, `getParent`,
-/// `parent`.  Used by `lowerVarDecl` to infer `is_pointer` from
-/// the init shape so `var x = recv.as(Ty); return &x.field;`
-/// doesn't fire stack-escape (the underlying pointee lives in
-/// caller / heap storage, not this frame).
-fn initCallNameIsPointerReturning(tree: *const Ast, init_node: Ast.Node.Index) bool {
-    const tag = tree.nodeTag(init_node);
-    const is_call = switch (tag) {
-        .call,
-        .call_comma,
-        .call_one,
-        .call_one_comma,
-        => true,
-        else => false,
-    };
-    if (!is_call) return false;
-    // The call's callee is at the node's main_token-1 or so; the
-    // method name is the LAST identifier before the `(`.  Walk the
-    // call's source tokens from firstToken to lastToken, find the
-    // first `(`, and grab the preceding identifier.
-    const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(init_node);
-    const last = tree.lastToken(init_node);
-    var t: Ast.TokenIndex = first;
-    var name_tok: ?Ast.TokenIndex = null;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .identifier => name_tok = t,
-            .l_paren => break,
-            else => {},
-        }
-    }
-    const nt = name_tok orelse return false;
-    const name = tree.tokenSlice(nt);
-    return std.mem.eql(u8, name, "as") or
-        std.mem.eql(u8, name, "cast") or
-        std.mem.eql(u8, name, "ptrCast") or
-        std.mem.eql(u8, name, "getPtr") or
-        std.mem.eql(u8, name, "getParent") or
-        std.mem.eql(u8, name, "parent");
+/// How far a wrapper peel may go before it stops describing the
+/// bound value.
+const PeelDepth = enum {
+    /// Stop at anything that changes the value's TYPE.
+    declared_type,
+    /// Look through the optional unwrap too, answering "what type is
+    /// the value that ends up bound?".
+    optional_payload,
+};
+
+/// The node whose value an initializer or scrutinee yields.  `try e`,
+/// `e.?` and `(e)` all evaluate to `e` — or, for the payload view, to
+/// the value `e` produces — so a question asked ABOUT that value has
+/// to ask about `e`, not the wrapper.  Returns `init_node` itself when
+/// it is not wrapped.
+///
+/// `catch` / `orelse` are peeled only past a VACUOUS fallback.  The
+/// bound value is the fallback's whenever the fallback can produce
+/// one: `const p = get() orelse &local` really does hold this frame's
+/// storage on the fallback path.  `try` has no such arm — its error
+/// path leaves the function, so the value is unconditionally the
+/// inner expression's.
+///
+/// Origin classification stays with `classifyExpr`'s own (narrower)
+/// unwrap: this helper answers typing questions only and asserts
+/// nothing about where the value's storage lives.
+fn initValueNode(tree: *const Ast, init_node: Ast.Node.Index) Ast.Node.Index {
+    return initPeelNode(tree, init_node, .optional_payload).node;
 }
 
-/// True iff `init_node` is a method call on a known pointer local.
-/// Catches factory/builder patterns like `b.addUpdateSourceFiles()` where
-/// the receiver `b` is a `*std.Build` parameter — the call returns a
-/// `*Step.T` but ZLS can't resolve it cross-file.  Suppresses FPs like
-/// `return &usf.step` where `usf` is actually a pointer.
-fn initCallReceiverIsPointerLocal(builder: *const Builder, tree: *const Ast, init_node: Ast.Node.Index) bool {
-    const tag = tree.nodeTag(init_node);
-    switch (tag) {
-        .call, .call_comma, .call_one, .call_one_comma => {},
-        else => return false,
+/// The TYPE-PRESERVING peel: what a wrapper leaves behind when the
+/// bound value keeps the inner expression's type.  `.unwrap_optional`
+/// is the one wrapper that is NOT crossed, because `f().?` does not
+/// bind `f()` — it binds f's optional PAYLOAD, and nothing about the
+/// callee's spelling reveals whether that payload is a pointer.
+/// `b.parent()` may return `?Box` by value just as well as `?*Box`.
+///
+/// Use this view for the syntactic pointer-shape proofs in
+/// `lowerVarDecl`; a semantic type query wants `initValueNode`,
+/// which resolves the payload type properly.
+fn initShapeNode(tree: *const Ast, init_node: Ast.Node.Index) Ast.Node.Index {
+    return initPeelNode(tree, init_node, .declared_type).node;
+}
+
+/// What a wrapper peel leaves behind, and whether getting there
+/// ACCEPTED an error on the way.
+///
+/// `try e` and `e catch <vacuous>` bind the callee's error-union
+/// SUCCESS PAYLOAD, not the `E!T` the callee declared — so a question
+/// about what the binding holds has to be asked about the payload, and
+/// a question about the callee's DECLARATION has to read the payload
+/// of its declared `E!T`.  That is what `accepted_error` reports, and
+/// `declaredCallYieldsPointer` is what acts on it.  `orelse` answers
+/// an optional and unwraps no error, so it never sets the flag.
+const Peeled = struct {
+    node: Ast.Node.Index,
+    accepted_error: bool,
+};
+
+fn initPeelNode(
+    tree: *const Ast,
+    init_node: Ast.Node.Index,
+    depth: PeelDepth,
+) Peeled {
+    var node = init_node;
+    var accepted_error = false;
+    while (true) {
+        switch (tree.nodeTag(node)) {
+            .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+            .unwrap_optional => {
+                if (depth == .declared_type) return .{ .node = node, .accepted_error = accepted_error };
+                node = tree.nodeData(node).node_and_token[0];
+            },
+            .@"try" => {
+                node = tree.nodeData(node).node;
+                accepted_error = true;
+            },
+            .@"catch" => {
+                const data = tree.nodeData(node).node_and_node;
+                if (!fallbackYieldsNothing(tree, data[1])) return .{ .node = node, .accepted_error = accepted_error };
+                node = data[0];
+                accepted_error = true;
+            },
+            .@"orelse" => {
+                const data = tree.nodeData(node).node_and_node;
+                if (!fallbackYieldsNothing(tree, data[1])) return .{ .node = node, .accepted_error = accepted_error };
+                node = data[0];
+            },
+            else => return .{ .node = node, .accepted_error = accepted_error },
+        }
     }
-    var buf: [1]Ast.Node.Index = undefined;
-    const call_full = tree.fullCall(&buf, init_node) orelse return false;
-    const callee = call_full.ast.fn_expr;
-    if (tree.nodeTag(callee) != .field_access) return false;
-    const recv = tree.nodeData(callee).node_and_token[0];
-    if (tree.nodeTag(recv) != .identifier) return false;
-    const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
-    const lid = builder.name_to_local.get(recv_name) orelse return false;
-    return builder.locals.items[@intFromEnum(lid)].is_pointer;
+}
+
+/// True when a `catch` / `orelse` fallback cannot yield a value, so the
+/// wrapper's value is unconditionally its left operand's.  `catch
+/// return e`, `orelse unreachable`, `catch break :blk` and a block whose
+/// final statement is one of those all qualify; anything that could bind
+/// a value — including an address-of — does not.
+fn fallbackYieldsNothing(tree: *const Ast, node: Ast.Node.Index) bool {
+    return fallbackDiverges(tree, node, 0);
+}
+
+/// How deeply a fallback may nest its own value expressions before the
+/// walk stops trusting itself.  Each level consumes source, so this
+/// bounds pathological nesting rather than acting as an analysis budget.
+const max_fallback_nesting: u8 = 16;
+
+/// True when `node` cannot produce a value on ANY path: it returns,
+/// continues, breaks without a label, or is unreachable.
+///
+/// The wrapper question is about the fallback as a whole, not about one
+/// spelling of it, so a fallback that leaves on every path counts however
+/// many wrappers it is written through.  That is what makes
+///
+///     const h = ctx.load(path) catch |err| switch (err) {
+///         error.OutOfMemory => return error.OutOfMemory,
+///         else => return error.Unavailable,
+///     };
+///
+/// peel to `ctx.load(path)`: every prong returns, so the binding is
+/// unconditionally the call's success payload.  A single value-yielding
+/// prong keeps the fallback binding, exactly as a bare `catch &local`
+/// does — the prong's own body is then the thing to look at.
+fn fallbackDiverges(tree: *const Ast, node: Ast.Node.Index, depth: u8) bool {
+    if (depth >= max_fallback_nesting) return false;
+    const tags = tree.tokens.items(.tag);
+    var cur = node;
+    while (true) switch (tree.nodeTag(cur)) {
+        .grouped_expression => cur = tree.nodeData(cur).node_and_token[0],
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            const Iterator = @import("type_engine").AstIterator;
+            var statements = Iterator.init(tree, cur);
+            var last: ?Ast.Node.Index = null;
+            while (statements.next(tree)) |current| last = current;
+            const tail = last orelse return false;
+            cur = tail;
+        },
+        // `target_expr` is the prong's BODY (`values` holds the labels).
+        .@"switch", .switch_comma => {
+            const switch_node = tree.fullSwitch(cur) orelse return false;
+            if (switch_node.ast.cases.len == 0) return false;
+            for (switch_node.ast.cases) |case_node| {
+                const case_full = tree.fullSwitchCase(case_node) orelse return false;
+                if (!fallbackDiverges(tree, case_full.ast.target_expr, depth + 1)) return false;
+            }
+            return true;
+        },
+        // Every possible branch must leave before a value can be bound.
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(cur) orelse return false;
+            if (!fallbackDiverges(tree, branch.ast.then_expr, depth + 1)) return false;
+            const else_expr = branch.ast.else_expr.unwrap() orelse return false;
+            if (!fallbackDiverges(tree, else_expr, depth + 1)) return false;
+            return true;
+        },
+        // `break;` leaves the enclosing loop / switch and hands back
+        // nothing, but `break :blk value` IS that label's value.
+        .@"break" => {
+            const after = tree.nodeMainToken(cur) + 1;
+            if (after < tags.len and tags[after] == .colon) return false;
+            return true;
+        },
+        .@"continue", .@"return", .unreachable_literal => return true,
+        else => return false,
+    };
 }
 
 /// later in the body.  Used by `lowerVarDecl` to infer `is_pointer`
@@ -359,11 +487,191 @@ fn localIsDereferencedAfter(
     return false;
 }
 
+/// True when the outer collection type stores pointer elements.
+///
+/// This deliberately inspects only the element position of a slice, array,
+/// or known ArrayList spelling. A pointer elsewhere in a generic type does
+/// not make an indexed element a pointer.
+fn typeRangeHasPointerElement(
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (first > last) return false;
+
+    var t = first;
+    while (t <= last and
+        (tags[t] == .question_mark or
+            tags[t] == .keyword_const or
+            tags[t] == .keyword_var)) : (t += 1)
+    {}
+
+    if (t <= last and tags[t] == .l_bracket) {
+        const close = tokens.matchBracket(tags, t, last) orelse return false;
+        return typeRangeStartsWithPointer(tags, close + 1, last);
+    }
+
+    while (t + 1 <= last) : (t += 1) {
+        if (tags[t] != .identifier or tags[t + 1] != .l_paren) continue;
+        const name = tree.tokenSlice(t);
+        if (!std.mem.eql(u8, name, "ArrayList") and
+            !std.mem.eql(u8, name, "ArrayListUnmanaged") and
+            !std.mem.eql(u8, name, "Managed"))
+        {
+            continue;
+        }
+        const close = tokens.matchParen(tags, t + 1, last) orelse return false;
+        return typeRangeStartsWithPointer(tags, t + 2, close -| 1);
+    }
+    return false;
+}
+
+fn typeRangeStartsWithPointer(
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    if (first > last) return false;
+    var t = first;
+    while (t <= last and
+        (tags[t] == .question_mark or
+            tags[t] == .keyword_const or
+            tags[t] == .keyword_var)) : (t += 1)
+    {}
+    return t <= last and tags[t] == .asterisk;
+}
+
+/// True when a declared type is spelled `?` + (`const`/`var`)* + `*` —
+/// an optional whose payload is a pointer.  Unwrapping such an
+/// optional hands out the pointer, so `if (recv.field) |cap|` binds a
+/// pointer BY VALUE.  The `?` is required: a bare `*T` field has no
+/// payload to capture and never reaches this path.
+fn typeRangeIsOptionalPointer(
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (first > last or tags[first] != .question_mark) return false;
+    var t = first + 1;
+    while (t <= last and
+        (tags[t] == .keyword_const or tags[t] == .keyword_var)) : (t += 1)
+    {}
+    return t <= last and tags[t] == .asterisk;
+}
+
+/// True when a declared type names a POINTER itself — `*T`, `*const T`,
+/// `*var T`.  A `?*T` declares an OPTIONAL whose payload is a pointer:
+/// the optional still occupies its field slot, and only the `?.` that
+/// unwraps it reaches the pointer.  So unlike
+/// `typeRangeStartsWithPointer`, this does NOT peel a leading `?` —
+/// it answers "does the value of this field live somewhere else",
+/// which only means anything for a field some further access reads
+/// THROUGH.  The access an address-of itself names is a slot, and
+/// `&x.f` never dereferences `f` whatever `f` is declared as.
+fn typeRangeIsPointerValue(
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    if (first > last) return false;
+    var t = first;
+    while (t <= last and
+        (tags[t] == .keyword_const or tags[t] == .keyword_var)) : (t += 1)
+    {}
+    return t <= last and tags[t] == .asterisk;
+}
+
+/// True when a declared type is an ERROR UNION whose SUCCESS payload is a
+/// pointer — `!*T`, `anyerror!*const T`.
+///
+/// Only meaningful to a binding that accepted the error (`try` / `catch`),
+/// because that is what binds the payload.  Without one the binding holds
+/// the whole `E!T`, which is not a pointer, so the same declaration must
+/// not answer the other way.  The `!` is what separates the two sides, so
+/// the payload is read from just past it; a leading error-set name
+/// (`anyerror`, `MyError`) sits before the `!` and does not shift it.
+fn errorUnionPayloadIsPointer(
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    var t = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] != .bang) continue;
+        var payload = t + 1;
+        while (payload <= last and
+            (tags[payload] == .keyword_const or tags[payload] == .keyword_var)) : (payload += 1)
+        {}
+        return payload <= last and tags[payload] == .asterisk;
+    }
+    return false;
+}
+
+/// True when a declared type is an error set — spelled `anyerror` or
+/// `error{ … }`.  A payload of such a type IS an error value, so a
+/// switch prong that captures it (`switch (r) { .err => |e| …
+/// return e }` over `union(enum) { ok: u8, err: anyerror }`) makes
+/// `return <cap>` an error return, and Zig replays `errdefer` frees
+/// not be treated that way.  Compared on source text: `anyerror` is
+/// unambiguous, and the token tag it lexes to is not worth pinning.
+fn typeRangeIsErrorSet(
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (first > last) return false;
+    if (tags[first] == .keyword_error) return true;
+    return std.mem.eql(u8, tree.tokenSlice(first), "anyerror");
+}
+
+/// The path an `@import("…")` initializer names, without its quotes.
+/// Null for any other initializer: a decl that isn't an import has no
+/// module behind it, and an escaped literal isn't a path this pass
+/// can hand to the project cache unrewritten.
+fn importPathOfInit(tree: *const Ast, init_node: Ast.Node.Index) ?[]const u8 {
+    const builtin_tok = tree.nodeMainToken(init_node);
+    if (builtin_tok + 2 >= tree.tokens.len) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(builtin_tok), "@import")) return null;
+    if (tree.tokens.items(.tag)[builtin_tok + 2] != .string_literal) return null;
+    const literal = tree.tokenSlice(builtin_tok + 2);
+    if (literal.len < 2 or std.mem.indexOfScalar(u8, literal, '\\') != null) return null;
+    return literal[1 .. literal.len - 1];
+}
+
+/// Inclusive token index range covering a source construct.
+const TokenSpan = struct { first: Ast.TokenIndex, last: Ast.TokenIndex };
+
+/// A `var|const <name>: <T> = <init>;` declaration, located from the
+/// local's recorded declaration offset.  `name_tok` proves the
+/// declaration precedes a construct that writes through the binding;
+/// `init_is_undefined` records the seed the initializer gave it.
+const DeclTypeSpan = struct {
+    type: TokenSpan,
+    name_tok: Ast.TokenIndex,
+    is_const: bool,
+    init_is_undefined: bool,
+};
+
+/// A `const <name> = <init>;` declaration the scope resolver picked for
+/// a reference: its optional type annotation and its initializer span.
+/// It is a declaration now, not a name — `ScopedDecl.name_tok` says
+/// WHICH `const` this is, and only that one's spans are here.
+/// Module-level because the token parse that fills it is not a
+/// `Builder` method.
+const FileConstDecl = struct {
+    type: ?TokenSpan,
+    init: TokenSpan,
+};
+
 // ── Builder ────────────────────────────────────────────────
 
 const LoopCtx = struct {
-    header: BlockId,
+    continue_to: BlockId,
     merge: BlockId,
+    defer_depth: usize,
     /// Label slice on the source (no colon), or null for unlabeled
     /// loops.  `break :name` walks the loop stack from inside out
     /// matching this field.
@@ -376,6 +684,7 @@ const LoopCtx = struct {
 const BlockLabelCtx = struct {
     label: []const u8,
     merge: BlockId,
+    defer_depth: usize,
 };
 
 const DeferKind = enum { normal, err };
@@ -387,6 +696,36 @@ const Builder = struct {
     /// Per-file FileCache for FnSummary / FileModel queries — the
     /// per-file shared model + inference cache.
     cache: ?*file_cache.FileCache = null,
+    address_cache: ?file_cache.FileCache = null,
+    /// Nesting depth of the current `classifyExpr` recursion.
+    classify_depth: u8 = 0,
+    /// Set by whichever bounded walk gave up first, naming the limit,
+    /// its bound, and the expression that tripped it.  `null` until a
+    /// walk exhausts, so "lowering completed" and "lowering gave up"
+    /// are distinguishable without a second flag.
+    budget_failure: ?budget_mod.Diagnostic = null,
+    /// Whole-file AST node count as the `u32` the budget diagnostic
+    /// reports.  Converted once, where the Builder is built, so every
+    /// walk that bounds itself by it compares against a value already
+    /// known to fit instead of narrowing the `usize` count again.
+    node_budget: u32,
+    /// Set by the first type-resolution query that FAILED (allocation,
+    /// cancellation) that a classification depended on — the chain
+    /// walk, the address-of direct-LHS check, the local registration's
+    /// pointer fallback, and the pointer / ownership / noreturn
+    /// classifications fed by the ZLS resolver and by the summary and
+    /// file-model lookups underneath them.  An unresolved type is an
+    /// answer of "nobody can tell" and is resolved conservatively,
+    /// keeping the frame; a failed query is an error the caller has to
+    /// see, so it is re-raised by the lowering entry point rather than
+    /// being folded into "undecided" or into a conservative verdict the
+    /// caller is never told about.  `queryOrUnknown` and `modelOrNull`
+    /// are the funnels, so no query can quietly answer for a failure.
+    resolution_error: ?anyerror = null,
+    /// Enclosing function's name, copied out of the source.  Reported
+    /// with a budget failure so the CLI can name the function whose
+    /// lowering gave up.
+    fn_name: budget_mod.NameBuf = .{},
     /// Optional ZLS-backed type resolver.  When set, `receiverTypeOfNode`
     /// falls back to ZLS when zbc's own type-name tracking can't
     /// resolve a local (cross-module types, generic instantiations,
@@ -419,6 +758,13 @@ const Builder = struct {
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
+    /// File-level `const NAME = @import("path.zig")` aliases, mapped to
+    /// their import path.  Built on first use so a file whose calls are
+    /// all instance calls pays nothing; keys and values are slices into
+    /// `tree.source`, which outlives the builder.  An alias names a
+    /// module namespace — a container, never a value — so a call
+    /// through one has no receiver slot to skip.
+    import_aliases: ?std.StringHashMapUnmanaged([]const u8) = null,
     /// Unified declaration-ordered stack of `defer` / `errdefer`
     /// bodies, LIFO.  Replayed at every `return` (normal only) and
     /// at synthetic err-exit sinks (both kinds, interleaved by
@@ -475,8 +821,218 @@ const Builder = struct {
     /// True when Builder owns line_offsets and must free it.  False when
     /// the slice is borrowed from FileCache (which owns and frees it).
     owns_line_offsets: bool = false,
+    /// `tree.source.len` as the `u32` every byte offset `SrcPos` records
+    /// is measured in.  Checked where the Builder is built: a source
+    /// too wide for `u32` offsets cannot be given positions at all.
+    source_len: u32,
+
+    /// Record that a bounded walk gave up.  First failure wins: a walk
+    /// that exhausts keeps unwinding and may trip further limits, but
+    /// the site where it first stopped is the one that explains the
+    /// rest.  The recorded function name and position let the CLI say
+    /// which function and which expression, instead of only that some
+    /// limit was hit.
+    fn noteBudgetFailure(
+        self: *Builder,
+        limit: budget_mod.Limit,
+        limit_value: u32,
+        reached: u32,
+        node: Ast.Node.Index,
+    ) void {
+        if (self.budget_failure != null) return;
+        const pos = self.posOf(node);
+        self.budget_failure = .{
+            .limit = limit,
+            .limit_value = limit_value,
+            .reached = reached,
+            .byte = pos.byte,
+            .line = pos.line,
+            .column = pos.column,
+            .function = self.fn_name,
+        };
+    }
+
+    /// Record a type-resolution query that failed rather than merely
+    /// coming back unresolved.  First failure wins, for the same
+    /// reason `noteBudgetFailure` keeps the first.
+    fn noteResolutionError(self: *Builder, err: anyerror) void {
+        if (self.resolution_error != null) return;
+        self.resolution_error = err;
+    }
+
+    /// Run a type-resolution query a classification depends on.  A
+    /// successful `null` is the resolver's normal "nobody can tell" and
+    /// passes through untouched, so the caller's declared/syntactic
+    /// fallbacks still run and the classification stays conservative.
+    ///
+    /// A FAILED query is not that.  An allocation failure or a
+    /// cancelled read leaves the question open, and answering `null`
+    /// for it is how a swallowed fault surfaces as a confident verdict:
+    /// a frame-charged `&local.field`, a missed ownership transfer, a
+    /// free bound to the wrong argument, a call through a receiver
+    /// whose type was never read.  The failure is recorded so
+    /// `lowerFunctionFullWithZls` re-raises it instead of publishing a
+    /// classification that leaned on a query that never answered.
+    ///
+    /// `T` is named at every call site: Zig does no inference for a
+    /// type parameter, so a `comptime T: type` is a generic every
+    /// caller spells out, and each query names the answer it wants.
+    fn queryOrUnknown(self: *Builder, comptime T: type, query: anyerror!?T) ?T {
+        const answer: ?T = query catch |err| err_blk: {
+            self.noteResolutionError(err);
+            break :err_blk null;
+        };
+        return answer;
+    }
+
+    /// Same rule as `queryOrUnknown` for `FileCache.fileModel`, which
+    /// answers a pointer rather than an optional.  Null here means the
+    /// file's declarations are unreadable, so the caller has to decline
+    /// the declared-shape proof it wanted — a conservative answer, but
+    /// still a failure, and recorded as one.
+    fn modelOrNull(self: *Builder, cache: *file_cache.FileCache) ?*const model_mod.FileModel {
+        const model: ?*const model_mod.FileModel = cache.fileModel() catch |err| err_blk: {
+            self.noteResolutionError(err);
+            break :err_blk null;
+        };
+        return model;
+    }
+
+    const BorrowIterator = struct {
+        const Iterator = @import("type_engine").AstIterator;
+        builder: *Builder,
+        frames: [64]Iterator = undefined,
+        depth: usize = 1,
+        /// Nodes visited by this walk.  Bounded by `Builder.node_budget`,
+        /// which is the whole-file node count already in the `u32` the
+        /// budget diagnostic uses, so the counter carries that width
+        /// and never needs converting to be reported.
+        visited: u32 = 0,
+
+        fn one(node: Ast.Node.Index) Iterator {
+            return .{ .array = .{ node.toOptional(), .none, .none, .none, .none } };
+        }
+
+        fn init(builder: *Builder, expression: Ast.Node.Index) BorrowIterator {
+            var result: BorrowIterator = .{ .builder = builder };
+            result.frames[0] = one(expression);
+            return result;
+        }
+
+        fn next(self: *BorrowIterator) ?ExprKind {
+            const builder = self.builder;
+            const tree = builder.tree;
+            while (self.depth != 0) {
+                const node = self.frames[self.depth - 1].next(tree) orelse {
+                    self.depth -= 1;
+                    continue;
+                };
+                if (self.visited == builder.node_budget) {
+                    return self.exhausted(node, .borrow_walk_nodes, builder.node_budget);
+                }
+                self.visited += 1;
+                if (self.children(node)) |child_nodes| {
+                    if (self.depth == self.frames.len) return self.exhausted(node, .borrow_walk_depth, self.frames.len);
+                    self.frames[self.depth] = child_nodes;
+                    self.depth += 1;
+                    continue;
+                }
+                switch (tree.nodeTag(node)) {
+                    .address_of, .slice, .slice_open, .slice_sentinel => {
+                        const kind = builder.classifyExpr(node);
+                        if (kind == .stack_ref or kind == .copy_of) return kind;
+                    },
+                    .identifier => {
+                        const local = builder.name_to_local.get(tree.tokenSlice(tree.nodeMainToken(node))) orelse continue;
+                        if (builder.locals.items[@intFromEnum(local)].init_hint != .other) continue;
+                        return .{ .copy_of = local };
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+
+        fn exhausted(
+            self: *BorrowIterator,
+            node: Ast.Node.Index,
+            limit: budget_mod.Limit,
+            limit_value: u32,
+        ) ?ExprKind {
+            self.builder.noteBudgetFailure(limit, limit_value, self.visited, node);
+            self.depth = 0;
+            return null;
+        }
+
+        fn children(self: *BorrowIterator, node: Ast.Node.Index) ?Iterator {
+            const builder = self.builder;
+            const tree = builder.tree;
+            return switch (tree.nodeTag(node)) {
+                .struct_init,
+                .struct_init_comma,
+                .struct_init_one,
+                .struct_init_one_comma,
+                .struct_init_dot,
+                .struct_init_dot_comma,
+                .struct_init_dot_two,
+                .struct_init_dot_two_comma,
+                .array_init,
+                .array_init_comma,
+                .array_init_one,
+                .array_init_one_comma,
+                .array_init_dot,
+                .array_init_dot_comma,
+                .array_init_dot_two,
+                .array_init_dot_two_comma,
+                .array_mult,
+                .@"catch",
+                .@"orelse",
+                => Iterator.init(tree, node),
+                .grouped_expression, .unwrap_optional => one(tree.nodeData(node).node_and_token[0]),
+                .@"try" => one(tree.nodeData(node).node),
+                .@"if", .if_simple => blk: {
+                    const branch = tree.fullIf(node).?;
+                    if (tree.nodeTag(branch.ast.cond_expr) == .identifier) {
+                        const condition = tree.tokenSlice(tree.nodeMainToken(branch.ast.cond_expr));
+                        if (std.mem.eql(u8, condition, "true")) break :blk one(branch.ast.then_expr);
+                        if (std.mem.eql(u8, condition, "false")) {
+                            break :blk one(branch.ast.else_expr.unwrap() orelse return null);
+                        }
+                    }
+                    break :blk .{ .array = .{ branch.ast.then_expr.toOptional(), branch.ast.else_expr, .none, .none, .none } };
+                },
+                .@"switch", .switch_comma => blk: {
+                    var cases = Iterator.init(tree, node);
+                    const condition = cases.next(tree) orelse unreachable;
+                    std.debug.assert(condition == tree.fullSwitch(node).?.ast.condition);
+                    break :blk cases;
+                },
+                .switch_case, .switch_case_one, .switch_case_inline, .switch_case_inline_one => one(tree.fullSwitchCase(node).?.ast.target_expr),
+                .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => one(builder.transparentCastSource(node) orelse return null),
+                .block, .block_two, .block_semicolon, .block_two_semicolon => blk: {
+                    const label = builder.blockLabelToken(node) orelse return null;
+                    break :blk one(builder.singleLabeledBreakValue(node, label) orelse return null);
+                },
+                else => null,
+            };
+        }
+    };
+
+    const BorrowKey = struct {
+        local: LocalId,
+        address: bool,
+
+        fn from(kind: ExprKind) BorrowKey {
+            return switch (kind) {
+                .stack_ref => |local| .{ .local = local, .address = true },
+                .copy_of, .composite_borrow => |local| .{ .local = local, .address = false },
+                else => unreachable,
+            };
+        }
+    };
 
     fn tempDeinit(self: *Builder) void {
+        if (self.address_cache) |*cache| cache.deinit();
         if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
         self.block_stmts.deinit(self.gpa);
@@ -485,6 +1041,7 @@ const Builder = struct {
         self.blocks.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.name_to_local.deinit(self.gpa);
+        if (self.import_aliases) |*aliases| aliases.deinit(self.gpa);
         self.deferred.deinit(self.gpa);
         self.loop_stack.deinit(self.gpa);
         self.block_label_stack.deinit(self.gpa);
@@ -506,6 +1063,59 @@ const Builder = struct {
 
     fn appendStmt(self: *Builder, block: BlockId, stmt: Stmt) !void {
         try self.block_stmts.items[@intFromEnum(block)].append(self.gpa, stmt);
+    }
+
+    fn booleanValue(self: *Builder, expression: Ast.Node.Index) ?cfg_types.BooleanValue {
+        var node = expression;
+        var inverted = false;
+        for (0..max_boolean_unwind) |_| {
+            switch (self.tree.nodeTag(node)) {
+                .grouped_expression => node = self.tree.nodeData(node).node_and_token[0],
+                .bool_not => {
+                    inverted = !inverted;
+                    node = self.tree.nodeData(node).node;
+                },
+                .identifier => {
+                    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+                    if (std.mem.eql(u8, name, "true")) return .{ .constant = !inverted };
+                    if (std.mem.eql(u8, name, "false")) return .{ .constant = inverted };
+                    const local = self.name_to_local.get(name) orelse return null;
+                    return if (inverted) .{ .not_local = local } else .{ .local = local };
+                },
+                .equal_equal, .bang_equal => |tag| {
+                    const pair = self.tree.nodeData(node).node_and_node;
+                    var operand = pair[0];
+                    var literal = pair[1];
+                    if (self.booleanLiteral(literal) == null) {
+                        operand = pair[1];
+                        literal = pair[0];
+                    }
+                    const value = self.booleanLiteral(literal) orelse return null;
+                    inverted = inverted != (if (tag == .equal_equal) !value else value);
+                    node = operand;
+                },
+                else => return null,
+            }
+        }
+        self.noteBudgetFailure(.boolean_unwind, max_boolean_unwind, max_boolean_unwind, expression);
+        return null;
+    }
+
+    fn booleanLiteral(self: *const Builder, node: Ast.Node.Index) ?bool {
+        if (self.tree.nodeTag(node) != .identifier) return null;
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        if (std.mem.eql(u8, name, "true")) return true;
+        if (std.mem.eql(u8, name, "false")) return false;
+        return null;
+    }
+
+    fn assumeCondition(self: *Builder, block: BlockId, node: Ast.Node.Index, condition: ?cfg_types.BooleanValue, expected: bool) !void {
+        const value = condition orelse return;
+        try self.appendStmt(block, .{
+            .kind = .{ .assume = if (expected) value else value.negate() },
+            .pos = self.posOf(node),
+            .end_pos = self.endPosOf(node),
+        });
     }
 
     fn addEdge(self: *Builder, from: BlockId, to: BlockId) !void {
@@ -605,57 +1215,26 @@ const Builder = struct {
         return false;
     }
 
-    /// Walk the type expression's tokens, stripping pointer / optional
-    /// / const wrappers, and return the BASE identifier — the LAST
-    /// component of a dotted chain.  `*Foo` → "Foo"; `*const Foo` →
-    /// "Foo"; `?*Foo` → "Foo"; `*lib.Foo` → "Foo" (the namespace
-    /// prefix is discarded — the type identity is what matters for
-    /// method dispatch).  Returns null when no plain identifier is
-    /// found — e.g. slice `[]T`, function pointer, anonymous struct.
-    ///
-    /// `Self` / `@This()` resolves to the enclosing fn's containing
-    /// type when `self_type` is supplied.
+    /// Keep the complete declaration path; resolve local names in lexical scope.
     fn extractTypeName(self: *Builder, type_node: Ast.Node.Index, self_type: ?[]const u8) ?[]const u8 {
         const tree = self.tree;
         const first = tree.firstToken(type_node);
         const last = tree.lastToken(type_node);
-        const tags = tree.tokens.items(.tag);
-        var t: Ast.TokenIndex = first;
-        // Strip leading `?`, `*`, `const` tokens.
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .question_mark, .asterisk, .keyword_const => continue,
-                .l_bracket => return null,
-                .identifier, .builtin => break,
-                else => return null,
+        const name = tokens.typeNameFromTokens(tree, first, last) orelse {
+            if (last >= first + 2 and tree.tokenTag(last - 2) == .builtin and
+                std.mem.eql(u8, tree.tokenSlice(last - 2), "@This")) return self_type;
+            return null;
+        };
+        if (self_type) |enclosing| {
+            if (std.mem.eql(u8, name, "Self")) return enclosing;
+            if (self.cache) |cache| {
+                const model = self.modelOrNull(cache) orelse return null;
+                if (model.findType(enclosing)) |owner| {
+                    if (model.resolveTypeNameInScope(name, owner)) |resolved| return resolved.qualified_name;
+                }
             }
         }
-        if (t > last) return null;
-        // Walk identifiers/builtins separated by dots; remember the
-        // last identifier seen.  `lib.HTMLRewriter` → "HTMLRewriter".
-        var last_name: ?[]const u8 = null;
-        var expecting_ident = true;
-        while (t <= last) : (t += 1) {
-            const tag = tags[t];
-            if (expecting_ident) {
-                if (tag == .identifier) {
-                    const n = tree.tokenSlice(t);
-                    last_name = if (std.mem.eql(u8, n, "Self")) self_type else n;
-                    expecting_ident = false;
-                } else if (tag == .builtin) {
-                    const n = tree.tokenSlice(t);
-                    if (std.mem.eql(u8, n, "@This")) {
-                        last_name = self_type;
-                        expecting_ident = false;
-                    } else return null;
-                } else return null;
-            } else {
-                if (tag == .period) {
-                    expecting_ident = true;
-                } else break;
-            }
-        }
-        return last_name;
+        return name;
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
@@ -676,17 +1255,11 @@ const Builder = struct {
         _ = try self.registerCapturesImpl(payload_token, null, true);
     }
 
-    /// Heuristic: when an `if (<Type>.fromJS(...))` scrutinee
-    /// unwraps to a capture, that capture is by Bun convention a
-    /// `*Type` pointer.  Set is_pointer on the capture so
-    /// `&capture.field` doesn't fire stack-escape (the address-of
-    /// borrows into heap-owned storage reached through the
-    /// pointer).  Conservative: only fires when the scrutinee's
-    /// outermost call name is in the known-returns-pointer list,
-    /// OR when the payload uses BY-POINTER form `|*cap|` and the
-    /// scrutinee is a field access whose receiver is itself a
-    /// pointer (`&dev.vm.debugger.field` lives in dev's storage,
-    /// not the local frame).
+    /// For an optional scrutinee, prefer the type engine's instantiated
+    /// payload type: `HashMapUnmanaged(*Entry).get(key)` is `?*Entry`, so
+    /// its capture points into the entry allocation rather than this frame.
+    /// A declared optional-pointer return or field also proves the payload
+    /// without semantic resolution. Unknown declarations remain conservative.
     fn inferPointerCapture(self: *Builder, payload_token: Ast.TokenIndex, cond_expr: Ast.Node.Index) void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
@@ -702,21 +1275,27 @@ const Builder = struct {
         const cap_name = tree.tokenSlice(t);
         if (std.mem.eql(u8, cap_name, "_")) return;
         const lid = self.name_to_local.get(cap_name) orelse return;
+        // Inspect the scrutinee — peel the success-path wrappers so the
+        // query below sees the expression that actually produced the
+        // optional.
+        const node = initValueNode(tree, cond_expr);
 
-        // Inspect the scrutinee — peel `try`/`catch` wrappers.
-        var node = cond_expr;
-        while (true) {
-            switch (tree.nodeTag(node)) {
-                .@"try" => node = tree.nodeData(node).node,
-                .@"catch" => node = tree.nodeData(node).node_and_node[0],
-                else => break,
+        // Prefer the type engine's instantiated generic result.  A call
+        // such as `HashMapUnmanaged(*Entry).get(key)` returns `?*Entry`;
+        // only that semantic payload proof may mark the capture as a
+        // pointer. Unknown result types do not imply a pointer.
+        if (self.zls) |zls| {
+            if (self.queryOrUnknown(bool, zls.optionalPayloadIsPointer(node))) |is_pointer| {
+                if (is_pointer) {
+                    self.locals.items[@intFromEnum(lid)].is_pointer = true;
+                    return;
+                }
             }
         }
         if (self.callReturnsOptionalPointer(node)) {
             self.locals.items[@intFromEnum(lid)].is_pointer = true;
             return;
         }
-        // By-pointer capture of a non-local field access:
         // `if (recv.field) |*cap|` where recv is a pointer-typed
         // local.  The capture points into recv's storage, not the
         // current fn's frame.
@@ -728,33 +1307,80 @@ const Builder = struct {
                 }
             }
         }
+
+        // `if (recv.optional_ptr_field) |cap|` binds the payload BY
+        // VALUE, so the `|cap|` form above never applies.  The semantic
+        // proof at the top of this function is the right one, but the
+        // type engine cannot resolve a payload spelled
+        // `?*@import("some_module").T` across a named-module boundary —
+        // it answers null, and the capture stays a stack value.  The
+        // DECLARATION settles it without the resolver: a field spelled
+        // `?*T` (optionally `?*const T`) carries a pointer payload, and
+        // unwrapping an optional pointer hands out the pointer.
+        //
+        // Losing this is not cosmetic.  In
+        //   const handle = context.sourceHandle(path) catch |err| …;
+        //   return .{ .borrowed = &handle.tree };
+        // `context` is never marked pointer, so `handle` inherits
+        // nothing, `&handle.tree` classifies as `.stack_ref(handle)`,
+        // and a borrow of the document store's own storage is reported
+        // as an escape from this frame.
+        if (!saw_star and self.fieldIsOptionalPointerPayload(node)) {
+            self.locals.items[@intFromEnum(lid)].is_pointer = true;
+            return;
+        }
     }
 
-    /// True iff `expr_node` is a call whose method name is a
-    /// known-returns-`?*T` convention (`fromJS`, `as`).  Used by
-    /// `inferPointerCapture` to mark `if (X.fromJS(value)) |v|`'s
-    /// `v` as a pointer.
-    fn callReturnsOptionalPointer(self: *const Builder, expr_node: Ast.Node.Index) bool {
+    /// True when `expr_node` reads a struct field whose declared type is
+    /// `?*T` / `?*const T`, so `if (recv.field) |cap|` captures a
+    /// pointer by value.  Declaration-driven on purpose: it must work
+    /// exactly where the type engine does not.
+    fn fieldIsOptionalPointerPayload(self: *Builder, expr_node: Ast.Node.Index) bool {
         const tree = self.tree;
-        const tag = tree.nodeTag(expr_node);
-        const is_call = switch (tag) {
-            .call, .call_one, .call_comma, .call_one_comma => true,
-            else => false,
-        };
-        if (!is_call) return false;
-        // The first token of the call is the receiver chain; the
-        // LAST token before the `(` is the method name.  Walk back
-        // from the call's main token to find the method ident.
-        const main_tok = tree.nodeMainToken(expr_node);
-        // For a call like `X.Y.fromJS(args)`, main_tok is the `(`.
-        // The token immediately before is the method ident.
-        const tags = tree.tokens.items(.tag);
-        if (main_tok == 0) return false;
-        const m = main_tok - 1;
-        if (tags[m] != .identifier) return false;
-        const name = tree.tokenSlice(m);
-        return std.mem.eql(u8, name, "fromJS") or
-            std.mem.eql(u8, name, "as");
+        if (tree.nodeTag(expr_node) != .field_access) return false;
+        const recv, const field_tok = tree.nodeData(expr_node).node_and_token;
+        if (tree.nodeTag(recv) != .identifier) return false;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+        const owner_type: ?[]const u8 = if (std.mem.eql(u8, recv_name, "self") or
+            std.mem.eql(u8, recv_name, "this"))
+            self.self_type
+        else if (self.name_to_local.get(recv_name)) |local|
+            self.locals.items[@intFromEnum(local)].type_name
+        else
+            null;
+        const type_name = owner_type orelse return false;
+        const cache = self.cache orelse return false;
+        const model = self.modelOrNull(cache) orelse return false;
+        const owner = model.findType(type_name) orelse return false;
+        const field = owner.findField(tree.tokenSlice(field_tok)) orelse return false;
+        return typeRangeIsOptionalPointer(tree, field.type_first, field.type_last);
+    }
+
+    /// True when `init_node` unwraps an optional (`e.?`) over a field
+    /// whose DECLARED type is `?*T` / `?*const T` — the one optional
+    /// unwrap whose payload type is knowable without a resolver.  The
+    /// callee-spelling proofs cannot make this call (`parent` may
+    /// return `?Box` by value), and the type engine cannot resolve a
+    /// payload spelled `?*@import("some_module").T` across a module
+    /// boundary.  The declaration settles both.
+    fn initUnwrapsOptionalPointerField(self: *Builder, init_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const value = initShapeNode(tree, init_node);
+        if (tree.nodeTag(value) != .unwrap_optional) return false;
+        return self.fieldIsOptionalPointerPayload(tree.nodeData(value).node_and_token[0]);
+    }
+
+    /// Prove an optional pointer from the callee's declared return type.
+    fn callReturnsOptionalPointer(self: *Builder, expr_node: Ast.Node.Index) bool {
+        const decl = self.calleeDeclOfCall(expr_node) orelse return false;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = decl.tree.fullFnProto(&buf, decl.fn_decl) orelse return false;
+        const return_type = proto.ast.return_type.unwrap() orelse return false;
+        return typeRangeIsOptionalPointer(
+            decl.tree,
+            decl.tree.firstToken(return_type),
+            decl.tree.lastToken(return_type),
+        );
     }
 
     /// Variant that, when `reset_into` is non-null, emits a
@@ -798,6 +1424,15 @@ const Builder = struct {
         }
     }
 
+    /// Number of locals registered so far, as the `u32` `LocalId`
+    /// indexes them by.  A body that declares more locals than a `u32`
+    /// can address has a local table larger than any allocator hands
+    /// out, so the count is checked rather than narrowed — the same
+    /// bound `LocalId` itself imposes on every access.
+    fn localsLen(self: *Builder) !u32 {
+        return std.math.cast(u32, self.locals.items.len) orelse error.OutOfMemory;
+    }
+
     fn registerCapturesWith(self: *Builder, payload_token: Ast.TokenIndex, reset_into: ?BlockId) !void {
         _ = try self.registerCapturesImpl(payload_token, reset_into, false);
     }
@@ -836,12 +1471,7 @@ const Builder = struct {
         }
     }
 
-    /// Lower the contents of a Zig block node into `cur` (mutated to the
-    /// last block reached — branches may have advanced past the original).
-    /// Defer statements encountered are queued and replayed in reverse
-    /// order at every `return` exit point.  Does NOT flush defers at
-    /// block exit — only the top-level function body does that, via
-    /// `lowerFunctionBody`.
+    /// Lower one lexical block and replay its normal defers at fallthrough.
     fn lowerBlock(self: *Builder, block_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         var stmt_buf: [2]Ast.Node.Index = undefined;
@@ -859,17 +1489,7 @@ const Builder = struct {
             try self.lowerStmt(stmt_idx, cur);
         }
 
-        // Fire defers added inside this block at fallthrough exit.
-        // Errdefers do NOT fire on fallthrough (success path) — they
-        // only fire on error returns, handled in flushErrAndNormalDefers.
-        var i = self.deferred.items.len;
-        while (i > save) {
-            i -= 1;
-            const entry = self.deferred.items[i];
-            if (entry.kind == .normal) {
-                try self.lowerStmt(entry.body, cur);
-            }
-        }
+        try self.flushScopeDefers(cur, save);
         self.deferred.shrinkRetainingCapacity(save);
     }
 
@@ -959,20 +1579,15 @@ const Builder = struct {
         try self.deferred.append(self.gpa, .{ .kind = .err, .body = body_node });
     }
 
-    /// Replay `defer` bodies (LIFO) into `cur`.  Doesn't pop — returns
-    /// happen mid-function and subsequent code in the same lexical
-    /// scope must still see the same defer set.  Called at function-
-    /// fallthrough exit and at every `return`.  Skips `.err` entries
-    /// since errdefers only fire on error returns (handled in
-    /// `flushErrAndNormalDefers`).
-    fn flushDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    /// Replay normal defers for the scopes crossed by a control-flow edge.
+    /// Keep registrations intact for other exits from the same lexical scope.
+    fn flushScopeDefers(self: *Builder, cur: *BlockId, first: usize) LoweringError!void {
         var i = self.deferred.items.len;
-        while (i > 0) {
+        std.debug.assert(first <= i);
+        while (i > first) {
             i -= 1;
             const entry = self.deferred.items[i];
-            if (entry.kind == .normal) {
-                try self.lowerStmt(entry.body, cur);
-            }
+            if (entry.kind == .normal) try self.lowerStmt(entry.body, cur);
         }
     }
 
@@ -982,7 +1597,7 @@ const Builder = struct {
     /// an `errdefer free(p)` runs FIRST on error exit, avoiding a
     /// spurious UAF in the synthetic err_exit sink.  Used at
     /// synthetic try-error-exit blocks.
-    fn flushErrAndNormalDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    fn flushErrAndNormalDefers(self: *Builder, cur: *BlockId) (LoweringError)!void {
         var i = self.deferred.items.len;
         while (i > 0) {
             i -= 1;
@@ -993,7 +1608,7 @@ const Builder = struct {
     /// Dispatch on statement node tag.  v1: handle decls, assigns,
     /// expression-statement calls, returns, if/while; everything else
     /// becomes a `.lowering_gap` placeholder.
-    fn lowerStmt(self: *Builder, stmt_node: Ast.Node.Index, cur: *BlockId) std.mem.Allocator.Error!void {
+    fn lowerStmt(self: *Builder, stmt_node: Ast.Node.Index, cur: *BlockId) LoweringError!void {
         const tree = self.tree;
         const tag = tree.nodeTag(stmt_node);
         switch (tag) {
@@ -1002,6 +1617,10 @@ const Builder = struct {
             },
             .assign, .assign_destructure => {
                 try self.lowerAssign(stmt_node, cur);
+            },
+            .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_shl_sat, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat => {
+                try self.emitUsesInExpr(stmt_node, cur.*, null);
+                try self.emitWritesInLhs(tree.nodeData(stmt_node).node_and_node[0], cur.*);
             },
             .@"return" => {
                 // lowerReturn handles its own defer-flush ordering —
@@ -1017,7 +1636,7 @@ const Builder = struct {
                 try self.pushDefer(body);
             },
             .@"errdefer" => {
-                const body = tree.nodeData(stmt_node).node;
+                const body = tree.nodeData(stmt_node).opt_token_and_node[1];
                 try self.pushErrdefer(body);
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
@@ -1026,6 +1645,7 @@ const Builder = struct {
             .@"switch", .switch_comma => try self.lowerSwitch(stmt_node, cur),
             .@"try" => try self.lowerTryStmt(stmt_node, cur),
             .@"catch" => try self.lowerCatchStmt(stmt_node, cur),
+            .@"orelse" => try self.lowerOrelseStmt(stmt_node, cur),
             .@"break" => try self.lowerBreakOrContinue(cur, .@"break", stmt_node),
             .@"continue" => try self.lowerBreakOrContinue(cur, .@"continue", stmt_node),
             // Divergent stmts: replace cur with a fresh dead block so
@@ -1068,65 +1688,34 @@ const Builder = struct {
     /// `if (cond) THEN [else ELSE]` → fork into two successor blocks,
     /// lower each branch into its own block, then join into a fresh
     /// merge block.  Subsequent statements emit into the merge block.
-    ///
-    /// We don't model the condition's truthiness — the abstract state
-    /// must be valid on BOTH branches (this is conservative and matches
-    /// our design: don't reason about branch-specific values).
     fn lowerIf(self: *Builder, if_node: Ast.Node.Index, cur: *BlockId) !void {
-        const tree = self.tree;
-        const if_data = tree.fullIf(if_node) orelse {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "if-extract" } },
-                .pos = self.posOf(if_node),
-                .end_pos = self.endPosOf(if_node),
-            });
-            return;
-        };
-
-        // Walk the condition for any local reads / address-of writes
-        // before we branch — the condition runs before either arm and
-        // its side effects (e.g. `&out` clearing .undef) must be
-        // visible in BOTH successor states.
-        try self.emitUsesInExpr(if_data.ast.cond_expr, cur.*, null);
-
-        // Allocate the three successor blocks up-front.
+        const branch = self.tree.fullIf(if_node).?;
+        try self.emitUsesInExpr(branch.ast.cond_expr, cur.*, null);
+        const condition = if (branch.payload_token == null) self.booleanValue(branch.ast.cond_expr) else null;
         const then_block = try self.newBlock();
-        const else_block = if (if_data.ast.else_expr.unwrap() != null) try self.newBlock() else null;
-        const merge_block = try self.newBlock();
-
-        // From `cur`: branch to then-block and (else-block OR merge directly
-        // if no else clause — falling through is the same as an empty else).
+        const else_block = try self.newBlock();
+        const merge = try self.newBlock();
         try self.addEdge(cur.*, then_block);
-        try self.addEdge(cur.*, else_block orelse merge_block);
-
-        // Lower the then branch.  `if (opt) |val|` payload is in scope
-        // for the then-body only.  Reset at then-entry: when the if is
-        // inside a loop body, the capture rebinds each iteration so
-        // prior-iter state must not propagate.
-        if (if_data.payload_token) |pt| {
-            try self.registerCapturesWith(pt, then_block);
-            // Infer is_pointer for the capture when the scrutinee is a
-            // `<Type>.fromJS(...)` call (Bun convention: returns
-            // `?*Type`).  Lets `&capture.field` skip stack-escape
-            // since `capture` is a heap pointer.
-            self.inferPointerCapture(pt, if_data.ast.cond_expr);
+        try self.addEdge(cur.*, else_block);
+        try self.assumeCondition(then_block, branch.ast.cond_expr, condition, true);
+        try self.assumeCondition(else_block, branch.ast.cond_expr, condition, false);
+        const pre_capture_len = try self.localsLen();
+        if (branch.payload_token) |token| {
+            try self.registerCapturesWith(token, then_block);
+            self.inferPointerCapture(token, branch.ast.cond_expr);
         }
         var then_cur = then_block;
-        try self.lowerStmt(if_data.ast.then_expr, &then_cur);
-        // Then-branch exits flow into merge.
-        try self.addEdge(then_cur, merge_block);
-
-        // Lower the else branch if present.  `else |err|` payload is
-        // in scope for the else-body only.
-        if (else_block) |eb| {
-            if (if_data.error_token) |et| try self.registerErrorCapturesWith(et, eb);
-            var else_cur = eb;
-            try self.lowerStmt(if_data.ast.else_expr.unwrap().?, &else_cur);
-            try self.addEdge(else_cur, merge_block);
+        try self.lowerStmt(branch.ast.then_expr, &then_cur);
+        try self.addEdge(then_cur, merge);
+        try self.restoreCaptureNames(pre_capture_len);
+        var else_cur = else_block;
+        if (branch.ast.else_expr.unwrap()) |else_expr| {
+            if (branch.error_token) |token| try self.registerErrorCapturesWith(token, else_block);
+            try self.lowerStmt(else_expr, &else_cur);
+            try self.restoreCaptureNames(pre_capture_len);
         }
-
-        // Subsequent statements emit into the merge block.
-        cur.* = merge_block;
+        try self.addEdge(else_cur, merge);
+        cur.* = merge;
     }
 
     /// `while (cond) BODY [else ELSE]` → produces a header block (where
@@ -1139,67 +1728,47 @@ const Builder = struct {
     ///   cur ─→ header ─→ body ─→ header (back-edge)
     ///                  ↘ merge (loop exit / else)
     fn lowerWhile(self: *Builder, while_node: Ast.Node.Index, cur: *BlockId) !void {
-        const tree = self.tree;
-        const while_data = tree.fullWhile(while_node) orelse {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "while-extract" } },
-                .pos = self.posOf(while_node),
-                .end_pos = self.endPosOf(while_node),
-            });
-            return;
-        };
-
-        // Walk the loop condition for .use/.assign side effects
-        // before any branching.  Skip rules in emitUsesInExpr now
-        // tolerate `arr.len` / `arr[..]` so this no longer drowns in
-        // false positives.
-        try self.emitUsesInExpr(while_data.ast.cond_expr, cur.*, null);
-
+        const loop = self.tree.fullWhile(while_node).?;
+        const condition = if (loop.payload_token == null) self.booleanValue(loop.ast.cond_expr) else null;
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
-
-        // Edge: cur → header (loop entry)
+        const natural_exit = if (loop.ast.else_expr != .none or condition != null) try self.newBlock() else merge;
+        const continuation = if (loop.ast.cont_expr != .none) try self.newBlock() else header;
         try self.addEdge(cur.*, header);
-
-        // Header branches to body (when cond true) or merge (when false).
+        try self.emitUsesInExpr(loop.ast.cond_expr, header, null);
         try self.addEdge(header, body);
-        try self.addEdge(header, merge);
-
-        // Lower the body; on exit, back-edge to header.  Push loop
-        // context so any `break`/`continue` inside lowers correctly.
-        const label_slice: ?[]const u8 = if (while_data.label_token) |lt|
-            tree.tokenSlice(lt)
-        else
-            null;
+        try self.addEdge(header, natural_exit);
+        try self.assumeCondition(body, loop.ast.cond_expr, condition, true);
+        try self.assumeCondition(natural_exit, loop.ast.cond_expr, condition, false);
         try self.loop_stack.append(self.gpa, .{
-            .header = header,
+            .continue_to = continuation,
             .merge = merge,
-            .label = label_slice,
+            .defer_depth = self.deferred.items.len,
+            .label = if (loop.label_token) |token| self.tree.tokenSlice(token) else null,
         });
-        // `while (opt) |x|` payload capture — register before body
-        // and emit reset stmts at body entry so back-edges don't
-        // propagate one iteration's state (e.g. .heap.dead from
-        // `free(x)`) into the next iteration's view of the capture.
-        const pre_capture_len: u32 = @intCast(self.locals.items.len);
-        if (while_data.payload_token) |pt| try self.registerCapturesWith(pt, body);
+        const pre_capture_len = try self.localsLen();
+        if (loop.payload_token) |token| try self.registerCapturesWith(token, body);
         var body_cur = body;
-        try self.lowerStmt(while_data.ast.then_expr, &body_cur);
-        _ = self.loop_stack.pop();
-        try self.addEdge(body_cur, header);
+        try self.lowerStmt(loop.ast.then_expr, &body_cur);
+        const ended_loop = self.loop_stack.pop().?;
+        std.debug.assert(ended_loop.merge == merge);
+        try self.addEdge(body_cur, continuation);
+        if (loop.ast.cont_expr.unwrap()) |expression| {
+            var continuation_cur = continuation;
+            try self.lowerStmt(expression, &continuation_cur);
+            try self.addEdge(continuation_cur, header);
+        }
         try self.restoreCaptureNames(pre_capture_len);
-
-        // Optional else block (runs once when cond becomes false).
-        // We don't model the "runs only on natural exit, not on break" —
-        // treat as falling through to merge.
-        if (while_data.ast.else_expr.unwrap()) |else_expr| {
-            const else_block = try self.newBlock();
-            try self.addEdge(header, else_block);
-            var else_cur = else_block;
-            try self.lowerStmt(else_expr, &else_cur);
+        if (natural_exit != merge) {
+            var else_cur = natural_exit;
+            if (loop.ast.else_expr.unwrap()) |else_expr| {
+                if (loop.error_token) |token| try self.registerErrorCapturesWith(token, natural_exit);
+                try self.lowerStmt(else_expr, &else_cur);
+                try self.restoreCaptureNames(pre_capture_len);
+            }
             try self.addEdge(else_cur, merge);
         }
-
         cur.* = merge;
     }
 
@@ -1346,10 +1915,13 @@ const Builder = struct {
     /// works for file-as-struct types too.
     fn typeHasSingletonAccessor(self: *Builder, type_name: []const u8) bool {
         const cache = self.cache orelse return false;
-        const model = cache.fileModel() catch return false;
+        const model = self.modelOrNull(cache) orelse return false;
         const ti = model.findType(type_name) orelse return false;
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
+        // The last token index is already a `u32` (`Ast.TokenIndex`), so
+        // the method-scan bound needs no conversion of its own.
+        const last_tok = tree.lastToken(.root);
         for (ti.methods) |m| {
             // Canonical accessors are parameterless.  Other names
             // (\`initGlobal\`, \`init<X>\`) may take args but still
@@ -1370,7 +1942,7 @@ const Builder = struct {
             if (name_tok + 2 >= tags.len) continue;
             if (tags[name_tok + 1] != .l_paren) continue;
             // Find the matching `)`.
-            const close = tokens.matchParen(tags, name_tok + 1, @intCast(tags.len - 1)) orelse continue;
+            const close = tokens.matchParen(tags, name_tok + 1, last_tok) orelse continue;
             var t: Ast.TokenIndex = close + 1;
             if (t < tags.len and tags[t] == .question_mark) t += 1;
             if (t >= tags.len or tags[t] != .asterisk) continue;
@@ -1393,7 +1965,7 @@ const Builder = struct {
 
     fn typeBodyHasRefCountMixin(self: *Builder, type_name: []const u8) bool {
         const cache = self.cache orelse return false;
-        const model = cache.fileModel() catch return false;
+        const model = self.modelOrNull(cache) orelse return false;
         const ti = model.findType(type_name) orelse return false;
         const tags = self.tree.tokens.items(.tag);
         if (ti.body_first >= ti.body_last) return false;
@@ -1425,7 +1997,10 @@ const Builder = struct {
         // Find any method on type `ct` whose body allocates a heap
         // instance of the type (`<x>.create(<ct>)` / `.create(Self)`).
         const cache = self.cache orelse return null;
-        const creator_found = cache.anyMethodAllocatesSelf(ct) catch false;
+        const creator_found = cache.anyMethodAllocatesSelf(ct) catch |err| {
+            self.noteResolutionError(err);
+            return null;
+        };
         if (!creator_found) return null;
 
         // Two-stage cleanup pattern: when fn is `deinit` / `finalize`
@@ -1435,7 +2010,10 @@ const Builder = struct {
         // partial.  The leak check naturally targets `destroy` (if
         // even there) instead.
         if (!std.mem.eql(u8, fn_name, "destroy")) {
-            const has_destroy = cache.typeHasMethod(ct, "destroy") catch false;
+            const has_destroy = cache.typeHasMethod(ct, "destroy") catch |err| err_blk: {
+                self.noteResolutionError(err);
+                break :err_blk false;
+            };
             if (has_destroy) return null;
         }
         // Refcount-managed lifecycle: types with bun's refcount
@@ -1483,7 +2061,7 @@ const Builder = struct {
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.
         if (self.cache) |c| {
-            if (c.summaryByMethod(ct, fn_name) catch null) |s| {
+            if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByMethod(ct, fn_name))) |s| {
                 if (s.takes_ownership_of) |idx| if (idx == 0) return null;
             }
         }
@@ -1597,7 +2175,7 @@ const Builder = struct {
                     // which is the right type for both `|x|` and
                     // `|*x|` captures (the `*` is just a borrow modifier).
                     if (self.zls) |z| {
-                        if (z.typeNameOfNode(input) catch null) |ty| {
+                        if (self.queryOrUnknown([]const u8, z.typeReferenceOfNode(input))) |ty| {
                             const li = &self.locals.items[@intFromEnum(capture_local)];
                             if (li.type_name == null) li.type_name = ty;
                         }
@@ -1610,69 +2188,1421 @@ const Builder = struct {
     }
 
     fn lowerFor(self: *Builder, for_node: Ast.Node.Index, cur: *BlockId) !void {
-        const tree = self.tree;
-        const for_data = tree.fullFor(for_node) orelse {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "for-extract" } },
-                .pos = self.posOf(for_node),
-                .end_pos = self.endPosOf(for_node),
-            });
-            return;
-        };
-
-        // Walk every input expression before any branching.
-        for (for_data.ast.inputs) |input| {
-            try self.emitUsesInExpr(input, cur.*, null);
-        }
-
+        const loop = self.tree.fullFor(for_node).?;
+        for (loop.ast.inputs) |input| try self.emitUsesInExpr(input, cur.*, null);
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
-
+        const natural_exit = if (loop.ast.else_expr != .none) try self.newBlock() else merge;
         try self.addEdge(cur.*, header);
         try self.addEdge(header, body);
-        try self.addEdge(header, merge);
-
-        const for_label: ?[]const u8 = if (for_data.label_token) |lt|
-            tree.tokenSlice(lt)
-        else
-            null;
+        try self.addEdge(header, natural_exit);
         try self.loop_stack.append(self.gpa, .{
-            .header = header,
+            .continue_to = header,
             .merge = merge,
-            .label = for_label,
+            .defer_depth = self.deferred.items.len,
+            .label = if (loop.label_token) |token| self.tree.tokenSlice(token) else null,
         });
-        // For-loops always have a payload (`|x|` or `|x, idx|`).
-        // Reset on iteration entry — see lowerWhile for rationale.
-        // Save locals count before capture registration so we can restore
-        // name_to_local after the body — see restoreCaptureNames.
-        const pre_capture_len: u32 = @intCast(self.locals.items.len);
-        try self.registerCapturesWith(for_data.payload_token, body);
-        // Detect interior-pointer captures: when input N is a
-        // `<container>.<field>` access AND capture N is `|*p|`
-        // (by-pointer), mark `p` as borrowing from the container.
-        // Used by destructor-call detection to flag the oven-sh/bun#30176
-        // pattern `for (entries.items) |*r| r.destroy();`.
-        self.markInteriorCaptures(for_data, body);
+        const pre_capture_len = try self.localsLen();
+        try self.registerCapturesWith(loop.payload_token, body);
+        self.markInteriorCaptures(loop, body);
         var body_cur = body;
-        try self.lowerStmt(for_data.ast.then_expr, &body_cur);
-        _ = self.loop_stack.pop();
-        try self.addEdge(body_cur, header); // back-edge for fixed-point iteration
-        // Restore name_to_local for capture names now that the body is done.
-        // Captures are scoped to the loop body; leaving them in name_to_local
-        // after this point causes subsequent defer replays (or code after the
-        // loop) to resolve the capture name to the wrong LocalId.
+        try self.lowerStmt(loop.ast.then_expr, &body_cur);
+        // Resolved after the body has been lowered, so every binding the
+        // body introduces — the payload capture AND any local declared
+        // inside it — is live in `name_to_local`.  That is what lets the
+        // proof see a body-local shadow, or a body-local `undefined`
+        // seed on the value being stored, as the same binding the write
+        // actually reaches, instead of resolving both against an outer
+        // name.  Still ahead of `restoreCaptureNames`, so the capture is
+        // in scope and can't be mistaken for the written local.
+        const field_fill = self.exhaustiveAggregateFill(loop);
+        const ended_loop = self.loop_stack.pop().?;
+        std.debug.assert(ended_loop.merge == merge);
+        try self.addEdge(body_cur, header);
         try self.restoreCaptureNames(pre_capture_len);
-
-        if (for_data.ast.else_expr.unwrap()) |else_expr| {
-            const else_block = try self.newBlock();
-            try self.addEdge(header, else_block);
-            var else_cur = else_block;
+        if (loop.ast.else_expr.unwrap()) |else_expr| {
+            var else_cur = natural_exit;
             try self.lowerStmt(else_expr, &else_cur);
             try self.addEdge(else_cur, merge);
         }
-
         cur.* = merge;
+        // Verified comptime-exhaustive aggregate fill: on every path
+        // that reaches the merge, the unrolled loop ran to exhaustion
+        // and therefore wrote every field / every element of the
+        // target.  Recording that as a plain write keeps
+        // `return <target>` from reading as a leak of `undefined` —
+        // without claiming that ANY write defines a whole aggregate.
+        // It sits in the merge block (after the else arm), so it
+        // dominates what follows the loop and can never reach a path
+        // that returned from inside the body.
+        if (field_fill) |fill| {
+            try self.appendStmt(merge, .{
+                .kind = .{ .assign = .{ .target = fill.local, .rhs_kind = .plain } },
+                .pos = fill.pos,
+                .end_pos = fill.end_pos,
+            });
+        }
+    }
+
+    /// Pick whichever comptime-exhaustive aggregate-fill proof this
+    /// loop satisfies.  Both require the loop to run a FIXED number of
+    /// times at comptime and to be unlabelled; they differ only in what
+    /// the body writes and how the count is established:
+    /// `exhaustiveFieldFill` for `@typeInfo(T).@"struct".fields` +
+    /// `@field`, `exhaustiveIndexedFill` for `for (xs, 0..)` +
+    /// `target[i]`.  A loop has one input for the former and two for
+    /// the latter, so at most one can ever fire.
+    ///
+    /// The comptime-exhaustion question is each proof's own: the field
+    /// proof only holds for an `inline for`, while the indexed proof
+    /// also accepts an ordinary `for` inside a `comptime` block, where
+    /// the loop still walks its whole collection — one statement at a
+    /// time, but every statement in such a block is comptime.
+    fn exhaustiveAggregateFill(self: *Builder, loop: Ast.full.For) ?FieldFillProof {
+        if (loop.label_token != null) return null;
+        return self.exhaustiveFieldFill(loop) orelse self.exhaustiveIndexedFill(loop);
+    }
+
+    /// True when [first, last] holds a `break` / `continue` that is
+    /// NOT followed by a `:` label.  Either would leave the loop, or
+    /// skip the rest of an iteration, before every element was
+    /// written.  A LABELED one is safe by construction: the proof only
+    /// ever runs on an UNLABELED loop, so `break :blk` binds an
+    /// enclosing labeled block or switch — which is what the packed
+    /// `=> blk: { … break :blk … }` arms depend on.
+    ///
+    /// A `defer`/`errdefer` needs no rule of its own: it fires at
+    /// scope exit, and it could only reach the target by naming it,
+    /// which the single-mention check rejects.
+    fn bodyHasUnlabeledLoopExit(
+        self: *const Builder,
+        first: Ast.TokenIndex,
+        last: Ast.TokenIndex,
+    ) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        var scan: Ast.TokenIndex = first;
+        while (scan <= last) : (scan += 1) {
+            const tag = tags[scan];
+            if (tag != .keyword_break and tag != .keyword_continue) continue;
+            if (scan + 1 >= tags.len or tags[scan + 1] != .colon) return true;
+        }
+        return false;
+    }
+
+    /// A verified `var x: T = undefined;` filled to the last slot by an
+    /// unrolled loop — `inline for (@typeInfo(T).@"struct".fields) |f| …`
+    /// writing `@field(x, f.name)`, or `inline for (xs, 0..) |v, i| …`
+    /// writing `x[i]`.  `local` holds a fully initialized value by the
+    /// time the loop's normal exit is reached.
+    const FieldFillProof = struct {
+        local: LocalId,
+        pos: SrcPos,
+        end_pos: SrcPos,
+    };
+
+    /// The one top-level store of the loop body: the token naming the
+    /// written local and the value expression stored into the field /
+    /// element this iteration owns.  Shared by both fill proofs —
+    /// `fieldFillAssignWrite` produces `@field(<base>, <capture>.name)`
+    /// and `indexedFillAssignWrite` produces `<base>[<index capture>]`.
+    const FieldFillWrite = struct {
+        base_tok: Ast.TokenIndex,
+        rhs: Ast.Node.Index,
+    };
+
+    /// Sound comptime-exhaustive-field-initialization proof.
+    ///
+    ///   var result: T = undefined;
+    ///   inline for (@typeInfo(T).@"struct".fields) |field| { … }
+    ///   return result;
+    ///
+    /// `inline for` unrolls at comptime, so after the loop every
+    /// semantic field of `T` has been assigned — valid Zig only
+    /// guarantees that if the body really writes each one.  The generic
+    /// CFG can't see it: the loop may run zero times, so `result` still
+    /// reads as `.undef` at the `return`.  This narrows exactly that
+    /// gap, and nothing else — in particular it does NOT treat a
+    /// single field write as defining the whole struct.
+    ///
+    /// Each clause below is load-bearing; any one missing would let the
+    /// loop finish with a field still unwritten:
+    ///   - the loop is `inline` (comptime-unrolled) and unlabelled,
+    ///     over exactly `@typeInfo(<T>).@"struct".fields`;
+    ///   - the descriptor's type argument is a bare identifier that
+    ///     names THIS function's `comptime <T>: type` parameter, and
+    ///     that parameter is still the binding the name resolves to
+    ///     here — so no body-level `T` (`const T = …`, `comptime var T
+    ///     = …`, a capture) shadows it.  Same source text is NOT the
+    ///     same type; this is the only accepted way to tie the two
+    ///     sites to one immutable binding.  The target's declared type
+    ///     must then be that same bare parameter name, so the fields
+    ///     enumerated are the target's fields and not another type's;
+    ///   - the payload is a by-value `|<ident>|` capture, and the
+    ///     body's single top-level `@field` lvalue selects through
+    ///     that exact capture as `.<ident>.name` — any other selector
+    ///     writes a field the loop never enumerates;
+    ///   - the target has exactly ONE mention in the whole body: that
+    ///     lvalue.  A read, a nested write, or a write behind a
+    ///     conditional each leave fields undefined on some path;
+    ///   - the body holds no UNLABELED `break` / `continue`.  Either
+    ///     would leave the loop, or skip the rest of an iteration,
+    ///     before the remaining fields were written.  A LABELED one is
+    ///     safe by construction: this loop is unlabeled, so `break :blk`
+    ///     binds an enclosing labeled block or switch — which is what
+    ///     the packed `=> blk: { … break :blk … }` arms depend on.
+    ///     `defer` needs no rule of its own: it fires at scope exit and
+    ///     can only reach the target by naming it, which the
+    ///     single-mention clause above already forbids.
+    ///   - the target is a `var` seeded with the `undefined` keyword —
+    ///     that seed is the only thing the loop clears — and the
+    ///     written value is not itself `undefined`.  Writing
+    ///     `undefined`, or copying a local that was seeded `undefined`,
+    ///     leaves every field exactly as uninitialized as it was, and a
+    ///     synthetic "the whole value is now defined" claim would hide
+    ///     that real use-undefined behind a loop that provably wrote
+    ///     nothing of substance.
+    ///
+    /// A `return` inside the body is neither rejected nor credited: the
+    /// effect lands in the loop's merge block, so an early return is
+    /// still analysed on its own path with only the fields it wrote.
+    /// Zero-field `T` is zero-sized — nothing to read — so the unrolled
+    /// loop writing nothing is safe.
+    fn exhaustiveFieldFill(self: *Builder, loop: Ast.full.For) ?FieldFillProof {
+        if (loop.inline_token == null) return null;
+        if (loop.label_token != null) return null;
+        if (loop.ast.inputs.len != 1) return null;
+        const arg = typeInfoStructFieldsArg(self.tree, loop.ast.inputs[0]) orelse return null;
+        const capture = self.forCaptureName(loop) orelse return null;
+        // A bare identifier is the only argument shape this accepts:
+        // anything else (`Key.Pointer`, `Self`, `@This()`, a call) is a
+        // type EXPRESSION whose identity needs real resolution.
+        if (arg.first != arg.last) return null;
+        const type_name = self.tree.tokenSlice(arg.first);
+        const param_tok = self.comptimeTypeParamToken(type_name) orelse return null;
+        if (!self.bindingIsParam(type_name, param_tok)) return null;
+
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const body_node = loop.ast.then_expr;
+        const body_first = tree.firstToken(body_node);
+        const body_last = tree.lastToken(body_node);
+        if (body_first > body_last or body_last >= tags.len) return null;
+
+        if (self.bodyHasUnlabeledLoopExit(body_first, body_last)) return null;
+
+        var stmt_buf: [2]Ast.Node.Index = undefined;
+        var single_buf: [1]Ast.Node.Index = undefined;
+        const stmts: []const Ast.Node.Index = switch (tree.nodeTag(body_node)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => blockStmts(tree, body_node, &stmt_buf),
+            else => blk: {
+                single_buf[0] = body_node;
+                break :blk single_buf[0..];
+            },
+        };
+
+        var base_tok: Ast.TokenIndex = 0;
+        var found = false;
+        for (stmts) |stmt| {
+            const w = self.fieldFillAssignWrite(stmt, capture) orelse continue;
+            // A second `@field` lvalue means the body isn't the single
+            // unconditional enumeration this proof is about.
+            if (found) return null;
+            const write_name = tree.tokenSlice(w.base_tok);
+            if (std.mem.eql(u8, write_name, capture)) return null;
+            if (self.name_to_local.get(write_name) == null) return null;
+            if (!self.rhsIsDefined(w.rhs)) return null;
+            base_tok = w.base_tok;
+            found = true;
+        }
+        if (!found) return null;
+        const local = self.name_to_local.get(tree.tokenSlice(base_tok)).?;
+
+        const name = self.locals.items[@intFromEnum(local)].name;
+        if (self.identifierMentions(name, body_first, body_last) != 1) return null;
+
+        const decl = self.varDeclTypeSpan(local) orelse return null;
+        // `@field` through a `const` doesn't compile, and the loop is
+        // only what defines the value if the seed really was `undefined`.
+        if (decl.is_const) return null;
+        if (!decl.init_is_undefined) return null;
+        if (decl.name_tok >= loop.ast.for_token) return null;
+        // The declared type must be that same bare parameter name.
+        if (decl.type.first != decl.type.last) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(decl.type.first), type_name)) return null;
+        return .{
+            .local = local,
+            .pos = self.posOfToken(loop.ast.for_token),
+            .end_pos = self.endPosOf(body_node),
+        };
+    }
+
+    /// The by-value capture identifier of `|<ident>|`.  Null for a
+    /// by-pointer capture (`|*x|`), for `_`, for a destructuring
+    /// payload (`|a, b|`), and for a loop with no payload at all —
+    /// none of which name a field descriptor.
+    ///
+    /// `full.For.payload_token` is the token AFTER the opening `|`
+    /// (`Ast.fullForComponents` sets it to `last_cond_token + 3`), the
+    /// convention `registerCapturesImpl` scans from — so the name is
+    /// AT it, with `|` on both sides.  A loop carrying no payload at
+    /// all still lands somewhere past its input expression, so the
+    /// opening `|` is what makes this a payload rather than the first
+    /// token of an unbraced body.
+    fn forCaptureName(self: *const Builder, loop: Ast.full.For) ?[]const u8 {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const pt = loop.payload_token;
+        if (pt >= tags.len or pt + 1 >= tags.len) return null;
+        if (tags[pt] != .identifier) return null;
+        if (pt == 0 or tags[pt - 1] != .pipe) return null;
+        if (tags[pt + 1] != .pipe) return null;
+        const name = tree.tokenSlice(pt);
+        if (std.mem.eql(u8, name, "_")) return null;
+        return name;
+    }
+
+    /// The top-level `@field(<base>, <capture>.name) = <rhs>` statement
+    /// of the loop body.  The selector must be exactly
+    /// `<capture>.name`: `.name` is what the loop's descriptor yields,
+    /// and any other path would write a different field than the one
+    /// being enumerated.
+    fn fieldFillAssignWrite(
+        self: *const Builder,
+        stmt: Ast.Node.Index,
+        capture: []const u8,
+    ) ?FieldFillWrite {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (tree.nodeTag(stmt) != .assign) return null;
+        const data = tree.nodeData(stmt).node_and_node;
+        const lhs = data[0];
+        switch (tree.nodeTag(lhs)) {
+            .builtin_call_two, .builtin_call_two_comma => {},
+            else => return null,
+        }
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "@field")) return null;
+        const args = tree.nodeData(lhs).opt_node_and_opt_node;
+        const base = args[0].unwrap() orelse return null;
+        const selector = args[1].unwrap() orelse return null;
+        if (tree.nodeTag(base) != .identifier) return null;
+        const sel_first = tree.firstToken(selector);
+        const sel_last = tree.lastToken(selector);
+        if (sel_first >= tags.len or sel_last >= tags.len) return null;
+        if (sel_last != sel_first + 2) return null;
+        if (tags[sel_first] != .identifier or tags[sel_first + 1] != .period) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(sel_first), capture)) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(sel_last), "name")) return null;
+        return .{ .base_tok = tree.nodeMainToken(base), .rhs = data[1] };
+    }
+
+    // ── Comptime-exhaustive INDEXED aggregate fill ──────────────
+
+    /// How many elements a proof-side aggregate has, when the source
+    /// states that exactly.  Each field is a different way of stating
+    /// a COUNT, and agreement below is always agreement about a count
+    /// — never about a spelling:
+    ///
+    ///   - `number`: an element count both sides independently
+    ///     resolved;
+    ///   - `vec`: the immutable DECLARATION whose own length is the
+    ///     count.  A target typed `T = @Tuple(&V)` has exactly `V.len`
+    ///     fields and an enumeration over `V` walks exactly that many,
+    ///     so the two agree when their `V`s are the same declaration —
+    ///     which is why this carries the declaring NAME TOKEN rather
+    ///     than the name's text;
+    ///   - `collection`: a COMPILER REFLECTION collection whose `.len`
+    ///     IS this extent.  A target declared `[func_info.params.len]`
+    ///     holds `func_info.params.len` elements and
+    ///     `for (func_info.params, 0..)` writes exactly that many, so
+    ///     agreement is settled by both sites naming the same declared
+    ///     collection — which is what [CollectionId] compares.  A
+    ///     collection built out of storage states its count directly,
+    ///     and that count is resolved by `number`.
+    const FillExtent = struct {
+        number: ?u64 = null,
+        vec: ?Ast.TokenIndex = null,
+        collection: ?CollectionId = null,
+    };
+
+    /// Longest field path one length expression may walk.  A `.len`
+    /// read off a hand-built descriptor is a handful of steps; a
+    /// longer chain is a data structure, not a static extent.
+    const max_fill_path_fields = 8;
+
+    /// A field path over the immutable binding a length expression is
+    /// rooted in: that binding's already-resolved declaration, plus
+    /// the field names walked from it, in order.
+    const FieldPath = struct {
+        root: ScopedDecl,
+        fields: [max_fill_path_fields][]const u8,
+        field_count: u8,
+    };
+
+    /// A COMPILER REFLECTION collection whose `.len` a `[<expr>.len]E`
+    /// target measures: the DECLARING name token of the binding the
+    /// expression is rooted in, plus the field path walked from it.
+    ///
+    /// A declaration and its enumeration are necessarily DISJOINT token
+    /// ranges — `var types: [func_info.params.len]type` and
+    /// `for (func_info.params, 0..)` cannot be one span — so identity
+    /// has to come from what the two sites RESOLVE TO, not from where
+    /// they are written.  `root` is the declaring token, so this
+    /// `info` and another descriptor of the same shape resolve apart
+    /// even though they share a spelling; the path is compared by
+    /// field name, so `first.params` and `second.params` — two
+    /// descriptors that may even agree on how many parameters each has
+    /// — still resolve apart.
+    ///
+    /// Only a reflection value may be identified this way.  Its count
+    /// is a property of the type it describes rather than of storage
+    /// anyone can write, which is what makes naming the same value at
+    /// both sites enough — see [bindingHoldsReflectionValue].  A
+    /// collection built out of storage states its count directly, and
+    /// that count is resolved rather than matched.
+    const CollectionId = struct {
+        root: Ast.TokenIndex,
+        fields: [max_fill_path_fields][]const u8,
+        field_count: u8,
+
+        fn eql(a: CollectionId, b: CollectionId) bool {
+            if (a.root != b.root or a.field_count != b.field_count) return false;
+            for (a.fields[0..a.field_count], b.fields[0..b.field_count]) |mine, theirs| {
+                if (!std.mem.eql(u8, mine, theirs)) return false;
+            }
+            return true;
+        }
+    };
+
+    /// Do two aggregate extents state the same element count?  Every
+    /// branch is a claim about a count.  None is a claim that two
+    /// sources happen to be spelled alike, and none is a claim that a
+    /// side which simply failed to resolve matches anything.
+    fn fillExtentsAgree(a: FillExtent, b: FillExtent) bool {
+        if (a.number) |n| {
+            if (b.number) |m| {
+                if (n == m) return true;
+            }
+        }
+        if (a.vec) |mine| {
+            if (b.vec) |theirs| {
+                if (mine == theirs) return true;
+            }
+        }
+        if (a.collection) |mine| {
+            if (b.collection) |theirs| {
+                // Same declared reflection value, same field path —
+                // one `.len`, read from two places that cannot share a
+                // token range.
+                if (mine.eql(theirs)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Deepest brace nesting the scope resolver will track for a fill
+    /// proof.  A reference nested past this declines rather than
+    /// guessing which block its name came from.
+    const max_fill_scope_depth = 64;
+
+    /// Ceilings on how far a comptime length expression may be chased
+    /// through `const` initializers, and on how many tokens one
+    /// expression may span.  Each level costs one file scan, so both
+    /// bound the work an `inline for` in a big file can ask for.
+    const max_fill_eval_depth = 6;
+    const max_fill_eval_tokens = 32;
+
+    /// The `| value , index |` payload of a two-input `inline for`.
+    const IndexedPayload = struct {
+        value: []const u8,
+        index: []const u8,
+    };
+
+    /// Sound comptime-exhaustive INDEXED-initialization proof.
+    ///
+    ///   var out: [N]E = undefined;
+    ///   inline for (xs, 0..) |v, i| { …; out[i] = …; }
+    ///   return out;
+    ///
+    /// `inline for` unrolls at comptime, so `i` runs `0 … xs.len-1`
+    /// with no bound to get wrong — the generic CFG models the loop as
+    /// possibly running zero times, so `out` still reads as `.undef` at
+    /// the `return`.  This closes exactly that gap, and only when the
+    /// enumeration provably covers the whole target.
+    ///
+    /// Load-bearing clauses, each of which would otherwise leave an
+    /// element unwritten on some path:
+    ///   - the loop runs a FIXED number of times at comptime and is
+    ///     unlabelled: either it is `inline`, or it is an ordinary
+    ///     `for` inside a `comptime` block (or a `comptime label:` one)
+    ///     with its target declared in that same block — comptime code
+    ///     cannot reach a runtime frame's slots, and every statement of
+    ///     such a block is evaluated at comptime, so the loop still
+    ///     walks its whole collection;
+    ///   - it has TWO inputs and the second is exactly `0..`.  A `1..`
+    ///     start shifts every write off index 0; a bounded `0..n`
+    ///     truncates the enumeration.  Only a from-zero open range
+    ///     walks 0, 1, 2, … over the whole collection;
+    ///   - the payload is `| value , index |` — two by-value captures,
+    ///     neither `_`, and not the same name.  A by-pointer payload
+    ///     (`|*xs|`) or a bare `|x|` names storage the index count
+    ///     says nothing about;
+    ///   - the body's ONE top-level lvalue is exactly
+    ///     `<target>[<index capture>]`, so the store lands on the slot
+    ///     this iteration owns.  A nested or conditional lvalue lets
+    ///     an iteration skip the write entirely;
+    ///   - the target has exactly ONE mention in the whole body: that
+    ///     lvalue.  A read, a second write through an alias, or a
+    ///     write behind a conditional each leave elements undefined on
+    ///     some path.  (An alias is what `&out` / `out[i]` copies out
+    ///     of the body look like, and both are rejected here.)
+    ///   - the body holds no UNLABELED `break` / `continue` — the same
+    ///     rule the field proof uses, for the same reason;
+    ///   - the target is a `var` seeded with the `undefined` keyword,
+    ///     declared before the loop, and the written value is not
+    ///     itself `undefined` (`rhsIsDefined`).  Writing `undefined`,
+    ///     or copying a local seeded `undefined`, leaves every element
+    ///     exactly as uninitialized as it was;
+    ///   - the two element counts are EQUAL, established as described
+    ///     on `declaredFillExtent` / `iteratedFillExtent`.
+    ///
+    /// A `return` or a `try` inside the body is neither rejected nor
+    /// credited: neither reaches the loop's merge block, so an early
+    /// exit is still analysed on its own path with only the elements it
+    /// wrote.  A zero-length array or tuple is vacuously filled, and
+    /// that is sound rather than merely tolerated: `undefined` for a
+    /// zero-length aggregate has no bytes, so there is nothing to read.
+    fn exhaustiveIndexedFill(self: *Builder, loop: Ast.full.For) ?FieldFillProof {
+        if (loop.label_token != null) return null;
+        if (loop.ast.inputs.len != 2) return null;
+        if (!self.zeroBasedRangeInput(loop.ast.inputs[1])) return null;
+        const payload = self.forIndexedCaptureNames(loop) orelse return null;
+
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const body_node = loop.ast.then_expr;
+        const body_first = tree.firstToken(body_node);
+        const body_last = tree.lastToken(body_node);
+        if (body_first > body_last or body_last >= tags.len) return null;
+        if (self.bodyHasUnlabeledLoopExit(body_first, body_last)) return null;
+
+        var stmt_buf: [2]Ast.Node.Index = undefined;
+        var single_buf: [1]Ast.Node.Index = undefined;
+        const stmts: []const Ast.Node.Index = switch (tree.nodeTag(body_node)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => blockStmts(tree, body_node, &stmt_buf),
+            else => blk: {
+                single_buf[0] = body_node;
+                break :blk single_buf[0..];
+            },
+        };
+
+        var base_tok: Ast.TokenIndex = 0;
+        var found = false;
+        for (stmts) |stmt| {
+            const w = self.indexedFillAssignWrite(stmt, payload.index) orelse continue;
+            // A second index lvalue means the body isn't the single
+            // unconditional enumeration this proof is about.
+            if (found) return null;
+            const write_name = tree.tokenSlice(w.base_tok);
+            if (std.mem.eql(u8, write_name, payload.value)) return null;
+            if (std.mem.eql(u8, write_name, payload.index)) return null;
+            if (self.name_to_local.get(write_name) == null) return null;
+            if (!self.rhsIsDefined(w.rhs)) return null;
+            base_tok = w.base_tok;
+            found = true;
+        }
+        if (!found) return null;
+        const local = self.name_to_local.get(tree.tokenSlice(base_tok)).?;
+
+        const name = self.locals.items[@intFromEnum(local)].name;
+        if (self.identifierMentions(name, body_first, body_last) != 1) return null;
+
+        const decl = self.varDeclTypeSpan(local) orelse return null;
+        // An index store through a `const` doesn't compile, and the
+        // loop only defines the value if the seed really was `undefined`.
+        if (decl.is_const) return null;
+        if (!decl.init_is_undefined) return null;
+        if (decl.name_tok >= loop.ast.for_token) return null;
+        // Either an `inline for`, which unrolls, or a plain `for` whose
+        // every statement is evaluated at comptime because it sits in a
+        // `comptime` block.  The target has to be in that same block:
+        // comptime code cannot store into a runtime frame's slots, so a
+        // declaration outside the block could not be what this loop
+        // wrote, and crediting it would hide a real use-undefined.
+        if (loop.inline_token == null) {
+            const block = self.comptimeBlockEnclosing(loop.ast.for_token) orelse return null;
+            if (decl.name_tok <= block) return null;
+        }
+
+        const target = self.declaredFillExtent(decl.type) orelse return null;
+        const iterated = self.iteratedFillExtent(loop.ast.inputs[0]) orelse return null;
+        if (!fillExtentsAgree(target, iterated)) return null;
+
+        return .{
+            .local = local,
+            .pos = self.posOfToken(loop.ast.for_token),
+            .end_pos = self.endPosOf(body_node),
+        };
+    }
+
+    /// True iff the loop's second input is exactly `0..`.
+    ///
+    /// A from-zero open range is what makes the index capture run
+    /// 0, 1, … over the WHOLE collection; `1..` shifts every write off
+    /// index 0 and `0..n` truncates it, so neither enumerates the
+    /// target's elements.
+    fn zeroBasedRangeInput(self: *const Builder, input: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const first = tree.firstToken(input);
+        const last = tree.lastToken(input);
+        if (first > last or last >= tags.len) return false;
+        if (last != first + 1) return false;
+        if (tags[first] != .number_literal) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(first), "0")) return false;
+        return tags[first + 1] == .ellipsis2;
+    }
+
+    /// The `| value , index |` capture names of a two-input loop.
+    /// Null for a by-pointer capture (`|*xs, i|`), for `_`, for a
+    /// destructuring or single-capture payload, and for a loop with no
+    /// payload at all — none of which bind a distinct index.
+    fn forIndexedCaptureNames(self: *const Builder, loop: Ast.full.For) ?IndexedPayload {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const pt = loop.payload_token;
+        if (pt == 0 or pt + 3 >= tags.len) return null;
+        if (tags[pt - 1] != .pipe) return null;
+        if (tags[pt] != .identifier) return null;
+        if (tags[pt + 1] != .comma) return null;
+        if (tags[pt + 2] != .identifier) return null;
+        if (tags[pt + 3] != .pipe) return null;
+        const value = tree.tokenSlice(pt);
+        const index = tree.tokenSlice(pt + 2);
+        if (std.mem.eql(u8, value, "_")) return null;
+        if (std.mem.eql(u8, index, "_")) return null;
+        if (std.mem.eql(u8, value, index)) return null;
+        return .{ .value = value, .index = index };
+    }
+
+    /// The top-level `<target>[<index capture>] = <rhs>` statement of
+    /// the loop body: the token naming the written local and the value
+    /// stored into this iteration's slot.
+    fn indexedFillAssignWrite(
+        self: *const Builder,
+        stmt: Ast.Node.Index,
+        index: []const u8,
+    ) ?FieldFillWrite {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (tree.nodeTag(stmt) != .assign) return null;
+        const data = tree.nodeData(stmt).node_and_node;
+        const lhs = data[0];
+        const first = tree.firstToken(lhs);
+        const last = tree.lastToken(lhs);
+        if (first >= tags.len or last >= tags.len or first > last) return null;
+        // EXACTLY `name [ name ]`.  A field chain (`a.b[i]`), a
+        // pointer (`p[i]` where `p` is a `*T`), a slice index range, or
+        // `@field` all name storage whose extent the loop's element
+        // count does not describe, so the token shape is checked
+        // rather than a node tag — `Node.Data` churns between Zig
+        // versions, and this file already prefers source text for
+        // that reason.
+        if (last != first + 3) return null;
+        if (tags[first] != .identifier) return null;
+        if (tags[first + 1] != .l_bracket) return null;
+        if (tags[first + 2] != .identifier) return null;
+        if (tags[first + 3] != .r_bracket) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(first + 2), index)) return null;
+        return .{ .base_tok = first, .rhs = data[1] };
+    }
+
+    /// Element count of the aggregate a fill writes, from its
+    /// DECLARED type token span.  Three shapes fix a count exactly: a
+    /// fixed array `[N]E` written out, a fixed array written as
+    /// `<collection>.len` — which states its count by naming a
+    /// collection, and is the only count a loop needs when the
+    /// collection's length is not a constant expression — and a name
+    /// bound to `@Tuple(&V)`, whose tuple has exactly `V.len` fields.
+    /// Every name is resolved as a visible DECLARATION, so an
+    /// unrelated `const` of the same spelling elsewhere in the file is
+    /// not what answers here.  Everything else — a slice (`[]E` has no
+    /// length), an optional, a sentinel, a named struct, a generic
+    /// parameter — is declined.
+    fn declaredFillExtent(self: *const Builder, span: TokenSpan) ?FillExtent {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (span.first > span.last or span.last >= tags.len) return null;
+        if (self.arrayLengthOf(span)) |length| {
+            if (self.stripLenSuffix(length)) |expr| {
+                // `[<collection>.len]E` states its count by naming the
+                // collection, and there are exactly two ways that
+                // count can be established — each needs its own proof:
+                //
+                //   - the collection is a field of an AGGREGATE
+                //     LITERAL, so its elements are written out and
+                //     can simply be counted;
+                //   - it is a field of a COMPILER REFLECTION value,
+                //     whose shape is a function of the type it
+                //     describes, so both sites naming the same
+                //     declared value name the same count.
+                //
+                // Everything else declines, and the interesting case
+                // is why: a `const` is not enough.  A `const` pointer
+                // to a resizable holder fixes the BINDING, not the
+                // length the loop walks, and neither is a field path
+                // that leaves the literal a value holds.
+                const root_tok = expr.first;
+                if (root_tok >= tags.len or tags[root_tok] != .identifier) return null;
+                const root = self.visibleConstDecl(root_tok, tree.tokenSlice(root_tok)) orelse return null;
+                const path = self.fieldPathOf(expr, root) orelse return null;
+                if (self.aggregateFieldCount(path)) |n| return .{ .number = n };
+                const id = self.collectionIdOf(path) orelse return null;
+                return .{ .collection = id };
+            }
+            const n = self.comptimeIntTokens(length, 0) orelse return null;
+            return .{ .number = n };
+        }
+        // A bare name: the type is another `const`, and only the two
+        // shapes below carry a count we can state exactly.
+        if (span.first != span.last) return null;
+        if (tags[span.first] != .identifier) return null;
+        const decl = self.visibleConstDecl(span.first, tree.tokenSlice(span.first)) orelse return null;
+        if (self.tupleVectorOf(decl)) |vector| return .{ .vec = vector };
+        // `const Vec = [4]u8;` states its length in the initializer;
+        // `const Vec: [4]u8 = …;` states it in the annotation.  Both
+        // name the same immutable type, so either answers — but only
+        // when the initializer IS that type expression.  A brace in it
+        // makes it an array VALUE (`const Vec = [4]u8{ … }` binds a
+        // pointer to an array, not the type), whose length says
+        // nothing about what `var v: Vec` stores.
+        const spans = decl.spans.?;
+        const type_span = spans.type orelse spans.init;
+        if (!spanHasBrace(tree, type_span)) {
+            if (self.arrayLengthOf(type_span)) |length| {
+                const n = self.comptimeIntTokens(length, 0) orelse return null;
+                return .{ .number = n };
+            }
+        }
+        return null;
+    }
+
+    /// Element count of what the loop enumerates.  A bare identifier —
+    /// or a dotted chain rooted in one — must resolve to a `const`
+    /// VISIBLE where the loop writes it: the trip count is that
+    /// binding's length, so a mutable `var`, a runtime parameter, or a
+    /// same-named `const` belonging to some other namespace leaves
+    /// nothing to state.  A literal collection needs no binding.
+    ///
+    /// The count itself comes from the binding's declared type when it
+    /// is a fixed array, and otherwise from an array-literal
+    /// initializer — which is what a `[]const T` bound to `&.{ … }`
+    /// has: the slice type carries no length, but the literal it points
+    /// at does.  A field path states its count the same way a target's
+    /// `[<it>.len]` does, so both sides of a proof end up asking the
+    /// same question of the same declaration.
+    fn iteratedFillExtent(self: *const Builder, input: Ast.Node.Index) ?FillExtent {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const first = tree.firstToken(input);
+        const last = tree.lastToken(input);
+        if (first > last or last >= tags.len) return null;
+        const span = TokenSpan{ .first = first, .last = last };
+        const root = self.immutableRootOf(span) orelse {
+            const n = arrayLiteralElementCount(tree, span) orelse return null;
+            return .{ .number = n };
+        };
+        const path = self.fieldPathOf(span, root) orelse return null;
+        var extent = FillExtent{
+            .collection = self.collectionIdOf(path),
+            .number = self.aggregateFieldCount(path),
+        };
+        // A chain (`info.params`) states a length but is not itself an
+        // aggregate a `@Tuple` target could be built over.
+        if (span.first != span.last) return extent;
+        const spans = root.spans.?;
+        extent.vec = root.name_tok;
+        if (spans.type) |type_span| {
+            if (self.arrayLengthOf(type_span)) |length| {
+                extent.number = self.comptimeIntTokens(length, 0);
+            }
+        }
+        if (extent.number == null) {
+            extent.number = arrayLiteralElementCount(tree, spans.init);
+        }
+        return extent;
+    }
+
+    /// The immutable declaration a `const X = @Tuple(&V);` initializer
+    /// measures.  `@Tuple` builds one field per element of its
+    /// argument, so the tuple's field count IS `V.len` — which is only
+    /// the same count the loop writes when `V` is the same declaration
+    /// at both sites.
+    fn tupleVectorOf(self: *const Builder, decl: ScopedDecl) ?Ast.TokenIndex {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const init = decl.spans.?.init;
+        if (init.first > init.last or init.last >= tags.len) return null;
+        if (init.last != init.first + 4) return null;
+        if (tags[init.first] != .builtin) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(init.first), "@Tuple")) return null;
+        if (tags[init.first + 1] != .l_paren) return null;
+        if (tags[init.first + 2] != .ampersand) return null;
+        if (tags[init.first + 3] != .identifier) return null;
+        if (tags[init.first + 4] != .r_paren) return null;
+        const vector_tok = init.first + 3;
+        const root = self.visibleConstDecl(vector_tok, tree.tokenSlice(vector_tok)) orelse return null;
+        return root.name_tok;
+    }
+
+    /// The `<expr>` of a length written `<expr>.len`.  Null for a bare
+    /// literal, a sum, a call — every shape whose count this does not
+    /// state.
+    fn stripLenSuffix(self: *const Builder, span: TokenSpan) ?TokenSpan {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const last = span.last;
+        if (last < span.first + 2 or last >= tags.len) return null;
+        if (tags[last] != .identifier) return null;
+        if (tags[last - 1] != .period) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(last), "len")) return null;
+        return .{ .first = span.first, .last = last - 2 };
+    }
+
+    /// The immutable `const` a length expression reads its length
+    /// from.  `span` must be a bare identifier or a dotted chain
+    /// rooted in one (`func_info.params`); only the ROOT is resolved,
+    /// because that is the binding whose fixed value — and so whose
+    /// `.len` — both sides read.
+    ///
+    /// A `var` root is refused on purpose: it can be reassigned or
+    /// resliced between the target's declaration and the loop, and
+    /// then the count the target was given is not the count the loop
+    /// walks.
+    fn immutableRootOf(self: *const Builder, span: TokenSpan) ?ScopedDecl {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (span.first > span.last or span.last >= tags.len) return null;
+        if (tags[span.first] != .identifier) return null;
+        var t: Ast.TokenIndex = span.first + 1;
+        while (t <= span.last) {
+            if (tags[t] != .period) return null;
+            if (t + 1 > span.last or tags[t + 1] != .identifier) return null;
+            t += 2;
+        }
+        return self.visibleConstDecl(span.first, tree.tokenSlice(span.first));
+    }
+
+    /// Split a length expression into the binding it is rooted in and
+    /// the field path walked from it.  `root` is that binding's
+    /// already-resolved declaration, so this costs no second file
+    /// scan — the caller has it in hand.
+    ///
+    /// A subscript, a deref, a call and an optional unwrap are all
+    /// refused: each of those steps through STORAGE rather than
+    /// through a struct's own fields, and a count read through storage
+    /// is not one this can pin.
+    fn fieldPathOf(self: *const Builder, span: TokenSpan, root: ScopedDecl) ?FieldPath {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (span.first > span.last or span.last >= tags.len) return null;
+        if (tags[span.first] != .identifier) return null;
+        var path = FieldPath{
+            .root = root,
+            .fields = undefined,
+            .field_count = 0,
+        };
+        var t: Ast.TokenIndex = span.first + 1;
+        while (t <= span.last) : (t += 2) {
+            if (tags[t] != .period) return null;
+            if (t + 1 > span.last or tags[t + 1] != .identifier) return null;
+            if (path.field_count == max_fill_path_fields) return null;
+            path.fields[path.field_count] = tree.tokenSlice(t + 1);
+            path.field_count += 1;
+        }
+        return path;
+    }
+
+    /// The element count a field path states, read straight off the
+    /// AGGREGATE LITERAL the binding is initialized with.
+    ///
+    /// Each step must be a field that literal actually DESIGNATES,
+    /// and the value it designates must itself be a brace literal —
+    /// either to walk one more step, or, at the end, to count.  A
+    /// literal is written out in the source, so the field holds
+    /// exactly what is shown and no statement can resize it.  Nothing
+    /// is inferred from any type, and in particular no step is assumed
+    /// to be a field rather than a pointer: every step is checked.
+    ///
+    /// A path that LEAVES the literal is declined, because what it
+    /// reaches is storage this cannot see:
+    ///
+    ///     const outer = Outer{ .child = &holder };
+    ///     outer.child.items.len
+    ///
+    /// `outer` is a value and `outer.child` is a `*Holder`, so the
+    /// `.len` read at the end is `holder`'s and not the literal's — and
+    /// `holder` can still be resized.  A root being a value is
+    /// therefore no evidence at all; the whole path, ending in
+    /// something countable, is.
+    fn aggregateFieldCount(self: *const Builder, path: FieldPath) ?u64 {
+        const spans = path.root.spans orelse return null;
+        var value = spans.init;
+        var i: u8 = 0;
+        while (i < path.field_count) : (i += 1) {
+            value = designatedFieldInit(self.tree, value, path.fields[i]) orelse return null;
+        }
+        return arrayLiteralElementCount(self.tree, value);
+    }
+
+    /// The reflection collection a field path reads, or null when the
+    /// path is not over a compiler reflection value.
+    fn collectionIdOf(self: *const Builder, path: FieldPath) ?CollectionId {
+        if (!self.bindingHoldsReflectionValue(path.root)) return null;
+        return .{
+            .root = path.root.name_tok,
+            .fields = path.fields,
+            .field_count = path.field_count,
+        };
+    }
+
+    /// Does this `const` bind a COMPILER REFLECTION value — what
+    /// `@typeInfo(<type>)` returns, optionally narrowed by field
+    /// accesses?
+    ///
+    /// `@typeInfo` is a comptime builtin: it takes a type and returns
+    /// that type's description, so the whole tree it yields — every
+    /// field, and every element of a field that is itself a
+    /// description — is a function of the type argument and of
+    /// nothing else.  No statement can write to it, and the type
+    /// argument is fixed for the function, so a `.len` read anywhere
+    /// under it is the same number at every read.  That is what lets a
+    /// generated wrapper size its own target with
+    /// `[func_info.params.len]type` and then walk
+    /// `func_info.params`.
+    ///
+    /// This is a statement about what the LANGUAGE computes, not about
+    /// any name, and it is the ONLY builtin whose result is treated
+    /// this way.  Every other initializer is declined, because
+    /// nothing here can show what it produces.  A function call and a
+    /// bare name are obvious; the ones that need saying are `@as` and
+    /// `@bitCast`, whose result TYPE the call chooses and may choose
+    /// to be a pointer; `@call`, whose result is whatever the callee
+    /// returns; `@field`, which hands back the named field, a pointer
+    /// field included; `@unionInit`, whose result can carry one;
+    /// `@extern` and `@embedFile`, which are addresses outright; and
+    /// `@errorReturnTrace`, `@cVaStart` and `@cVaArg`, which carry
+    /// pointers and optionals.  Treating an UNLISTED builtin as a
+    /// value would be a guess, and a guess in this direction is
+    /// precisely how a resizable `.len` comes to be treated as fixed.
+    fn bindingHoldsReflectionValue(self: *const Builder, decl: ScopedDecl) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const spans = decl.spans orelse return false;
+        // The rule is about the value `@typeInfo` computes; an
+        // annotation would be a claim about a type instead.
+        if (spans.type != null) return false;
+        const init = spans.init;
+        if (init.first > init.last or init.last >= tags.len) return false;
+        if (tags[init.first] != .builtin) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(init.first), "@typeInfo")) return false;
+        if (init.first + 1 >= tags.len or tags[init.first + 1] != .l_paren) return false;
+        const close = matchingDelim(tree, init.first + 1, init.last) orelse return false;
+        // Everything past the call must be field selection: the
+        // descriptor itself, and any narrowing of it.
+        var t: Ast.TokenIndex = close + 1;
+        while (t <= init.last) : (t += 1) {
+            if (tags[t] != .period) return false;
+            t += 1;
+            if (t > init.last or tags[t] != .identifier) return false;
+        }
+        return true;
+    }
+
+    /// Length-expression token span of a fixed array type written
+    /// `[N]E`.  Null for a slice (`[]E`, an empty span), for a
+    /// sentinel (`[N:s]E`), for a nested bracket, and for a span with
+    /// no element type after the closing bracket.
+    fn arrayLengthOf(self: *const Builder, span: TokenSpan) ?TokenSpan {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (span.first > span.last or span.last >= tags.len) return null;
+        if (tags[span.first] != .l_bracket) return null;
+        var t: Ast.TokenIndex = span.first + 1;
+        while (t <= span.last and t < tags.len) : (t += 1) {
+            switch (tags[t]) {
+                .l_bracket, .l_paren, .l_brace, .colon => return null,
+                .r_bracket => {
+                    if (t == span.first + 1) return null;
+                    if (t == span.last) return null;
+                    return .{ .first = span.first + 1, .last = t - 1 };
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// Integer value of a comptime length expression, from a closed
+    /// grammar: decimal literals, `+` / `-` between them, parentheses,
+    /// and references to a `const` in this file whose initializer is
+    /// itself such an expression.  Nothing else — no call, no field
+    /// access, no `@sizeOf`, no enum field — is guessed at, so the
+    /// answer is exact or absent.
+    fn comptimeIntTokens(self: *const Builder, span: TokenSpan, depth: u32) ?u64 {
+        if (depth > max_fill_eval_depth) return null;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (span.first > span.last or span.last >= tags.len) return null;
+        if (span.last - span.first + 1 > max_fill_eval_tokens) return null;
+        var eval = FillIntEval{
+            .builder = self,
+            .tree = tree,
+            .tags = tags,
+            .pos = span.first,
+            .end = span.last,
+            .depth = depth,
+        };
+        const value = eval.expr() orelse return null;
+        // Trailing tokens mean this was not the expression it looked
+        // like (`a + b * c`, `f(x)`); an unanswered question, not a
+        // number.
+        if (eval.pos <= eval.end) return null;
+        return value;
+    }
+
+    /// Value of the `const` a reference at `name_tok` resolves to,
+    /// chased one binding at a time.
+    fn constIntBinding(self: *const Builder, name_tok: Ast.TokenIndex, depth: u32) ?u64 {
+        if (depth > max_fill_eval_depth) return null;
+        const tree = self.tree;
+        const decl = self.visibleConstDecl(name_tok, tree.tokenSlice(name_tok)) orelse return null;
+        return self.comptimeIntTokens(decl.spans.?.init, depth);
+    }
+
+    const FillIntEval = struct {
+        builder: *const Builder,
+        tree: *const Ast,
+        tags: []const std.zig.Token.Tag,
+        pos: Ast.TokenIndex,
+        end: Ast.TokenIndex,
+        depth: u32,
+
+        fn expr(self: *FillIntEval) ?u64 {
+            var acc = self.term() orelse return null;
+            while (self.pos <= self.end) {
+                const tag = self.tags[self.pos];
+                if (tag != .plus and tag != .minus) break;
+                self.pos += 1;
+                const rhs = self.term() orelse return null;
+                if (tag == .minus) {
+                    // A comptime-negative length can't be written, so
+                    // this is not a value a real type has.
+                    if (rhs > acc) return null;
+                    acc -= rhs;
+                } else {
+                    acc = std.math.add(u64, acc, rhs) catch return null;
+                }
+            }
+            return acc;
+        }
+
+        fn term(self: *FillIntEval) ?u64 {
+            if (self.pos > self.end) return null;
+            switch (self.tags[self.pos]) {
+                .number_literal => {
+                    const text = self.tree.tokenSlice(self.pos);
+                    const value = std.fmt.parseInt(u64, text, 0) catch return null;
+                    self.pos += 1;
+                    return value;
+                },
+                .identifier => {
+                    const name_tok = self.pos;
+                    self.pos += 1;
+                    return self.builder.constIntBinding(name_tok, self.depth + 1);
+                },
+                .l_paren => {
+                    self.pos += 1;
+                    const value = self.expr() orelse return null;
+                    if (self.pos > self.end) return null;
+                    if (self.tags[self.pos] != .r_paren) return null;
+                    self.pos += 1;
+                    return value;
+                },
+                else => return null,
+            }
+        }
+    };
+
+    /// A binding a reference can see, with the scope it sits in.
+    const ScopedDecl = struct {
+        /// Token index of the DECLARING name token — a declaration's
+        /// identity.  Two proofs that resolve this token talk about the
+        /// same declaration; two that merely share a spelling resolve
+        /// different tokens.
+        name_tok: Ast.TokenIndex,
+        /// How many `{` enclose the declaration.  A reference sees the
+        /// innermost — the largest — such count, so a `const` in an
+        /// inner block beats one at file scope exactly as Zig's lookup
+        /// does.
+        scope_len: usize,
+        /// Type-annotation and initializer spans, present only for a
+        /// plain `const <name>[: T] = <init>;`.  A `var`, a parameter,
+        /// a capture, a destructured name, and a `const` written some
+        /// other way all carry null, which is what makes them unusable
+        /// as the immutable anchor of a count.
+        spans: ?FileConstDecl,
+    };
+
+    /// Running answer while the resolver scans for one name.
+    const DeclFind = struct {
+        best: ?ScopedDecl = null,
+        ambiguous: bool = false,
+
+        fn add(self: *DeclFind, candidate: ScopedDecl) void {
+            if (self.best) |held| {
+                // An outer declaration loses to an inner one, and two
+                // in the SAME scope is a tie nothing here can break.
+                if (held.scope_len > candidate.scope_len) return;
+                if (held.scope_len == candidate.scope_len) {
+                    self.ambiguous = true;
+                    return;
+                }
+            }
+            self.best = candidate;
+            self.ambiguous = false;
+        }
+    };
+
+    /// The immutable `const` declaration a bare identifier reference at
+    /// `use_tok` names — or null when nothing is visible, when what is
+    /// visible is a `var`, a parameter, a capture or a destructured
+    /// name, or when two declarations tie for the name.
+    ///
+    /// This is a scope question, not a spelling question.  The
+    /// file-wide `const <name>` search it replaces could read a
+    /// declaration out of a sibling namespace, so an unrelated
+    /// `const specs` of length three could vouch for a fill over some
+    /// other `specs` of length two, and the tail of that fill would
+    /// read as defined.
+    fn visibleConstDecl(self: *const Builder, use_tok: Ast.TokenIndex, name: []const u8) ?ScopedDecl {
+        const decl = self.visibleDeclAt(use_tok, name) orelse return null;
+        if (decl.spans == null) return null;
+        return decl;
+    }
+
+    /// Every declaration that binds `name` at `use_tok`, resolved
+    /// through the file's real scopes and reduced to the innermost.
+    ///
+    /// Visibility is the enclosing-brace chain: a declaration is seen
+    /// exactly when every block it sits in also encloses the reference.
+    /// That one rule answers for a block, a container body and a
+    /// sibling block alike, because each opens a brace — which is what
+    /// keeps a `const` inside one container from answering for a
+    /// reference inside another.  Where the chain alone is too coarse
+    /// (a capture really only reaches its own body) the scan claims
+    /// MORE visibility than exists: claiming a binding that is not
+    /// there costs a declined proof, while missing one that is would
+    /// let a shadowed name vouch for a count.
+    fn visibleDeclAt(self: *const Builder, use_tok: Ast.TokenIndex, name: []const u8) ?ScopedDecl {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (use_tok >= tags.len) return null;
+        // A payload lists a handful of names; a longer run of
+        // identifiers and commas is not one.
+        const capture_scan_limit = 8;
+
+        var regions: [max_fill_scope_depth]Ast.TokenIndex = undefined;
+        const region_len = openBraceStack(tags, use_tok, &regions) orelse return null;
+
+        var found: DeclFind = .{};
+        // A name this file declares more than once is not one this
+        // analysis will count on, even when the scope chain settles
+        // which declaration a reference means: the point of resolving
+        // visibility is to never answer from a declaration the
+        // reference does not name, and a second declaration under the
+        // same spelling is the case where a count read off the wrong
+        // one is hardest to see.  It costs a declined proof, never a
+        // wrong one.
+        var foreign = false;
+        var stack: [max_fill_scope_depth]Ast.TokenIndex = undefined;
+        var depth: usize = 0;
+        var t: Ast.TokenIndex = 0;
+        while (t < tags.len) : (t += 1) {
+            switch (tags[t]) {
+                .l_brace => {
+                    if (depth == max_fill_scope_depth) return null;
+                    stack[depth] = t;
+                    depth += 1;
+                },
+                .r_brace => {
+                    if (depth > 0) depth -= 1;
+                },
+                .keyword_const, .keyword_var => {
+                    // Every modifier (`pub`, `comptime`, `export`,
+                    // `inline`, `threadlocal`) sits BEFORE the keyword,
+                    // so the bound name is always the token after it.
+                    const name_tok: Ast.TokenIndex = t + 1;
+                    if (name_tok >= tags.len) break;
+                    // Zig declares before it uses: a name that does
+                    // not yet exist at `use_tok` is not the binding
+                    // this reference names.  Only the FIRST declaring
+                    // token matters — a later `var x = …;` re-statement
+                    // of a name already in scope is not a new
+                    // declaration, and it is the earlier one the
+                    // reference resolves to.
+                    if (tags[name_tok] != .identifier) continue;
+                    if (name_tok >= use_tok) continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(name_tok), name)) continue;
+                    if (bracesArePrefix(stack[0..depth], regions[0..region_len])) {
+                        found.add(.{
+                            .name_tok = name_tok,
+                            .scope_len = depth,
+                            .spans = if (tags[t] == .keyword_const) parseConstDeclAt(tree, name_tok) else null,
+                        });
+                    } else foreign = true;
+                },
+                .pipe => {
+                    // `| a |`, `| a, b |`, `| *a |`: a payload binds
+                    // every name it lists.  A binary `a | b` reads as
+                    // one too, which only invents a binding — the safe
+                    // direction.
+                    var u: Ast.TokenIndex = t + 1;
+                    var want_name = true;
+                    var steps: usize = 0;
+                    while (u < tags.len and steps < capture_scan_limit) : (steps += 1) {
+                        switch (tags[u]) {
+                            .asterisk, .keyword_noalias => u += 1,
+                            .comma => {
+                                u += 1;
+                                want_name = true;
+                            },
+                            .identifier => {
+                                if (want_name and use_tok > u and
+                                    bracesArePrefix(stack[0..depth], regions[0..region_len]) and
+                                    std.mem.eql(u8, tree.tokenSlice(u), name))
+                                {
+                                    found.add(.{ .name_tok = u, .scope_len = depth, .spans = null });
+                                }
+                                u += 1;
+                                want_name = false;
+                            },
+                            else => break,
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // A parameter binds inside its own fn's body and nowhere else,
+        // so its scope is the enclosing chain plus the body's brace.
+        // The prototype is the only place a parameter name is created,
+        // and the iteration reaches nested fns — a struct literal's
+        // method reads the locals of the fn that built the literal,
+        // which is how a generated wrapper's `args_tuple` / `arg_types`
+        // pair reaches the loop that fills it.
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        var fns = tokens.iterFnDecls(tree);
+        while (fns.next(&proto_buf)) |entry| {
+            const body_first = tree.firstToken(entry.body);
+            if (use_tok < body_first or use_tok > tree.lastToken(entry.body)) continue;
+            var body_index: usize = 0;
+            var in_body = false;
+            while (body_index < region_len) : (body_index += 1) {
+                if (regions[body_index] != body_first) continue;
+                in_body = true;
+                break;
+            }
+            if (!in_body) continue;
+            var it = entry.proto.iterate(tree);
+            while (it.next()) |param| {
+                const param_tok = param.name_token orelse continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(param_tok), name)) continue;
+                found.add(.{ .name_tok = param_tok, .scope_len = body_index + 1, .spans = null });
+            }
+        }
+
+        if (found.ambiguous or foreign) return null;
+        return found.best;
+    }
+
+    /// The `{` of the innermost `comptime` block — `comptime { … }` or
+    /// `comptime label: { … }` — enclosing `tok`, or null when there
+    /// is none.  Every statement of such a block is evaluated at
+    /// comptime, so a `for` inside one walks its whole collection
+    /// whether or not it is `inline`.
+    fn comptimeBlockEnclosing(self: *const Builder, tok: Ast.TokenIndex) ?Ast.TokenIndex {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        var regions: [max_fill_scope_depth]Ast.TokenIndex = undefined;
+        const region_len = openBraceStack(tags, tok, &regions) orelse return null;
+        var i = region_len;
+        while (i > 0) {
+            i -= 1;
+            const brace = regions[i];
+            if (brace == 0) continue;
+            if (tags[brace - 1] == .keyword_comptime) return brace;
+            if (brace >= 3 and tags[brace - 3] == .keyword_comptime and
+                tags[brace - 2] == .identifier and tags[brace - 1] == .colon) return brace;
+        }
+        return null;
+    }
+
+    /// The token naming this function's `comptime <name>: type`
+    /// parameter.  The fn prototype is the only place such a binding is
+    /// created, and a comptime type parameter is immutable for the
+    /// whole body — so a bare identifier naming it denotes one and the
+    /// same type wherever it appears.  `*const type` and `anytype` are
+    /// rejected: neither is the immutable `type` binding this proof
+    /// needs.
+    fn comptimeTypeParamToken(self: *const Builder, name: []const u8) ?Ast.TokenIndex {
+        const proto = self.fn_proto orelse return null;
+        const tree = self.tree;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            const comptime_tok = param.comptime_noalias orelse continue;
+            if (tree.tokenTag(comptime_tok) != .keyword_comptime) continue;
+            const name_tok = param.name_token orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(name_tok), name)) continue;
+            const type_expr = param.type_expr orelse continue;
+            const t_first = tree.firstToken(type_expr);
+            const t_last = tree.lastToken(type_expr);
+            if (t_first != t_last) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t_first), "type")) continue;
+            return name_tok;
+        }
+        return null;
+    }
+
+    /// True when `name` still resolves to the local registered for
+    /// `param_tok`.  That registration is the fn parameter's own
+    /// declaration position, so a match proves nothing declared inside
+    /// the body has shadowed it — no `const T = …`, no `comptime var T
+    /// = …`, no capture, no destructured binding.
+    fn bindingIsParam(self: *const Builder, name: []const u8, param_tok: Ast.TokenIndex) bool {
+        const lid = self.name_to_local.get(name) orelse return false;
+        const param_byte = self.tree.tokens.items(.start)[param_tok];
+        return self.locals.items[@intFromEnum(lid)].decl_pos.byte == param_byte;
+    }
+
+    /// Lowering-time "this value is not `undefined`" test for the
+    /// value stored into every field.
+    ///
+    /// Assigning `undefined` — or copying a local that was itself
+    /// seeded `undefined` — writes the same uninitialized bytes the
+    /// field already held.  Claiming the whole struct is then defined
+    /// would suppress a real use-undefined on exactly the code the
+    /// proof describes, so only values the lowering can already vouch
+    /// for are accepted: no `undefined` identifier anywhere in the
+    /// expression, and no read of a local whose declaration seeded it
+    /// with `undefined`.
+    ///
+    /// The lexical `undefined` scan is strictly wider than asking
+    /// `classifyExpr` for `.undef` (its only `.undef` producer is that
+    /// same identifier, and it misses `undefined` nested inside an
+    /// aggregate like `@as(u32, undefined)`), and running `classifyExpr`
+    /// here would spend lowering budget on a value that is only ever
+    /// discarded.  A seed that is later assigned still reads as
+    /// unprovable — over-rejecting is the safe direction.
+    fn rhsIsDefined(self: *const Builder, rhs: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const first = tree.firstToken(rhs);
+        const last = tree.lastToken(rhs);
+        var t = first;
+        while (t < tags.len and t <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            const name = tree.tokenSlice(t);
+            if (std.mem.eql(u8, name, "undefined")) return false;
+            if (t > 0 and tags[t - 1] == .period) continue;
+            const lid = self.name_to_local.get(name) orelse continue;
+            const decl = self.varDeclTypeSpan(lid) orelse continue;
+            if (decl.init_is_undefined) return false;
+        }
+        return true;
+    }
+
+    /// How many times `name` is referenced as a non-field identifier
+    /// token in [first, last].  Names after `.` are field/method
+    /// selectors, not references to the binding, so they don't count.
+    fn identifierMentions(
+        self: *const Builder,
+        name: []const u8,
+        first: Ast.TokenIndex,
+        last: Ast.TokenIndex,
+    ) usize {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        var n: usize = 0;
+        var t = first;
+        while (t < tags.len and t <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (t > 0 and tags[t - 1] == .period) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Token span of the type annotation in `var|const <name>: <T> =
+    /// <init>`, found from the local's recorded declaration offset,
+    /// together with whether the binding is `const` and whether the
+    /// initializer was the `undefined` keyword.  Null for every shape
+    /// we don't model exactly: a parameter, an
+    /// `align`/`address`/`section` modifier that would fold extra
+    /// tokens into the span, or a declaration we can't attribute.
+    fn varDeclTypeSpan(self: *const Builder, local: LocalId) ?DeclTypeSpan {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const starts = tree.tokens.items(.start);
+        const info = self.locals.items[@intFromEnum(local)];
+        // decl_pos is the byte offset of the declaring name token;
+        // find the last token starting at or before it.
+        var lo: usize = 0;
+        var hi: usize = starts.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (starts[mid] <= info.decl_pos.byte) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const name_tok: Ast.TokenIndex = @intCast(lo - 1);
+        if (tags[name_tok] != .identifier) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(name_tok), info.name)) return null;
+        if (name_tok == 0) return null;
+        const is_const = switch (tags[name_tok - 1]) {
+            .keyword_var => false,
+            .keyword_const => true,
+            else => return null,
+        };
+        if (name_tok + 1 >= tags.len or tags[name_tok + 1] != .colon) return null;
+        const first = name_tok + 2;
+        var depth: u32 = 0;
+        var t = first;
+        while (t < tags.len) : (t += 1) {
+            const tag = tags[t];
+            if (depth == 0 and (tag == .equal or tag == .semicolon or tag == .comma)) {
+                if (t == first) return null;
+                return .{
+                    .type = .{ .first = first, .last = t - 1 },
+                    .name_tok = name_tok,
+                    .is_const = is_const,
+                    .init_is_undefined = tag == .equal and t + 1 < tags.len and
+                        tags[t + 1] == .identifier and
+                        std.mem.eql(u8, tree.tokenSlice(t + 1), "undefined"),
+                };
+            }
+            switch (tag) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     /// `switch (cond) { CASE => EXPR, ... }` — N-way fork.  Each case
@@ -1719,8 +3649,7 @@ const Builder = struct {
             // a loop) doesn't cause spurious double-free / UAF.
             // Mirrors the reset_into=body approach used by while/for.
             if (case_full.payload_token) |pt| {
-                try self.registerCapturesWith(pt, case_block);
-                if (sw_union_ti) |un_ti| self.markPointerCapturesFromUnion(pt, un_ti, case_full.ast.values);
+                try self.registerSwitchCaptures(pt, case_block, sw_union_ti, case_full.ast.values);
             }
             var case_cur = case_block;
             try self.lowerStmt(case_full.ast.target_expr, &case_cur);
@@ -1744,27 +3673,43 @@ const Builder = struct {
         const local = self.locals.items[@intFromEnum(lid)];
         const type_name = local.type_name orelse return null;
         const cache = self.cache orelse return null;
-        const model = cache.fileModel() catch return null;
+        const model = self.modelOrNull(cache) orelse return null;
         const ti = model.findType(type_name) orelse return null;
         if (ti.kind != .union_) return null;
         return ti;
     }
 
-    /// For each case-prong `.<tag>` in `prong_values`, if the union's
-    /// `<tag>` field is declared as `*T`, mark the corresponding
-    /// payload capture's LocalInfo with `is_pointer = true`.
-    fn markPointerCapturesFromUnion(
+    /// Register a switch prong's `|cap|` payload and type it from the
+    /// scrutinee's union when that union is known: a `*T` field makes
+    /// the capture a pointer, an error-set field makes it an error
+    /// value whose `return` replays `errdefer`.  `reset_into` emits
+    /// the `.reset_capture` loop guard (null in `return switch (…)`,
+    /// whose arms are forked once and never looped back).
+    fn registerSwitchCaptures(
         self: *Builder,
         payload_token: Ast.TokenIndex,
-        un_ti: *const model_mod.TypeInfo,
+        reset_into: ?BlockId,
+        un_ti: ?*const model_mod.TypeInfo,
         prong_values: []const Ast.Node.Index,
-    ) void {
+    ) !void {
+        // Registration first: it creates the capture local the
+        // marking below looks up by name.
+        if (reset_into) |blk| {
+            try self.registerCapturesWith(payload_token, blk);
+        } else {
+            try self.registerCaptures(payload_token);
+        }
+        const un = un_ti orelse return;
+        self.markPointerCapturesFromUnion(payload_token, un, prong_values);
+        self.markErrorCapturesFromUnion(payload_token, un, prong_values);
+    }
+
+    /// The local a switch prong's `|cap|` payload binds.  `payload_token`
+    /// is the first token AFTER the opening `|` (matching
+    /// registerCapturesImpl semantics); a leading `*` (by-pointer
+    /// capture) and `_` yield nothing to type.
+    fn switchCaptureLocal(self: *Builder, payload_token: Ast.TokenIndex) ?LocalId {
         const tree = self.tree;
-        // payload_token is the start of the payload region (first
-        // token AFTER the opening `|`, matching registerCapturesWith
-        // semantics).  Walk forward to the first `.identifier`,
-        // bailing on the closing `.pipe`.  Skip leading `*` for
-        // by-pointer capture form.
         const tags = tree.tokens.items(.tag);
         var t: Ast.TokenIndex = payload_token;
         var cap_name: ?[]const u8 = null;
@@ -1778,25 +3723,80 @@ const Builder = struct {
                 else => {},
             }
         }
-        const name = cap_name orelse return;
-        if (std.mem.eql(u8, name, "_")) return;
-        const lid = self.name_to_local.get(name) orelse return;
+        const name = cap_name orelse return null;
+        if (std.mem.eql(u8, name, "_")) return null;
+        return self.name_to_local.get(name);
+    }
+
+    /// For each case-prong `.<tag>` in `prong_values`, if the union's
+    /// `<tag>` field is declared as `*T`, mark the corresponding
+    /// payload capture's LocalInfo with `is_pointer = true`.
+    fn markPointerCapturesFromUnion(
+        self: *Builder,
+        payload_token: Ast.TokenIndex,
+        un_ti: *const model_mod.TypeInfo,
+        prong_values: []const Ast.Node.Index,
+    ) void {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const lid = self.switchCaptureLocal(payload_token) orelse return;
         // Walk each prong value `.<tag>` and check the union's
         // field type starts with `*`.  All prongs in one arm must
         // agree (same payload type), so checking ANY is enough.
         for (prong_values) |v| {
-            if (tree.nodeTag(v) != .enum_literal) continue;
-            const tag_name_tok = tree.nodeMainToken(v);
-            if (tag_name_tok >= tags.len) continue;
-            if (tags[tag_name_tok] != .identifier) continue;
-            const tag_name = tree.tokenSlice(tag_name_tok);
-            const field = un_ti.findField(tag_name) orelse continue;
+            const field = self.unionFieldForProng(un_ti, v) orelse continue;
             if (field.type_first > field.type_last) continue;
             if (tags[field.type_first] == .asterisk) {
                 self.locals.items[@intFromEnum(lid)].is_pointer = true;
                 return;
             }
         }
+    }
+
+    /// Mark the prong capture `is_error_capture` when the union field
+    /// it binds is an error set.  `switch (r) { .err => |e| { free(p);
+    /// return e; } }` over `union(enum) { ok: u8, err: anyerror }` is a
+    /// real double free: Zig runs `errdefer` on `return e`, so the
+    /// free inside the arm is the SECOND one.  `is_error_capture` is
+    /// the only thing that picks `flushErrAndNormalDefers` over
+    /// `flushScopeDefers` in `lowerReturn`, so without this the replay
+    /// never happens and the bug is invisible.
+    ///
+    /// Only an error-set payload qualifies.  A `u8` prong binds an
+    /// ordinary value and returning it must NOT replay errdefers —
+    /// marking every capture would report a double free on every
+    /// switch that captures a success payload.
+    fn markErrorCapturesFromUnion(
+        self: *Builder,
+        payload_token: Ast.TokenIndex,
+        un_ti: *const model_mod.TypeInfo,
+        prong_values: []const Ast.Node.Index,
+    ) void {
+        const lid = self.switchCaptureLocal(payload_token) orelse return;
+        for (prong_values) |v| {
+            const field = self.unionFieldForProng(un_ti, v) orelse continue;
+            if (field.type_first > field.type_last) continue;
+            if (typeRangeIsErrorSet(self.tree, field.type_first, field.type_last)) {
+                self.locals.items[@intFromEnum(lid)].is_error_capture = true;
+                return;
+            }
+        }
+    }
+
+    /// The union field a `.<tag>` switch prong selects, if `un_ti`
+    /// declares one by that name.
+    fn unionFieldForProng(
+        self: *const Builder,
+        un_ti: *const model_mod.TypeInfo,
+        prong_value: Ast.Node.Index,
+    ) ?*const model_mod.FieldInfo {
+        const tree = self.tree;
+        if (tree.nodeTag(prong_value) != .enum_literal) return null;
+        const tags = tree.tokens.items(.tag);
+        const tag_name_tok = tree.nodeMainToken(prong_value);
+        if (tag_name_tok >= tags.len) return null;
+        if (tags[tag_name_tok] != .identifier) return null;
+        return un_ti.findField(tree.tokenSlice(tag_name_tok));
     }
 
     /// `try expr` at statement position.  Lower `expr` on the success
@@ -1876,12 +3876,18 @@ const Builder = struct {
         cur: *BlockId,
     ) !bool {
         const tree = self.tree;
-        switch (tree.nodeTag(expr)) {
+        // `const x = comptime blk: { … };` — the `comptime` wrapper says
+        // WHEN the block is evaluated, not that its statements do not
+        // run.  Leaving the body unlowered skipped every store,
+        // allocation and call inside it, and with them any use of a
+        // value the block builds up before `break :blk`.
+        const target = if (tree.nodeTag(expr) == .@"comptime") tree.nodeData(expr).node else expr;
+        switch (tree.nodeTag(target)) {
             .block, .block_semicolon, .block_two, .block_two_semicolon => {},
             else => return false,
         }
-        const lt = self.blockLabelToken(expr) orelse return false;
-        try self.lowerLabeledBlock(expr, lt, cur);
+        const lt = self.blockLabelToken(target) orelse return false;
+        try self.lowerLabeledBlock(target, lt, cur);
         return true;
     }
 
@@ -1899,7 +3905,7 @@ const Builder = struct {
         const tree = self.tree;
         const label = tree.tokenSlice(label_token);
         const merge = try self.newBlock();
-        try self.block_label_stack.append(self.gpa, .{ .label = label, .merge = merge });
+        try self.block_label_stack.append(self.gpa, .{ .label = label, .merge = merge, .defer_depth = self.deferred.items.len });
         try self.lowerBlock(block_node, cur);
         _ = self.block_label_stack.pop();
         // Natural fallthrough — body completed without breaking.
@@ -1949,10 +3955,16 @@ const Builder = struct {
         if (opt_value_node.unwrap()) |v| {
             const vt = tree.nodeTag(v);
             const is_call_value = switch (vt) {
-                .call, .call_one, .call_comma, .call_one_comma,
-                .builtin_call, .builtin_call_two,
-                .builtin_call_comma, .builtin_call_two_comma,
-                .@"switch", .switch_comma,
+                .call,
+                .call_one,
+                .call_comma,
+                .call_one_comma,
+                .builtin_call,
+                .builtin_call_two,
+                .builtin_call_comma,
+                .builtin_call_two_comma,
+                .@"switch",
+                .switch_comma,
                 => true,
                 else => false,
             };
@@ -1970,6 +3982,7 @@ const Builder = struct {
                     i -= 1;
                     const ctx = self.block_label_stack.items[i];
                     if (std.mem.eql(u8, ctx.label, wanted)) {
+                        try self.flushScopeDefers(cur, ctx.defer_depth);
                         try self.addEdge(cur.*, ctx.merge);
                         cur.* = try self.newBlock();
                         return;
@@ -1985,8 +3998,9 @@ const Builder = struct {
                     if (std.mem.eql(u8, lbl, wanted)) {
                         const target = switch (kind) {
                             .@"break" => ctx.merge,
-                            .@"continue" => ctx.header,
+                            .@"continue" => ctx.continue_to,
                         };
+                        try self.flushScopeDefers(cur, ctx.defer_depth);
                         try self.addEdge(cur.*, target);
                         cur.* = try self.newBlock();
                         return;
@@ -2018,8 +4032,9 @@ const Builder = struct {
         const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
         const target = switch (kind) {
             .@"break" => ctx.merge,
-            .@"continue" => ctx.header,
+            .@"continue" => ctx.continue_to,
         };
+        try self.flushScopeDefers(cur, ctx.defer_depth);
         try self.addEdge(cur.*, target);
         cur.* = try self.newBlock();
     }
@@ -2065,6 +4080,29 @@ const Builder = struct {
         // Success path: lhs's side effects emit into cur.
         try self.lowerStmt(data[0], cur);
         try self.emitCatchFork(catch_node, cur);
+    }
+
+    /// `lhs orelse BODY` — the optional's success path continues in
+    /// `cur` (any nested try / catch / orelse the lhs carries is
+    /// lowered there first, so evaluation order holds), the null path
+    /// lowers BODY in its own block, and both join at a fresh merge.
+    /// The shape mirrors `lowerCatchStmt`; orelse has no payload to
+    /// register.
+    ///
+    /// Every kill the fallback performs belongs in the CFG.  A body
+    /// that frees, deinits an arena or transfers ownership changes the
+    /// state the merge sees, and dropping it makes the orelse invisible
+    /// to the dataflow — the kill simply never happens, so the double
+    /// free it causes is reported for the `catch` spelling of the same
+    /// program and missed for `orelse`.
+    ///
+    /// Reads of the lhs are emitted by the caller, which has already
+    /// walked the whole expression; re-emitting them here would double
+    /// every `.use`.
+    fn lowerOrelseStmt(self: *Builder, orelse_node: Ast.Node.Index, cur: *BlockId) !void {
+        const data = self.tree.nodeData(orelse_node).node_and_node;
+        try self.lowerInitSideEffects(data[0], cur);
+        try self.emitOrelseFork(data[1], cur);
     }
 
     /// Append a catch-body fork to `cur`: one edge straight to merge
@@ -2154,6 +4192,30 @@ const Builder = struct {
         else
             .plain;
 
+        // Pointer inference asks two different questions of the init.
+        // `init_shape` is the TYPE-PRESERVING peel (`try f()`, `f()
+        // catch …`, `f() orelse …`, `(f())` all bind `f()`'s result,
+        // and the init-shape proofs below only recognise a call node);
+        // `init_value` looks through an optional unwrap as well and so
+        // names the value that is really bound.  The syntactic proofs
+        // must use the first: `b.parent().?` binds `parent`'s optional
+        // PAYLOAD, which `parent`'s name and receiver say nothing
+        // about, so proving "pointer" through the unwrap hides the
+        // stack escape of a by-value payload.  The semantic query at
+        // the bottom resolves that payload's real type instead.
+        // The same peel, keeping whether it crossed an error-accepting
+        // wrapper.  A declaration-driven proof has to know that the
+        // binding holds the callee's success PAYLOAD before it may read
+        // an `E!T` declaration as handing out a pointer.
+        const init_shape_peel: ?Peeled = if (init_opt) |init|
+            initPeelNode(self.tree, init, .declared_type)
+        else
+            null;
+        const init_value: ?Ast.Node.Index = if (init_opt) |init|
+            initValueNode(self.tree, init)
+        else
+            null;
+
         // Infer is_pointer from the init expression when there's no
         // explicit type annotation.  Catches the common shapes:
         //   - `const p = &x.field;` — literal address-of
@@ -2164,8 +4226,8 @@ const Builder = struct {
         // Prevents stack-escape FPs on `&p.subfield` later, since p
         // is itself a pointer into caller-owned (or heap) storage.
         if (!is_pointer) {
-            if (init_opt) |init| {
-                if (tree.nodeTag(init) == .address_of) is_pointer = true;
+            if (init_value) |value| {
+                if (tree.nodeTag(value) == .address_of) is_pointer = true;
             }
             if (init_kind == .heap_alloc) is_pointer = true;
             if (init_kind == .copy_of) {
@@ -2192,38 +4254,75 @@ const Builder = struct {
                     is_pointer = true;
                 }
             }
-            // Init-shape signal: `<recv>.<method>(...)` where
-            // `<method>` is one of the conventional pointer-yielding
-            // cast/accessor names (`as`, `cast`, `ptrCast`,
-            // `getPtr`, `getParent`, `parent`).  These reliably
-            // return `*T` in Zig idioms (`@ptrCast`, tagged-union
-            // `.as(Ty)`, `@fieldParentPtr`-wrapping helpers).
-            // Suppresses stack-escape FPs on `&casted.<field>`
-            // shapes (interpreter.zig:1552 etc.).
-            if (!is_pointer and init_kind == .unknown) {
-                if (init_opt) |init| {
-                    if (initCallNameIsPointerReturning(tree, init)) is_pointer = true;
+            // An indexed `.items` expression copies an element. When the
+            // collection's declared element type is a pointer, the copy is
+            // also a pointer into non-stack storage.
+            if (!is_pointer) {
+                if (init_value) |value| {
+                    if (self.initArrayElementIsPointer(value)) is_pointer = true;
                 }
             }
-            // Receiver-pointer heuristic: if the init call's direct
-            // receiver is a known pointer local, the factory/builder
-            // call likely returns a pointer too — e.g. `b.addStep()`
-            // where `b: *std.Build` → result is `*Step.*`.  O(1)
-            // hash lookup — run before ZLS to avoid expensive
-            // cross-file resolution when the answer is already known.
+            // The callee's own DECLARED result type settles the same
+            // question with no name and no receiver spelling in it:
+            // `fn sourceHandle(self: *Ctx, p: []const u8) !*Handle`
+            // hands back a `*Handle` after `catch`, so the binding is a
+            // pointer into storage the context owns and `&handle.<f>`
+            // is not a borrow of this frame.  Runs before the resolver
+            // because a declaration answers on its own, and because the
+            // resolver's node-level query has to retype the whole call
+            // chain — receiver, field, method — to reach the same one.
+            //
+            // A callee this file cannot read answers nothing, so the
+            // syntactic proofs above and the resolver below still
+            // decide those; nothing is retired here.
+            if (!is_pointer and init_kind == .unknown) {
+                if (init_shape_peel) |peel| {
+                    if (self.declaredCallYieldsPointer(peel.node, peel.accepted_error)) is_pointer = true;
+                }
+            }
+            // `self.handle.?` — the unwrapped payload is a pointer
+            // exactly when the FIELD is declared `?*T`.  Neither the
+            // callee spelling above nor the resolver can settle this
+            // (`?*@import("mod").Doc` is unresolvable across the
+            // module boundary), so read the declaration.
             if (!is_pointer and init_kind == .unknown) {
                 if (init_opt) |init| {
-                    if (initCallReceiverIsPointerLocal(self, tree, init)) is_pointer = true;
+                    if (self.initUnwrapsOptionalPointerField(init)) is_pointer = true;
                 }
             }
             // ZLS fallback: if the init expression resolves to a
             // pointer type at the outermost level, the local is a
             // pointer.  Catches opaque-pointer-returning calls whose
             // receiver isn't a locally-tracked pointer.
+            //
+            // A successful `null` is the resolver's normal "nobody can
+            // tell": no proof and no error, so `is_pointer` stays what
+            // the syntactic proofs above left it.  A FAILED query is
+            // not that — an allocation failure or a cancelled read
+            // leaves the question open, and filing it as "not a
+            // pointer" under-proves the local and charges its
+            // `&local.field` addresses to the frame without saying so.
+            // It is recorded for the lowering entry point to raise.
             if (!is_pointer and init_kind == .unknown) {
-                if (init_opt) |init| {
+                if (init_value) |value| {
                     if (self.zls) |z| {
-                        if (z.resolvedTypeIsPointer(init) catch false) is_pointer = true;
+                        if (self.queryOrUnknown(bool, z.resolvedTypeIsPointer(value)) == true) {
+                            is_pointer = true;
+                        } else if (init_opt) |init| {
+                            // Either spelling can be the one the
+                            // resolver can type: the peeled plain call
+                            // is the easy node, while for `catch` the
+                            // WRAPPER's own type is the payload the
+                            // binding holds.  Asking both keeps either
+                            // one a proof, so a shape this pass now
+                            // peels never costs an answer the wrapper
+                            // spelling used to give.
+                            if (init != value and
+                                self.queryOrUnknown(bool, z.resolvedTypeIsPointer(init)) == true)
+                            {
+                                is_pointer = true;
+                            }
+                        }
                     }
                 }
             }
@@ -2334,8 +4433,7 @@ const Builder = struct {
         // buf's freed state.  Skipped for labeled-block inits (the
         // inner stmts already lowered themselves).
         if (init_opt) |init| if (!init_was_labeled_block) {
-            try self.unpackStructInitFields(cur.*, local, null, init,
-                self.posOf(decl_node), self.endPosOf(decl_node));
+            try self.unpackStructInitFields(cur.*, local, null, init, self.posOf(decl_node), self.endPosOf(decl_node));
             // Constructor-call result with heap fields: when init is
             // `T.constructor(...)` and that fn's body returned
             // `.{ .X = <heap_alloc> }`, emit a synthetic
@@ -2343,8 +4441,7 @@ const Builder = struct {
             // downstream field-use machinery sees the right state
             // (e.g. `var u = toUtf8(a); use(u.bytes);` tracks
             // u.bytes's heap allocation).
-            try self.emitConstructorResultHeapFields(cur.*, local, init,
-                self.posOf(decl_node), self.endPosOf(decl_node));
+            try self.emitConstructorResultHeapFields(cur.*, local, init, self.posOf(decl_node), self.endPosOf(decl_node));
         };
 
         // Init-position try/catch: now that the decl has emitted, model
@@ -2357,6 +4454,65 @@ const Builder = struct {
         if (init_opt) |init| {
             try self.lowerInitSideEffects(init, cur);
         }
+    }
+
+    /// Infer pointer-ness for an indexed collection element from its
+    /// declared element type. This covers receiver fields such as
+    /// `self.handles.items[index]` and direct slice parameters.
+    fn initArrayElementIsPointer(self: *Builder, init: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const first = tree.firstToken(init);
+        const last = tree.lastToken(init);
+
+        var items_tok: ?Ast.TokenIndex = null;
+        var t = first;
+        while (t + 2 <= last) : (t += 1) {
+            if (tags[t] != .period or tags[t + 1] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t + 1), "items")) continue;
+            if (tags[t + 2] != .l_bracket) continue;
+            items_tok = t + 1;
+            break;
+        }
+
+        if (items_tok) |items| {
+            if (items < first + 2) return false;
+            const field_tok = items - 2;
+            if (field_tok != first + 2 or tags[first] != .identifier or
+                tags[field_tok] != .identifier) return false;
+            const root = tree.tokenSlice(first);
+            const owner_type: ?[]const u8 = if (std.mem.eql(u8, root, "self") or
+                std.mem.eql(u8, root, "this"))
+                self.self_type
+            else if (self.name_to_local.get(root)) |local|
+                self.locals.items[@intFromEnum(local)].type_name
+            else
+                null;
+
+            const type_name = owner_type orelse return false;
+            const cache = self.cache orelse return false;
+            const model = self.modelOrNull(cache) orelse return false;
+            const owner = model.findType(type_name) orelse return false;
+            const field = owner.findField(tree.tokenSlice(field_tok)) orelse return false;
+            return typeRangeHasPointerElement(tree, field.type_first, field.type_last);
+        }
+
+        if (first + 1 > last or tags[first] != .identifier or
+            tags[first + 1] != .l_bracket) return false;
+        const root = tree.tokenSlice(first);
+        const proto = self.fn_proto orelse return false;
+        var params = proto.iterate(tree);
+        while (params.next()) |param| {
+            const name_tok = param.name_token orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(name_tok), root)) continue;
+            const type_node = param.type_expr orelse return false;
+            return typeRangeHasPointerElement(
+                tree,
+                tree.firstToken(type_node),
+                tree.lastToken(type_node),
+            );
+        }
+        return false;
     }
 
     /// Walk an init / rhs expression for top-level catch / try / orelse
@@ -2373,21 +4529,15 @@ const Builder = struct {
     ///     plus lower orelse-BODY as a fork of its own
     ///
     /// Recursion bounded by AST depth; cheap.
-    fn lowerInitSideEffects(self: *Builder, init: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    fn lowerInitSideEffects(self: *Builder, init: Ast.Node.Index, cur: *BlockId) (LoweringError)!void {
         const tree = self.tree;
         switch (tree.nodeTag(init)) {
             .@"try" => try self.emitTryErrorExit(cur, self.posOf(init)),
             .@"catch" => try self.emitCatchFork(init, cur),
-            .@"orelse" => {
-                const data = tree.nodeData(init).node_and_node;
-                // lhs may itself contain a top-level catch/try whose
-                // body has side effects (the common
-                // `expr catch {...} orelse {...}` shape).
-                try self.lowerInitSideEffects(data[0], cur);
-                // Fork the orelse body: success edge (optional was
-                // non-null) and orelse-body edge.  Body is BODY=data[1].
-                try self.emitOrelseFork(data[1], cur);
-            },
+            // The lhs may itself carry a top-level catch/try whose body
+            // has side effects (the common `expr catch {…} orelse {…}`
+            // shape), so `lowerOrelseStmt` lowers it before forking.
+            .@"orelse" => try self.lowerOrelseStmt(init, cur),
             else => {},
         }
     }
@@ -2410,10 +4560,10 @@ const Builder = struct {
     /// Otherwise (field access, deref, destructuring) fall back to a
     /// lowering_gap so locals collapse conservatively to .plain.
     ///
-    /// Either way, if the RHS has a top-level `try` or `catch`, emit
-    /// the same error-exit / fork helpers we use in init/return
-    /// positions — those error-path CFG edges are independent of
-    /// whether we successfully tracked the target.
+    /// Either way, if the RHS has a top-level `try`, `catch` or
+    /// `orelse`, lower it the way the matching var-decl would — those
+    /// error / null-path CFG edges are independent of whether we
+    /// successfully tracked the target.
     fn lowerAssign(self: *Builder, assign_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         const tag = tree.nodeTag(assign_node);
@@ -2446,15 +4596,17 @@ const Builder = struct {
         // emit a .use(host) at the labeled-block's opening AFTER the
         // body already lowered an `allocator.free(host)`.  Symmetric
         // to the same guard in lowerVarDecl.
-        const rhs_was_labeled_block = try self.maybeLowerLabeledBlockExpr(rhs, cur);
-
+        if (!try self.maybeLowerLabeledBlockExpr(rhs, cur)) {
+            try self.emitUsesInExpr(rhs, cur.*, null);
+            try self.applyTopLevelCallEffects(rhs, cur);
+            // `try` / `catch` / `orelse` all fork, and the bodies they
+            // carry have to run — `lowerInitSideEffects` is that one
+            // walk, so an assignment lowers exactly what the matching
+            // decl would.
+            try self.lowerInitSideEffects(rhs, cur);
+        }
 
         if (target_local) |t| {
-            // .use stmts for rhs reads, skipping the LHS itself
-            // (assignment writes LHS, not reads it).
-            if (!rhs_was_labeled_block) {
-                try self.emitUsesInExpr(rhs, cur.*, t);
-            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .assign = .{
                     .target = t,
@@ -2468,16 +4620,12 @@ const Builder = struct {
             // `container = .{ .ptr = buf }` registers
             // `(container, "ptr") → buf's origin` so a later
             // `container.ptr` read sees buf's freed state.
-            try self.unpackStructInitFields(cur.*, t, null, rhs,
-                self.posOf(assign_node), self.endPosOf(assign_node));
+            try self.unpackStructInitFields(cur.*, t, null, rhs, self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (self.fieldLhsFor(lhs)) |fref| {
             // `obj.field = RHS` where obj is a known local — emit
             // .field_assign so the field's origin is tracked
             // separately.  Catches store-then-free-then-use of a
             // struct field.
-            if (!rhs_was_labeled_block) {
-                try self.emitUsesInExpr(rhs, cur.*, null);
-            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .field_assign = .{
                     .parent = fref.parent,
@@ -2490,16 +4638,14 @@ const Builder = struct {
             // Nested struct-literal unpack for the field LHS, e.g.
             // `install.ca = .{ .str = buf }` → field_assign on
             // `(install, "ca.str")`.  oven-sh/bun#25563 shape.
-            try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs,
-                self.posOf(assign_node), self.endPosOf(assign_node));
+            try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs, self.posOf(assign_node), self.endPosOf(assign_node));
             // oven-sh/bun#29422: `obj.field = .{ .tag = try ... }` leaves
             // the union with the new tag and garbage payload on the
             // error path.  Fire only on field assignments through a
             // pointer-typed parent — pure-local field writes don't
             // outlive the frame and aren't observable.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
-                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent, fref.name,
-                    self.posOf(assign_node), self.endPosOf(assign_node));
+                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent, fref.name, self.posOf(assign_node), self.endPosOf(assign_node));
             }
             // Escape-via-out-param: `out.field = X` where `out` is a
             // pointer-typed parameter writes through to caller
@@ -2538,9 +4684,6 @@ const Builder = struct {
             // Mirror the field-of-pointer case above: emit a
             // pointer_write to clear .undef on the pointer and an
             // out_param_write for the escape check.
-            if (!rhs_was_labeled_block) {
-                try self.emitUsesInExpr(rhs, cur.*, null);
-            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .pointer_write = .{ .target = out_local } },
                 .pos = self.posOf(assign_node),
@@ -2567,31 +4710,18 @@ const Builder = struct {
             // observed field LHSs ARE unions).
             const tn = self.locals.items[@intFromEnum(out_local)].type_name;
             if (tn != null and self.typeIsTaggedUnion(tn.?)) {
-                try self.maybePartialUnionWrite(cur.*, rhs, out_local, null,
-                    self.posOf(assign_node), self.endPosOf(assign_node));
+                try self.maybePartialUnionWrite(cur.*, rhs, out_local, null, self.posOf(assign_node), self.endPosOf(assign_node));
             }
             // Unpack struct-literal fields so arena/heap-field origins
             // are tracked per-field.  Needed for the "object owns its
             // own arena" pattern (`ptr.* = .{ .arena = arena, ... }`) —
             // the arena field_assign marks the arena as heap-moved,
             // suppressing the spurious arena-escape on `return ptr`.
-            try self.unpackStructInitFields(cur.*, out_local, null, rhs,
-                self.posOf(assign_node), self.endPosOf(assign_node));
+            try self.unpackStructInitFields(cur.*, out_local, null, rhs, self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (tree.nodeTag(lhs) == .identifier and
             std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
         {
-            // Discard: `_ = expr;`.  Reads the RHS, writes nothing.
-            // CRUCIALLY we must NOT emit a .lowering_gap here — gap
-            // collapses every local to .plain (since it represents
-            // "we don't know what this stmt did").  `_ = x` is a
-            // common idiom (`_ = arg; // autofix`) sprinkled all over
-            // real codebases; treating each as a state wipe defeats
-            // heap / arena tracking everywhere downstream.
-            try self.emitUsesInExpr(rhs, cur.*, null);
-            // If RHS is a call, its @takes-ownership / arena-kill
-            // side effects must still fire.  `_ = h.markInactive();`
-            // would otherwise miss the inter-procedural UAF.
-            try self.applyTopLevelCallEffects(rhs, cur);
+            // Discard reads and call effects were lowered with the RHS.
         } else {
             // Untracked target (e.g. `@field(obj, ...) = X`,
             // `arr[i] = X`).  For any known local mentioned anywhere in
@@ -2600,17 +4730,10 @@ const Builder = struct {
             // initialized, so clearing its .undef state is sound.
             try self.emitWritesInLhs(lhs, cur.*);
             try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "assign-target" } },
+                .kind = .{ .lowering_gap = .{ .note = "assign-target", .may_assign_locals = false } },
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
-        }
-
-        // Mirror the init-position try/catch dispatch.
-        switch (tree.nodeTag(rhs)) {
-            .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
-            .@"catch" => try self.emitCatchFork(rhs, cur),
-            else => {},
         }
     }
 
@@ -2618,9 +4741,9 @@ const Builder = struct {
     /// pure-identifier targets emit `.assign` against the resolved
     /// local; var-decl targets (`const x`) register a new local and
     /// emit `.decl`.  All rhs classifications are .unknown — we don't
-    /// match tuple slots to types.  The rhs's top-level try/catch /
-    /// labeled-block side-effects ARE lowered (once, before the
-    /// per-target emissions), matching plain-assign semantics.
+    /// match tuple slots to types.  The rhs's top-level try / catch /
+    /// orelse / labeled-block side-effects ARE lowered (once, before
+    /// the per-target emissions), matching plain-assign semantics.
     fn lowerAssignDestructure(
         self: *Builder,
         assign_node: Ast.Node.Index,
@@ -2630,9 +4753,11 @@ const Builder = struct {
         const full = tree.assignDestructure(assign_node);
         const rhs = full.ast.value_expr;
 
-        // Labeled-block expression rhs — lower body first.
-        if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
-
+        if (!try self.maybeLowerLabeledBlockExpr(rhs, cur)) {
+            try self.emitUsesInExpr(rhs, cur.*, null);
+            try self.applyTopLevelCallEffects(rhs, cur);
+            try self.lowerInitSideEffects(rhs, cur);
+        }
 
         for (full.ast.variables) |var_node| {
             const vtag = tree.nodeTag(var_node);
@@ -2678,15 +4803,6 @@ const Builder = struct {
                 },
             }
         }
-
-        // Mirror plain assign: rhs try/catch dispatch comes after the
-        // per-target emissions (so the success path has the assigns
-        // visible before the error-exit / catch fork branches off).
-        switch (tree.nodeTag(rhs)) {
-            .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
-            .@"catch" => try self.emitCatchFork(rhs, cur),
-            else => {},
-        }
     }
 
     fn lowerReturn(self: *Builder, ret_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -2694,18 +4810,14 @@ const Builder = struct {
         const data = tree.nodeData(ret_node);
         const value_opt = data.opt_node.unwrap();
 
-        // Top-level try/catch in the returned expression — model the
-        // error path BEFORE flushing defers (so the synthetic sink and
-        // the merge block both get the right view of state).  The
-        // err-exit sink does its own flushErrAndNormalDefers; the
-        // catch fork advances cur to a merge where we continue the
+        // Top-level try / catch / orelse in the returned expression —
+        // model those paths BEFORE flushing defers (so the synthetic
+        // sink and the merge block both get the right view of state).
+        // The err-exit sink does its own flushErrAndNormalDefers; each
+        // fork advances cur to a merge where we continue the
         // success-path return.
         if (value_opt) |expr| {
-            switch (tree.nodeTag(expr)) {
-                .@"try" => try self.emitTryErrorExit(cur, self.posOf(expr)),
-                .@"catch" => try self.emitCatchFork(expr, cur),
-                else => {},
-            }
+            try self.lowerInitSideEffects(expr, cur);
             // Top-level labeled-block return (`return blk: { ... };`)
             // — lower body in-place so side effects + breaks run
             // before the return.  cur advances to post-merge; the
@@ -2756,30 +4868,14 @@ const Builder = struct {
         if (value_is_error) {
             try self.flushErrAndNormalDefers(cur);
         } else {
-            try self.flushDefers(cur);
+            try self.flushScopeDefers(cur, 0);
         }
 
-        // Multi-borrow composite returns: classifyExpr captures only
-        // the first borrow in `value_kind`.  Walk the return value
-        // again for ANY ADDITIONAL borrows (skipping the primary)
-        // and emit a per-local .composite_escape check before the
-        // .ret.  Without this, `return .{ .a = &x, .b = &y };` would
-        // only flag x.
-        //
-        // Only run when value_kind ITSELF is a borrow-shape — that
-        // tells us the return value is a composite-borrow construct,
-        // not a call.  Skipping for .unknown / .owned / etc. avoids
-        // false positives on `return foo(alloc, &local)` where
-        // `&local` is just a call arg, not part of the return value.
-        const primary_local: ?LocalId = switch (value_kind) {
-            .stack_ref => |l| l,
-            .composite_borrow => |l| l,
-            else => null,
-        };
-        if (primary_local != null) {
-            if (value_opt) |expr| {
-                try self.emitAdditionalEscapeChecks(expr, cur.*, primary_local);
-            }
+        switch (value_kind) {
+            .stack_ref, .copy_of, .composite_borrow => {
+                if (value_opt) |expr| try self.emitAdditionalEscapeChecks(expr, cur.*, value_kind);
+            },
+            else => {},
         }
 
         // Detect `return undefined;` — a literal sentinel return,
@@ -2889,8 +4985,14 @@ const Builder = struct {
     fn initWrapsResourceLocalRef(self: *Builder, init_node: Ast.Node.Index) ?WrapHit {
         const tree = self.tree;
         switch (tree.nodeTag(init_node)) {
-            .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
-            .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
             => {},
             else => return null,
         }
@@ -2934,8 +5036,8 @@ const Builder = struct {
         const name = tree.tokenSlice(tree.nodeMainToken(init_node));
         // Existence check — does the file declare a fn with this name?
         if (self.cache) |c| {
-            const model = c.fileModel() catch null;
-            if (model) |m| if (m.findFn(name) != null) return name;
+            const model = self.modelOrNull(c) orelse return null;
+            if (model.findFn(name) != null) return name;
         }
         return null;
     }
@@ -3004,7 +5106,7 @@ const Builder = struct {
         init_expr: Ast.Node.Index,
         pos: SrcPos,
         end_pos: SrcPos,
-    ) std.mem.Allocator.Error!void {
+    ) LoweringError!void {
         const tree = self.tree;
         var node = init_expr;
         while (true) switch (tree.nodeTag(node)) {
@@ -3034,14 +5136,14 @@ const Builder = struct {
                 if (tree.nodeTag(recv) == .identifier) {
                     const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
                     if (self.cache) |c| {
-                        if (c.summaryByMethod(recv_name, callee_name) catch null) |s| {
+                        if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByMethod(recv_name, callee_name))) |s| {
                             if (s.result_heap_fields.len > 0) break :blk s.result_heap_fields;
                         }
                     }
                 }
             }
             if (self.cache) |c| {
-                if (c.summaryByName(callee_name) catch null) |s| {
+                if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByName(callee_name))) |s| {
                     if (s.result_heap_fields.len > 0) break :blk s.result_heap_fields;
                 }
             }
@@ -3063,7 +5165,7 @@ const Builder = struct {
         }
     }
 
-    fn applyTopLevelCallEffects(self: *Builder, expr_node: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    fn applyTopLevelCallEffects(self: *Builder, expr_node: Ast.Node.Index, cur: *BlockId) (LoweringError)!void {
         const tree = self.tree;
         // Walk through `try` / `catch` wrappers — they don't change
         // which call's effects fire on success path.
@@ -3159,7 +5261,7 @@ const Builder = struct {
         if (anyPatternMatches(text, self.config.arena_kill_patterns)) {
             const recv_local = self.firstIdentifierLocal(text) orelse {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .lowering_gap = .{ .note = "deinit-no-receiver" } },
+                    .kind = .{ .lowering_gap = .{ .note = "deinit-no-receiver", .may_assign_locals = false } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
@@ -3191,14 +5293,22 @@ const Builder = struct {
                 switch (target) {
                     .local => |freed| {
                         try self.appendStmt(cur.*, .{
-                            .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                            .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: {
+                                const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                                self.next_heap += 1;
+                                break :blk_h h;
+                            } } },
                             .pos = self.posOf(call_node),
                             .end_pos = self.endPosOf(call_node),
                         });
                     },
                     .field => |fref| {
                         try self.appendStmt(cur.*, .{
-                            .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                            .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                                const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                                self.next_heap += 1;
+                                break :blk_hid h;
+                            } } },
                             .pos = self.posOf(call_node),
                             .end_pos = self.endPosOf(call_node),
                         });
@@ -3210,7 +5320,11 @@ const Builder = struct {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .heap_free = .{
                         .freed_local = freed,
-                        .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; },
+                        .fallback_hid = blk_h: {
+                            const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                            self.next_heap += 1;
+                            break :blk_h h;
+                        },
                         .allocator_local = self.allocReceiverLocal(call_node),
                     } },
                     .pos = self.posOf(call_node),
@@ -3221,14 +5335,18 @@ const Builder = struct {
             // `g.free(obj.field)` — field-level free.
             if (self.heapFreedField(call_node)) |fref| {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                        const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                        self.next_heap += 1;
+                        break :blk_hid h;
+                    } } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
                 return;
             }
             try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "free-untracked-arg" } },
+                .kind = .{ .lowering_gap = .{ .note = "free-untracked-arg", .may_assign_locals = false } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -3245,7 +5363,11 @@ const Builder = struct {
         var fired_any = false;
         if (self.takesOwnershipFreedLocal(call_node)) |freed| {
             try self.appendStmt(cur.*, .{
-                .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_h h;
+                } } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -3259,7 +5381,11 @@ const Builder = struct {
         // because the receiver is a field_access, not a bare ident.
         if (self.takesOwnershipFreedField(call_node)) |fref| {
             try self.appendStmt(cur.*, .{
-                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_hid h;
+                } } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -3278,7 +5404,11 @@ const Builder = struct {
             if (emissions.items.len > 0) {
                 for (emissions.items) |em| {
                     try self.appendStmt(cur.*, .{
-                        .kind = .{ .field_heap_free = .{ .parent = em.parent, .name = em.field, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                        .kind = .{ .field_heap_free = .{ .parent = em.parent, .name = em.field, .fallback_hid = blk_hid: {
+                            const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                            self.next_heap += 1;
+                            break :blk_hid h;
+                        } } },
                         .pos = self.posOf(call_node),
                         .end_pos = self.endPosOf(call_node),
                     });
@@ -3293,7 +5423,7 @@ const Builder = struct {
         // conservative gap erases tracked origins.
         try self.emitUsesInExpr(call_node, cur.*, null);
         try self.appendStmt(cur.*, .{
-            .kind = .{ .lowering_gap = .{ .note = "call-untracked" } },
+            .kind = .{ .lowering_gap = .{ .note = "call-untracked", .may_assign_locals = false } },
             .pos = self.posOf(call_node),
             .end_pos = self.endPosOf(call_node),
         });
@@ -3328,7 +5458,7 @@ const Builder = struct {
         else
             raw_name;
         if (self.cache) |c| {
-            if (c.summaryByName(name) catch null) |s| if (s.is_noreturn) return true;
+            if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByName(name))) |s| if (s.is_noreturn) return true;
         }
         // Aliased noreturn local: `const exit = std.process.exit;`
         // then `exit(1)`.  Bare-identifier callee referencing a
@@ -3355,6 +5485,131 @@ const Builder = struct {
             if (std.mem.endsWith(u8, callee_text, pat)) return true;
         }
         return false;
+    }
+
+    /// Map a declared callee parameter index to the caller-side
+    /// argument node of `call_node`.  `recv_node` is the field-access
+    /// receiver, or null for a bare `fn(...)` callee.
+    ///
+    /// An instance method spends declared param 0 on its receiver, so
+    /// param N lands on `ast.params[N - 1]`.  A container receiver is
+    /// not a value at all: an `@import`ed namespace (`lib.dispose(g,
+    /// b)`) and a type name (`Item.deinit(item, gpa)`) both name a
+    /// top-level fn whose param N lands on `ast.params[N]`.  Shifting
+    /// such a call by the receiver maps a declared freed parameter one
+    /// slot early — onto the allocator — and loses the finding.
+    ///
+    /// Which of the two it is is settled by DECLARED TYPE IDENTITY, not
+    /// by how the argument is spelled: the type engine resolves the
+    /// callee's prototype and asks whether its first parameter IS the
+    /// receiver's own type.  Without the type engine the DECLARATION
+    /// of the receiver settles it instead — a tracked local is a value,
+    /// an `@import` alias or a type declared in this file is a
+    /// container (see `receiverSpendsParamZero`).  A receiver that is
+    /// neither keeps the syntactic shift, so an absent proof costs
+    /// precision at the call site, never a finding.
+    fn calleeParamArgNode(
+        self: *Builder,
+        call_node: Ast.Node.Index,
+        args: []const Ast.Node.Index,
+        recv_node: ?Ast.Node.Index,
+        param: u32,
+    ) ?Ast.Node.Index {
+        if (self.zls) |z| {
+            if (self.queryOrUnknown(Ast.Node.Index, z.callArgument(call_node, @intCast(param)))) |node| return node;
+        }
+        if (recv_node) |rn| {
+            // No proof either way keeps the receiver slot, exactly as
+            // before — an absent proof must not move the mapping.
+            const spends_param_zero = self.receiverSpendsParamZero(rn) orelse true;
+            if (!spends_param_zero) {
+                if (param >= args.len) return null;
+                return args[param];
+            }
+            if (param == 0) return rn;
+            const explicit_idx = param - 1;
+            if (explicit_idx >= args.len) return null;
+            return args[explicit_idx];
+        }
+        if (param >= args.len) return null;
+        return args[param];
+    }
+
+    /// Does the callee's declared parameter 0 name the receiver — i.e.
+    /// is this an instance call (`holder.dispose(gpa, item)`)?
+    ///
+    /// `<recv>.<method>(...)` alone can't answer it: `lib.dispose(gpa,
+    /// b)` spells a top-level fn of an imported file, and `lib` is a
+    /// container, not a value.  The receiver's own DECLARATION answers
+    /// it — a tracked local is a value, an `@import` alias or a type
+    /// declared in this file is a container.  Null when the receiver is
+    /// neither, so the caller keeps its existing mapping.
+    fn receiverSpendsParamZero(self: *Builder, recv_node: Ast.Node.Index) ?bool {
+        const tree = self.tree;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        // A local in this function is a value: `holder.dispose(...)`
+        // spends param 0 on `holder`, and a local that shadows an
+        // import alias is a value too.
+        if (self.name_to_local.get(name) != null) return true;
+        if (self.importAliasPath(name) != null) return false;
+        if (self.self_type) |owner| {
+            if (std.mem.eql(u8, owner, name)) return false;
+        }
+        const cache = self.cache orelse return null;
+        const model = self.modelOrNull(cache) orelse return null;
+        if (model.hasType(name)) return false;
+        return null;
+    }
+
+    /// Import path of the file-level `@import` alias `alias`, or null
+    /// when this file declares no such alias.  Builds the alias table
+    /// on first use.
+    fn importAliasPath(self: *Builder, alias: []const u8) ?[]const u8 {
+        // `.{}` on an optional is null, not an empty map — the table
+        // has to be spelled out or the lookup below unwraps nothing.
+        if (self.import_aliases == null) {
+            self.import_aliases = std.StringHashMapUnmanaged([]const u8){};
+            self.collectImportAliases() catch |err| self.noteResolutionError(err);
+        }
+        return self.import_aliases.?.get(alias);
+    }
+
+    /// Record every file-level `const NAME = @import("path")`.
+    fn collectImportAliases(self: *Builder) !void {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        for (tree.rootDecls()) |node| {
+            const decl = tree.fullVarDecl(node) orelse continue;
+            const name_tok = decl.ast.mut_token + 1;
+            if (name_tok >= tags.len or tags[name_tok] != .identifier) continue;
+            const init = decl.ast.init_node.unwrap() orelse continue;
+            const path = importPathOfInit(tree, init) orelse continue;
+            try self.import_aliases.?.put(self.gpa, tree.tokenSlice(name_tok), path);
+        }
+    }
+
+    /// Declared parameter the top-level fn `callee_name` takes
+    /// ownership of, reached through the file-level namespace alias
+    /// `alias` (`lib.dispose(gpa, b)`).  A namespace is a container, so
+    /// there is no receiver type to look the summary up by: the callee
+    /// is a top-level fn of the imported file and is inferred from
+    /// that file's own body.  Null when the alias isn't an `@import`
+    /// here, the target file can't be loaded, or it declares no such fn.
+    fn importedNamespaceTakes(self: *Builder, alias: []const u8, callee_name: []const u8) ?u32 {
+        const cache = self.cache orelse return null;
+        const project = cache.project orelse return null;
+        const import_path = self.importAliasPath(alias) orelse return null;
+        const target = (project.modelForRelativeImport(cache.file_path, import_path) catch |err| {
+            project.failure = err;
+            project.parse_failure = null;
+            return null;
+        }) orelse return null;
+        const fn_info = target.findFn(callee_name) orelse return null;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(target.tree, &buf, fn_info.fn_decl) orelse return null;
+        const body = tokens.bodyOf(target.tree, fn_info.fn_decl) orelse return null;
+        return fn_summary.inferDirectTakes(target.tree, proto, body);
     }
 
     /// If the callee has `@takes ownership(p)`, return the LocalId
@@ -3407,12 +5662,12 @@ const Builder = struct {
             // cross-file paths.
             if (self.cache) |c| {
                 if (recv_ty) |ty| {
-                    if (c.summaryByMethod(ty, callee_name) catch null) |s| {
+                    if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByMethod(ty, callee_name))) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
                 }
                 if (!receiver_is_arg0) {
-                    if (c.summaryByName(callee_name) catch null) |s| {
+                    if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByName(callee_name))) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
                 }
@@ -3421,29 +5676,27 @@ const Builder = struct {
                 // has already propagated intra-file chains; what's left are
                 // callees whose destructor lives in a foreign file.
                 if (recv_ty) |ty| {
-                    if (c.summaryByMethodCrossFile(ty, callee_name) catch null) |xf| {
+                    if (self.queryOrUnknown(fn_summary.FnSummary, c.summaryByMethodCrossFile(ty, callee_name))) |xf| {
                         if (xf.takes_ownership_of) |i| break :blk i;
+                    }
+                }
+                // Remote namespace: `lib.dispose(gpa, b)` where `lib`
+                // is a file-level `@import` alias.  The receiver is
+                // the imported module's container, so there is no
+                // receiver type to look a summary up by — the callee
+                // is a top-level fn of the imported file, reached
+                // through the alias instead.
+                if (recv_node) |rn| {
+                    if (tree.nodeTag(rn) == .identifier) {
+                        const alias = tree.tokenSlice(tree.nodeMainToken(rn));
+                        if (self.importedNamespaceTakes(alias, callee_name)) |i| break :blk i;
                     }
                 }
             }
             return null;
         };
 
-        // For cross-file namespace calls (`lib.dispose(g, buf)`), the
-        // receiver IS the imported namespace — not part of the
-        // callee's logical arg list.  ast.params already holds the
-        // full explicit-arg list; don't subtract for the namespace.
-        // Cross-file detection retired with remote_resolver; receiver
-        // is now always treated as arg 0 for field-access callees.
-        const effective_recv_is_arg0 = receiver_is_arg0;
-
-        const candidate = if (effective_recv_is_arg0 and target_idx == 0)
-            recv_node.?
-        else blk: {
-            const explicit_idx = if (effective_recv_is_arg0) target_idx - 1 else target_idx;
-            if (explicit_idx >= call_full.ast.params.len) return null;
-            break :blk call_full.ast.params[explicit_idx];
-        };
+        const candidate = self.calleeParamArgNode(call_node, call_full.ast.params, recv_node, target_idx) orelse return null;
 
         if (tree.nodeTag(candidate) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(candidate));
@@ -3476,35 +5729,12 @@ const Builder = struct {
         const field_name = tree.tokenSlice(recv_fa[1]);
         const method_name = tree.tokenSlice(fa[1]);
 
-        // The receiver of the method call is the FIELD (`parent.field`).
-        // Resolve its declared type via the parent local's type +
-        // field name → Db.fieldType.  This scopes `<local>.<field>
-        // .<method>()` lookups to the field's exact type instead of
-        // falling back to bare-name (which would inherit a sibling
-        // overload's annotation across types).
-        const recv_ty: ?[]const u8 = blk: {
-            const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse break :blk null;
-            const cache = self.cache orelse break :blk null;
-            const model = cache.fileModel() catch break :blk null;
-            break :blk model.fieldType(parent_ty, field_name);
-        };
-
-        // Resolve method's @takes: same-file typed -> cross-file typed.
-        // No bare-name fallback — see takesOwnershipFreedLocal for rationale.
-        const takes_idx: u32 = blk: {
-            if (recv_ty) |ty| {
-                if (self.cache) |c| {
-                    if (c.summaryByMethod(ty, method_name) catch null) |s| {
-                        if (s.takes_ownership_of) |i| break :blk i;
-                    }
-                    if (c.summaryByMethodCrossFile(ty, method_name) catch null) |xf| {
-                        if (xf.takes_ownership_of) |i| break :blk i;
-                    }
-                }
-            }
-            return null;
-        };
-        if (takes_idx != 0) return null;
+        const cache = self.cache orelse return null;
+        const parent_name = self.locals.items[@intFromEnum(parent)].type_name orelse return null;
+        const owner = cache.findTypeAcrossImports(parent_name) orelse return null;
+        const child = cache.fieldType(owner, field_name) orelse return null;
+        const summary = (self.queryOrUnknown(fn_summary.FnSummary, cache.summaryForType(child, method_name))) orelse return null;
+        if (summary.takes_ownership_of != 0) return null;
         return .{ .parent = parent, .name = field_name };
     }
 
@@ -3524,7 +5754,7 @@ const Builder = struct {
                 // result in the local so every subsequent call on the same
                 // receiver skips ZLS entirely.
                 if (self.zls) |z| {
-                    if (z.typeNameOfNode(node) catch null) |ty| {
+                    if (self.queryOrUnknown([]const u8, z.typeReferenceOfNode(node))) |ty| {
                         self.locals.items[@intFromEnum(lid)].type_name = ty;
                         return ty;
                     }
@@ -3538,9 +5768,98 @@ const Builder = struct {
         // and cross-module aliases (`const W = ns.factory.Type`)
         // where zbc's AST-only tracking can't see the type.
         if (self.zls) |z| {
-            return z.typeNameOfNode(node) catch null;
+            return self.queryOrUnknown([]const u8, z.typeReferenceOfNode(node));
         }
         return null;
+    }
+
+    /// Where a call's callee is DECLARED, and in which file.  Null when
+    /// the declaration cannot be pinned down — which includes the
+    /// ambiguous case: a free function whose name this file declares
+    /// twice has no single signature, so no single answer can be
+    /// attributed to it.
+    const CalleeDecl = struct { tree: *const Ast, fn_decl: Ast.Node.Index };
+
+    fn calleeDeclOfCall(self: *Builder, call_node: Ast.Node.Index) ?CalleeDecl {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call.ast.fn_expr;
+        switch (tree.nodeTag(callee)) {
+            .field_access => {
+                const recv = tree.nodeData(callee).node_and_token[0];
+                const method = tree.tokenSlice(tree.nodeData(callee).node_and_token[1]);
+                // The receiver's TYPE is what says which declaration is
+                // being called, so an unreadable receiver type answers
+                // nothing rather than guessing from the method name.
+                const recv_ty = self.receiverTypeOfNode(recv) orelse return null;
+                const cache = self.cache orelse return null;
+                const owner = cache.findTypeAcrossImports(recv_ty) orelse return null;
+                const decl = owner.info.findMethod(method) orelse return null;
+                return .{ .tree = owner.model.tree, .fn_decl = decl.fn_decl };
+            },
+            .identifier => {
+                // A local or parameter can shadow a declaration of this name.
+                // Its callable value needs semantic resolution, not a lookup
+                // of an unrelated same-spelled function in the file.
+                if (self.name_to_local.contains(tree.tokenSlice(tree.nodeMainToken(callee)))) return null;
+                const name = self.resolveBoundCallee(tree.tokenSlice(tree.nodeMainToken(callee)));
+                const cache = self.cache orelse return null;
+                const model = self.modelOrNull(cache) orelse return null;
+                var found: ?Ast.Node.Index = null;
+                for (model.fns) |info| {
+                    if (!std.mem.eql(u8, info.name, name)) continue;
+                    if (found != null) return null;
+                    found = info.fn_decl;
+                }
+                const fn_decl = found orelse return null;
+                return .{ .tree = model.tree, .fn_decl = fn_decl };
+            },
+            else => return null,
+        }
+    }
+
+    /// True when `call_node` is a call whose CALLEE'S OWN DECLARATION
+    /// says it hands back a pointer, and the binding therefore holds one.
+    ///
+    /// This is the proof that needs no callee NAME and no receiver
+    /// spelling: `fn sourceHandle(self: *Ctx, p: []const u8) !*Handle`
+    /// binds a `*Handle` after `catch`, so `&handle.tree` addresses the
+    /// handle's own storage — the context's — and not this frame.
+    /// The declaration, not a method name or the receiver's pointer type,
+    /// proves the result type.
+    ///
+    /// Two constraints keep it sound:
+    ///
+    ///  - It only ever answers TRUE.  A callee whose declared return
+    ///    type is a type parameter, an opaque generic, or anything this
+    ///    file cannot read answers nothing, so the questions below it —
+    ///    and the frame attribution — keep their say.
+    ///  - An error union counts only when the binding ACCEPTED the
+    ///    error.  `const h = try f();` holds the payload, and the
+    ///    payload of `!*Handle` is a pointer; a binding that took the
+    ///    whole `E!T` holds an error union, which is not a pointer and
+    ///    whose `&h.tree` would not compile.  zbc reads source that
+    ///    need not compile, so that distinction is carried rather than
+    ///    assumed away — `accepted_error` is what carries it, and
+    ///    without it an `!*T` declaration would read as a pointer for a
+    ///    binding that holds no pointer at all.
+    ///
+    /// A `*T` return stays a pointer under every instantiation of `T`,
+    /// so a generic callee is decided by its declaration too; the
+    /// converse — a `T` return instantiated as a pointer — is one this
+    /// deliberately does not claim.
+    fn declaredCallYieldsPointer(self: *Builder, call_node: Ast.Node.Index, accepted_error: bool) bool {
+        const decl = self.calleeDeclOfCall(call_node) orelse return false;
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const proto = decl.tree.fullFnProto(&proto_buf, decl.fn_decl) orelse return false;
+        const return_node = proto.ast.return_type.unwrap() orelse return false;
+        const first = decl.tree.firstToken(return_node);
+        const last = decl.tree.lastToken(return_node);
+        const tags = decl.tree.tokens.items(.tag);
+        if (typeRangeIsPointerValue(tags, first, last)) return true;
+        if (!accepted_error) return false;
+        return errorUnionPayloadIsPointer(tags, first, last);
     }
 
     /// A single (parent_local, field) emission triggered by a
@@ -3602,7 +5921,7 @@ const Builder = struct {
         const frees: []const Free = blk: {
             if (self.cache) |c| {
                 if (recv_ty) |ty| {
-                    if (c.summaryByMethod(ty, callee_name) catch null) |s| {
+                    if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByMethod(ty, callee_name))) |s| {
                         if (s.may_free_fields.len > 0) {
                             const n = @min(s.may_free_fields.len, free_buf.len);
                             for (s.may_free_fields[0..n], 0..) |ff, i| {
@@ -3615,7 +5934,7 @@ const Builder = struct {
                 // Identifier-style call (e.g. `cleanup(x, y)`): no
                 // receiver type, look up the top-level fn by name.
                 if (!receiver_is_arg0) {
-                    if (c.summaryByName(callee_name) catch null) |s| {
+                    if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByName(callee_name))) |s| {
                         if (s.may_free_fields.len > 0) {
                             const n = @min(s.may_free_fields.len, free_buf.len);
                             for (s.may_free_fields[0..n], 0..) |ff, i| {
@@ -3629,19 +5948,9 @@ const Builder = struct {
             return;
         };
 
-        // Receiver is param 0 for field-access callees.  Cross-file
-        // namespace detection retired with remote_resolver.
-        const effective_recv_is_arg0 = receiver_is_arg0 and recv_node != null;
-
         for (frees) |ff| {
             // Map the callee's param index to the caller's arg node.
-            const arg_node: Ast.Node.Index = if (effective_recv_is_arg0 and ff.param == 0)
-                recv_node.?
-            else blk: {
-                const explicit_idx = if (effective_recv_is_arg0) ff.param - 1 else ff.param;
-                if (explicit_idx >= call_full.ast.params.len) continue;
-                break :blk call_full.ast.params[explicit_idx];
-            };
+            const arg_node = self.calleeParamArgNode(call_node, call_full.ast.params, recv_node, ff.param) orelse continue;
             // The arg local must be a bare identifier known to the
             // caller — that's the only shape we can rebind a field
             // origin on.
@@ -3800,10 +6109,65 @@ const Builder = struct {
         }
     }
 
+    /// The borrow of THIS frame that a `catch` / `orelse` fallback
+    /// binds, if it binds one.  `&local` is only the easiest spelling
+    /// — a fallback also hands out frame storage through a grouped
+    /// address (`catch (&local)`), a labeled block (`catch blk: {
+    /// break :blk &local }`), a slice of a local array (`catch
+    /// local[0..]`) and a switch whose fallback prong binds it
+    /// (`catch switch (v) { .a => other, else => &local }`).  All of
+    /// them make the declared local point into this frame on that
+    /// path, so matching the address-of node tag alone diagnosed the
+    /// bare spelling and stayed silent on the rest.
+    ///
+    /// A fallback that binds nothing yields null, and so does one that
+    /// binds a value with no frame storage (`catch other_heap_slice`).
+    /// Both keep the lhs origin — the success path must not lose its
+    /// tracked heap / arena allocation.
+    fn fallbackFrameBorrow(self: *Builder, fallback: Ast.Node.Index) ?ExprKind {
+        if (fallbackYieldsNothing(self.tree, fallback)) return null;
+        switch (self.tree.nodeTag(fallback)) {
+            .@"switch", .switch_comma => {
+                // A switch fallback yields whichever value its prong
+                // takes; find the one that borrows the frame.  Only
+                // classify here — the fork that runs the fallback
+                // lowers the prong bodies.
+                const sw = self.tree.fullSwitch(fallback) orelse return null;
+                for (sw.ast.cases) |case_node| {
+                    const case_full = self.tree.fullSwitchCase(case_node) orelse continue;
+                    const kind = self.classifyExpr(case_full.ast.target_expr);
+                    switch (kind) {
+                        .stack_ref, .composite_borrow => return kind,
+                        else => {},
+                    }
+                }
+                return null;
+            },
+            else => {},
+        }
+        const kind = self.classifyExpr(fallback);
+        return switch (kind) {
+            .stack_ref, .composite_borrow => kind,
+            else => null,
+        };
+    }
 
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
+        if (self.classify_depth == max_classify_depth) {
+            self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, self.classify_depth, expr_node);
+            return .unknown;
+        }
+        self.classify_depth += 1;
+        defer self.classify_depth -= 1;
         const tree = self.tree;
         const tag = tree.nodeTag(expr_node);
+        if (tag == .grouped_expression) {
+            return self.classifyExpr(tree.nodeData(expr_node).node_and_token[0]);
+        }
+        if (self.booleanLiteral(expr_node)) |value| return .{ .boolean = .{ .constant = value } };
+        if (tag == .bool_not or tag == .equal_equal or tag == .bang_equal) {
+            if (self.booleanValue(expr_node)) |value| return .{ .boolean = value };
+        }
 
         // `try expr` — unwrap and classify the inner expression.  The
         // error-exit edge isn't modeled yet (phase 9); for success-path
@@ -3813,14 +6177,27 @@ const Builder = struct {
             return self.classifyExpr(tree.nodeData(expr_node).node);
         }
 
-        // `lhs catch rhs` — the success-path value has the lhs's
-        // origin (e.g. `gpa.alloc(...) catch return &.{}` produces a
-        // heap allocation on success).  The error path is modeled
-        // separately via emitCatchFork at statement level; here we
-        // just unwrap to lhs so the origin propagates into the
-        // declaring local instead of collapsing to .unknown.
-        if (tag == .@"catch") {
-            return self.classifyExpr(tree.nodeData(expr_node).node_and_node[0]);
+        // `lhs catch rhs` / `lhs orelse rhs` — with a vacuous fallback
+        // (`catch return`, `orelse unreachable`, a block ending in one)
+        // the bound value is the lhs's, so the origin propagates into
+        // the declaring local instead of collapsing to .unknown
+        // (`gpa.alloc(...) catch return &.{}` still produces a tracked
+        // heap allocation).  The error path itself is modeled separately
+        // via emitCatchFork / emitOrelseFork at statement level.
+        //
+        // A fallback that DOES bind a value is a second origin for the
+        // same local.  When it binds a borrow of THIS frame, peeling
+        // would erase a real escape: `const p = fallible() catch
+        // &local; return p;` reports nothing at all otherwise.  That
+        // holds for every spelling of the borrow, so ask the fallback
+        // what it produces rather than matching one node tag — see
+        // `fallbackFrameBorrow`.  Keep the lhs origin otherwise, so a
+        // value-yielding fallback never costs the success path its
+        // heap / arena identity.
+        if (tag == .@"catch" or tag == .@"orelse") {
+            const data = tree.nodeData(expr_node).node_and_node;
+            if (self.fallbackFrameBorrow(data[1])) |borrow| return borrow;
+            return self.classifyExpr(data[0]);
         }
 
         // `ArenaAllocator.init(...)` → .arena_init
@@ -3966,7 +6343,10 @@ const Builder = struct {
         // storage; same lifetime semantics, since taking the address
         // of a field is taking a pointer into the parent.
         if (tag == .address_of) {
-            const inner = tree.nodeData(expr_node).node;
+            var inner = tree.nodeData(expr_node).node;
+            while (tree.nodeTag(inner) == .grouped_expression) {
+                inner = tree.nodeData(inner).node_and_token[0];
+            }
             if (tree.nodeTag(inner) == .identifier) {
                 const name = tree.tokenSlice(tree.nodeMainToken(inner));
                 if (self.name_to_local.get(name)) |id| {
@@ -3979,13 +6359,18 @@ const Builder = struct {
                     return .{ .stack_ref = id };
                 }
             }
-            if (tree.nodeTag(inner) == .field_access) {
-                if (self.fieldLhsFor(inner)) |fref| {
+            // `&x.f`, `&x.f.g`, `&x.f.?`, `&x.f.?.g`: the operand's
+            // access chain decides where the address lives, so walk the
+            // chain instead of matching a spelling of it.
+            const operand_tag = tree.nodeTag(inner);
+            if (operand_tag == .field_access or operand_tag == .unwrap_optional) {
+                const chain = self.addressOperandChain(inner);
+                if (chain.root) |root| {
                     // Pointer-typed parent: the pointee lives in the
                     // caller, not this fn's stack frame.  `&self.field`
                     // where `self: *Self` is a borrow from caller-owned
                     // storage — not a stack escape candidate.
-                    const parent_info = self.locals.items[@intFromEnum(fref.parent)];
+                    const parent_info = self.locals.items[@intFromEnum(root)];
                     if (parent_info.is_pointer) {
                         return .unknown;
                     }
@@ -4005,32 +6390,53 @@ const Builder = struct {
                     if (parent_info.init_hint == .type_alias) {
                         return .unknown;
                     }
-                    // Pointer-named field in the chain: e.g.
-                    // `&entry.value_ptr.field` where `value_ptr` is a
-                    // `*V` (stdlib HashMap GetOrPutResult convention).
-                    // The address-of borrows V's interior — not a
-                    // stack ref.  Same for `*.key_ptr.*` / `*.ptr.*`
-                    // and any field name ending in `_ptr`.
-                    if (fieldPathHasPointerName(fref.name)) {
-                        return .unknown;
-                    }
                     // Type engine: check if the direct LHS of this
-                    // field_access resolves to a pointer type.  Covers
-                    // two cases the syntactic checks above miss:
-                    //   1. `&ptr_local.field` where the local's type
-                    //      wasn't annotated as a pointer (e.g. a capture
-                    //      from a HashMap.get call whose return type is
-                    //      `?*V`).
-                    //   2. `&local.ptr_field.sub` where an intermediate
-                    //      field in the chain is `*T` — the address-of
-                    //      borrows through the heap pointer, not the stack.
+                    // operand resolves to a pointer type.  Covers
+                    // `&ptr_local.field` where the local's type
+                    // wasn't annotated as a pointer (e.g. a capture
+                    // from a HashMap.get call whose return type is
+                    // `?*V`).  A field NAMED like a pointer proves
+                    // nothing: `value_ptr` / `key_ptr` / `ptr` are a
+                    // stdlib spelling convention, not a declaration,
+                    // and honouring the name lets a by-value field of
+                    // that name hide a real frame escape.  So the
+                    // answer comes from the type or not at all.
+                    //
+                    // A successful `null` is the resolver's normal
+                    // "nobody can tell" — no proof, no error: the walk
+                    // falls through to the chain walk and then to the
+                    // frame.  A FAILED query is not that.  An
+                    // allocation failure or a cancelled read is
+                    // recorded for the lowering entry point to raise
+                    // rather than folded into "undecided" and dropped
+                    // here, and the verdict stays the conservative
+                    // one: the address is charged to the frame
+                    // immediately instead of continuing into
+                    // questions this query never answered, so a
+                    // swallowed failure can never surface as
+                    // "outside".
                     if (self.zls) |zls| {
                         const child = tree.nodeData(inner).node_and_token[0];
-                        if (zls.resolvedTypeIsPointer(child) catch false) {
-                            return .unknown;
-                        }
+                        const lhs_pointer = zls.resolvedTypeIsPointer(child) catch |err| {
+                            self.noteResolutionError(err);
+                            return .{ .stack_ref = root };
+                        };
+                        if (lhs_pointer == true) return .unknown;
                     }
-                    return .{ .stack_ref = fref.parent };
+                    // Past the first access every further one READS
+                    // what the earlier one produced, so a pointer
+                    // anywhere on the way puts the address in the
+                    // pointee rather than in this frame.
+                    if (chain.count >= 2 and self.chainLeavesRootFrame(root, chain)) {
+                        return .unknown;
+                    }
+                    return .{ .stack_ref = root };
+                }
+            }
+            if (tree.nodeTag(inner) == .array_access) {
+                if (tokens.rootIdentifier(tree, inner)) |root| {
+                    const id = self.name_to_local.get(tree.tokenSlice(tree.nodeMainToken(root))) orelse return .unknown;
+                    if (self.locals.items[@intFromEnum(id)].is_array) return .{ .stack_ref = id };
                 }
             }
         }
@@ -4118,185 +6524,72 @@ const Builder = struct {
             return self.classifyCall(expr_node);
         }
 
-        // Composite escape fallback — only fires for expressions
-        // whose TOP-LEVEL shape is a composite literal (struct or
-        // array init).  For other shapes (binary ops, catch chains,
-        // parens, ifs, etc.) an `&local` token sequence inside is
-        // typically a call arg buried in the expression, not part
-        // of the return value's shape — firing would produce a
-        // flood of false positives like `return (call(&buf)) != 0`.
+        // Only value-position children can carry a borrow out of an aggregate.
         const is_composite_literal = switch (tag) {
-            .struct_init, .struct_init_comma,
-            .struct_init_one, .struct_init_one_comma,
-            .struct_init_dot, .struct_init_dot_comma,
-            .struct_init_dot_two, .struct_init_dot_two_comma,
-            .array_init, .array_init_comma,
-            .array_init_one, .array_init_one_comma,
-            .array_init_dot, .array_init_dot_comma,
-            .array_init_dot_two, .array_init_dot_two_comma,
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            .array_init,
+            .array_init_comma,
+            .array_init_one,
+            .array_init_one_comma,
+            .array_init_dot,
+            .array_init_dot_comma,
+            .array_init_dot_two,
+            .array_init_dot_two_comma,
+            .array_mult,
             => true,
             else => false,
         };
         if (is_composite_literal) {
-            if (self.firstAddressedLocal(expr_node)) |id| {
-                return .{ .stack_ref = id };
-            }
+            const borrow = self.firstCompositeBorrow(expr_node);
+            if (borrow) |kind| if (kind == .stack_ref) return kind;
             if (!self.suppress_composite_borrow) {
                 if (self.firstResourceMethodBorrow(expr_node)) |id| {
                     return .{ .composite_borrow = id };
                 }
             }
+            if (borrow) |kind| return kind;
         }
 
         return .unknown;
     }
 
-    /// Walk `expr_node`'s tokens for every borrow shape recognized
-    /// by firstAddressedLocal (`&id`, `array_local[`), skipping
-    /// `primary_local` (already handled by the surrounding .ret).
-    /// Emits one .composite_escape per additional distinct borrow
-    /// so multi-borrow composite returns get fully flagged.
+    /// Check every value-position borrow except the one checked by `.ret`.
     fn emitAdditionalEscapeChecks(
         self: *Builder,
         expr_node: Ast.Node.Index,
         cur: BlockId,
-        primary_local: ?LocalId,
+        primary_kind: ExprKind,
     ) !void {
-        const tree = self.tree;
-        const first = tree.firstToken(expr_node);
-        const last = tree.lastToken(expr_node);
-        const tags = tree.tokens.items(.tag);
-        const pos = self.posOf(expr_node);
-        const end_pos = self.endPosOf(expr_node);
-
-        var seen: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
+        var seen: std.AutoArrayHashMapUnmanaged(BorrowKey, void) = .empty;
         defer seen.deinit(self.gpa);
-        if (primary_local) |p| try seen.put(self.gpa, p, {});
-
-        // Same depth-gate as firstAddressedLocal: only direct field
-        // values of the outermost composite literal, not nested
-        // inside call args / switch arms / sub-literals.
-        var depth: i32 = 0;
-        var t: Ast.TokenIndex = first;
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .l_brace, .l_paren, .l_bracket => depth += 1,
-                .r_brace, .r_paren, .r_bracket => depth -= 1,
-                else => {},
-            }
-            if (depth != 1) continue;
-            const id_opt: ?LocalId = blk: {
-                if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
-                    if (t + 2 <= last) {
-                        const next = tags[t + 2];
-                        if (next == .period or next == .l_bracket or
-                            next == .period_asterisk) break :blk null;
-                    }
-                    const name = tree.tokenSlice(t + 1);
-                    break :blk self.name_to_local.get(name);
-                }
-                if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
-                    if (t > 0 and tags[t - 1] == .period) break :blk null;
-                    const name = tree.tokenSlice(t);
-                    const local = self.name_to_local.get(name) orelse break :blk null;
-                    if (!self.locals.items[@intFromEnum(local)].is_array) break :blk null;
-                    break :blk local;
-                }
-                break :blk null;
-            };
-            const local = id_opt orelse continue;
-            const gop = try seen.getOrPut(self.gpa, local);
-            if (gop.found_existing) continue;
+        try seen.put(self.gpa, BorrowKey.from(primary_kind), {});
+        var borrows = BorrowIterator.init(self, expr_node);
+        while (borrows.next()) |kind| {
+            const entry = try seen.getOrPut(self.gpa, BorrowKey.from(kind));
+            if (entry.found_existing) continue;
             try self.appendStmt(cur, .{
-                .kind = .{ .composite_escape = .{ .local = local } },
-                .pos = pos,
-                .end_pos = end_pos,
+                .kind = .{ .composite_escape = kind },
+                .pos = self.posOf(expr_node),
+                .end_pos = self.endPosOf(expr_node),
             });
         }
     }
 
-    /// Walk `expr_node`'s tokens looking for either:
-    ///   `&<ident>`         — address-of a known local, OR
-    ///   `<array_local>[`   — slice/index of a known `[N]T` local.
-    /// Returns the first such LocalId — caller propagates as
-    /// `.stack_ref` so transferRet can flag the escape.
-    fn firstAddressedLocal(self: *Builder, expr_node: Ast.Node.Index) ?LocalId {
-        const tree = self.tree;
-        const first = tree.firstToken(expr_node);
-        const last = tree.lastToken(expr_node);
-        const tags = tree.tokens.items(.tag);
-
-        // Bracket-depth tracker: only fire at depth == 1 (direct
-        // field values of the OUTERMOST struct/array literal).  At
-        // depth 0 we'd match expressions outside the literal (we
-        // skip that anyway since callers gate on the literal tag).
-        // At depth 2+ we're inside nested calls, switch arms,
-        // sub-literals — `&local` there is rarely a field value.
-        var depth: i32 = 0;
-        var t: Ast.TokenIndex = first;
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .l_brace, .l_paren, .l_bracket => depth += 1,
-                .r_brace, .r_paren, .r_bracket => depth -= 1,
-                else => {},
-            }
-            if (depth != 1) continue;
-
-            // Address-of pattern: `& <ident>` where `<ident>` is the
-            // WHOLE address-of operand (not `&local.field` /
-            // `&local[i]` — those address memory the local merely
-            // points INTO, typically caller-owned).
-            if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
-                if (t + 2 <= last) {
-                    const next = tags[t + 2];
-                    // Skip `&local.field`, `&local[i]`, `&local.*`
-                    // (period_asterisk is the single `.*` deref token),
-                    // and `&local.?` — those address memory the local
-                    // merely points INTO, typically caller-owned storage.
-                    if (next == .period or next == .l_bracket or
-                        next == .period_asterisk) continue;
-                }
-                const name = tree.tokenSlice(t + 1);
-                if (self.name_to_local.get(name)) |local| {
-                    // Comptime-initialized locals (`const X =
-                    // comptime ...;`) live in static memory.
-                    // `&X` inside a return composite isn't a
-                    // stack borrow.  Common for vtable returns:
-                    // `return .{ .vtable = &vtable };`.
-                    const info = self.locals.items[@intFromEnum(local)];
-                    if (info.init_hint == .type_alias) continue;
-                    return local;
-                }
-                continue;
-            }
-            // Slice of a stack array: `<ident> [ ... .. ... ]`.
-            // Bare INDEX access `<ident> [ <expr> ]` (no `..`)
-            // produces a VALUE — not a pointer.  Walk past `[`
-            // to see if `..` appears before the matching `]`.
-            if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
-                // Skip if preceded by `.` (struct field access on something).
-                if (t > 0 and tags[t - 1] == .period) continue;
-                const name = tree.tokenSlice(t);
-                const local = self.name_to_local.get(name) orelse continue;
-                if (!self.locals.items[@intFromEnum(local)].is_array) continue;
-                // Slice vs index: scan to matching `]` looking
-                // for `..`.  Only slices borrow the array's
-                // storage — index access is a value copy.
-                var u: Ast.TokenIndex = t + 2;
-                var br: i32 = 1;
-                var saw_dotdot = false;
-                while (u <= last and br > 0) : (u += 1) {
-                    switch (tags[u]) {
-                        .l_bracket => br += 1,
-                        .r_bracket => br -= 1,
-                        .ellipsis2 => saw_dotdot = true,
-                        else => {},
-                    }
-                }
-                if (saw_dotdot) return local;
-            }
+    fn firstCompositeBorrow(self: *Builder, expr_node: Ast.Node.Index) ?ExprKind {
+        var borrows = BorrowIterator.init(self, expr_node);
+        var alias: ?ExprKind = null;
+        while (borrows.next()) |kind| {
+            if (kind == .stack_ref) return kind;
+            if (alias == null) alias = kind;
         }
-        return null;
+        return alias;
     }
 
     /// Walk `expr_node`'s tokens looking for any
@@ -4357,23 +6650,19 @@ const Builder = struct {
             const method_name = tree.tokenSlice(method_tok);
             const recv_ty = self.locals.items[@intFromEnum(local)].type_name orelse continue;
 
-            // Walk the field path through the model to find the type
-            // that owns `method`.  No field segments → method is on
-            // local's own type.  With segments, each step asks the
-            // model for the next field's type.
-            const final_ty: ?[]const u8 = blk: {
-                if (field_first == 0) break :blk recv_ty;
-                const model = cache.fileModel() catch break :blk null;
-                var cur_ty: []const u8 = recv_ty;
-                var ft: Ast.TokenIndex = field_first;
-                while (ft <= field_last) : (ft += 2) {
-                    const fname = tree.tokenSlice(ft);
-                    cur_ty = model.fieldType(cur_ty, fname) orelse break :blk null;
+            var owner = cache.findTypeAcrossImports(recv_ty) orelse continue;
+            var field = field_first;
+            var resolved = true;
+            if (field_first != 0) {
+                while (field <= field_last) : (field += 2) {
+                    owner = cache.fieldType(owner, tree.tokenSlice(field)) orelse {
+                        resolved = false;
+                        break;
+                    };
                 }
-                break :blk cur_ty;
-            };
-            const ty = final_ty orelse continue;
-            const summary = (cache.summaryByMethod(ty, method_name) catch null) orelse continue;
+            }
+            if (!resolved) continue;
+            const summary = (self.queryOrUnknown(fn_summary.FnSummary, cache.summaryForType(owner, method_name))) orelse continue;
             switch (summary.returns) {
                 .borrowed_from => |idx| if (idx == 0) return local,
                 else => {},
@@ -4522,12 +6811,12 @@ const Builder = struct {
     /// so we just leak the forked block — it has no successor.
     ///
     /// No-op when `expr` isn't a switch.  Idempotent — called from
-    /// lowerReturn after the try/catch/labeled-block dispatch.
+    /// lowerReturn after the try / catch / orelse / labeled-block dispatch.
     fn maybeLowerReturnSwitchArms(
         self: *Builder,
         expr: Ast.Node.Index,
         cur: *BlockId,
-    ) (std.mem.Allocator.Error)!void {
+    ) (LoweringError)!void {
         const tree = self.tree;
         switch (tree.nodeTag(expr)) {
             .@"switch", .switch_comma => {},
@@ -4535,26 +6824,28 @@ const Builder = struct {
         }
         const sw = tree.fullSwitch(expr) orelse return;
 
-        // Discriminant uses fire from the outer cur (before any arm).
-        try self.emitUsesInExpr(sw.ast.condition, cur.*, null);
+        // Edges inherit the final state of their predecessor block. Keep
+        // switch evaluation in a predecessor that cannot also contain the
+        // outer return's deferred cleanup.
+        const eval_block = cur.*;
+        const continuation = try self.newBlock();
+        try self.emitUsesInExpr(sw.ast.condition, eval_block, null);
 
+        // Same union typing as `lowerSwitch`: an arm that captures an
+        // error-set field must replay `errdefer` on `return <cap>`.
+        const sw_union_ti: ?*const model_mod.TypeInfo = self.scrutineeUnionType(sw.ast.condition);
         for (sw.ast.cases) |case_node| {
             const case_full = tree.fullSwitchCase(case_node) orelse continue;
             const case_block = try self.newBlock();
-            try self.addEdge(cur.*, case_block);
-            if (case_full.payload_token) |pt| try self.registerCaptures(pt);
+            try self.addEdge(eval_block, case_block);
+            if (case_full.payload_token) |payload_token| {
+                try self.registerSwitchCaptures(payload_token, null, sw_union_ti, case_full.ast.values);
+            }
             var case_cur = case_block;
-            // The arm body is the case's target_expr.  Block bodies
-            // (`.err => { ... }`) lower naturally; naked expressions
-            // (`.success => v`) end up as a lowering_gap, which is
-            // harmless for state preservation.
             try self.lowerStmt(case_full.ast.target_expr, &case_cur);
-            // Don't add an edge back to cur or anywhere — the arm is
-            // a forked side-path used purely to surface bugs inside
-            // diverging branches.  Adding an edge would propagate
-            // arm-local state (free, deinit) back into the outer
-            // return, causing spurious "use after free" downstream.
         }
+        try self.addEdge(eval_block, continuation);
+        cur.* = continuation;
     }
 
     /// True iff `expr` is syntactically a literal error return value
@@ -4598,7 +6889,7 @@ const Builder = struct {
 
     fn isConstructorName(name: []const u8) bool {
         const list = [_][]const u8{
-            "init", "create", "new", "open",
+            "init",           "create",    "new", "open",
             "fromOwnedSlice", "fromSlice",
         };
         for (list) |n| if (std.mem.eql(u8, n, name)) return true;
@@ -4618,9 +6909,7 @@ const Builder = struct {
     ///   - `T{ ... }` and `T.{ ... }` struct literals — but NOT
     ///     anonymous `.{ ... }`, which needs the surrounding context's
     ///     type that we don't have.
-    /// Returns the LAST identifier in a dotted chain
-    /// (`lib.Owner.init(...)` → "Owner"), matching extractTypeName's
-    /// namespace-stripping rule.
+    /// Preserve namespace qualification for method dispatch.
     fn inferTypeNameFromInit(self: *Builder, init_node: Ast.Node.Index) ?[]const u8 {
         const tree = self.tree;
         var node = init_node;
@@ -4642,7 +6931,7 @@ const Builder = struct {
                 const fa = tree.nodeData(callee).node_and_token;
                 const method_name = tree.tokenSlice(fa[1]);
                 if (!isConstructorName(method_name)) break :blk null;
-                break :blk self.lastIdentInDottedChain(fa[0]);
+                break :blk self.extractTypeName(fa[0], self.self_type);
             },
             .struct_init,
             .struct_init_comma,
@@ -4652,7 +6941,7 @@ const Builder = struct {
                 var buf: [2]Ast.Node.Index = undefined;
                 const si = tree.fullStructInit(&buf, node) orelse break :blk null;
                 const type_expr = si.ast.type_expr.unwrap() orelse break :blk null;
-                break :blk self.lastIdentInDottedChain(type_expr);
+                break :blk self.extractTypeName(type_expr, self.self_type);
             },
             else => null,
         };
@@ -4662,23 +6951,9 @@ const Builder = struct {
         // token-pattern match above can't classify because the type
         // isn't syntactically visible at the call site.
         if (self.zls) |z| {
-            return z.typeNameOfNode(init_node) catch null;
+            return self.queryOrUnknown([]const u8, z.typeReferenceOfNode(init_node));
         }
         return null;
-    }
-
-    /// Return the LAST identifier token slice in a dotted chain.
-    /// `lib.Owner` → "Owner", `Owner` → "Owner", anything else → null.
-    fn lastIdentInDottedChain(self: *Builder, node: Ast.Node.Index) ?[]const u8 {
-        const tree = self.tree;
-        switch (tree.nodeTag(node)) {
-            .identifier => return tree.tokenSlice(tree.nodeMainToken(node)),
-            .field_access => {
-                const fa = tree.nodeData(node).node_and_token;
-                return tree.tokenSlice(fa[1]);
-            },
-            else => return null,
-        }
     }
 
     /// Resolve an expression node to an arena-bound LocalId if
@@ -4754,7 +7029,7 @@ const Builder = struct {
                 // 1. Same-file FnSummary hit — typed lookup only.
                 if (self.cache) |c| {
                     if (self.receiverTypeOfNode(recv_node)) |ty| {
-                        if (c.summaryByMethod(ty, method_name) catch null) |s| {
+                        if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByMethod(ty, method_name))) |s| {
                             if (self.applySummaryReturnsToCall(s.returns, recv_node, args, recv_is_local)) |k| return k;
                         }
                     }
@@ -4766,7 +7041,7 @@ const Builder = struct {
                 const raw_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
                 const fn_name = self.resolveBoundCallee(raw_name);
                 if (self.cache) |c| {
-                    if (c.summaryByName(fn_name) catch null) |s| {
+                    if (self.queryOrUnknown(*const fn_summary.FnSummary, c.summaryByName(fn_name))) |s| {
                         if (self.applySummaryReturnsToCall(s.returns, callee_node, args, false)) |k| return k;
                     }
                 }
@@ -4861,6 +7136,217 @@ const Builder = struct {
         const last_len = tree.tokenSlice(last_tok).len;
         const path = tree.source[first_path_byte..(last_start + last_len)];
         return .{ .parent = parent, .name = path };
+    }
+
+    /// Where an access chain's address lands relative to the frame slot
+    /// of the local it starts from.  `undecided` is "nobody can tell",
+    /// NOT "safe": the caller must not read it as a frame borrow.
+    const StorageVerdict = enum { inside, outside, undecided };
+
+    /// One access of an address-of operand.  `node` is the
+    /// sub-expression the access produces, so its resolved type is what
+    /// a LATER access reads through.  `field` names the field selected,
+    /// for the declaration walk; null for `?` and `[i]`.
+    const AddrStep = struct {
+        node: Ast.Node.Index,
+        field: ?[]const u8,
+        kind: enum { field, unwrap, index },
+    };
+
+    /// The access chain of an address-of operand, outermost step first,
+    /// with the root local it bottoms out at.
+    const AddrChain = struct {
+        steps: [8]AddrStep,
+        count: usize,
+        /// The operand has more accesses than `steps` holds: the
+        /// recorded prefix stops short of the root, so the storage
+        /// walks must not answer from it.  `root` is still the local
+        /// the chain bottoms out at.
+        truncated: bool,
+        /// Null when the walk hit a construct this pass does not model,
+        /// or names no local — the chain is then undescribed.
+        root: ?LocalId,
+    };
+
+    /// Split `&x.a.b` / `&x.a.?` / `&x.items[0].field` into its access
+    /// steps.  Mirrors `fieldLhsFor`'s descent (field accesses and
+    /// literal index steps) so the chain this describes is one the
+    /// caller already accepted, plus the `?.` unwrap.  Anything else —
+    /// a method call, a computed index, a deref — leaves `root` null:
+    /// the pass cannot say where such an operand's address lives, and
+    /// must not claim it lives in a frame slot.
+    ///
+    /// A chain deeper than `steps` keeps descending with `truncated`
+    /// set rather than stopping at the cap.  The steps past it are not
+    /// recorded, but the root is: that local is what the caller charges
+    /// the address to, and abandoning the walk at the cap would drop a
+    /// real stack origin without recording why.
+    fn addressOperandChain(self: *Builder, operand: Ast.Node.Index) AddrChain {
+        const tree = self.tree;
+        var chain: AddrChain = .{ .steps = undefined, .count = 0, .truncated = false, .root = null };
+        var cur = operand;
+        while (true) {
+            switch (tree.nodeTag(cur)) {
+                .grouped_expression => cur = tree.nodeData(cur).node_and_token[0],
+                .field_access => {
+                    const data = tree.nodeData(cur).node_and_token;
+                    if (chain.count < chain.steps.len) {
+                        chain.steps[chain.count] = .{
+                            .node = cur,
+                            .field = tree.tokenSlice(data[1]),
+                            .kind = .field,
+                        };
+                        chain.count += 1;
+                    } else {
+                        chain.truncated = true;
+                    }
+                    cur = data[0];
+                },
+                .unwrap_optional => {
+                    if (chain.count < chain.steps.len) {
+                        chain.steps[chain.count] = .{ .node = cur, .field = null, .kind = .unwrap };
+                        chain.count += 1;
+                    } else {
+                        chain.truncated = true;
+                    }
+                    cur = tree.nodeData(cur).node_and_token[0];
+                },
+                .array_access => {
+                    const data = tree.nodeData(cur).node_and_node;
+                    if (tree.nodeTag(data[1]) != .number_literal) return chain;
+                    if (chain.count < chain.steps.len) {
+                        chain.steps[chain.count] = .{ .node = cur, .field = null, .kind = .index };
+                        chain.count += 1;
+                    } else {
+                        chain.truncated = true;
+                    }
+                    cur = data[0];
+                },
+                .identifier => {
+                    const name = tree.tokenSlice(tree.nodeMainToken(cur));
+                    chain.root = self.name_to_local.get(name);
+                    return chain;
+                },
+                else => return chain,
+            }
+        }
+    }
+
+    /// Declarations answer "does an access of `chain` leave `root`'s own
+    /// storage?", from the root outward through the file model.  This
+    /// is the resolver-free half of the question: it still answers when
+    /// the type engine cannot see across a module boundary or through a
+    /// descriptor type with no declaration to look into.
+    fn declaredChainStorage(self: *Builder, root: LocalId, chain: AddrChain) StorageVerdict {
+        // A truncated chain's recorded steps stop before the root, so
+        // they describe no hop out of it and can prove nothing.
+        if (chain.truncated) return .undecided;
+        const cache = self.cache orelse return .undecided;
+        const type_name = self.locals.items[@intFromEnum(root)].type_name orelse return .undecided;
+        var current = cache.findTypeAcrossImports(type_name) orelse return .undecided;
+        var i: usize = chain.count;
+        while (i > 0) {
+            i -= 1;
+            const step = chain.steps[i];
+            // Where an indexed element lives is the dedicated
+            // `&<local>[i]` handling's question, and this walk has no
+            // element type to descend into.  Stop rather than guess.
+            if (step.kind == .index) return .inside;
+            // The OUTERMOST access is the address itself: `&x.a.b` is
+            // the slot `b` occupies inside whatever `x.a` produced,
+            // so `b`'s own declared type cannot move that slot
+            // anywhere.  Nothing outward of it asks anything, so stop
+            // before reading a type no later step reads.
+            if (i == 0) break;
+            // `?.` reads the optional in place; the payload's own type
+            // is the type this walk already descended into.
+            if (step.kind == .unwrap) continue;
+            const field_name = step.field orelse return .undecided;
+            const field = current.info.findField(field_name) orelse return .undecided;
+            if (field.type_first > field.type_last) return .undecided;
+            const tags = current.model.tree.tokens.items(.tag);
+            // A pointer field: the next access reads THROUGH it, so the
+            // address lands in the pointee — caller, heap or static
+            // storage — and not in the slot holding the pointer.
+            if (typeRangeIsPointerValue(tags, field.type_first, field.type_last)) return .outside;
+            // `?*T`: the optional is in place, but the `?.` that
+            // unwraps it yields the pointer, and an access PAST that
+            // unwrap reads through it.  `&x.opt.?` stops at the
+            // payload slot, which is still this frame's own storage,
+            // so the outside verdict needs `i >= 2`: the unwrap must
+            // not itself be the outermost access.
+            if (typeRangeIsOptionalPointer(current.model.tree, field.type_first, field.type_last) and
+                i >= 2 and chain.steps[i - 1].kind == .unwrap)
+            {
+                return .outside;
+            }
+            current = cache.fieldType(current, field_name) orelse blk: {
+                // A field spelled through an optional or a qualified
+                // path has no name `fieldType` can resolve; the base
+                // type name of its declaration still names the hop.
+                const next = baseTypeNameOfField(current.model.tree, field) orelse
+                    return .undecided;
+                break :blk cache.findTypeAcrossImports(next) orelse return .undecided;
+            };
+        }
+        return .inside;
+    }
+
+    /// Type engine half of the same question: for every access past the
+    /// first, the value it reads is a pointer exactly when the chain
+    /// has left the root's storage.  Null answers (unresolved types)
+    /// stay undecided rather than counting as by value.
+    fn resolvedChainStorage(self: *Builder, chain: AddrChain) StorageVerdict {
+        // Same reason: the recorded prefix stops short of the root.
+        if (chain.truncated) return .undecided;
+        const zls = self.zls orelse return .undecided;
+        var i: usize = 0;
+        while (i + 1 < chain.count) : (i += 1) {
+            const base = chain.steps[i + 1];
+            // An indexed element is addressed by the dedicated
+            // `&<local>[i]` handling; its type says nothing about
+            // whether the element lives in this frame.
+            if (base.kind == .index) return .inside;
+            const pointer = zls.resolvedTypeIsPointer(base.node) catch |err| {
+                // A failed query is NOT a proved "not a pointer": an
+                // allocation failure or a cancelled read must not be
+                // filed as an answer.  Keep it for the lowering entry
+                // point to raise instead of dropping it here.
+                self.noteResolutionError(err);
+                return .undecided;
+            };
+            const answer = pointer orelse return .undecided;
+            if (answer) return .outside;
+        }
+        return .inside;
+    }
+
+    /// True when the address a chain of two or more accesses names must
+    /// not be attributed to `root`'s frame slot.
+    ///
+    /// `&x.f` is ONE access, and `&` never auto-derefs: `x.f` names the
+    /// field SLOT inside `x`, whatever `f`'s declared type, so the
+    /// address really is in `x`'s frame and returning it escapes.  The
+    /// caller keeps that case out of this walk.
+    ///
+    /// Every FURTHER access (`&x.f.g`, `&x.f.?.g`) first READS `x.f` as
+    /// a value, and reading it auto-derefs as soon as `f` is a pointer.
+    /// The address then lands in the pointee — caller, heap or static
+    /// storage — which is not an escape of `x`.
+    ///
+    /// So the chain leaves the frame only on a PROVED pointer
+    /// traversal: a field the declarations type as a pointer, or an
+    /// access the type engine types as a pointer.  A chain nobody can
+    /// settle is not safe — the pass holds no proof the address left
+    /// this frame, and dropping the attribution on "I don't know"
+    /// silently loses a real stack origin.  It keeps the frame.
+    ///
+    /// A chain too deep to describe is in the same position — the root
+    /// is known but no hop out of it is — so it too keeps the frame.
+    fn chainLeavesRootFrame(self: *Builder, root: LocalId, chain: AddrChain) bool {
+        const declared = self.declaredChainStorage(root, chain);
+        if (declared == .outside) return true;
+        return self.resolvedChainStorage(chain) == .outside;
     }
 
     /// True if `lhs_node` is `<local>.*` where `local` is pointer-
@@ -4973,13 +7459,13 @@ const Builder = struct {
     /// require ZLS or external summary infrastructure and remain
     /// uncovered by this path.
     fn installIsConsumedByCrossFnRead(
-        self: *const Builder,
+        self: *Builder,
         recv_name: []const u8,
         path: []const u8,
         install_tok: Ast.TokenIndex,
     ) bool {
         const cache = self.cache orelse return false;
-        const model = cache.fileModel() catch return false;
+        const model = self.modelOrNull(cache) orelse return false;
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         const last = self.fn_body_last;
@@ -5067,7 +7553,7 @@ const Builder = struct {
                 };
                 if (call_recv_type) |tn| {
                     if (cache.findMethodAcrossImports(tn, fn_name)) |rm| {
-                        if (calledFnTouchesParamField(rm.tree, rm.method.fn_decl, path)) return true;
+                        if (calledFnTouchesParamField(rm.tree, rm.fn_decl, path)) return true;
                     }
                 }
             }
@@ -5520,7 +8006,7 @@ const Builder = struct {
         rhs_node: Ast.Node.Index,
         pos: SrcPos,
         end_pos: SrcPos,
-    ) std.mem.Allocator.Error!void {
+    ) LoweringError!void {
         const tree = self.tree;
         var buf: [2]Ast.Node.Index = undefined;
         const init = tree.fullStructInit(&buf, rhs_node) orelse return;
@@ -5563,20 +8049,15 @@ const Builder = struct {
     ) bool {
         const cache = self.cache orelse return false;
         const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse return false;
-        const model = cache.fileModel() catch return false;
-        var cur_ti = model.findType(parent_ty) orelse blk: {
-            // Fall back to the cross-file index for the root type.
-            break :blk cache.findTypeAcrossImports(parent_ty) orelse return false;
-        };
-        const tree = self.tree;
-        const tags = tree.tokens.items(.tag);
+        var current = cache.findTypeAcrossImports(parent_ty) orelse return false;
         var rest = path;
         // Walk the dotted path one segment at a time, descending
         // into nested field types as we go.
         while (rest.len > 0) {
+            const tags = current.model.tree.tokens.items(.tag);
             const dot_at = std.mem.indexOfScalar(u8, rest, '.');
             const seg = if (dot_at) |i| rest[0..i] else rest;
-            const field = cur_ti.findField(seg) orelse return false;
+            const field = current.info.findField(seg) orelse return false;
             const remainder = if (dot_at) |i| rest[i + 1 ..] else "";
             if (remainder.len == 0) {
                 // Last segment: check the field's type tokens for
@@ -5600,12 +8081,7 @@ const Builder = struct {
                 // number / identifier (not `]` or `*`).
                 return tags[t + 1] != .r_bracket and tags[t + 1] != .asterisk;
             }
-            // Descend into the field's TYPE for the next segment.
-            // baseTypeName + findType (or cross-file lookup).
-            const inner_name = baseTypeNameOfField(tree, field) orelse return false;
-            cur_ti = model.findType(inner_name) orelse blk: {
-                break :blk cache.findTypeAcrossImports(inner_name) orelse return false;
-            };
+            current = cache.fieldType(current, seg) orelse return false;
             rest = remainder;
         }
         return false;
@@ -5662,6 +8138,10 @@ const Builder = struct {
         const first = tree.firstToken(expr_node);
         const last = tree.lastToken(expr_node);
         const tags = tree.tokens.items(.tag);
+        if (self.cache == null and self.address_cache == null) {
+            self.address_cache = try file_cache.FileCache.init(self.gpa, tree);
+        }
+        const address_cache = self.cache orelse &self.address_cache.?;
 
         // Use the whole-expression pos for every emitted stmt.  Per-
         // token positions (posOfToken) are O(byte_offset) — calling
@@ -5729,7 +8209,6 @@ const Builder = struct {
                 continue;
             }
             if (comptime_skip_active) continue;
-            if (write_dest_skip_active) continue;
             if (tag != .identifier) continue;
             // LHS of a plain `=` assignment inside a sub-expression
             // (e.g. a switch arm body or labeled block being used as
@@ -5759,31 +8238,13 @@ const Builder = struct {
                 }
                 continue;
             }
-            // Address-of: `&id` is conservatively treated as a possible
-            // write (out-param pattern).  Emit an .assign with .unknown
-            // rhs so the local's origin collapses to .plain — clears
-            // .undef and avoids spurious use-of-undefined findings on
-            // common idioms like `var x = undefined; fillOut(&x);`.
-            //
-            // EXCEPTION: arena/heap-bearing locals.  Their resource
-            // identity is stable across `&x` (the address-of doesn't
-            // re-bind the underlying allocator), so clearing would
-            // mask real escape findings — e.g. `return wrap(&arena)`
-            // depends on arena's .arena origin surviving to the .ret.
-            //
-            // Also handles `&@field(id.f, "name")` — the `&` is three
-            // tokens back (through `@field(`).  Taking the address of a
-            // field through the comptime lookup builtin does not read
-            // the value: the same "possible write, clear .undef"
-            // treatment applies.
-            const is_addr_of_field_arg = t >= 3 and
-                tags[t - 1] == .l_paren and
-                tags[t - 2] == .builtin and
-                tags[t - 3] == .ampersand and
-                std.mem.eql(u8, tree.tokenSlice(t - 2), "@field");
-            if ((t > 0 and tags[t - 1] == .ampersand) or is_addr_of_field_arg) {
+            // Taking an address is not a value read. Only an address passed
+            // into a call can act as an out-parameter write.
+            if (try address_cache.addressUseAt(t)) |address| {
                 const name = tree.tokenSlice(t);
                 const id = self.name_to_local.get(name) orelse continue;
+                self.locals.items[@intFromEnum(id)].address_taken = true;
+                if (!address.may_write) continue;
                 if (skip_local) |s| if (id == s) continue;
                 const hint = self.locals.items[@intFromEnum(id)].init_hint;
                 if (hint != .other) continue;
@@ -5809,6 +8270,7 @@ const Builder = struct {
                 });
                 continue;
             }
+            if (write_dest_skip_active) continue;
             // Field/method access: `.method` — skip; it's not a local.
             if (t > 0 and tags[t - 1] == .period) continue;
             // Structural / comptime access on the next token that
@@ -5994,10 +8456,10 @@ const Builder = struct {
         if (std.mem.startsWith(u8, name, "set")) return true;
         if (std.mem.startsWith(u8, name, "reset")) return true;
         const list = [_][]const u8{
-            "clear", "clearRetainingCapacity", "clearAndFree",
-            "deinit", "destroy", "close",
-            "open", "load", "loadFromDisk", "loadFromBytes",
-            "fillFromPackageJSON",
+            "clear",         "clearRetainingCapacity", "clearAndFree",
+            "deinit",        "destroy",                "close",
+            "open",          "load",                   "loadFromDisk",
+            "loadFromBytes", "fillFromPackageJSON",
         };
         for (list) |n| if (std.mem.eql(u8, n, name)) return true;
         return false;
@@ -6009,8 +8471,8 @@ const Builder = struct {
     fn isComptimeOnlyBuiltin(name: []const u8) bool {
         // `name` includes the leading `@`.
         const candidates = [_][]const u8{
-            "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf",
-            "@typeInfo", "@typeName", "@hasField", "@hasDecl",
+            "@TypeOf",   "@sizeOf",      "@alignOf",        "@bitSizeOf",
+            "@typeInfo", "@typeName",    "@hasField",       "@hasDecl",
             "@offsetOf", "@bitOffsetOf", "@fieldParentPtr",
         };
         for (candidates) |c| if (std.mem.eql(u8, name, c)) return true;
@@ -6043,7 +8505,7 @@ const Builder = struct {
         last: Ast.TokenIndex,
         pos: SrcPos,
         end_pos: SrcPos,
-    ) (std.mem.Allocator.Error)!void {
+    ) (LoweringError)!void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         // Caller verified tags[t+1] == `.`, tags[t+2] = ident.
@@ -6217,20 +8679,10 @@ const Builder = struct {
     }
 
     /// End position (exclusive) — one past the last token of `node`.
-    /// Walks lastToken's start + slice length.  Used together with
-    /// posOf to give diagnostics a real span the editor can highlight.
+    /// Used together with posOf to give diagnostics a real span the
+    /// editor can highlight.
     fn endPosOf(self: *Builder, node: Ast.Node.Index) SrcPos {
-        const tree = self.tree;
-        const last = tree.lastToken(node);
-        const start = tree.tokens.items(.start)[last];
-        const slice = tree.tokenSlice(last);
-        const end_byte: u32 = @intCast(start + slice.len);
-        const lc = byteToLineCol(self.line_offsets, start);
-        return .{
-            .byte = end_byte,
-            .line = lc.line + 1,
-            .column = lc.col + 1 + @as(u32, @intCast(slice.len)),
-        };
+        return self.posOfTokenEnd(self.tree.lastToken(node));
     }
 
     fn posOfToken(self: *Builder, tok: Ast.TokenIndex) SrcPos {
@@ -6245,16 +8697,32 @@ const Builder = struct {
 
     /// End-of-token (exclusive) position.  Single-token analog of
     /// endPosOf.
+    ///
+    /// `tokenSlice` returns a window of `tree.source` that begins at
+    /// `start`, so the token's own length is at most what is left of
+    /// the source after `start` — and `source_len` is that source
+    /// length, checked where the Builder is built to fit the `u32`
+    /// byte offsets use.  Taking the length from the slice and the end
+    /// from those two `u32`s keeps the span in the width `SrcPos`
+    /// records with nothing left to narrow; the start offset comes from
+    /// the token table rather than from the slice pointer, so the
+    /// window's own length is all that has to be converted.
     fn posOfTokenEnd(self: *Builder, tok: Ast.TokenIndex) SrcPos {
         const tree = self.tree;
         const start = tree.tokens.items(.start)[tok];
-        const slice = tree.tokenSlice(tok);
-        const end_byte: u32 = @intCast(start + slice.len);
+        const token_len = std.math.cast(u32, tree.tokenSlice(tok).len) orelse unreachable;
+        // Both operands are `u32` and the sum is bounded by
+        // `source_len`, which construction left a byte of headroom
+        // under `maxInt(u32)` precisely so a 1-indexed column can
+        // still be added to an end offset.
+        const end_byte: u32 = start + token_len;
         const lc = byteToLineCol(self.line_offsets, start);
         return .{
             .byte = end_byte,
             .line = lc.line + 1,
-            .column = lc.col + 1 + @as(u32, @intCast(slice.len)),
+            // The end's column on the start's line: both are offsets
+            // into the same buffer, so their difference is a column.
+            .column = lc.col + 1 + token_len,
         };
     }
 
@@ -6274,12 +8742,13 @@ const Builder = struct {
         const locals = try self.locals.toOwnedSlice(self.gpa);
         const owned_paths = try self.owned_paths.toOwnedSlice(self.gpa);
         const start = tree.tokens.items(.start)[tree.firstToken(fn_decl)];
-        const end_tok = tree.lastToken(fn_decl);
-        const end = tree.tokens.items(.start)[end_tok] + tree.tokenSlice(end_tok).len;
         return .{
             .blocks = blocks,
             .entry = entry,
-            .fn_span = .{ .start = start, .end = @intCast(end) },
+            // The span's end is the same exclusive token-end offset
+            // `endPosOf` computes for every other position, so the
+            // checked conversion lives there instead of here.
+            .fn_span = .{ .start = start, .end = self.endPosOf(fn_decl).byte },
             .locals = locals,
             .owned_paths = owned_paths,
         };
@@ -6351,4 +8820,608 @@ fn blockStmts(
     };
 }
 
+/// Token span of the type argument in a `@typeInfo(<T>).@"struct".fields`
+/// input expression, or null unless the input's tokens are EXACTLY
+/// that descriptor.  `.@"struct"` is a field of `std.builtin.Type`
+/// only on the `Struct` variant, so a successful match means valid Zig
+/// types the loop's element set as precisely `<T>`'s field tuple —
+/// empty for a zero-field struct, which is zero-sized.
+fn typeInfoStructFieldsArg(tree: *const Ast, input: Ast.Node.Index) ?TokenSpan {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(input);
+    const last = tree.lastToken(input);
+    if (first >= tags.len or last >= tags.len or first > last) return null;
+    if (tags[first] != .builtin or !std.mem.eql(u8, tree.tokenSlice(first), "@typeInfo")) return null;
+    const lparen = first + 1;
+    if (lparen >= tags.len or tags[lparen] != .l_paren) return null;
 
+    // Balanced-paren scan for the argument list's closing paren.
+    var t: Ast.TokenIndex = lparen;
+    var depth: u32 = 0;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .l_paren) depth += 1;
+        if (tags[t] == .r_paren) {
+            depth -= 1;
+            if (depth == 0) break;
+        }
+    }
+    if (depth != 0) return null;
+    const close = t;
+    const arg_first = lparen + 1;
+    if (arg_first >= close) return null;
+
+    // `)` `.` `@"struct"` `.` `fields` — four tokens after the closing
+    // paren, with no room for a further selector or index.  Zig lexes
+    // `@"…"` as ONE string-identifier token (tokenizer `.saw_at_sign`),
+    // so `.@"struct"` is a `.period` plus a single `.identifier`.
+    if (close + 4 != last) return null;
+    if (tags[close + 1] != .period) return null;
+    if (tags[close + 2] != .identifier or !std.mem.eql(u8, tree.tokenSlice(close + 2), "@\"struct\"")) return null;
+    if (tags[close + 3] != .period) return null;
+    if (tags[close + 4] != .identifier or !std.mem.eql(u8, tree.tokenSlice(close + 4), "fields")) return null;
+    return .{ .first = arg_first, .last = close - 1 };
+}
+
+/// The `{` tokens still open at `limit`, outermost first.  Every
+/// block, container body and braced value opens one, so this chain is
+/// what says which regions a reference sits inside.  Null when the
+/// nesting runs deeper than the caller's fixed buffer, which the
+/// caller answers by declining.
+fn openBraceStack(
+    tags: []const std.zig.Token.Tag,
+    limit: Ast.TokenIndex,
+    out: []Ast.TokenIndex,
+) ?usize {
+    var count: usize = 0;
+    var t: Ast.TokenIndex = 0;
+    while (t < limit and t < tags.len) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => {
+                if (count == out.len) return null;
+                out[count] = t;
+                count += 1;
+            },
+            .r_brace => {
+                if (count > 0) count -= 1;
+            },
+            else => {},
+        }
+    }
+    return count;
+}
+
+/// True when every brace enclosing a declaration also encloses the
+/// reference — the condition for the reference to sit inside the
+/// declaration's scope.
+fn bracesArePrefix(inner: []const Ast.TokenIndex, outer: []const Ast.TokenIndex) bool {
+    if (inner.len > outer.len) return false;
+    for (inner, outer[0..inner.len]) |opened, reference| {
+        if (opened != reference) return false;
+    }
+    return true;
+}
+
+/// The declaration a `const <name>` token introduces: its optional
+/// type annotation and its initializer span.  Null unless the tokens
+/// after the name really are `= <expr>;` (or `: <type> = <expr>;`) —
+/// a `|const x|` capture and a `for`/`switch` payload are declined
+/// here rather than being read as a scalar binding.
+fn parseConstDeclAt(tree: *const Ast, name_tok: Ast.TokenIndex) ?FileConstDecl {
+    const tags = tree.tokens.items(.tag);
+    if (name_tok == 0 or name_tok + 1 >= tags.len) return null;
+    if (tags[name_tok] != .identifier) return null;
+    if (tags[name_tok - 1] != .keyword_const) return null;
+    // `const a, const b, const c = .{ … };` DESTRUCTURES: `b` and `c`
+    // name ELEMENTS of the initializer tuple, not the tuple.  Reading
+    // `c` as the whole `.{ … }` credits it with the length of the thing
+    // it destructures — three descriptors for a one-element payload —
+    // and a fill measured by that count leaves its tail unwritten.  A
+    // scalar `const b = …` is always preceded by `const` alone; the
+    // `, const` in front of the name is what makes this a later arm of
+    // a destructuring.
+    if (name_tok >= 2 and tags[name_tok - 2] == .comma) return null;
+
+    var u: Ast.TokenIndex = name_tok + 1;
+    var type_span: ?TokenSpan = null;
+    if (u < tags.len and tags[u] == .colon) {
+        const type_first = u + 1;
+        var depth: u32 = 0;
+        var t: Ast.TokenIndex = type_first;
+        while (t < tags.len) : (t += 1) {
+            switch (tags[t]) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                .equal, .semicolon => {
+                    if (depth != 0 or t == type_first) return null;
+                    type_span = .{ .first = type_first, .last = t - 1 };
+                    break;
+                },
+                else => {},
+            }
+        }
+        if (type_span == null) return null;
+        u = t;
+    }
+    if (u >= tags.len or tags[u] != .equal) return null;
+
+    // Balance to the `;` that ends the declaration, so an initializer
+    // containing its own blocks, parens, or semicolons is captured
+    // whole.
+    const init_first = u + 1;
+    var depth: u32 = 0;
+    var w: Ast.TokenIndex = init_first;
+    while (w < tags.len) : (w += 1) {
+        switch (tags[w]) {
+            .l_paren, .l_brace, .l_bracket => depth += 1,
+            .r_paren, .r_brace, .r_bracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .semicolon => {
+                if (depth != 0) continue;
+                if (w == init_first) return null;
+                return .{ .type = type_span, .init = .{ .first = init_first, .last = w - 1 } };
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Opening brace of a complete aggregate literal, optionally addressed.
+/// Named struct literals and fixed-array literals share this parser.
+/// Calls, suffix operations, and unresolved element-type bodies decline.
+fn braceLiteralOpen(tree: *const Ast, span: TokenSpan) ?Ast.TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    if (span.first > span.last or span.last >= tags.len) return null;
+    var open: Ast.TokenIndex = span.first;
+    if (tags[open] == .ampersand) {
+        open += 1;
+        if (open > span.last) return null;
+    }
+    if (tags[open] == .l_bracket) {
+        // `[_]T{ … }` / `[N]T{ … }` — skip the element-type prefix up
+        // to the literal's brace.
+        var depth: u32 = 0;
+        while (true) {
+            if (open > span.last) return null;
+            switch (tags[open]) {
+                .l_bracket => depth += 1,
+                .r_bracket => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                .l_brace => {
+                    if (depth != 0) return null;
+                    return if (matchingDelim(tree, open, span.last) == span.last) open else null;
+                },
+                .keyword_struct, .keyword_union, .keyword_enum => return null,
+                else => {},
+            }
+            open += 1;
+        }
+    } else if (tags[open] == .period) {
+        open += 1;
+        if (open > span.last or tags[open] != .l_brace) return null;
+    } else if (tags[open] == .identifier) {
+        open += 1;
+        while (open < span.last and tags[open] == .period) {
+            if (tags[open + 1] != .identifier) return null;
+            open += 2;
+        }
+        if (open > span.last or tags[open] != .l_brace) return null;
+    } else if (tags[open] != .l_brace) return null;
+    return if (matchingDelim(tree, open, span.last) == span.last) open else null;
+}
+
+/// Index of the `)`, `}` or `]` that closes the delimiter at `open`,
+/// or null when it does not close before `limit`.  All three openers
+/// raise one depth, so a brace written inside a call is matched the
+/// same way the element counter matches it.
+fn matchingDelim(tree: *const Ast, open: Ast.TokenIndex, limit: Ast.TokenIndex) ?Ast.TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    if (open >= tags.len or open > limit) return null;
+    var depth: u32 = 0;
+    var t: Ast.TokenIndex = open;
+    while (t <= limit and t < tags.len) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_brace, .l_bracket => depth += 1,
+            .r_paren, .r_brace, .r_bracket => {
+                depth -= 1;
+                if (depth == 0) return t;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Element count of an array-literal token span — `.{ … }`,
+/// `{ … }`, `[_]T{ … }` / `[N]T{ … }`, or any of those behind a `&`.
+/// Counts the pieces between TOP-LEVEL commas, so `.{ }` is 0 and
+/// `.{ x }` (no comma) is 1.  Nested braces, parens and brackets raise
+/// the depth so a comma inside one element does not split it; a string
+/// literal is a single token and cannot split either.  Null when the
+/// span is not a brace literal at all — a bare type (`[N]T` has no
+/// elements to count), a call, a field access, a named binding.
+fn arrayLiteralElementCount(tree: *const Ast, span: TokenSpan) ?u64 {
+    const tags = tree.tokens.items(.tag);
+    const open = braceLiteralOpen(tree, span) orelse return null;
+    const close = matchingBrace(tree, open, span.last) orelse return null;
+
+    var count: u64 = 0;
+    var depth: u32 = 1;
+    var element_open = false;
+    var t: Ast.TokenIndex = open + 1;
+    while (t < close) : (t += 1) {
+        switch (tags[t]) {
+            .comma => {
+                // Only a TOP-LEVEL comma separates elements, and only
+                // a top-level one may end the element in progress.  A
+                // comma nested inside one element does not split it —
+                // and must not clear the flag either, or
+                // `.{ .{ 1, 2 }, .{}, .{ 3 } }` loses the element
+                // whose own comma came first and counts two.
+                if (depth == 1) {
+                    if (element_open) count += 1;
+                    element_open = false;
+                }
+            },
+            .l_brace, .l_paren, .l_bracket => depth += 1,
+            .r_brace, .r_paren, .r_bracket => depth -|= 1,
+            else => {
+                if (depth == 1) element_open = true;
+            },
+        }
+    }
+    if (element_open) count += 1;
+    return count;
+}
+
+/// The initializer a DESIGNATED field of a brace literal carries —
+/// the `.name = <init>` element of `{ … }`, `.{ … }` or `[N]T{ … }`.
+/// The span returned is the whole element after the `=`, so it is the
+/// designated value's own source and can be walked into.  Null when
+/// `span` is not a brace literal, designates no such field, or
+/// designates an empty one.
+///
+/// Only DESIGNATED fields are matched.  A positional element of a
+/// tuple literal has no name, so a path through one stops here rather
+/// than guessing which element a field name meant.
+fn designatedFieldInit(tree: *const Ast, span: TokenSpan, name: []const u8) ?TokenSpan {
+    const tags = tree.tokens.items(.tag);
+    // A pointer to an aggregate is not the aggregate's immutable value.
+    // Following it could observe fields changed through another handle.
+    if (span.first > span.last or span.last >= tags.len or tags[span.first] == .ampersand) return null;
+    const open = braceLiteralOpen(tree, span) orelse return null;
+    const close = matchingDelim(tree, open, span.last) orelse return null;
+    var depth: u32 = 0;
+    var element_first: Ast.TokenIndex = open + 1;
+    var t: Ast.TokenIndex = open + 1;
+    while (t <= close) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace, .l_paren, .l_bracket => depth += 1,
+            .r_brace, .r_paren, .r_bracket => {
+                if (depth > 0) {
+                    depth -= 1;
+                    continue;
+                }
+                // The literal's own `}` ends the last element.  A
+                // closer that reaches depth zero anywhere else means
+                // the delimiters do not balance, so nothing here can
+                // be trusted to name the right field.
+                if (tags[t] != .r_brace or t != close) return null;
+                return designatedValueSpan(tree, element_first, t - 1, name);
+            },
+            .comma => {
+                if (depth != 0) continue;
+                if (designatedValueSpan(tree, element_first, t - 1, name)) |value| return value;
+                element_first = t + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The value part of one brace-literal element, when that element is
+/// the designated field `.name = <value>` (or `.name: <value>`).
+fn designatedValueSpan(
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    name: []const u8,
+) ?TokenSpan {
+    const tags = tree.tokens.items(.tag);
+    if (first + 3 > last or last >= tags.len) return null;
+    if (tags[first] != .period) return null;
+    if (tags[first + 1] != .identifier) return null;
+    if (tags[first + 2] != .equal and tags[first + 2] != .colon) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(first + 1), name)) return null;
+    return .{ .first = first + 3, .last = last };
+}
+
+/// Index of the `}` that closes the `{` at `open`, or null when it
+/// does not close before `limit`.
+fn matchingBrace(tree: *const Ast, open: Ast.TokenIndex, limit: Ast.TokenIndex) ?Ast.TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    if (open >= tags.len or open > limit or tags[open] != .l_brace) return null;
+    var depth: u32 = 0;
+    var t: Ast.TokenIndex = open;
+    while (t <= limit and t < tags.len) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                depth -= 1;
+                if (depth == 0) return t;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// True when any token in `span` opens a brace — i.e. the span builds
+/// a VALUE, not a bare type.  `const V = [4]u8;` names the type;
+/// `const V = [4]u8{ … };` names a pointer to one, and only the first
+/// describes what `var v: V` stores.
+fn spanHasBrace(tree: *const Ast, span: TokenSpan) bool {
+    const tags = tree.tokens.items(.tag);
+    if (span.first > span.last or span.last >= tags.len) return false;
+    var t: Ast.TokenIndex = span.first;
+    while (t <= span.last) : (t += 1) {
+        if (tags[t] == .l_brace) return true;
+    }
+    return false;
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+/// Build `depth` nested parentheses around `inner`.  Paren nesting is the
+/// cheapest expression shape that drives `classifyExpr`'s recursion
+/// depth, so a depth test can isolate the limit it names.
+fn nestedParens(gpa: std.mem.Allocator, depth: usize, inner: []const u8) ![]u8 {
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(gpa);
+    for (0..depth) |_| try text.appendSlice(gpa, "(");
+    try text.appendSlice(gpa, inner);
+    for (0..depth) |_| try text.appendSlice(gpa, ")");
+    return text.toOwnedSlice(gpa);
+}
+
+/// Lower every fn in `src` and report which budget (if any) stopped it.
+/// Returns null when the whole source lowered cleanly.
+fn lowerAllBudgetFailure(gpa: std.mem.Allocator, src: []const u8) !?budget_mod.Diagnostic {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    budget_mod.clear();
+    var node_idx: u32 = 1;
+    // Stop at the first fn whose lowering gave up: its record is the one
+    // worth reporting, and later fns are never reached.
+    lower: while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var cfg = (lowerFunction(gpa, &tree, node) catch |err| switch (err) {
+            error.AnalysisBudgetExceeded => break :lower,
+            else => return err,
+        }) orelse continue;
+        cfg.deinit(gpa);
+    }
+    return budget_mod.take();
+}
+
+test "classifyExpr depth budget names the expression-depth limit and the function" {
+    const gpa = std.testing.allocator;
+    const expression = try nestedParens(gpa, max_classify_depth + 4, "flag");
+    defer gpa.free(expression);
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "fn deeplyParenWrapped(flag: bool) bool {\n    return ");
+    try source.appendSlice(gpa, expression);
+    try source.appendSlice(gpa, ";\n}\n");
+
+    const failure = (try lowerAllBudgetFailure(gpa, source.items)) orelse
+        return error.TestExpectedBudgetFailure;
+    try std.testing.expectEqual(budget_mod.Limit.expr_classify_depth, failure.limit);
+    try std.testing.expectEqual(@as(u32, max_classify_depth), failure.limit_value);
+    try std.testing.expectEqual(@as(u32, max_classify_depth), failure.reached);
+    try std.testing.expectEqualStrings("deeplyParenWrapped", failure.function.slice());
+    // The failure points at the expression that stopped the walk.
+    try std.testing.expect(failure.line > 0);
+    try std.testing.expect(failure.byte > 0);
+}
+
+test "booleanValue unwind budget names the boolean-unwind limit" {
+    const gpa = std.testing.allocator;
+    // A chain of `!` longer than the unwind cap: each `!` peels one
+    // level, so the walk runs out of steps before reaching `flag`.
+    var condition: std.ArrayListUnmanaged(u8) = .empty;
+    defer condition.deinit(gpa);
+    for (0..max_boolean_unwind + 4) |_| try condition.appendSlice(gpa, "!");
+    try condition.appendSlice(gpa, "flag");
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "fn longNotChain(flag: bool) bool {\n    if (");
+    try source.appendSlice(gpa, condition.items);
+    try source.appendSlice(gpa, ") return true;\n    return false;\n}\n");
+
+    const failure = (try lowerAllBudgetFailure(gpa, source.items)) orelse
+        return error.TestExpectedBudgetFailure;
+    try std.testing.expectEqual(budget_mod.Limit.boolean_unwind, failure.limit);
+    try std.testing.expectEqual(@as(u32, max_boolean_unwind), failure.limit_value);
+    try std.testing.expectEqual(@as(u32, max_boolean_unwind), failure.reached);
+    try std.testing.expectEqualStrings("longNotChain", failure.function.slice());
+    try std.testing.expect(failure.line > 0);
+}
+
+test "expressions just under every lowering budget still lower" {
+    const gpa = std.testing.allocator;
+    const expression = try nestedParens(gpa, max_classify_depth - 4, "flag");
+    defer gpa.free(expression);
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "fn shallowParenWrapped(flag: bool) bool {\n    return ");
+    try source.appendSlice(gpa, expression);
+    try source.appendSlice(gpa, ";\n}\n");
+    // Below the cap the walk must complete and leave no failure record —
+    // an exhaustion that silently poisoned ordinary code would hide
+    // every finding in the file.
+    try std.testing.expect((try lowerAllBudgetFailure(gpa, source.items)) == null);
+
+    var chain: std.ArrayListUnmanaged(u8) = .empty;
+    defer chain.deinit(gpa);
+    for (0..max_boolean_unwind - 4) |_| try chain.appendSlice(gpa, "!");
+    try chain.appendSlice(gpa, "flag");
+    var short_source: std.ArrayListUnmanaged(u8) = .empty;
+    defer short_source.deinit(gpa);
+    try short_source.appendSlice(gpa, "fn shortNotChain(flag: bool) bool {\n    if (");
+    try short_source.appendSlice(gpa, chain.items);
+    try short_source.appendSlice(gpa, ") return true;\n    return false;\n}\n");
+    try std.testing.expect((try lowerAllBudgetFailure(gpa, short_source.items)) == null);
+}
+
+test "a lowering budget failure names the fn whose body gave up" {
+    const gpa = std.testing.allocator;
+    const expression = try nestedParens(gpa, max_classify_depth + 4, "flag");
+    defer gpa.free(expression);
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    // A well-formed fn ahead of the failing one proves the recorded name
+    // is the failing function's, not simply the first one lowered.
+    try source.appendSlice(gpa, "fn fine(flag: bool) bool {\n    return flag;\n}\n");
+    try source.appendSlice(gpa, "fn theFailingOne(flag: bool) bool {\n    return ");
+    try source.appendSlice(gpa, expression);
+    try source.appendSlice(gpa, ";\n}\n");
+
+    const failure = (try lowerAllBudgetFailure(gpa, source.items)) orelse
+        return error.TestExpectedBudgetFailure;
+    try std.testing.expectEqualStrings("theFailingOne", failure.function.slice());
+}
+
+/// Lower `fn_name` in `src` and report whether its returned value was
+/// attributed to a frame slot of `local_name`.  That attribution is the
+/// builder's own lifetime decision — the stack-escape rule only
+/// consumes it — so an address that really lives in caller or heap
+/// storage and one that really sits in this frame are told apart here,
+/// before any diagnostic text exists.
+fn returnBorrowsLocalFrame(
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    fn_name: []const u8,
+    local_name: []const u8,
+) !bool {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    var cache = try file_cache.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    var buf: [1]Ast.Node.Index = undefined;
+    var node_idx: u32 = 1;
+    const target: Ast.Node.Index = while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const proto = tokens.fnProto(&tree, &buf, node) orelse continue;
+        const name_tok = proto.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(name_tok), fn_name)) continue;
+        break node;
+    } else return error.TestUnexpectedResult;
+    var cfg = (try lowerFunctionFull(gpa, &tree, target, &config_mod.Default, &cache)) orelse
+        return error.TestUnexpectedResult;
+    defer cfg.deinit(gpa);
+    for (cfg.blocks) |block| {
+        for (block.stmts) |stmt| {
+            const escaped: ?ExprKind = switch (stmt.kind) {
+                .ret => |r| r.value_kind,
+                .composite_escape => |c| c,
+                else => null,
+            };
+            const owner: ?LocalId = switch (escaped orelse continue) {
+                .stack_ref => |id| id,
+                .copy_of => |id| id,
+                else => null,
+            };
+            const id = owner orelse continue;
+            if (std.mem.eql(u8, cfg.locals[@intFromEnum(id)].name, local_name)) return true;
+        }
+    }
+    return false;
+}
+
+test "addressing through a pointer field leaves the frame, a by-value chain does not" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Leaf = struct { count: u32 };
+        \\const Branch = struct { leaf: Leaf };
+        \\const Trunk = struct { branch: Branch };
+        \\const Descriptor = struct { doc: *Branch };
+        \\fn throughPointer(descriptor: Descriptor) *const u32 {
+        \\    return &descriptor.doc.leaf.count;
+        \\}
+        \\fn throughValues(trunk: Trunk) *const u32 {
+        \\    return &trunk.branch.leaf.count;
+        \\}
+    ;
+    // `descriptor` is a by-value parameter, but `doc` is a pointer, so
+    // the address names the branch the pointer owns.
+    try std.testing.expect(!try returnBorrowsLocalFrame(gpa, source, "throughPointer", "descriptor"));
+    // Every access on the other path is a by-value field of this
+    // parameter's own storage, so its address really does die here.
+    try std.testing.expect(try returnBorrowsLocalFrame(gpa, source, "throughValues", "trunk"));
+}
+
+test "an optional value payload keeps its address in the frame, an optional pointer does not" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Leaf = struct { count: u32 };
+        \\const Boxed = struct { leaf: ?Leaf };
+        \\const Linked = struct { leaf: ?*Leaf };
+        \\fn optionalValue(boxed: Boxed) *const u32 {
+        \\    return &boxed.leaf.?.count;
+        \\}
+        \\fn optionalPointer(linked: Linked) *const u32 {
+        \\    return &linked.leaf.?.count;
+        \\}
+    ;
+    try std.testing.expect(try returnBorrowsLocalFrame(gpa, source, "optionalValue", "boxed"));
+    try std.testing.expect(!try returnBorrowsLocalFrame(gpa, source, "optionalPointer", "linked"));
+}
+
+test "a chain no type can settle keeps the frame it cannot prove it left" {
+    const gpa = std.testing.allocator;
+    // `descriptor` arrives from a generic payload, so neither the
+    // declarations nor the type engine can say what `doc` is.  That is
+    // "nobody can tell", not "safe": no pointer traversal was proved,
+    // so the address stays charged to this frame instead of a real
+    // stack origin being dropped on an absence of evidence.
+    const source =
+        \\const Leaf = struct { count: u32 };
+        \\fn fromOpaque(payload: anytype) *const u32 {
+        \\    const descriptor = payload.inner;
+        \\    return &descriptor.doc.leaf.count;
+        \\}
+    ;
+    try std.testing.expect(try returnBorrowsLocalFrame(gpa, source, "fromOpaque", "descriptor"));
+}
+
+test "addressing a single field stays a frame borrow whatever the field is declared as" {
+    const gpa = std.testing.allocator;
+    // `&` never auto-derefs: `holder.handle` is the SLOT inside the
+    // parameter, so its address dies with the frame even though the
+    // value stored there is itself a pointer.
+    const source =
+        \\const Handle = struct { id: u32 };
+        \\const Holder = struct { handle: *Handle };
+        \\fn singleField(holder: Holder) *const *Handle {
+        \\    return &holder.handle;
+        \\}
+    ;
+    try std.testing.expect(try returnBorrowsLocalFrame(gpa, source, "singleField", "holder"));
+}

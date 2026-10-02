@@ -67,6 +67,9 @@ pub const StmtKind = union(enum) {
     /// `LHS = RHS;` — overwrite local with new RHS.
     assign: struct { target: LocalId, rhs_kind: ExprKind },
 
+    /// Require a boolean condition on this path.
+    assume: BooleanValue,
+
     /// `<receiver>.deinit()` on an arena.  Marks the arena dead.
     arena_kill: struct { arena_local: LocalId },
 
@@ -114,15 +117,9 @@ pub const StmtKind = union(enum) {
     /// the field's tracked origin (separate from the parent local's).
     field_use: struct { parent: LocalId, name: []const u8 },
 
-    /// Synthetic check emitted before a `.ret` when the return-value
-    /// expression contains MORE than one borrow of a local
-    /// (composite literal embedding multiple `&local` / array-slice
-    /// references).  The primary value_kind on `.ret` fires for the
-    /// first; one `.composite_escape` per additional one catches
-    /// the rest.  Fires escape checks against `local`'s current
-    /// origin regardless of return type — same model as transferRet
-    /// for composite-borrow value-shape returns.
-    composite_escape: struct { local: LocalId },
+    /// Additional value-position borrow in a returned aggregate. The origin
+    /// can be a direct address or a runtime alias, not an ampersand token.
+    composite_escape: ExprKind,
 
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
@@ -202,9 +199,8 @@ pub const StmtKind = union(enum) {
         from_method_call: bool = false,
     },
 
-    /// Statement shape we couldn't lower precisely.  Conservative:
-    /// analyzer collapses every local's origin to .plain.
-    lowering_gap: struct { note: []const u8 },
+    /// Unknown operation. Calls cannot assign unexposed local variables.
+    lowering_gap: struct { note: []const u8, may_assign_locals: bool = true },
 };
 
 pub const Stmt = struct {
@@ -227,6 +223,7 @@ pub const Stmt = struct {
 pub const ExprKind = union(enum) {
     /// Literal, arithmetic, value-typed call — no lifetime constraint.
     plain,
+    boolean: BooleanValue,
     /// Call to a fn annotated `// @returns borrowed_from(<param>)`.
     /// `borrowed_from_local` is the local that the lifetime is tied to.
     borrowed_from: LocalId,
@@ -269,6 +266,20 @@ pub const ExprKind = union(enum) {
     field_copy_of: struct { parent: LocalId, name: []const u8 },
     /// Couldn't classify — conservative .plain at use site.
     unknown,
+};
+
+pub const BooleanValue = union(enum) {
+    constant: bool,
+    local: LocalId,
+    not_local: LocalId,
+
+    pub fn negate(value: BooleanValue) BooleanValue {
+        return switch (value) {
+            .constant => |v| .{ .constant = !v },
+            .local => |v| .{ .not_local = v },
+            .not_local => |v| .{ .local = v },
+        };
+    }
 };
 
 // ── Basic block ────────────────────────────────────────────
@@ -327,6 +338,8 @@ pub const LocalInfo = struct {
     /// Address-of classification gates on this to avoid spurious
     /// stack-escape on the common `return &self.field` shape.
     is_pointer: bool = false,
+    /// Aliases can mutate this local; do not retain boolean path facts.
+    address_taken: bool = false,
     /// Coarse classification of the init expression — lets the
     /// composite-borrow walker decide at classify time whether a
     /// bare reference to this local in a returned struct should be

@@ -35,24 +35,40 @@ pub const Ctx = struct {
     /// fires from transferRet, not from a dedicated Stmt) — those
     /// consult the config to honor Config.enabled.
     config: *const config_mod.Config = &config_mod.Default,
+    report_enabled: bool = true,
 };
 
 /// Mutate `state` to reflect the effect of `stmt`.  Emit any problems
 /// to `ctx.problems`.
 pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
+    if (!state.feasible) return;
     switch (stmt.kind) {
         .decl => |d| try transferDecl(ctx, state, d, stmt.pos),
         .assign => |a| try transferAssign(ctx, state, a, stmt.pos),
+        .assume => |condition| {
+            if (booleanValue(state, condition)) |value| {
+                if (!value) state.feasible = false;
+            } else switch (condition) {
+                .local => |local| try bindBoolean(ctx, state, local, .{ .boolean = .{ .constant = true } }),
+                .not_local => |local| try bindBoolean(ctx, state, local, .{ .boolean = .{ .constant = false } }),
+                .constant => unreachable,
+            }
+        },
         .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos, stmt.end_pos),
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .pointer_write => |p| {
+            if (state.booleans.getIndex(p.target)) |index| state.booleans.swapRemoveAt(index);
             if (state.locals.get(p.target)) |origin| {
+                if (origin == .stack) {
+                    if (state.booleans.getIndex(origin.stack)) |index| state.booleans.swapRemoveAt(index);
+                }
                 if (origin == .undef) try state.locals.put(ctx.gpa, p.target, .plain);
             }
         },
         .reset_capture => |r| {
+            if (state.booleans.getIndex(r.local)) |index| state.booleans.swapRemoveAt(index);
             try state.locals.put(ctx.gpa, r.local, .plain);
             // Also clear any tracked FIELD origins for this local —
             // `for (bins) |bin| ctx.allocator.free(bin.path);` frees
@@ -77,7 +93,28 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
         .leak_warning => |l| try transferLeakWarning(ctx, l, stmt.pos, stmt.end_pos),
         .partial_union_write => |p| try transferPartialUnionWrite(ctx, p, stmt.pos, stmt.end_pos),
-        .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+        .lowering_gap => |g| transferGap(state, g),
+    }
+}
+
+fn booleanValue(state: *const AbstractState, value: cfg.BooleanValue) ?bool {
+    return switch (value) {
+        .constant => |v| v,
+        .local => |local| state.booleans.get(local),
+        .not_local => |local| if (state.booleans.get(local)) |v| !v else null,
+    };
+}
+
+fn bindBoolean(ctx: Ctx, state: *AbstractState, local: LocalId, kind: ExprKind) !void {
+    const value = if (ctx.locals[@intFromEnum(local)].address_taken) null else switch (kind) {
+        .boolean => |v| booleanValue(state, v),
+        .copy_of => |source| state.booleans.get(source),
+        else => null,
+    };
+    if (value) |v| {
+        try state.booleans.put(ctx.gpa, local, v);
+    } else {
+        if (state.booleans.getIndex(local)) |index| state.booleans.swapRemoveAt(index);
     }
 }
 
@@ -88,9 +125,7 @@ fn transferLeakWarning(
     end_pos: cfg.SrcPos,
 ) !void {
     if (!config_mod.isEnabled(ctx.config, .heap_leak)) return;
-    try report(ctx, "heap-leak", pos, end_pos, .@"error",
-        "destructor for `{s}` does not free `self` — instances allocated by the type's heap-creator leak (no `allocator.destroy(self)` reachable from this destructor)",
-        .{l.type_name});
+    try report(ctx, "heap-leak", pos, end_pos, .@"error", "destructor for `{s}` does not free `self` — instances allocated by the type's heap-creator leak (no `allocator.destroy(self)` reachable from this destructor)", .{l.type_name});
 }
 
 fn transferPartialUnionWrite(
@@ -100,9 +135,7 @@ fn transferPartialUnionWrite(
     end_pos: cfg.SrcPos,
 ) !void {
     if (!config_mod.isEnabled(ctx.config, .partial_union_write)) return;
-    try report(ctx, "partial-union-write", pos, end_pos, .@"error",
-        "tagged-union literal writes the `.{s}` tag before evaluating its payload; an early-exit (`try` / `catch return`) in the payload leaves the LHS with the new tag and stale/garbage payload bytes — hoist the fallible expression into a local first",
-        .{p.tag_name});
+    try report(ctx, "partial-union-write", pos, end_pos, .@"error", "tagged-union literal writes the `.{s}` tag before evaluating its payload; an early-exit (`try` / `catch return`) in the payload leaves the LHS with the new tag and stale/garbage payload bytes — hoist the fallible expression into a local first", .{p.tag_name});
 }
 
 fn transferInteriorPointerDestroy(
@@ -116,9 +149,7 @@ fn transferInteriorPointerDestroy(
     if (!config_mod.isEnabled(ctx.config, .interior_pointer_destroy)) return;
     const receiver_name = ctx.locals[@intFromEnum(i.receiver)].name;
     const container_name = ctx.locals[@intFromEnum(i.container)].name;
-    try report(ctx, "interior-pointer-destroy", pos, end_pos, .@"error",
-        "destroying `{s}` — an interior pointer into `{s}` — is undefined behavior under typical allocators (the pointer wasn't returned by allocator.create)",
-        .{ receiver_name, container_name });
+    try report(ctx, "interior-pointer-destroy", pos, end_pos, .@"error", "destroying `{s}` — an interior pointer into `{s}` — is undefined behavior under typical allocators (the pointer wasn't returned by allocator.create)", .{ receiver_name, container_name });
 }
 
 fn transferDecl(
@@ -127,6 +158,7 @@ fn transferDecl(
     d: @TypeOf(@as(StmtKind, undefined).decl),
     pos: cfg.SrcPos,
 ) !void {
+    try bindBoolean(ctx, state, d.local, d.init_kind);
     const origin = try originOfInit(ctx, state, d.init_kind, pos);
     try state.locals.put(ctx.gpa, d.local, origin);
     // Clear any stale field state for this local — a fresh decl
@@ -151,6 +183,7 @@ fn transferAssign(
     a: @TypeOf(@as(StmtKind, undefined).assign),
     pos: cfg.SrcPos,
 ) !void {
+    try bindBoolean(ctx, state, a.target, a.rhs_kind);
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
     try state.locals.put(ctx.gpa, a.target, origin);
     // Whole-local reassignment invalidates any tracked field
@@ -225,13 +258,10 @@ fn transferHeapFree(
                 if (st.state == .dead) {
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const name = ctx.locals[@intFromEnum(f.freed_local)].name;
-                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error",
-                            "double-free of `{s}`",
-                            .{name},
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "first freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error", "double-free of `{s}`", .{name}, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "first freed here" }
+                        else
+                            null);
                     }
                     return;
                 }
@@ -249,9 +279,7 @@ fn transferHeapFree(
                         const freed_name = ctx.locals[@intFromEnum(f.freed_local)].name;
                         const alloc_alloc = ctx.locals[@intFromEnum(st.allocator_local.?)].name;
                         const free_alloc = ctx.locals[@intFromEnum(f.allocator_local.?)].name;
-                        try report(ctx, "allocator-mismatch", pos, end_pos, .@"error",
-                            "`{s}` was allocated by `{s}` but freed by `{s}` — allocators must match",
-                            .{ freed_name, alloc_alloc, free_alloc });
+                        try report(ctx, "allocator-mismatch", pos, end_pos, .@"error", "`{s}` was allocated by `{s}` but freed by `{s}` — allocators must match", .{ freed_name, alloc_alloc, free_alloc });
                     }
                     return;
                 }
@@ -314,13 +342,10 @@ fn transferRetOutParamDanglingHeaps(
         const st = state.heaps.get(hid) orelse continue;
         if (st.state != .dead) continue;
         const out_name = ctx.locals[@intFromEnum(out_local)].name;
-        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-            "value written through `{s}` was freed before return — caller's pointee dangles",
-            .{out_name},
-            if (st.killed_at) |ks|
-                .{ .site = ks, .label = "value freed here" }
-            else
-                null);
+        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "value written through `{s}` was freed before return — caller's pointee dangles", .{out_name}, if (st.killed_at) |ks|
+            .{ .site = ks, .label = "value freed here" }
+        else
+            null);
     }
 }
 
@@ -349,8 +374,7 @@ fn transferRetValueChecks(
     if (origin == .undef and !r.is_literal_undef and
         config_mod.isEnabled(ctx.config, .use_undefined))
     {
-        try report(ctx, "use-undefined", pos, end_pos, .@"error",
-            "returning a value that is still `undefined`", .{});
+        try report(ctx, "use-undefined", pos, end_pos, .@"error", "returning a value that is still `undefined`", .{});
         return;
     }
 
@@ -362,11 +386,9 @@ fn transferRetValueChecks(
     if (origin == .stack and config_mod.isEnabled(ctx.config, .stack_escape)) {
         const name = ctx.locals[@intFromEnum(origin.stack)].name;
         if (r.is_borrowed_return_type) {
-            try report(ctx, "stack-escape", pos, end_pos, .@"error",
-                "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
+            try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
         } else {
-            try report(ctx, "stack-escape", pos, end_pos, .@"error",
-                "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+            try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
         }
         return;
     }
@@ -389,23 +411,19 @@ fn transferRetValueChecks(
             // to the heap — the struct manages its own cleanup.
             if (ast.is_heap_allocated) return;
             if (is_composite) {
-                try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                    "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
+                try report(ctx, "arena-escape", pos, end_pos, .@"error", "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
             } else {
-                try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                    "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
+                try report(ctx, "arena-escape", pos, end_pos, .@"error", "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "returning a heap pointer after free", .{},
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "value freed here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "returning a heap pointer after free", .{}, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "value freed here" }
+                else
+                    null);
             }
         },
         else => {},
@@ -478,13 +496,10 @@ fn transferFieldHeapFree(
                 if (st.state == .dead) {
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
-                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error",
-                            "double-free of `{s}{s}{s}`",
-                            .{ parent_name, pathSep(f.name), f.name },
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "first freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error", "double-free of `{s}{s}{s}`", .{ parent_name, pathSep(f.name), f.name }, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "first freed here" }
+                        else
+                            null);
                     }
                     return;
                 }
@@ -516,25 +531,18 @@ fn transferFieldUse(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    // Parent-liveness check, gated on inter-procedural origin:
-    // `h.x` after `h` was freed via a @takes-ownership call IS a
-    // UAF regardless of whether `h.x` itself was tracked.  Only
-    // fire when the parent's freed state came from the
-    // inter-procedural fallback — regular alloc+free pairs already
-    // track their own field state, and would otherwise cascade
-    // back-edge FPs across loop iterations.
+    // Reading a field dereferences its owner, even when the field's own
+    // referent is still live. A dead owner invalidates either origin path.
     if (state.locals.get(u.parent)) |parent_origin| switch (parent_origin) {
         .heap => |hid| {
             const st = state.heaps.get(hid);
-            if (st) |s| if (s.state == .dead and s.is_inter_procedural) {
+            if (st) |s| if (s.state == .dead) {
                 if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
                     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
-                    try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                        "use of `{s}` after free", .{parent_name},
-                        if (s.killed_at) |ks|
-                            .{ .site = ks, .label = "value freed here" }
-                        else
-                            null);
+                    try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}` after free", .{parent_name}, if (s.killed_at) |ks|
+                        .{ .site = ks, .label = "value freed here" }
+                    else
+                        null);
                 }
                 return;
             };
@@ -549,33 +557,25 @@ fn transferFieldUse(
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error",
-                    "`{s}{s}{s}` borrows from an arena that was deinit'd",
-                    .{ parent_name, pathSep(u.name), u.name },
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "arena deinit'd here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}{s}{s}` borrows from an arena that was deinit'd", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "arena deinit'd here" }
+                else
+                    null);
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "use of `{s}{s}{s}` after free",
-                    .{ parent_name, pathSep(u.name), u.name },
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "value freed here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` after free", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "value freed here" }
+                else
+                    null);
             }
         },
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
-            try report(ctx, "use-undefined", pos, end_pos, .@"error",
-                "use of `{s}{s}{s}` while still `undefined`",
-                .{ parent_name, pathSep(u.name), u.name });
+            try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while still `undefined`", .{ parent_name, pathSep(u.name), u.name });
         },
         .stack => |owner_id| {
             // Field borrows from a stack owner — mirrors the .stack
@@ -590,13 +590,10 @@ fn transferFieldUse(
                 .heap => |hid| {
                     const st = state.heaps.get(hid) orelse return;
                     if (st.state == .dead) {
-                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                            "use of `{s}{s}{s}` (borrow from `{s}`) after free",
-                            .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name },
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "value freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` (borrow from `{s}`) after free", .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name }, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "value freed here" }
+                        else
+                            null);
                     }
                 },
                 else => {},
@@ -606,11 +603,7 @@ fn transferFieldUse(
     }
 }
 
-/// Composite-escape check: fires the same escape diagnostics as
-/// transferRet would for a value-shape composite return embedding
-/// this local.  Used for the SECOND, third, ... borrow in a
-/// multi-borrow composite — the first is handled by the surrounding
-/// .ret's value_kind.
+/// Check direct stack addresses and the current origins of aggregate aliases.
 fn transferCompositeEscape(
     ctx: Ctx,
     state: *AbstractState,
@@ -618,15 +611,12 @@ fn transferCompositeEscape(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    _ = state;
-    // Walker only emits this stmt for `&local` / `array[..]`
-    // patterns — those are stack borrows by construction.  Don't
-    // consult state.locals: the address-of-write rule already
-    // collapsed the local's origin to .plain before we get here.
+    std.debug.assert(c == .stack_ref or c == .copy_of);
     if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
-    const name = ctx.locals[@intFromEnum(c.local)].name;
-    try report(ctx, "stack-escape", pos, end_pos, .@"error",
-        "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+    const origin = try originOfInit(ctx, state, c, pos);
+    if (origin != .stack) return;
+    const name = ctx.locals[@intFromEnum(origin.stack)].name;
+    try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
 }
 
 /// Write-through-pointer escape check.  `out.* = X` (or
@@ -680,9 +670,7 @@ fn transferOutParamWrite(
                 if (out_origin == .stack) return;
             }
             const src_name = ctx.locals[@intFromEnum(src_local)].name;
-            try report(ctx, "stack-escape", pos, end_pos, .@"error",
-                "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)",
-                .{ src_name, out_name });
+            try report(ctx, "stack-escape", pos, end_pos, .@"error", "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)", .{ src_name, out_name });
         },
         .heap => |hid| {
             // Record the write for the deferred check at fn exit
@@ -723,9 +711,7 @@ fn transferOutParamWrite(
             // FROM the arena leaving the frame — which arrives here
             // with value_kind != .arena_init.
             if (w.value_kind == .arena_init) return;
-            try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                "writing a value borrowed from a function-local arena through `{s}` (escapes its lifetime)",
-                .{out_name});
+            try report(ctx, "arena-escape", pos, end_pos, .@"error", "writing a value borrowed from a function-local arena through `{s}` (escapes its lifetime)", .{out_name});
         },
         else => {},
     }
@@ -753,14 +739,10 @@ fn transferUse(
 }
 
 fn transferGap(
-    ctx: Ctx,
     state: *AbstractState,
     g: @TypeOf(@as(StmtKind, undefined).lowering_gap),
-    pos: cfg.SrcPos,
-) !void {
-    _ = g;
-    _ = pos;
-    _ = ctx;
+) void {
+    if (g.may_assign_locals) state.booleans.clearRetainingCapacity();
     // Conservative: collapse .undef → .plain since an unknown stmt
     // may have written through a passed pointer to initialize the
     // local.  But PRESERVE resource origins (.heap, .arena,
@@ -788,7 +770,7 @@ fn originOfInit(
 ) !Origin {
     _ = pos;
     return switch (kind) {
-        .plain => .plain,
+        .plain, .boolean => .plain,
         .owned => .plain,
         .arena_init => |info| blk: {
             // OVERWRITE to .live on every visit — the decl represents
@@ -847,32 +829,25 @@ fn checkOriginAlive(
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error",
-                    "`{s}` borrows from an arena that was deinit'd",
-                    .{local_name},
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "arena deinit'd here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}` borrows from an arena that was deinit'd", .{local_name}, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "arena deinit'd here" }
+                else
+                    null);
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "use of `{s}` after free",
-                    .{local_name},
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "value freed here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}` after free", .{local_name}, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "value freed here" }
+                else
+                    null);
             }
         },
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
-            try report(ctx, "use-undefined", pos, end_pos, .@"error",
-                "use of `{s}` while still `undefined`", .{local_name});
+            try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}` while still `undefined`", .{local_name});
         },
         .stack => |owner_id| {
             // Stack-borrow liveness — the borrow inherits the owner
@@ -889,13 +864,10 @@ fn checkOriginAlive(
                 .heap => |hid| {
                     const st = state.heaps.get(hid) orelse return;
                     if (st.state == .dead) {
-                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                            "use of `{s}` (borrow from `{s}`) after free",
-                            .{ local_name, ctx.locals[@intFromEnum(owner_id)].name },
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "value freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}` (borrow from `{s}`) after free", .{ local_name, ctx.locals[@intFromEnum(owner_id)].name }, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "value freed here" }
+                        else
+                            null);
                     }
                 },
                 else => {},
@@ -927,35 +899,31 @@ fn reportWithNote(
     args: anytype,
     kill_site: ?struct { site: state_mod.KillSite, label: []const u8 },
 ) !void {
+    if (!ctx.report_enabled) return;
+    // One source operation can be reached through several cleanup paths.
+    for (ctx.problems.items) |p| {
+        if (p.start.byte == pos.byte and std.mem.eql(u8, p.rule_id, rule_id)) return;
+    }
     const msg = try std.fmt.allocPrint(ctx.gpa, fmt, args);
+    errdefer ctx.gpa.free(msg);
     const real_end: cfg.SrcPos = if (end_pos.byte > pos.byte)
         end_pos
     else
         .{ .line = pos.line, .column = pos.column + 1, .byte = pos.byte + 1 };
     var notes: []problem_mod.Note = &.{};
     if (kill_site) |ks| {
-        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
         const label = try ctx.gpa.dupe(u8, ks.label);
+        errdefer ctx.gpa.free(label);
+        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
         notes[0] = .{
             .start = .{ .line = ks.site.line, .column = ks.site.column, .byte = ks.site.byte },
             .end = .{ .line = ks.site.end_line, .column = ks.site.end_column, .byte = ks.site.end_byte },
             .label = label,
         };
     }
-    // Dedupe by (rule_id, start.byte).  The cfg builder inlines
-    // defer/errdefer bodies at every exit point, so a diagnostic
-    // emitted from inside a defer body fires once per exit — one
-    // logical bug, N reports.  Linear scan is fine here: per-fn
-    // problem counts are small (rarely >50).
-    for (ctx.problems.items) |p| {
-        if (p.start.byte == pos.byte and std.mem.eql(u8, p.rule_id, rule_id)) {
-            ctx.gpa.free(msg);
-            if (notes.len > 0) {
-                for (notes) |*n| ctx.gpa.free(n.label);
-                ctx.gpa.free(notes);
-            }
-            return;
-        }
+    errdefer {
+        for (notes) |note| ctx.gpa.free(note.label);
+        ctx.gpa.free(notes);
     }
     try ctx.problems.append(ctx.gpa, .{
         .rule_id = rule_id,
@@ -1252,9 +1220,6 @@ test "transferGap: collapses .undef → .plain, preserves resource origins" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
     defer state.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "u", "h", "a" }), .problems = &problems, .path = "test" };
 
     const u: LId = @enumFromInt(0);
     const h: LId = @enumFromInt(1);
@@ -1263,7 +1228,7 @@ test "transferGap: collapses .undef → .plain, preserves resource origins" {
     try state.locals.put(gpa, h, .{ .heap = @enumFromInt(1) });
     try state.locals.put(gpa, a, .{ .arena = @enumFromInt(1) });
 
-    try transferGap(ctx, &state, .{ .note = "test" }, pos0());
+    transferGap(&state, .{ .note = "test" });
 
     try testing.expect(state.locals.get(u).? == .plain);
     try testing.expect(state.locals.get(h).? == .heap);
