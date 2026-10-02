@@ -27,7 +27,7 @@ zig fetch --save https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.g
 // build.zig
 const zbc_dep = b.dependency("zbc", .{
     .target = target,
-    .optimize = .ReleaseFast,
+    .optimize = .fast,
 });
 
 const zbc_run = b.addRunArtifact(zbc_dep.artifact("zbc"));
@@ -41,7 +41,7 @@ b.default_step.dependOn(&zbc_run.step);
 For standalone use:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zbc src/
 zbc --format=compact src/   # grep-friendly
 zbc --list-rules
@@ -49,6 +49,10 @@ zbc --explain <rule-id>
 ```
 
 Exit 0 if clean, 1 if problems found.
+
+Put the analyzed project's Zig compiler on `PATH`. The type engine runs
+`zig env` to locate that compiler and its standard library. It accepts JSON
+and ZON output and does not require a separate `which` executable.
 
 ## Rules
 
@@ -90,6 +94,25 @@ per-fn CFG and abstract interpretation:
   `assert-on-untrusted-input`
 
 `zbc --explain <rule-id>` prints the rationale, canonical bug, and fix.
+
+`slice-loop-reentrant-grow` uses the actual loop body, including single-expression
+bodies. Both direct methods and transitive calls account for possible aliases.
+Different parameters or embedded list headers do not prove separate allocations:
+a caller can pass one pointer twice or copy a header. Private storage requires a
+declaration-proved fresh initializer and no publication or rebinding. Integer
+field reads by value and deferred standard-list cleanup preserve that ownership;
+field addresses, header copies and assignment targets do not. A direct
+call through a different receiver is exempt only for the actual standard-library
+single-element append and private storage; same-named project methods do not
+qualify. A project member named `empty` is not the standard library's empty-list
+constant.
+The compiler-owned `std.mem.eql` declaration and its aliases only read their
+operands, so their callers do not acquire collection-growth effects. Project
+lookalikes and unresolved declarations remain conservatively charged.
+
+`index-minus-one-without-zero-guard` follows evaluation order into `catch` and
+`orelse` fallbacks. Effects of the failing operand precede the fallback; a later
+fallback mutation cannot erase a guard for an earlier indexed read.
 
 ## False positives and missed bugs
 
