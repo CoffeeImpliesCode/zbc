@@ -12,11 +12,17 @@ pub const BuildConfig = @import("build_runner_shared.zig").BuildConfig;
 const tracy = @import("tracy_stub.zig");
 const DocumentScope = @import("document_scope.zig");
 const DiagnosticsCollection = @import("diagnostics_collection.zig");
+const SourcePolicy = @import("source_policy.zig").SourcePolicy;
 
 const DocumentStore = @This();
 
 io: std.Io,
 allocator: std.mem.Allocator,
+source_policy: @import("source_policy.zig").SourcePolicy = .{},
+canonical_paths: @import("source_policy.zig").CanonicalPaths = .{},
+source_aliases: Uri.ArrayHashMap(Uri) = .empty,
+source_failure: ?anyerror = null,
+parse_failure: ?@import("source_policy.zig").ParseFailure = null,
 /// the DocumentStore assumes that `config` is not modified while calling one of its functions.
 config: Config,
 mutex: std.Io.Mutex = .init,
@@ -25,6 +31,12 @@ handles: Uri.ArrayHashMap(*Handle.Future) = .empty,
 build_files: if (supports_build_system) Uri.ArrayHashMap(*BuildFile) else void = if (supports_build_system) .empty else {},
 diagnostics_collection: *DiagnosticsCollection,
 builds_in_progress: std.atomic.Value(i32) = .init(0),
+/// Named-module wiring recovered from `build.zig` without executing it.  No
+/// build runner is ever spawned: running a project's `build.zig` runs that
+/// project's code, so the wiring is read instead of run and only where the
+/// source policy already admits the target file.
+named_modules: ?NamedModuleMap = null,
+named_modules_mutex: std.Io.Mutex = .init,
 lsp_capabilities: struct {
     supports_work_done_progress: bool = false,
     supports_semantic_tokens_refresh: bool = false,
@@ -203,7 +215,7 @@ pub const Handle = struct {
                 /// to avoid checking build files multiple times, a bitset stores whether or
                 /// not the build file should be skipped because it has previously been
                 /// found to be "unassociated" with the handle.
-                has_been_checked: std.bit_set.Dynamic,
+                has_been_checked: std.DynamicBitSetUnmanaged,
             },
             /// The Handle has no associated build file (build.zig).
             none,
@@ -246,7 +258,7 @@ pub const Handle = struct {
                     return .none;
                 }
 
-                var has_been_checked: std.bit_set.Dynamic = try .initEmpty(document_store.allocator, potential_build_files.len);
+                var has_been_checked: std.DynamicBitSetUnmanaged = try .initEmpty(document_store.allocator, potential_build_files.len);
                 errdefer has_been_checked.deinit(document_store.allocator);
 
                 self.impl.associated_build_file = .{ .unresolved = .{
@@ -344,7 +356,7 @@ pub const Handle = struct {
 
         const modules = &build_config.modules.map;
 
-        var visted: std.bit_set.Dynamic = try .initEmpty(allocator, modules.count());
+        var visted: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, modules.count());
         defer visted.deinit(allocator);
 
         var queue: std.ArrayList(usize) = try .initCapacity(allocator, 1);
@@ -439,9 +451,29 @@ pub const Handle = struct {
         handle.document_scope = .unset;
     }
 
+    /// The source domain every reported position lives in.
+    ///
+    /// `Ast` keeps each token start as a `u32`, and `source.len` is
+    /// carried in that same table as the end-of-file token's start, so a
+    /// source of exactly `maxInt(u32)` bytes would still fit `Ast`'s own
+    /// table.  A reported column is a byte offset *plus one*, though, so
+    /// the last byte of such a source has no representable column: the
+    /// domain is strictly shorter than `maxInt(u32)`.
+    ///
+    /// `error.OutOfMemory` is that address-space capacity failure, not a
+    /// failed allocation — nothing has been allocated when this is
+    /// reported.  It is surfaced rather than swallowed because a document
+    /// too wide to address is exactly what the caller has to be told,
+    /// and it is the existing error these entry points already carry.
+    fn requireAddressableSource(source: []const u8) error{OutOfMemory}!void {
+        if (source.len >= std.math.maxInt(u32)) return error.OutOfMemory;
+    }
+
     fn parseTree(allocator: std.mem.Allocator, new_text: [:0]const u8, mode: Ast.Mode) error{OutOfMemory}!Ast {
         const tracy_zone = tracy.traceNamed(@src(), "Ast.parse");
         defer tracy_zone.end();
+
+        try requireAddressableSource(new_text);
 
         var tree = try Ast.parse(allocator, new_text, mode);
         errdefer tree.deinit(allocator);
@@ -650,6 +682,9 @@ pub fn deinit(self: *DocumentStore) void {
         self.allocator.destroy(future);
     }
     self.handles.deinit(self.allocator);
+    for (self.source_aliases.keys()) |uri| uri.deinit(self.allocator);
+    self.source_aliases.deinit(self.allocator);
+    self.canonical_paths.deinit(self.allocator);
 
     if (supports_build_system) {
         for (self.build_files.values()) |build_file| {
@@ -658,6 +693,8 @@ pub fn deinit(self: *DocumentStore) void {
         }
         self.build_files.deinit(self.allocator);
     }
+
+    if (self.named_modules) |*modules| modules.deinit();
 
     self.* = undefined;
 }
@@ -669,12 +706,25 @@ pub fn getHandle(self: *DocumentStore, uri: Uri) ?*Handle {
     const future = future: {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        break :future self.handles.get(uri) orelse return null;
+        break :future self.handles.get(self.source_aliases.get(uri) orelse uri) orelse return null;
     };
-    return future.await(self.io) catch return null;
+    const handle = future.await(self.io) catch |err| {
+        if (err != error.SourceExcluded) {
+            self.source_failure = err;
+            self.parse_failure = null;
+        }
+        return null;
+    };
+    if (handle.tree.errors.len != 0) {
+        self.source_failure = error.ImportInvalidSyntax;
+        self.parse_failure = .fromTree(handle.uri.raw, &handle.tree);
+        return null;
+    }
+    return handle;
 }
 
-const ReadFileError = std.mem.Allocator.Error || std.Io.Cancelable || std.Io.File.OpenError || std.Io.File.Reader.Error || error{StreamTooLong};
+const ReadFileError = std.mem.Allocator.Error || std.Io.Cancelable || std.Io.File.OpenError ||
+    std.Io.File.Reader.Error || std.Io.Dir.RealPathFileError || error{ StreamTooLong, SourceExcluded };
 
 /// Must satisfy `uri.isFileScheme()`.
 fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
@@ -686,6 +736,9 @@ fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer self.allocator.free(file_path);
+    if (!self.allowsSource(file_path)) return error.SourceExcluded;
+    const canonical = try self.canonical_paths.resolve(self.allocator, self.io, file_path);
+    if (!self.allowsSource(canonical)) return error.SourceExcluded;
 
     const dir, const sub_path = blk: {
         if (builtin.target.cpu.arch.isWasm() and !builtin.link_libc) {
@@ -693,23 +746,64 @@ fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
                 const preopen_dir: std.Io.Dir = .{ .handle = @intCast(i) };
                 const preopen_path = std.mem.trimEnd(u8, name, "/");
 
-                if (!std.mem.startsWith(u8, file_path, preopen_path)) continue;
-                if (!std.mem.startsWith(u8, file_path[preopen_path.len..], "/")) continue;
+                if (!std.mem.startsWith(u8, canonical, preopen_path)) continue;
+                if (!std.mem.startsWith(u8, canonical[preopen_path.len..], "/")) continue;
 
-                break :blk .{ preopen_dir, std.mem.trimStart(u8, file_path[preopen_path.len..], "/") };
+                break :blk .{ preopen_dir, std.mem.trimStart(u8, canonical[preopen_path.len..], "/") };
             }
         }
-        break :blk .{ std.Io.Dir.cwd(), file_path };
+        break :blk .{ std.Io.Dir.cwd(), canonical };
     };
 
     return try dir.readFileAllocOptions(
         self.io,
         sub_path,
         self.allocator,
-        .limited(std.zig.max_src_size),
+        .limited(@import("source_policy.zig").SourcePolicy.max_source_bytes),
         .of(u8),
         0,
     );
+}
+
+fn allowsSource(self: *const DocumentStore, path: []const u8) bool {
+    if (self.source_policy.allowsAbsolutePath(path)) return true;
+    const zig_lib = self.config.zig_lib_dir orelse return false;
+    const root = zig_lib.path orelse return false;
+    return @import("source_policy.zig").within(root, path);
+}
+
+fn canonicalUri(self: *DocumentStore, uri: Uri) ReadFileError!Uri {
+    const path = uri.toFsPath(self.allocator) catch |err| switch (err) {
+        error.UnsupportedScheme => unreachable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer self.allocator.free(path);
+    if (!self.allowsSource(path)) return error.SourceExcluded;
+    const canonical = try self.canonical_paths.resolve(self.allocator, self.io, path);
+    if (!self.allowsSource(canonical)) return error.SourceExcluded;
+    return Uri.fromPath(self.allocator, canonical);
+}
+
+fn rememberSourceAlias(self: *DocumentStore, uri: Uri, canonical: Uri) !void {
+    if (std.mem.eql(u8, uri.raw, canonical.raw)) return;
+    try self.mutex.lock(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.source_aliases.contains(uri)) return;
+    const key = try uri.dupe(self.allocator);
+    errdefer key.deinit(self.allocator);
+    try self.source_aliases.putNoClobber(self.allocator, key, canonical);
+}
+
+fn loadFailed(self: *DocumentStore, err: ReadFileError) error{ Canceled, OutOfMemory }!?*Handle {
+    switch (err) {
+        error.Canceled, error.OutOfMemory => |e| return e,
+        error.SourceExcluded => return null,
+        else => {
+            self.source_failure = err;
+            self.parse_failure = null;
+            return null;
+        },
+    }
 }
 
 /// Returns a handle to the given document
@@ -721,18 +815,30 @@ pub fn getOrLoadHandle(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMem
     defer tracy_zone.end();
 
     if (!uri.isFileScheme()) return self.getHandle(uri);
-    return self.createAndStoreDocument(
-        uri,
+    const known_uri, const cached = known: {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        const known = self.source_aliases.get(uri) orelse uri;
+        break :known .{ known, self.handles.contains(known) };
+    };
+    const canonical: ?Uri = if (cached) null else self.canonicalUri(known_uri) catch |err| return self.loadFailed(err);
+    defer if (canonical) |value| value.deinit(self.allocator);
+    const handle = self.createAndStoreDocument(
+        canonical orelse known_uri,
         .uri,
         .{
             .lsp_synced = false,
             .override = false,
             .load_build_file_behaviour = .never,
         },
-    ) catch |err| switch (err) {
-        error.Canceled, error.OutOfMemory => |e| return e,
-        else => return null,
-    };
+    ) catch |err| return self.loadFailed(err);
+    try self.rememberSourceAlias(uri, handle.uri);
+    if (handle.tree.errors.len != 0) {
+        self.source_failure = error.ImportInvalidSyntax;
+        self.parse_failure = .fromTree(handle.uri.raw, &handle.tree);
+        return null;
+    }
+    return handle;
 }
 
 /// **Thread safe** takes a shared lock
@@ -787,6 +893,10 @@ pub fn openLspSyncedDocument(self: *DocumentStore, uri: Uri, text: []const u8) e
         }
     }
 
+    // Client text is not capped by `SourcePolicy` the way file reads are,
+    // so reject a source the engine cannot address before it is copied.
+    try Handle.requireAddressableSource(text);
+
     const duped_text = try self.allocator.dupeSentinel(u8, text, 0);
     _ = self.createAndStoreDocument(
         uri,
@@ -830,6 +940,8 @@ pub fn closeLspSyncedDocument(self: *DocumentStore, uri: Uri) void {
 
 /// Updates a document that is synced over the LSP protocol (`textDocument/didChange`).
 /// Takes ownership of `new_text` which has to be allocated with this DocumentStore's allocator.
+/// `new_text` is released, and the document left untouched, when it is
+/// rejected — including by the source-domain check in `parseTree`.
 /// **Not thread safe**
 pub fn refreshLspSyncedDocument(self: *DocumentStore, uri: Uri, new_text: [:0]const u8) error{ Canceled, OutOfMemory }!void {
     const tracy_zone = tracy.trace(@src());
@@ -978,6 +1090,301 @@ pub fn isBuiltinFile(uri: Uri) bool {
 pub fn isInStd(uri: Uri) bool {
     // TODO: Better logic for detecting std or subdirectories?
     return std.mem.find(u8, uri.raw, "/std/") != null;
+}
+
+// ── Static module wiring ───────────────────────────────────────────────
+
+/// Named-module wiring recovered from the `build.zig` files that govern a
+/// source tree, without executing any of them.
+///
+/// Only unique, explicit wiring is evidence: a literal `addModule` /
+/// `createModule` `root_source_file` reached through a literal `.imports`
+/// entry or a literal `addImport` alias.  Everything else stays unresolved on
+/// purpose, because a wrong root is worse than no root — an unknown module
+/// yields an unknown type, a guessed one yields a wrong type:
+///   * a generated module (`b.addOptions().createModule()`) has no path in
+///     the source tree;
+///   * `dep.module("name")` is wired by the *dependency's* build.zig, which
+///     the source policy does not admit;
+///   * a module chosen by a runtime condition, a computed path, or a shadowed
+///     module variable is not proof of anything;
+///   * a name wired to two different roots is ambiguous, so it stays unknown;
+///   * a root that is not a readable file right now (a path a build step would
+///     still have to write) is not a source, so it stays unknown.
+///
+/// Every recorded root passes the caller's source policy and exists on disk,
+/// so publishing wiring never widens which files the store may read and never
+/// turns an unknown type into a failed file.
+pub const NamedModuleMap = struct {
+    gpa: std.mem.Allocator,
+    /// Owns every recorded name and root; released as one block.
+    arena: std.heap.ArenaAllocator,
+    /// import name -> root source file, or null when the name is ambiguous.
+    entries: std.StringArrayHashMapUnmanaged(?[]const u8) = .empty,
+    /// Directories whose `build.zig` chain has already been read.
+    scanned_dirs: std.StringArrayHashMapUnmanaged(void) = .empty,
+
+    pub fn init(gpa: std.mem.Allocator) NamedModuleMap {
+        return .{ .gpa = gpa, .arena = .init(gpa) };
+    }
+
+    pub fn deinit(self: *NamedModuleMap) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// The root source file proven for `name`, or null when the name is
+    /// unknown, ambiguous, or not yet scanned.
+    pub fn lookup(self: *const NamedModuleMap, name: []const u8) ?[]const u8 {
+        return self.entries.get(name) orelse null;
+    }
+
+    fn put(self: *NamedModuleMap, name: []const u8, root_source_file: []const u8) !void {
+        if (self.entries.get(name)) |known| {
+            const previous = known orelse return;
+            if (!std.mem.eql(u8, previous, root_source_file)) self.entries.getPtr(name).?.* = null;
+            return;
+        }
+        const gpa = self.arena.allocator();
+        try self.entries.put(gpa, try gpa.dupe(u8, name), try gpa.dupe(u8, root_source_file));
+    }
+
+    /// Read every `build.zig` that governs `directory`, walking upwards and
+    /// stopping at the first directory the source policy rejects.
+    ///
+    /// Every directory the walk visits is memoized, not just the one it
+    /// started from: the whole chain between it and the policy boundary is
+    /// read by the time the walk returns, so a later lookup that starts in a
+    /// sibling subtree of the same project has nothing left to read.  A walk
+    /// cut short by an error commits none of them, because the next caller
+    /// has to stay free to finish it.
+    pub fn scanInto(
+        self: *NamedModuleMap,
+        io: std.Io,
+        policy: SourcePolicy,
+        directory: []const u8,
+    ) (error{OutOfMemory} || std.Io.Cancelable)!void {
+        const gpa = self.arena.allocator();
+        if (self.scanned_dirs.contains(directory)) return;
+
+        // `directory` is a directory, not a file path, so the walk starts at
+        // the directory itself and then steps to its parent, and so on.  The
+        // source policy ends the walk: a directory the policy rejects is not
+        // source, and no build file above it describes this source either.
+        var visited: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer visited.deinit(gpa);
+        var dir_path: ?[]const u8 = directory;
+        while (dir_path) |dir| : (dir_path = std.fs.path.dirname(dir)) {
+            if (!policy.allowsAbsolutePath(dir)) break;
+            try visited.append(gpa, dir);
+            if (!try buildDotZigExists(io, dir)) continue;
+            const build_path = try std.Io.Dir.path.join(gpa, &.{ dir, "build.zig" });
+            if (!policy.allowsAbsolutePath(build_path)) continue;
+            try self.scanBuildZig(io, policy, build_path);
+        }
+        for (visited.items) |dir| {
+            if (self.scanned_dirs.contains(dir)) continue;
+            try self.scanned_dirs.put(gpa, try gpa.dupe(u8, dir), {});
+        }
+    }
+
+    fn scanBuildZig(
+        self: *NamedModuleMap,
+        io: std.Io,
+        policy: SourcePolicy,
+        build_path: []const u8,
+    ) (error{OutOfMemory} || std.Io.Cancelable)!void {
+        const gpa = self.arena.allocator();
+        // An unreadable or unparsable build.zig proves nothing.  That is an
+        // honest "unknown", not a failure of the analysis itself.
+        const source = std.Io.Dir.cwd().readFileAllocOptions(
+            io,
+            build_path,
+            gpa,
+            .limited(SourcePolicy.max_source_bytes),
+            .of(u8),
+            0,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A cancelled read says nothing about the file.  Answering
+            // "unknown" here would turn one cancellation into a permanently
+            // missing root for every later lookup.
+            error.Canceled => return error.Canceled,
+            else => return,
+        };
+        var tree = Ast.parse(gpa, source, .zig) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        defer tree.deinit(gpa);
+        if (tree.errors.len != 0) return;
+        var scan: BuildModuleScan = .{
+            .map = self,
+            .gpa = gpa,
+            .io = io,
+            .tree = &tree,
+            .policy = policy,
+            .build_dir = std.fs.path.dirname(build_path) orelse return,
+        };
+        try scan.run();
+    }
+
+    const BuildModuleScan = struct {
+        map: *NamedModuleMap,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        tree: *const Ast,
+        policy: SourcePolicy,
+        /// Directory holding the `build.zig` being read; `b.path` is relative to it.
+        build_dir: []const u8,
+
+        /// Every module expression in a build.zig is either an inline call or a
+        /// variable bound to one, so one pass over the nodes sees all wiring.
+        fn run(scan: *BuildModuleScan) !void {
+            var index: u32 = 1;
+            while (index < scan.tree.nodes.len) : (index += 1) {
+                var call_buf: [1]Ast.Node.Index = undefined;
+                const call = scan.tree.fullCall(&call_buf, @enumFromInt(index)) orelse continue;
+                const method = callName(scan.tree, call) orelse continue;
+                if (std.mem.eql(u8, method, "addModule") and call.ast.params.len == 2) {
+                    // A module with an unprovable root can still name provable
+                    // imports, so the import table is read either way.
+                    try scan.recordImports(call.ast.params[1]);
+                    const name = stringLiteral(scan.tree, call.ast.params[0]) orelse continue;
+                    const root = try scan.moduleRootFromOptions(call.ast.params[1]) orelse continue;
+                    try scan.record(name, root);
+                } else if (std.mem.eql(u8, method, "createModule") and call.ast.params.len == 1) {
+                    try scan.recordImports(call.ast.params[0]);
+                } else if (std.mem.eql(u8, method, "addImport") and call.ast.params.len == 2) {
+                    const name = stringLiteral(scan.tree, call.ast.params[0]) orelse continue;
+                    const root = try scan.moduleRootFromExpr(call.ast.params[1]) orelse continue;
+                    try scan.record(name, root);
+                }
+            }
+        }
+
+        fn record(scan: *BuildModuleScan, name: []const u8, root_source_file: []const u8) !void {
+            if (name.len == 0) return;
+            if (!scan.policy.allowsAbsolutePath(root_source_file)) return;
+            // A path a previous build step would have generated is real build
+            // metadata but not a readable source.  Publishing it would turn an
+            // unknown type into a failed file, which is strictly worse.
+            std.Io.Dir.cwd().access(scan.io, root_source_file, .{}) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
+            try scan.map.put(name, root_source_file);
+        }
+
+        /// `.{ .imports = &.{ .{ .name = "alias", .module = <module> }, ... } }`
+        fn recordImports(scan: *BuildModuleScan, options: Ast.Node.Index) !void {
+            var init_buf: [2]Ast.Node.Index = undefined;
+            if (scan.tree.fullStructInit(&init_buf, options) == null) return;
+            const imports = scan.fieldValue(options, "imports") orelse return;
+            const array_node = if (scan.tree.nodeTag(imports) == .address_of)
+                scan.tree.nodeData(imports).node
+            else
+                imports;
+            var array_buf: [2]Ast.Node.Index = undefined;
+            const array = scan.tree.fullArrayInit(&array_buf, array_node) orelse return;
+            for (array.ast.elements) |element| {
+                var entry_buf: [2]Ast.Node.Index = undefined;
+                if (scan.tree.fullStructInit(&entry_buf, element) == null) continue;
+                const name_node = scan.fieldValue(element, "name") orelse continue;
+                const name = stringLiteral(scan.tree, name_node) orelse continue;
+                const module = scan.fieldValue(element, "module") orelse continue;
+                const root = try scan.moduleRootFromExpr(module) orelse continue;
+                try scan.record(name, root);
+            }
+        }
+
+        /// The root source file a module expression names, as an absolute path.
+        fn moduleRootFromExpr(scan: *BuildModuleScan, expr: Ast.Node.Index) !?[]const u8 {
+            const options = scan.moduleOptions(expr) orelse return null;
+            return try scan.moduleRootFromOptions(options);
+        }
+
+        /// The options literal a `createModule` / `addModule` expression passes,
+        /// or null for every other expression.
+        fn moduleOptions(scan: *BuildModuleScan, expr: Ast.Node.Index) ?Ast.Node.Index {
+            var resolved = expr;
+            if (scan.tree.nodeTag(expr) == .identifier) {
+                resolved = scan.variableInitializer(expr) orelse return null;
+            }
+            var call_buf: [1]Ast.Node.Index = undefined;
+            const call = scan.tree.fullCall(&call_buf, resolved) orelse return null;
+            const method = callName(scan.tree, call) orelse return null;
+            if (std.mem.eql(u8, method, "createModule") and call.ast.params.len == 1) return call.ast.params[0];
+            if (std.mem.eql(u8, method, "addModule") and call.ast.params.len == 2) return call.ast.params[1];
+            return null;
+        }
+
+        /// The `root_source_file` of a `createModule` / `addModule` options literal.
+        fn moduleRootFromOptions(scan: *BuildModuleScan, options: Ast.Node.Index) !?[]const u8 {
+            const root_source_file = scan.fieldValue(options, "root_source_file") orelse return null;
+            const relative = scan.lazyPathText(root_source_file) orelse return null;
+            if (relative.len == 0 or std.fs.path.isAbsolute(relative)) return null;
+            return try std.fs.path.resolve(scan.gpa, &.{ scan.build_dir, relative });
+        }
+
+        /// `b.path("src/x.zig")`, `b.pathFromRoot("src/x.zig")`,
+        /// `.{ .cwd_relative = "src/x.zig" }` or a bare relative literal.
+        fn lazyPathText(scan: *BuildModuleScan, value: Ast.Node.Index) ?[]const u8 {
+            var call_buf: [1]Ast.Node.Index = undefined;
+            if (scan.tree.fullCall(&call_buf, value)) |call| {
+                const method = callName(scan.tree, call) orelse return null;
+                if (call.ast.params.len != 1) return null;
+                if (!std.mem.eql(u8, method, "path") and !std.mem.eql(u8, method, "pathFromRoot")) return null;
+                return stringLiteral(scan.tree, call.ast.params[0]);
+            }
+            var init_buf: [2]Ast.Node.Index = undefined;
+            if (scan.tree.fullStructInit(&init_buf, value) != null) {
+                const cwd_relative = scan.fieldValue(value, "cwd_relative") orelse return null;
+                return stringLiteral(scan.tree, cwd_relative);
+            }
+            return stringLiteral(scan.tree, value);
+        }
+
+        /// The value node of a `.name = value` struct-init field.
+        fn fieldValue(scan: *BuildModuleScan, struct_init: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+            var init_buf: [2]Ast.Node.Index = undefined;
+            const initializer = scan.tree.fullStructInit(&init_buf, struct_init) orelse return null;
+            for (initializer.ast.fields) |field| {
+                const first = scan.tree.firstToken(field);
+                if (first < 2) continue;
+                if (!std.mem.eql(u8, scan.tree.tokenSlice(first - 2), name)) continue;
+                return field;
+            }
+            return null;
+        }
+
+        /// The single initializer of the variable an identifier names. A name
+        /// declared more than once is shadowed, so it proves nothing.
+        fn variableInitializer(scan: *BuildModuleScan, identifier: Ast.Node.Index) ?Ast.Node.Index {
+            const name = scan.tree.tokenSlice(scan.tree.nodeMainToken(identifier));
+            var found: ?Ast.Node.Index = null;
+            var index: u32 = 1;
+            while (index < scan.tree.nodes.len) : (index += 1) {
+                const decl = scan.tree.fullVarDecl(@enumFromInt(index)) orelse continue;
+                if (!std.mem.eql(u8, scan.tree.tokenSlice(decl.ast.mut_token + 1), name)) continue;
+                if (found != null) return null;
+                found = decl.ast.init_node.unwrap();
+            }
+            return found;
+        }
+    };
+};
+
+fn stringLiteral(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    if (tree.nodeTag(node) != .string_literal) return null;
+    const text = tree.tokenSlice(tree.nodeMainToken(node));
+    if (text.len < 2 or std.mem.indexOfScalar(u8, text, '\\') != null) return null;
+    return text[1 .. text.len - 1];
+}
+
+fn callName(tree: *const Ast, call: Ast.full.Call) ?[]const u8 {
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    return tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
 }
 
 /// looks for a `zls.build.json` file in the build file directory
@@ -1172,6 +1579,7 @@ fn collectPotentialBuildFiles(self: *DocumentStore, uri: Uri) error{ Canceled, O
             did_check_root = true;
             break :blk it.root();
         } orelse break;
+        if (!self.source_policy.allowsAbsolutePath(dir_path)) break;
         if (!try buildDotZigExists(self.io, dir_path)) continue;
 
         const build_path = try std.Io.Dir.path.join(self.allocator, &.{ dir_path, "build.zig" });
@@ -1326,7 +1734,7 @@ fn createAndStoreDocument(
     const text: [:0]const u8 = switch (file_source) {
         .text => |text| text,
         .uri => store.readFile(uri) catch |err| {
-            const should_log = err != error.Canceled and err != error.FileNotFound;
+            const should_log = err != error.Canceled and err != error.FileNotFound and err != error.SourceExcluded;
             if (should_log) log.err("failed to read document '{s}': {}", .{ uri.raw, err });
             handle_future.handle = undefined;
             handle_future.err = err;
@@ -1444,15 +1852,53 @@ pub fn uriFromImportStr(
         return .none;
     }
 
+    // A real `build.zig` run is authoritative when one is available, because
+    // it knows the wiring a build-time condition actually selected.
     switch (try handle.getAssociatedBuildFile(self)) {
-        .none, .unresolved => return .none,
+        .none, .unresolved => {},
         .resolved => |resolved| {
-            const build_config = resolved.build_file.tryLockConfig(self.io) orelse return .none;
-            defer resolved.build_file.unlockConfig(self.io);
-
-            const module = build_config.modules.map.get(resolved.root_source_file) orelse return .none;
-            const imported_root_source_file = module.import_table.map.get(import_str) orelse return .none;
-            return .{ .one = try .fromPath(allocator, imported_root_source_file) };
+            if (resolved.build_file.tryLockConfig(self.io)) |build_config| {
+                defer resolved.build_file.unlockConfig(self.io);
+                if (build_config.modules.map.get(resolved.root_source_file)) |module| {
+                    if (module.import_table.map.get(import_str)) |imported_root_source_file| {
+                        return .{ .one = try .fromPath(allocator, imported_root_source_file) };
+                    }
+                }
+            }
         },
     }
+
+    if (try self.namedModuleUri(allocator, handle, import_str)) |uri| return .{ .one = uri };
+    return .none;
+}
+
+/// The root source file the project's own `build.zig` gives to a named import.
+///
+/// This is the fallback for when no build configuration exists, which is the
+/// normal state here: zbc never spawns a build runner, because running a
+/// project's `build.zig` executes that project's code.  The wiring is read
+/// from the file instead, and only a root the source policy already admits is
+/// ever published, so this cannot widen what the store may read.
+fn namedModuleUri(
+    self: *DocumentStore,
+    allocator: std.mem.Allocator,
+    handle: *const Handle,
+    import_str: []const u8,
+) (error{OutOfMemory} || std.Io.Cancelable)!?Uri {
+    const path = handle.uri.toFsPath(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedScheme => return null,
+    };
+    defer allocator.free(path);
+    const directory = std.fs.path.dirname(path) orelse return null;
+
+    try self.named_modules_mutex.lock(self.io);
+    defer self.named_modules_mutex.unlock(self.io);
+    const modules = if (self.named_modules) |*existing| existing else blk: {
+        self.named_modules = .init(self.allocator);
+        break :blk &self.named_modules.?;
+    };
+    try modules.scanInto(self.io, self.source_policy, directory);
+    const root_source_file = modules.lookup(import_str) orelse return null;
+    return try Uri.fromPath(allocator, root_source_file);
 }

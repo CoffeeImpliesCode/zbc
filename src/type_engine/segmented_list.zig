@@ -103,6 +103,19 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
     return struct {
         const Self = @This();
         const ShelfIndex = std.math.Log2Int(usize);
+        // `dynamic_segments` is a list of shelf pointers, so its length is a shelf
+        // *count*, and a count is one more than the largest shelf index a list can
+        // address: a list big enough to fill shelf `maxInt(ShelfIndex)` owns that
+        // shelf plus every shelf below it.  Counts are therefore `usize` — the type
+        // of `dynamic_segments.len`, `len` and `new_capacity` — and are never
+        // narrowed to `ShelfIndex`; only `shelfSize` does that, where the shift
+        // needs it.
+        comptime {
+            // Proving the domain of `shelfCount` here means a later edit cannot
+            // reintroduce a list whose shelf count the shelf index type cannot
+            // address — the case that `maxInt(usize)` boxes exercise.
+            assert(shelfCount(std.math.maxInt(usize)) <= @as(usize, 1) << @bitSizeOf(ShelfIndex));
+        }
 
         const prealloc_exp: ShelfIndex = blk: {
             // we don't use the prealloc_exp constant when prealloc_item_count is 0
@@ -131,7 +144,7 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
-            self.freeShelves(allocator, @as(ShelfIndex, @intCast(self.dynamic_segments.len)), 0);
+            self.freeShelves(allocator, self.dynamic_segments.len, 0);
             allocator.free(self.dynamic_segments);
             self.* = undefined;
         }
@@ -195,7 +208,12 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
         /// TODO update this and related methods to match the conventions set by ArrayList
         pub fn setCapacity(self: *Self, allocator: Allocator, new_capacity: usize) Allocator.Error!void {
             if (prealloc_item_count != 0) {
-                if (new_capacity <= @as(usize, 1) << (prealloc_exp + @as(ShelfIndex, @intCast(self.dynamic_segments.len)))) {
+                // The preallocated segment and the shelves together hold
+                // `2 ** (prealloc_exp + shelf_count)` boxes.  With a preallocated
+                // segment a list owns at most one shelf less than the largest shelf
+                // index, so this shift stays in range.
+                const capacity: usize = @as(usize, 1) << (@as(usize, prealloc_exp) + self.dynamic_segments.len);
+                if (new_capacity <= capacity) {
                     return self.shrinkCapacity(allocator, new_capacity);
                 }
             }
@@ -205,13 +223,13 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
         /// Only grows capacity, or retains current capacity.
         pub fn growCapacity(self: *Self, allocator: Allocator, new_capacity: usize) Allocator.Error!void {
             const new_cap_shelf_count = shelfCount(new_capacity);
-            const old_shelf_count = @as(ShelfIndex, @intCast(self.dynamic_segments.len));
+            const old_shelf_count = self.dynamic_segments.len;
             if (new_cap_shelf_count <= old_shelf_count) return;
 
             const new_dynamic_segments = try allocator.alloc([*]T, new_cap_shelf_count);
             errdefer allocator.free(new_dynamic_segments);
 
-            var i: ShelfIndex = 0;
+            var i: usize = 0;
             while (i < old_shelf_count) : (i += 1) {
                 new_dynamic_segments[i] = self.dynamic_segments[i];
             }
@@ -230,15 +248,14 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
         /// It may fail to reduce the capacity in which case the capacity will remain unchanged.
         pub fn shrinkCapacity(self: *Self, allocator: Allocator, new_capacity: usize) void {
             if (new_capacity <= prealloc_item_count) {
-                const len = @as(ShelfIndex, @intCast(self.dynamic_segments.len));
-                self.freeShelves(allocator, len, 0);
+                self.freeShelves(allocator, self.dynamic_segments.len, 0);
                 allocator.free(self.dynamic_segments);
                 self.dynamic_segments = &[_][*]T{};
                 return;
             }
 
             const new_cap_shelf_count = shelfCount(new_capacity);
-            const old_shelf_count = @as(ShelfIndex, @intCast(self.dynamic_segments.len));
+            const old_shelf_count = self.dynamic_segments.len;
             assert(new_cap_shelf_count <= old_shelf_count);
             if (new_cap_shelf_count == old_shelf_count) return;
 
@@ -284,7 +301,7 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
             while (i < end) {
                 const shelf_index = shelfIndex(i);
                 const copy_start = boxIndex(i, shelf_index);
-                const copy_end = @min(shelfSize(shelf_index), copy_start + end - i);
+                const copy_end = @min(shelfSize(@as(usize, shelf_index)), copy_start + end - i);
                 const src = self.dynamic_segments[shelf_index][copy_start..copy_end];
                 @memcpy(dest[i - start ..][0..src.len], src);
                 i += (copy_end - copy_start);
@@ -300,14 +317,42 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
             return &self.dynamic_segments[shelf_index][box_index];
         }
 
-        fn shelfCount(box_count: usize) ShelfIndex {
+        /// The number of shelves needed to hold `box_count` boxes.
+        ///
+        /// The result is a count, not a shelf index: the shelf that
+        /// `maxInt(ShelfIndex)` addresses still needs an entry of its own in
+        /// `dynamic_segments`, so the count does not fit in `ShelfIndex`.
+        fn shelfCount(box_count: usize) usize {
             if (prealloc_item_count == 0) {
-                return log2_int_ceil(usize, box_count + 1);
+                // ceil(log2(box_count + 1)) is one more than
+                // floor(log2(box_count)) for every non-empty list, which is
+                // written this way so that a list holding `maxInt(usize)`
+                // boxes does not overflow `box_count + 1`.
+                if (box_count == 0) return 0;
+                return @as(usize, std.math.log2_int(usize, box_count)) + 1;
             }
-            return log2_int_ceil(usize, box_count + prealloc_item_count) - prealloc_exp - 1;
+            // ceil(log2(box_count + prealloc_item_count)) - prealloc_exp - 1 is
+            // floor(log2(box_count + prealloc_item_count - 1)) - prealloc_exp.
+            // Taking the `- 1` first keeps `box_count + prealloc_item_count`
+            // from overflowing, and a total past `maxInt(usize)` has the same
+            // log2 as `maxInt(usize)` itself.  A list that fits in the
+            // preallocated segment owns no shelf at all, which the `+ 1`
+            // spells out: `log2_int` rejects a zero argument.
+            const total = std.math.add(usize, @max(box_count, 1), prealloc_item_count - 1) catch std.math.maxInt(usize);
+            return @as(usize, std.math.log2_int(usize, total)) - @as(usize, prealloc_exp);
         }
 
-        fn shelfSize(shelf_index: ShelfIndex) usize {
+        /// The number of boxes in shelf `shelf`.
+        ///
+        /// `shelf` is a shelf index — a `shelfIndex` result, or a counter
+        /// walking the shelves of a list — which never exceeds
+        /// `maxInt(ShelfIndex)`, but the counters that walk shelf counts hold
+        /// it in a `usize`.  Narrowing it here is what keeps the shifts below
+        /// in range, and the conversion is checked so that a shelf count which
+        /// ever did exceed the largest shelf index traps instead of wrapping.
+        fn shelfSize(shelf: usize) usize {
+            const shelf_index = std.math.cast(ShelfIndex, shelf) orelse
+                @panic("SegmentedList shelf index is out of range");
             if (prealloc_item_count == 0) {
                 return @as(usize, 1) << shelf_index;
             }
@@ -328,7 +373,7 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
             return list_index + prealloc_item_count - (@as(usize, 1) << ((prealloc_exp + 1) + shelf_index));
         }
 
-        fn freeShelves(self: *Self, allocator: Allocator, from_count: ShelfIndex, to_count: ShelfIndex) void {
+        fn freeShelves(self: *Self, allocator: Allocator, from_count: usize, to_count: usize) void {
             var i = from_count;
             while (i != to_count) {
                 i -= 1;
@@ -401,7 +446,7 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
                     if (index < prealloc_item_count) return;
                     it.shelf_index = shelfIndex(index);
                     it.box_index = boxIndex(index, it.shelf_index);
-                    it.shelf_size = shelfSize(it.shelf_index);
+                    it.shelf_size = shelfSize(@as(usize, it.shelf_index));
                 }
             };
         }
@@ -432,12 +477,143 @@ pub fn SegmentedList(comptime T: type, comptime prealloc_item_count: usize) type
     };
 }
 
-/// TODO look into why this std.math function was changed in
-/// fc9430f56798a53f9393a697f4ccd6bf9981b970.
-fn log2_int_ceil(comptime T: type, x: T) std.math.Log2Int(T) {
-    assert(x != 0);
-    const log2_val = std.math.log2_int(T, x);
-    if (@as(T, 1) << log2_val == x)
-        return log2_val;
-    return log2_val + 1;
+test "growth, reads and shrink at the shelf boundaries" {
+    const List = SegmentedList(u32, 0);
+    var list: List = .{};
+    defer list.deinit(testing.allocator);
+
+    // A list of `n` boxes owns `ceil(log2(n + 1))` shelves: no box at all fits
+    // in no shelf, one box needs the size-1 shelf, and each further shelf
+    // doubles the capacity.
+    const shelf_counts = [_]usize{ 0, 1, 2, 2, 3, 3, 3, 3, 4, 4 };
+    for (shelf_counts, 0..) |expected, capacity| {
+        try list.setCapacity(testing.allocator, capacity);
+        try testing.expectEqual(expected, list.dynamic_segments.len);
+    }
+
+    for (0..17) |i| {
+        try list.append(testing.allocator, @intCast(i));
+        try testing.expectEqual(i + 1, list.count());
+    }
+    for (0..17) |i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), list.at(i).*);
+    }
+
+    // Boxes that straddle a shelf boundary live in different shelves: 7 is the
+    // last box of the size-4 shelf and 8 the first box of the size-8 shelf.
+    try testing.expectEqual(@as(u32, 7), list.at(7).*);
+    try testing.expectEqual(@as(u32, 8), list.at(8).*);
+
+    var dest: [17]u32 = undefined;
+    list.writeToSlice(&dest, 0);
+    for (dest, 0..) |item, i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), item);
+    }
+
+    try testing.expectEqual(@as(u32, 16), list.pop().?);
+    try testing.expectEqual(@as(usize, 16), list.count());
+
+    // Shrinking drops the shelves above the requested capacity, down to none
+    // at all, and the boxes that remain are still readable.
+    list.shrink(8);
+    list.shrinkCapacity(testing.allocator, 8);
+    try testing.expectEqual(@as(usize, 4), list.dynamic_segments.len);
+    for (0..8) |i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), list.at(i).*);
+    }
+
+    list.shrink(0);
+    list.shrinkCapacity(testing.allocator, 0);
+    try testing.expectEqual(@as(usize, 0), list.dynamic_segments.len);
+
+    // The released shelves are allocated again on the next growth.
+    for (0..9) |i| {
+        try list.append(testing.allocator, @intCast(i));
+    }
+    for (0..9) |i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), list.at(i).*);
+    }
+    try testing.expectEqual(@as(usize, 4), list.dynamic_segments.len);
+}
+
+test "boxes hand over from the preallocated segment to the shelves" {
+    const List = SegmentedList(u32, 4);
+    var list: List = .{};
+    defer list.deinit(testing.allocator);
+
+    // The preallocated segment holds the first four boxes without a shelf.
+    for (0..4) |i| {
+        try list.append(testing.allocator, @intCast(i));
+    }
+    try testing.expectEqual(@as(usize, 0), list.dynamic_segments.len);
+
+    // Box 4 is the first box of the first shelf, which holds eight boxes; box
+    // 12 is the first box of the second one, which holds sixteen.
+    for (4..20) |i| {
+        try list.append(testing.allocator, @intCast(i));
+    }
+    try testing.expectEqual(@as(usize, 2), list.dynamic_segments.len);
+    for (0..20) |i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), list.at(i).*);
+    }
+
+    list.shrink(0);
+    list.shrinkCapacity(testing.allocator, 0);
+    try testing.expectEqual(@as(usize, 0), list.dynamic_segments.len);
+
+    for (0..20) |i| {
+        try list.append(testing.allocator, @intCast(i));
+    }
+    for (0..20) |i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), list.at(i).*);
+    }
+}
+
+/// Fill `list` with `filled` boxes — enough to fill every shelf it owns — and
+/// then append one more, which is the first box of a shelf the list does not
+/// own yet, so growing for it allocates.
+fn fillThenCrossAShelfBoundary(allocator: Allocator, list: anytype, filled: usize) !void {
+    for (0..filled) |i| {
+        try list.append(allocator, @intCast(i));
+    }
+    const shelf_count = list.dynamic_segments.len;
+
+    // A growth that cannot be satisfied must leave the list exactly as it
+    // was: the same boxes, the same count, no shelf freed and none leaked.
+    list.append(allocator, @intCast(filled)) catch |err| {
+        try testing.expectEqual(filled, list.count());
+        try testing.expectEqual(shelf_count, list.dynamic_segments.len);
+        for (0..filled) |i| {
+            try testing.expectEqual(@as(u32, @intCast(i)), list.at(i).*);
+        }
+        return err;
+    };
+    try testing.expectEqual(filled + 1, list.count());
+    try testing.expectEqual(@as(u32, @intCast(filled)), list.at(filled).*);
+    // The box did cost a shelf, so a run that fails here fails a shelf
+    // allocation rather than running out of memory somewhere harmless.
+    try testing.expectEqual(shelf_count + 1, list.dynamic_segments.len);
+}
+
+fn appendAcrossAShelfBoundary(allocator: Allocator) !void {
+    var list: SegmentedList(u32, 0) = .{};
+    defer list.deinit(allocator);
+    // Boxes 0, 1 and 2 fill the first two shelves; box 3 opens the third.
+    try fillThenCrossAShelfBoundary(allocator, &list, 3);
+}
+
+fn appendAcrossAShelfBoundaryFromPrealloc(allocator: Allocator) !void {
+    var list: SegmentedList(u32, 4) = .{};
+    defer list.deinit(allocator);
+    // The preallocated segment and the first shelf hold twelve boxes; box 12
+    // opens the second shelf.
+    try fillThenCrossAShelfBoundary(allocator, &list, 12);
+}
+
+test "a failed growth leaves the list unchanged" {
+    try testing.checkAllAllocationFailures(testing.allocator, appendAcrossAShelfBoundary, .{});
+}
+
+test "a failed growth from the preallocated segment leaves the list unchanged" {
+    try testing.checkAllAllocationFailures(testing.allocator, appendAcrossAShelfBoundaryFromPrealloc, .{});
 }

@@ -22,6 +22,13 @@ pub const Severity = enum { off, warning, @"error" };
 /// unconfirmed finding stays `.unknown`, never auto-`.refuted`.
 pub const Verdict = enum { unknown, confirmed, refuted };
 
+/// A reported source position.
+///
+/// Requires a valid AST with source shorter than `maxInt(u32)` bytes.
+/// Analyzer entry points reject wider buffers before parsing or copying;
+/// `FileCache.init` checks caller-supplied ASTs. The strict bound preserves
+/// 1-indexed lines and columns, whereas AST byte offsets alone also permit
+/// a source of exactly `maxInt(u32)` bytes.
 pub const Pos = struct {
     /// 1-indexed line number.
     line: u32,
@@ -30,24 +37,34 @@ pub const Pos = struct {
     /// Byte offset into the source file.
     byte: u32,
 
+    fn assertSourceFits(tree: *const std.zig.Ast) void {
+        std.debug.assert(tree.source.len < std.math.maxInt(u32));
+    }
+
     pub fn fromTokenStart(tree: *const std.zig.Ast, tok: std.zig.Ast.TokenIndex) Pos {
+        assertSourceFits(tree);
+        const starts = tree.tokens.items(.start);
         const loc = tree.tokenLocation(0, tok);
         return .{
             .line = @intCast(loc.line + 1),
             .column = @intCast(loc.column + 1),
-            .byte = @intCast(tree.tokens.items(.start)[tok]),
+            // The byte offset is the token's own, already `u32`.
+            .byte = starts[tok],
         };
     }
 
     pub fn fromTokenEnd(tree: *const std.zig.Ast, tok: std.zig.Ast.TokenIndex) Pos {
-        const start = tree.tokens.items(.start)[tok];
-        const slice = tree.tokenSlice(tok);
-        const end_byte: u32 = @intCast(start + slice.len);
+        assertSourceFits(tree);
+        const starts = tree.tokens.items(.start);
+        const length = std.math.cast(u32, tree.tokenSlice(tok).len) orelse unreachable;
+        const end = starts[tok] + length;
         const loc = tree.tokenLocation(0, tok);
         return .{
             .line = @intCast(loc.line + 1),
-            .column = @intCast(loc.column + 1 + slice.len),
-            .byte = end_byte,
+            // The end's column on the start's line: both are offsets
+            // into the same buffer, so their difference is a column.
+            .column = @intCast(end - loc.line_start + 1),
+            .byte = end,
         };
     }
 };
@@ -85,3 +102,13 @@ pub const Problem = struct {
         if (self.witness) |w| gpa.free(w);
     }
 };
+
+test "diagnostic token ends exclude inter-token whitespace and comments" {
+    const allocator = std.testing.allocator;
+    const source = "const alpha = 1 /* gap */ ;";
+    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    defer tree.deinit(allocator);
+
+    const end = Pos.fromTokenEnd(&tree, 3);
+    try std.testing.expectEqual(Pos{ .line = 1, .column = 16, .byte = 15 }, end);
+}

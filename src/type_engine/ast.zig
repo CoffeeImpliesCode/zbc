@@ -9,8 +9,8 @@ const Node = Ast.Node;
 const full = Ast.full;
 
 fn fullPtrTypeComponents(tree: *const Ast, info: full.PtrType.Components) full.PtrType {
-    const size: std.lang.Type.Pointer.Size = switch (tree.tokenTag(info.main_token)) {
-        .asterisk => .one,
+    const size: std.builtin.Type.Pointer.Size = switch (tree.tokenTag(info.main_token)) {
+        .asterisk, .asterisk_asterisk => .one,
         .l_bracket => switch (tree.tokenTag(info.main_token + 1)) {
             .asterisk => if (tree.tokenTag(info.main_token + 2) == .identifier) .c else .many,
             else => .slice,
@@ -395,12 +395,18 @@ fn findMatchingRBrace(tree: *const Ast, start: Ast.TokenIndex) ?Ast.TokenIndex {
 }
 
 pub fn isKeyword(tag: std.zig.Token.Tag) bool {
-    const tags = std.zig.Token.keywords.values();
-    var first_keyword: std.meta.Tag(std.zig.Token.Tag) = @intFromEnum(tags[0]);
-    var last_keyword: std.meta.Tag(std.zig.Token.Tag) = @intFromEnum(tags[tags.len - 1]);
+    // `std.zig.Token.keywords` is a fixed compile-time table, so both bounds
+    // are folded over every entry it holds.  Seeding the fold from the ends
+    // of the tag domain keeps it clear of the table itself: naming "the
+    // first" or "the last" entry would need an index that a table is not
+    // obliged to have, and the folded answer of an empty table - no tag -
+    // is the right one for a table that holds no keywords.
+    var first_keyword: std.meta.Tag(std.zig.Token.Tag) = std.math.maxInt(std.meta.Tag(std.zig.Token.Tag));
+    var last_keyword: std.meta.Tag(std.zig.Token.Tag) = 0;
     for (std.zig.Token.keywords.values()) |token_tag| {
-        first_keyword = @min(@intFromEnum(token_tag), first_keyword);
-        last_keyword = @max(@intFromEnum(token_tag), last_keyword);
+        const value = @intFromEnum(token_tag);
+        first_keyword = @min(value, first_keyword);
+        last_keyword = @max(value, last_keyword);
     }
     return first_keyword <= @intFromEnum(tag) and @intFromEnum(tag) <= last_keyword;
 }
@@ -417,7 +423,7 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) Ast.TokenIndex {
     var n = node;
     var end_offset: u32 = 0;
     const last_token = while (true) switch (tree.nodeTag(n)) {
-        .root => return @intCast(tree.tokens.len - 1),
+        .root => return tree.lastToken(.root),
 
         .bool_not,
         .negation,
@@ -466,6 +472,7 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) Ast.TokenIndex {
         .add,
         .sub,
         .array_cat,
+        .array_mult,
         .add_wrap,
         .sub_wrap,
         .add_sat,
@@ -489,7 +496,8 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) Ast.TokenIndex {
         => n = tree.nodeData(n).node_and_node[1],
 
         .test_decl => n = tree.nodeData(n).opt_token_and_node[1],
-        .@"errdefer", .@"defer" => n = tree.nodeData(n).node,
+        .@"errdefer" => n = tree.nodeData(n).opt_token_and_node[1],
+        .@"defer" => n = tree.nodeData(n).node,
         .anyframe_type => n = tree.nodeData(n).token_and_node[1],
 
         .switch_case_one,
@@ -649,10 +657,13 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) Ast.TokenIndex {
             };
             var buffer: [2]Node.Index = undefined;
             const array_init = tree.fullArrayInit(&buffer, n).?;
-            const last_element = array_init.ast.elements[array_init.ast.elements.len - 1];
-            end_offset += @intFromBool(has_comma);
             end_offset += 1; // rbrace
-            n = last_element;
+            if (array_init.ast.elements.len == 0) {
+                break tree.nodeMainToken(n);
+            } else {
+                end_offset += @intFromBool(has_comma);
+                n = array_init.ast.elements[array_init.ast.elements.len - 1];
+            }
         },
 
         .struct_init_one,
@@ -1053,7 +1064,15 @@ pub const FnParamIterator = struct {
 };
 
 pub const Iterator = union(enum) {
-    array: [5]Ast.Node.OptionalIndex,
+    /// The `.array` variant is a fixed register file rather than a
+    /// runtime-length list, so its length is a compile-time constant and the
+    /// slot `next` vacates at the end of every step is named rather than
+    /// recomputed from a length that a zero-length collection could not
+    /// supply.
+    const slot_count = 5;
+    const last_slot = slot_count - 1;
+
+    array: [slot_count]Ast.Node.OptionalIndex,
     sub_range: struct {
         prefix: Ast.Node.OptionalIndex = .none,
         items: Ast.Node.SubRange,
@@ -1085,10 +1104,10 @@ pub const Iterator = union(enum) {
             .@"resume",
             .@"comptime",
             .@"nosuspend",
-            .@"errdefer",
             .@"defer",
             => return .initArray(.{tree.nodeData(node).node}),
             .@"return" => return .initArray(.{tree.nodeData(node).opt_node}),
+            .@"errdefer" => return .initArray(.{tree.nodeData(node).opt_token_and_node[1]}),
 
             .@"catch",
             .equal_equal,
@@ -1124,6 +1143,7 @@ pub const Iterator = union(enum) {
             .add,
             .sub,
             .array_cat,
+            .array_mult,
             .add_wrap,
             .sub_wrap,
             .add_sat,
@@ -1410,8 +1430,8 @@ pub const Iterator = union(enum) {
         sw: switch (it.*) {
             .array => |*array| {
                 const result = array[0].unwrap() orelse return null;
-                @memmove(array[0 .. array.len - 1], array[1..]);
-                array[array.len - 1] = .none;
+                @memmove(array[0..last_slot], array[1..]);
+                array[last_slot] = .none;
                 return result;
             },
             .sub_range => |*sub_range| {
