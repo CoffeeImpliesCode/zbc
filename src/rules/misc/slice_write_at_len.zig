@@ -47,7 +47,7 @@ pub fn check(
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 7) return;
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     var t: Ast.TokenIndex = 0;
     while (t + 6 <= last_tok) : (t += 1) {

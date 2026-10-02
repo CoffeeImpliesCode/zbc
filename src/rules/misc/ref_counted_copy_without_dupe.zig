@@ -82,7 +82,7 @@ pub fn check(
     _ = cache;
 
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     // ── Pass 1: collect evidenced field names ─────────────────────────────
     // Scan the whole file for `identifier . FIELD . <acquire_or_release> (`.
@@ -215,12 +215,12 @@ fn sourceIsClearedAfter(
         // Empty init: `= {}`, `= .{}`, or `.empty`
         if (k + 4 > end) continue;
         switch (tags[k + 4]) {
-            .l_brace => return true,               // `= {`
+            .l_brace => return true, // `= {`
             .period => {
                 if (k + 5 > end) continue;
                 switch (tags[k + 5]) {
-                    .l_brace => return true,       // `= .{`
-                    .identifier => {               // `= .empty` / `= .none` / `= .zero`
+                    .l_brace => return true, // `= .{`
+                    .identifier => { // `= .empty` / `= .none` / `= .zero`
                         const w = tree.tokenSlice(k + 5);
                         if (std.mem.eql(u8, w, "empty") or
                             std.mem.eql(u8, w, "none") or
@@ -262,7 +262,10 @@ fn isRefcountedFieldName(name: []const u8) bool {
         if (suffix.len > 0) {
             var all_digits = true;
             for (suffix) |c| {
-                if (!std.ascii.isDigit(c)) { all_digits = false; break; }
+                if (!std.ascii.isDigit(c)) {
+                    all_digits = false;
+                    break;
+                }
             }
             if (all_digits) return false;
         }

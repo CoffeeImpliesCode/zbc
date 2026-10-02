@@ -38,7 +38,7 @@ pub fn check(
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 6) return;
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     var t: Ast.TokenIndex = 0;
     while (t + 5 <= last_tok) : (t += 1) {
@@ -94,7 +94,8 @@ fn report(
     tree: *const Ast,
     allocator_tok: Ast.TokenIndex,
 ) !void {
-    const msg = try gpa.dupe(u8,
+    const msg = try gpa.dupe(
+        u8,
         "`.allocator().free(...)` is a no-op on arena-style allocators — `ArenaAllocator` does not free individual allocations; memory is reclaimed only when the arena itself is deinitialized via `.deinit()`",
     );
     errdefer gpa.free(msg);

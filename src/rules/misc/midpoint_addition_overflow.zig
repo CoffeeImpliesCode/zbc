@@ -1,30 +1,15 @@
-//! Detects `(a + b) / 2` — the classic binary-search midpoint overflow.
-//! If `a` and `b` are both at their maximum values, `a + b` overflows the
-//! integer type before the division, producing a wrong or wrapped midpoint.
-//! The correct form is `a + (b - a) / 2` (or `left + (right - left) / 2`).
-//!
-//! Real-world instances:
-//!   - ziglang/zig#20029 (std.sort.upperBound): `mid = (right + left) / 2` — overflow
-//!     for bounds near `maxInt(usize)`.  Fix: `left + (right - left) / 2`.
-//!   - ziglang/zig#18718 (std.sort.lowerBound / equalRange): same pattern.
-//!
-//! Detection (Tier 1, flat token walk):
-//!   Pattern: `( identifier + identifier ) / 2`  — 7 tokens.
-//!   Fire at the `(` token.
-//!   Also catches `( identifier + identifier ) / 2` when the literal is `number_literal("2")`.
-//!   Does NOT fire for `(a + b) / other_var` (not a division by 2) or
-//!   `(a + b) / 2` inside a `comptime` expression (compiler catches overflow).
-
+//! Report midpoint sums without a proved non-overflowing integer range.
 const std = @import("std");
 const Ast = std.zig.Ast;
-
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
+const tokens = @import("../../ast/tokens.zig");
+const value_range = @import("../../flow/value_range.zig");
 const testing = @import("../../testing.zig");
-
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+
 const R = "midpoint-addition-overflow";
 
 pub fn check(
@@ -35,209 +20,200 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .midpoint_addition_overflow)) return;
-
-    const tags = tree.tokens.items(.tag);
-    if (tree.tokens.len < 7) return;
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
-
-    // Map identifier-reference AST nodes by their main token so the type
-    // engine can resolve the operand types.  Empty when engine is absent.
-    var ident_nodes: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
-    defer ident_nodes.deinit(gpa);
-    {
-        var ni: u32 = 0;
-        while (ni < tree.nodes.len) : (ni += 1) {
-            const node: Ast.Node.Index = @enumFromInt(ni);
-            if (tree.nodeTag(node) == .identifier) {
-                try ident_nodes.put(gpa, tree.nodeMainToken(node), node);
-            }
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const operands: [2]Ast.Node.Index = switch (tag) {
+            .div => tree.nodeData(node).node_and_node,
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (!std.mem.eql(u8, name, "@divTrunc") and
+                    !std.mem.eql(u8, name, "@divFloor") and
+                    !std.mem.eql(u8, name, "@divExact")) continue;
+                const params = tree.builtinCallParams(&buffer, node).?;
+                if (params.len != 2) continue;
+                break :blk .{ params[0], params[1] };
+            },
+            else => continue,
+        };
+        if (tree.nodeTag(operands[1]) != .number_literal) continue;
+        const divisor = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(operands[1])), 0) catch continue;
+        if (divisor != 2) continue;
+        const sum = addition(tree, operands[0]) orelse continue;
+        if (cache.isFloatType(sum) == true) continue;
+        const token = tree.firstToken(sum);
+        const declaration = tokens.enclosingFnDecl(tree, token) orelse continue;
+        if (!tokens.isRuntimeUse(tree, declaration, token)) continue;
+        if (cache.intInfoOf(sum)) |integer| {
+            const bounds = try value_range.boundsAt(gpa, tree, tokens.bodyOf(tree, declaration).?, sum, token, cache);
+            if (bounds.fitsInteger(integer.bits, integer.signed)) continue;
         }
-    }
-
-    var t: Ast.TokenIndex = 0;
-    while (t + 6 <= last_tok) : (t += 1) {
-        // Pattern: ( identifier + identifier ) / 2
-        if (tags[t] != .l_paren) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .plus) continue;
-        if (tags[t + 3] != .identifier) continue;
-        if (tags[t + 4] != .r_paren) continue;
-        if (tags[t + 5] != .slash) continue;
-        if (tags[t + 6] != .number_literal) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 6), "2")) continue;
-
-        const a = tree.tokenSlice(t + 1);
-        const b = tree.tokenSlice(t + 3);
-
-        // Type-engine suppression: if the type engine resolves either
-        // operand to a float type (f16/f32/f64/f128), addition cannot
-        // overflow in the integer sense — suppress.
-        if (operandIsFloat(cache, &ident_nodes, t + 1) or
-            operandIsFloat(cache, &ident_nodes, t + 3)) continue;
-
-        // Syntactic fallback: suppress when either operand is declared
-        // with float arithmetic nearby (catches @floatFromInt / f64 decls
-        // when the type engine is absent).
-        if (hasFloatDecl(tags, tree, t, a) or hasFloatDecl(tags, tree, t, b)) continue;
-        try report(gpa, problems, tree, t, a, b);
+        const message = try gpa.dupe(u8, "the midpoint sum was not proved to fit its integer type before division; prove bounds for the addition or widen the operands before adding");
+        errdefer gpa.free(message);
+        try problems.append(gpa, .{
+            .rule_id = R,
+            .severity = .warning,
+            .start = Pos.fromTokenStart(tree, token),
+            .end = Pos.fromTokenEnd(tree, tree.lastToken(node)),
+            .message = message,
+        });
     }
 }
 
-/// True iff the identifier at `tok` resolves to a float type via the type
-/// engine.  Floats are `simple_type`s, not containers, so `typeNameOfNode`
-/// (container-only) can never report them — `isFloatType` inspects the
-/// resolved type's InternPool key directly.  Resolves through local-variable
-/// initializers (`const start_y = metrics.face_y + …` ⇒ f64), so float
-/// midpoints written over derived locals are suppressed.
-fn operandIsFloat(
-    cache: *file_cache_mod.FileCache,
-    ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
-    tok: Ast.TokenIndex,
-) bool {
-    const node = ident_nodes.get(tok) orelse return false;
-    return cache.isFloatType(node);
-}
-
-fn report(
-    gpa: std.mem.Allocator,
-    problems: *std.ArrayListUnmanaged(Problem),
-    tree: *const Ast,
-    lparen_tok: Ast.TokenIndex,
-    a: []const u8,
-    b: []const u8,
-) !void {
-    const msg = try std.fmt.allocPrint(
-        gpa,
-        "`({s} + {s}) / 2` overflows when `{s} + {s}` exceeds the integer type's maximum; use `{s} + ({s} - {s}) / 2` to compute the midpoint without overflow",
-        .{ a, b, a, b, a, b, a },
-    );
-    errdefer gpa.free(msg);
-    try problems.append(gpa, .{
-        .rule_id = R,
-        .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, lparen_tok),
-        .end = Pos.fromTokenEnd(tree, lparen_tok + 6),
-        .message = msg,
-    });
-}
-
-/// Returns true when the nearest `const/var VAR_NAME = …` declaration visible
-/// before `anchor` contains a float marker in its initialiser: a `@floatFromInt`
-/// or `@floatCast` builtin, a float type identifier (`f32`, `f64`, `f128`,
-/// `f16`), or a number literal that contains a `.` (e.g. `255.0`).
-/// Scans backward up to 150 tokens to find the declaration, then forward up
-/// to 60 tokens into the initialiser for the marker.
-fn hasFloatDecl(
-    tags: []const std.zig.Token.Tag,
-    tree: *const Ast,
-    anchor: Ast.TokenIndex,
-    var_name: []const u8,
-) bool {
-    const back_window: Ast.TokenIndex = 150;
-    const fwd_window: Ast.TokenIndex = 60;
-    const start: Ast.TokenIndex = if (anchor >= back_window) anchor - back_window else 0;
-    var k = anchor;
-    while (k > start + 1) {
-        k -= 1;
-        if (tags[k] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(k), var_name)) continue;
-        if (tags[k - 1] != .keyword_const and tags[k - 1] != .keyword_var) continue;
-        // Found `const/var VAR_NAME`; scan forward for float markers.
-        const decl_end = @min(k + fwd_window, anchor);
-        var j = k + 1;
-        while (j < decl_end) : (j += 1) {
-            switch (tags[j]) {
-                .builtin => {
-                    const s = tree.tokenSlice(j);
-                    if (std.mem.eql(u8, s, "@floatFromInt") or
-                        std.mem.eql(u8, s, "@floatCast")) return true;
-                },
-                .identifier => {
-                    const s = tree.tokenSlice(j);
-                    if (std.mem.eql(u8, s, "f32") or
-                        std.mem.eql(u8, s, "f64") or
-                        std.mem.eql(u8, s, "f128") or
-                        std.mem.eql(u8, s, "f16")) return true;
-                },
-                .number_literal => {
-                    if (std.mem.indexOf(u8, tree.tokenSlice(j), ".") != null) return true;
-                },
-                else => {},
-            }
-        }
+fn addition(tree: *const Ast, original: Ast.Node.Index) ?Ast.Node.Index {
+    var node = original;
+    for (0..64) |_| {
+        if (tree.nodeTag(node) == .add) return node;
+        if (tree.nodeTag(node) != .grouped_expression) return null;
+        node = tree.nodeData(node).node_and_token[0];
     }
-    return false;
+    return null;
 }
 
-// ── Tests ──────────────────────────────────────────────────
-
-test "midpoint-addition-overflow: fires on (left + right) / 2" {
-    try testing.expectFires(check, R,
-        \\fn midpoint(left: usize, right: usize) usize {
+test "midpoint-addition-overflow: range proof accepts bounded operands" {
+    try testing.expectNoFireTyped(check,
+        \\fn middle(left: u32, right: u32) u32 {
+        \\    if (left > 100 or right > 100) return 0;
         \\    return (left + right) / 2;
         \\}
-        \\
     );
 }
 
-test "midpoint-addition-overflow: fires on binary search pattern" {
-    try testing.expectFires(check, R,
-        \\fn binarySearch(items: []const u32, target: u32) ?usize {
-        \\    var left: usize = 0;
-        \\    var right: usize = items.len;
-        \\    while (left < right) {
-        \\        const mid = (left + right) / 2;
-        \\        if (items[mid] == target) return mid;
-        \\        if (items[mid] < target) left = mid + 1 else right = mid;
+test "midpoint-addition-overflow: range proof ignores unrelated float declarations" {
+    try testing.expectFiresTyped(check, R,
+        \\fn middle(x: u32, y: u32) u32 {
+        \\    const left = x;
+        \\    const scale: f32 = 0.0;
+        \\    _ = scale;
+        \\    const right = y;
+        \\    return (left + right) / 2;
+        \\}
+    );
+}
+
+test "midpoint-addition-overflow: unbounded sum remains uncertain" {
+    try testing.expectFiresTyped(check, R,
+        \\fn midpoint(left: usize, right: usize) usize { return (left + right) / 2; }
+    );
+}
+
+test "midpoint-addition-overflow: floating arithmetic is not integer overflow" {
+    try testing.expectNoFireTyped(check,
+        \\fn midpoint(left: f64, right: f64) f64 { return (left + right) / 2; }
+    );
+}
+
+test "midpoint-addition-overflow: subtraction formulation is outside this rule" {
+    try testing.expectNoFireTyped(check,
+        \\fn midpoint(left: usize, right: usize) usize { return left + (right - left) / 2; }
+    );
+}
+
+test "midpoint-addition-overflow: loop induction proves a fixed table envelope" {
+    try testing.expectNoFireTyped(check,
+        \\fn search(value: f64, table: *const [29]f64) usize {
+        \\    var lower: usize = 0;
+        \\    var upper: usize = table.len;
+        \\    while (lower + 1 < upper) {
+        \\        const middle = (lower + upper) / 2;
+        \\        if (table[middle] < value) lower = middle else upper = middle;
         \\    }
-        \\    return null;
+        \\    return lower;
         \\}
-        \\
     );
 }
 
-test "midpoint-addition-overflow: correct form does not fire" {
-    try testing.expectNoFire(check,
-        \\fn midpoint(left: usize, right: usize) usize {
-        \\    return left + (right - left) / 2;
+test "midpoint-addition-overflow: loop induction rejects a growing upper bound" {
+    try testing.expectFiresTyped(check, R,
+        \\fn search(table: *const [256]bool) u8 {
+        \\    var lower: u8 = 0;
+        \\    var upper: u8 = 100;
+        \\    while (lower + 1 < upper) {
+        \\        const middle = (lower + upper) / 2;
+        \\        if (table[middle]) lower = middle else upper += 100;
+        \\    }
+        \\    return lower;
         \\}
-        \\
     );
 }
 
-test "midpoint-addition-overflow: division by non-2 does not fire" {
-    try testing.expectNoFire(check,
-        \\fn third(a: usize, b: usize) usize {
-        \\    return (a + b) / 3;
+test "midpoint-addition-overflow: signed division builtins retain addition risk" {
+    try testing.expectFiresTyped(check, R,
+        \\fn midpoint(left: i32, right: i32) i32 {
+        \\    return @divTrunc(left + right, 2);
         \\}
-        \\
+    );
+    try testing.expectNoFireTyped(check,
+        \\fn midpoint(left: i32, right: i32) i32 {
+        \\    if (left < -100 or left > 100 or right < -100 or right > 100) return 0;
+        \\    return @divFloor(left + right, 2);
+        \\}
     );
 }
 
-test "midpoint-addition-overflow: variable divisor does not fire" {
-    try testing.expectNoFire(check,
-        \\fn avg(a: usize, b: usize, n: usize) usize {
-        \\    return (a + b) / n;
+test "midpoint-addition-overflow: body invariants exclude terminating search states" {
+    try testing.expectNoFireTyped(check,
+        \\fn search(value: i64, table: *const [97]i64) i32 {
+        \\    var lower: i32 = 0;
+        \\    var upper: i32 = @intCast(table.len - 1);
+        \\    while (lower <= upper) {
+        \\        const middle = @divTrunc(lower + upper, 2);
+        \\        const element = table[@intCast(middle)];
+        \\        if (element < value) lower = middle + 1
+        \\        else if (element > value) upper = middle - 1
+        \\        else return middle;
+        \\    }
+        \\    return -1;
         \\}
-        \\
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn search(value: i64, table: *const [97]i64) i8 {
+        \\    var lower: i8 = 0;
+        \\    var upper: i8 = @intCast(table.len - 1);
+        \\    while (lower <= upper) {
+        \\        const middle = @divTrunc(lower + upper, 2);
+        \\        const element = table[@intCast(middle)];
+        \\        if (element < value) lower = middle + 1
+        \\        else if (element > value) upper = middle - 1
+        \\        else return middle;
+        \\    }
+        \\    return -1;
+        \\}
     );
 }
 
-// NOTE: the type-engine float suppression (`operandIsFloat` → `isFloatType`)
-// is validated live against the corpus, not here: the unit-test harness runs
-// token-only (no resolver), so f64-typed locals can't be distinguished from
-// integers without the engine.  The `hasFloatDecl` syntactic fallback is what
-// the tests below exercise.  Regression covered live by ghostty font/face.zig
-// (`(start_y + end_y) / 2`, start_y/end_y inferred f64 → suppressed).
-
-test "midpoint-addition-overflow: f32 pixel operands do not fire" {
-    try testing.expectNoFire(check,
-        \\fn encode(rgba: []const u8) void {
-        \\    const al: f32 = @as(f32, @floatFromInt(rgba[3])) / 255.0;
-        \\    const r = @as(f32, @floatFromInt(rgba[0])) * al;
-        \\    const g = @as(f32, @floatFromInt(rgba[1])) * al;
-        \\    _ = (r + g) / 2;
+test "midpoint-addition-overflow: nested searches preserve only unchanged outer bounds" {
+    try testing.expectNoFireTyped(check,
+        \\fn search(value: i64, table: *const [97]i64) i32 {
+        \\    var lower: i32 = 0;
+        \\    var upper: i32 = @intCast(table.len - 1);
+        \\    while (lower <= upper) {
+        \\        const middle = @divTrunc(lower + upper, 2);
+        \\        const element = table[@intCast(middle)];
+        \\        if (element < value) lower = middle + 1
+        \\        else if (element > value) upper = middle - 1
+        \\        else {
+        \\            var offset: i8 = -1;
+        \\            while (offset <= 1) : (offset += 1) {
+        \\                if (offset == 0) return middle;
+        \\            }
+        \\            break;
+        \\        }
+        \\    }
+        \\    return -1;
         \\}
-        \\
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn growing(limit: u8) u8 {
+        \\    const lower: u8 = 16;
+        \\    var upper: u8 = 96;
+        \\    while (lower <= upper) {
+        \\        const middle = (lower + upper) / 2;
+        \\        if (middle == limit) return middle;
+        \\        var index: u8 = 0;
+        \\        while (index < 2) : (index += 1) upper += 1;
+        \\    }
+        \\    return 0;
+        \\}
     );
 }

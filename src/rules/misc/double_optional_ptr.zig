@@ -38,7 +38,7 @@ pub fn check(
     if (!config_mod.isEnabled(config, .double_optional_ptr)) return;
 
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     // Map identifier nodes by main token so the inner `T` of `?*?T` can be
     // resolved to its denoted type.  Empty/unused without the type engine.

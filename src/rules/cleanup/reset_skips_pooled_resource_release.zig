@@ -46,10 +46,13 @@ pub fn check(
     if (!config_mod.isEnabled(config, .reset_skips_pooled_resource_release)) return;
     _ = cache;
 
+    if (tree.tokens.len == 0) return;
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
-    if (tok_count == 0) return;
-    const last: Ast.TokenIndex = tok_count - 1;
+    // The root decl runs to the final token of the stream, so its last token
+    // is exactly the old `tok_count - 1` — the exclusive upper bound the walk
+    // below needs — without narrowing a `usize` length into the token index
+    // type on the way in.
+    const last: Ast.TokenIndex = tree.lastToken(.root);
 
     var t: Ast.TokenIndex = 0;
     while (t + 1 < last) : (t += 1) {

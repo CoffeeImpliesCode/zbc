@@ -100,8 +100,14 @@ fn checkBody(
     var brace_depth: u32 = 0;
     var t: Ast.TokenIndex = first;
     while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .l_brace) { brace_depth += 1; continue; }
-        if (tags[t] == .r_brace) { if (brace_depth > 0) brace_depth -= 1; continue; }
+        if (tags[t] == .l_brace) {
+            brace_depth += 1;
+            continue;
+        }
+        if (tags[t] == .r_brace) {
+            if (brace_depth > 0) brace_depth -= 1;
+            continue;
+        }
         if (tags[t] == .keyword_fn) {
             t = skipNestedFn(tags, t, last);
             continue;
@@ -170,8 +176,7 @@ fn checkBody(
             var depth_left = brace_depth;
             var s = semi + 1;
             while (s <= last) : (s += 1) {
-                if (tags[s] == .l_brace) depth_left += 1
-                else if (tags[s] == .r_brace) {
+                if (tags[s] == .l_brace) depth_left += 1 else if (tags[s] == .r_brace) {
                     depth_left -= 1;
                     if (depth_left < brace_depth) break :blk s - 1;
                 }

@@ -42,11 +42,11 @@ pub fn check(
     _ = cache;
 
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     var test_ranges: std.ArrayListUnmanaged(Range) = .empty;
     defer test_ranges.deinit(gpa);
-    try collectTestRanges(gpa, tags, &test_ranges);
+    try collectTestRanges(gpa, tags, last_tok, &test_ranges);
 
     var t: Ast.TokenIndex = 0;
     while (t + 2 <= last_tok) : (t += 1) {
@@ -80,26 +80,26 @@ pub fn check(
 fn collectTestRanges(
     gpa: std.mem.Allocator,
     tags: []const std.zig.Token.Tag,
+    last_tok: Ast.TokenIndex,
     out: *std.ArrayListUnmanaged(Range),
 ) !void {
-    const n: u32 = @intCast(tags.len);
     var i: Ast.TokenIndex = 0;
-    while (i < n) : (i += 1) {
+    while (i <= last_tok) : (i += 1) {
         if (tags[i] != .keyword_test) continue;
         var j = i + 1;
-        while (j < n and tags[j] != .l_brace) : (j += 1) {
+        while (j <= last_tok and tags[j] != .l_brace) : (j += 1) {
             if (tags[j] == .semicolon or tags[j] == .r_brace) break;
         }
-        if (j >= n or tags[j] != .l_brace) continue;
+        if (j > last_tok or tags[j] != .l_brace) continue;
         var depth: u32 = 0;
         var k = j;
-        while (k < n) : (k += 1) {
+        while (k <= last_tok) : (k += 1) {
             if (tags[k] == .l_brace) depth += 1 else if (tags[k] == .r_brace) {
                 depth -= 1;
                 if (depth == 0) break;
             }
         }
-        if (k >= n) break;
+        if (k > last_tok) break;
         try out.append(gpa, .{ .start = i, .end = k });
         i = k;
     }

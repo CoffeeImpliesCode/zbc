@@ -77,7 +77,7 @@ fn checkBody(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const ct = ct_ti.name;
+    const ct = ct_ti.qualified_name;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -248,24 +248,11 @@ fn checkBody(
             t = sc;
             continue;
         }
-        // Enum leaf-type skip: when the field's qualified type
-        // path resolves to an `enum` in the model, the field has
-        // no payload and can never leak.  Uses
-        // `resolveFieldTypeQualifiedTi` so `state: Result.Pending.State`
-        // resolves to the NESTED `State` (an enum) rather than the
-        // outer `Result` union.  Falls back to leaf-identifier
-        // scan when the qualified resolver can't follow the chain.
+        // Enum values have no owned payload.
         if (model.resolveFieldTypeQualifiedTi(ct_ti, field_name)) |leaf_ti| {
             if (leaf_ti.kind == .enum_) {
                 t = sc;
                 continue;
-            }
-        } else if (fieldTypeLastIdent(tree, model, ct, field_name)) |leaf| {
-            if (model.findType(leaf)) |leaf_ti| {
-                if (leaf_ti.kind == .enum_) {
-                    t = sc;
-                    continue;
-                }
             }
         }
         // Tagged-union variant analysis: if the field's type is
@@ -276,54 +263,35 @@ fn checkBody(
         // variant carries no owned payload, the retag doesn't
         // leak — there was nothing to deinit.
         //
-        // Resolve the field's QUALIFIED type path
-        // (`Result.Pending.State` → nested `State`).  Fall back to
-        // leaf-id and first-id lookups when the qualified resolver
-        // can't follow the chain.
-        const qualified_ti = model.resolveFieldTypeQualifiedTi(ct_ti, field_name);
-        const last_id = fieldTypeLastIdent(tree, model, ct, field_name) orelse field_type;
-        const union_ti: ?*const file_model.TypeInfo = blk: {
-            if (qualified_ti) |q| if (q.kind == .union_) break :blk q;
-            // Scope-aware lookup: when multiple like-named types
-            // exist in the file (e.g. Writable.Pending.Future and
-            // Result.Pending.Future), prefer the one in the SAME
-            // enclosing scope as the outer struct holding the
-            // field.  Resolves name-collisions that findType's
-            // first-match behavior gets wrong.
-            const scope_ti = model.findTypeInScope(last_id, ct_ti) orelse model.findTypeInScope(field_type, ct_ti);
-            if (scope_ti) |s| if (s.kind == .union_) break :blk s;
-            if (model.isTaggedUnion(last_id)) break :blk model.findType(last_id);
-            if (model.isTaggedUnion(field_type)) break :blk model.findType(field_type);
-            break :blk null;
-        };
+        const union_ti = model.resolveFieldTypeQualifiedTi(ct_ti, field_name);
         if (union_ti) |un| {
-            if (taggedUnionRetagIsSafeTi(tree, model, un,
-                first, t, sc, this_name, field_name, ct)) {
-                t = sc;
-                continue;
-            }
-            // `= undefined` default: no prior value to deinit.
-            // Use ct_ti directly to avoid the name-keyed findType
-            // collision (Writable.Pending vs Result.Pending both
-            // named "Pending").
-            if (fieldDefaultIsUndefinedTi(tree, ct_ti, field_name) and
-                !priorWriteInFn(tree, first, t, this_name, field_name))
-            {
-                t = sc;
-                continue;
-            }
-            // Switch-arm awareness: when the assignment sits in
-            // an arm of `switch (<this>.<field>) { ... }`, the
-            // prior variant is constrained by the arm pattern.
-            //  - `.X =>` arm: prior IS `.X` (just matched).
-            //  - `else =>` arm: prior is in the COMPLEMENT of the
-            //    explicit arms.
-            // If every constrained-prior variant is non-owned,
-            // the retag doesn't leak.
-            if (switchArmRetagIsSafeTi(tree, model, un, first, t,
-                this_name, field_name)) {
-                t = sc;
-                continue;
+            if (un.kind == .union_) {
+                if (taggedUnionRetagIsSafeTi(tree, model, un, first, t, sc, this_name, field_name, ct)) {
+                    t = sc;
+                    continue;
+                }
+                // `= undefined` default: no prior value to deinit.
+                // Use ct_ti directly to avoid the name-keyed findType
+                // collision (Writable.Pending vs Result.Pending both
+                // named "Pending").
+                if (fieldDefaultIsUndefinedTi(tree, ct_ti, field_name) and
+                    !priorWriteInFn(tree, first, t, this_name, field_name))
+                {
+                    t = sc;
+                    continue;
+                }
+                // Switch-arm awareness: when the assignment sits in
+                // an arm of `switch (<this>.<field>) { ... }`, the
+                // prior variant is constrained by the arm pattern.
+                //  - `.X =>` arm: prior IS `.X` (just matched).
+                //  - `else =>` arm: prior is in the COMPLEMENT of the
+                //    explicit arms.
+                // If every constrained-prior variant is non-owned,
+                // the retag doesn't leak.
+                if (switchArmRetagIsSafeTi(tree, model, un, first, t, this_name, field_name)) {
+                    t = sc;
+                    continue;
+                }
             }
         }
         try report(gpa, problems, tree, t, this_name, field_name, ct);
@@ -628,27 +596,6 @@ fn skipPastVariantPayload(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex
     return last;
 }
 
-/// Extract the LAST identifier of a field's declared type path.
-/// `state: Result.Pending.State = .none` → "State".  Used to find
-/// the LEAF type for tagged-union variant lookups when the field
-/// type is qualified across nested type scopes.
-fn fieldTypeLastIdent(
-    tree: *const Ast,
-    model: *const file_model.FileModel,
-    struct_name: []const u8,
-    field_name: []const u8,
-) ?[]const u8 {
-    const ti = model.findType(struct_name) orelse return null;
-    const f = ti.findField(field_name) orelse return null;
-    const tags = tree.tokens.items(.tag);
-    var last_id: ?[]const u8 = null;
-    var t = f.type_first;
-    while (t <= f.type_last) : (t += 1) {
-        if (tags[t] == .identifier) last_id = tree.tokenSlice(t);
-    }
-    return last_id;
-}
-
 /// Tagged-union retag safety analysis.  For a `<this>.<field> =
 /// .{ .<tag> = ... };` where `<field>`'s type is `union(enum)`,
 /// the retag is safe iff the PRIOR variant carried no owned
@@ -852,7 +799,10 @@ fn priorVariantInFn(
     while (t > body_first + 4) {
         t -= 1;
         switch (tags[t]) {
-            .r_brace => { depth += 1; continue; },
+            .r_brace => {
+                depth += 1;
+                continue;
+            },
             .l_brace => {
                 depth -= 1;
                 if (depth < 0) break; // exited enclosing block — stop

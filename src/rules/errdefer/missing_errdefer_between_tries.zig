@@ -572,7 +572,7 @@ fn rhsTypeViaZlsLacksDeinit(
     // FIRST matching node and try several end-token candidates.
     var end = b.rhs_last;
     while (end >= start) : (end -= 1) {
-        const name_opt = cache.typeNameOfExpr(start, end) catch null;
+        const name_opt = cache.typeReferenceOfExpr(start, end) catch null;
         if (name_opt) |name| {
             if (model.hasType(name)) {
                 if (!model.typeHasMethod(name, "deinit")) return true;
@@ -603,9 +603,8 @@ fn typeHasDeinitProject(
     if (model.fileIsTypeNamed(type_name)) {
         return model.typeOrFileHasMethod(type_name, "deinit");
     }
-    // Cross-file: scan @import("./...") declarations.
-    if (cache.findTypeAcrossImports(type_name)) |ti| {
-        return ti.hasMethod("deinit");
+    if (cache.findTypeAcrossImports(type_name)) |resolved| {
+        return resolved.info.hasMethod("deinit");
     }
     return true;
 }

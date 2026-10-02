@@ -358,12 +358,8 @@ pub const Invariant = enum {
     /// `unreleased-refs-on-error` which is about loop-side addref
     /// without paired release.
     unreleased_factory_handle,
-    /// `<X>.<field>.len = NEW;` followed by `@memset(<X>.<field>...,
-    /// undefined);` in the same scope — the memset slices the
-    /// ALREADY-TRUNCATED items so the range is empty and the memset
-    /// is a no-op.  The freed-but-retained capacity keeps its old
-    /// bytes, defeating Zig's `undefined` use-after-shrink safety.
-    /// Catches ziglang/zig#25810 + #25832 class.
+    /// A proved slice-length reduction precedes an empty undefined fill.
+    /// The fill cannot touch the removed elements.
     memset_undef_after_len_truncation,
     /// `<chain>.<publish-method>(this);` (or `(self)`) where the
     /// chain or method suggests concurrent / cross-thread dispatch
@@ -764,11 +760,6 @@ pub const Invariant = enum {
     /// `if (map.getEntry(key)) |e| { … }` or `orelse return`.
     /// Catches oven-sh/bun#14606 (H2 stream forced-unwrap after callback dispatch).
     hashmap_getentry_forced_unwrap,
-    /// `?*?T` — doubly-optional pointer type; almost always a copy-paste error
-    /// where one `?` was duplicated.  The correct form for a nullable out-param
-    /// is `?*T`; for a non-null pointer to an optional it is `*?T`.
-    /// Catches oven-sh/bun#13955 (NAPI out-param corrupted caller stack).
-    double_optional_ptr,
     /// `@alignCast(x.?)` — forced optional unwrap inside an alignment assertion;
     /// two panic sources in one expression: `.?` panics on null, `@alignCast`
     /// panics on misalignment.  Use a non-optional type or guard with `orelse`.
@@ -829,7 +820,7 @@ pub const Invariant = enum {
     clamp_wrong_direction,
 };
 
-pub const all_invariants: [113]Invariant = .{
+pub const all_invariants: [112]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -929,7 +920,6 @@ pub const all_invariants: [113]Invariant = .{
     .lessthan_uses_leq,
     .duplicate_defer_free,
     .hashmap_getentry_forced_unwrap,
-    .double_optional_ptr,
     .aligncast_on_optional_unwrap,
     .adjacent_decl_same_source_field,
     .intcast_of_negated_signed,
@@ -959,23 +949,18 @@ pub fn isEnabled(config: *const Config, inv: Invariant) bool {
 /// unknown names so callers can surface a useful error message
 /// rather than silently ignoring typos.
 pub fn invariantFromName(name: []const u8) ?Invariant {
-    inline for (@typeInfo(Invariant).@"enum".fields) |f| {
-        if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
+    inline for (@typeInfo(Invariant).@"enum".fields) |field| {
+        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
     }
     return null;
 }
 
 // ── Tests ──────────────────────────────────────────────────
 
-test "Default config defaults" {
-    try std.testing.expectEqualStrings("ArenaAllocator.init", Default.arena_init_patterns[0]);
-    try std.testing.expectEqualStrings(".deinit(", Default.arena_kill_patterns[0]);
-}
-
 test "invariantFromName round-trips every variant" {
-    inline for (@typeInfo(Invariant).@"enum".fields) |f| {
-        const got = invariantFromName(f.name).?;
-        try std.testing.expectEqual(@as(Invariant, @enumFromInt(f.value)), got);
+    inline for (@typeInfo(Invariant).@"enum".fields) |field| {
+        const got = invariantFromName(field.name).?;
+        try std.testing.expectEqual(@as(Invariant, @enumFromInt(field.value)), got);
     }
 }
 

@@ -167,7 +167,10 @@ fn checkFn(
         const recv = ca.receiver;
         if (recv.len == 0) continue;
         var recv_has_dot = false;
-        for (recv) |c| if (c == '.') { recv_has_dot = true; break; };
+        for (recv) |c| if (c == '.') {
+            recv_has_dot = true;
+            break;
+        };
         if (recv_has_dot) continue;
 
         try borrows.append(gpa, .{
@@ -186,8 +189,12 @@ fn checkFn(
         const scan_start = b.end_token + 1;
         if (scan_start > last) continue;
         const gc_tok = findGcTriggerCall(
-            tree, cache, tags,
-            scan_start, last, b.recv_name,
+            tree,
+            cache,
+            tags,
+            scan_start,
+            last,
+            b.recv_name,
         ) orelse continue;
         try reportProblem(gpa, problems, tree, b, gc_tok);
     }

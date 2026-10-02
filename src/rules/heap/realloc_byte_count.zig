@@ -30,7 +30,7 @@ pub fn check(
     _ = cache;
 
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
     var t: Ast.TokenIndex = 0;
     while (t + 3 < last_tok) : (t += 1) {
         // Match `.realloc (`.

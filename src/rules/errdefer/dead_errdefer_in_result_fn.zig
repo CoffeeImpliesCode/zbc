@@ -67,7 +67,7 @@ fn fnReturnIsErrorUnion(tree: *const Ast, fp: Ast.full.FnProto, type_node: Ast.N
     // Find the params' close paren by walking forward from lparen.
     var depth: u32 = 1;
     var t: Ast.TokenIndex = fp.lparen + 1;
-    const max_t: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const max_t = tree.lastToken(.root);
     while (t <= max_t and depth > 0) : (t += 1) {
         switch (tags[t]) {
             .l_paren => depth += 1,
