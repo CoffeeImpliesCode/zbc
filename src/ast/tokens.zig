@@ -22,6 +22,56 @@ const Ast = std.zig.Ast;
 pub const TokenIndex = Ast.TokenIndex;
 pub const TokenTag = std.zig.Token.Tag;
 
+/// Root binding of an lvalue path. Arithmetic expressions have no such root.
+pub fn rootIdentifier(tree: *const Ast, expression: Ast.Node.Index) ?Ast.Node.Index {
+    var node = expression;
+    for (0..tree.nodes.len) |_| {
+        switch (tree.nodeTag(node)) {
+            .identifier => return node,
+            .field_access, .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+            .array_access, .slice_open => node = tree.nodeData(node).node_and_node[0],
+            .slice, .slice_sentinel => node = tree.nodeData(node).node_and_extra[0],
+            .deref => node = tree.nodeData(node).node,
+            .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return null;
+                var children = @import("type_engine").AstIterator.init(tree, node);
+                node = children.next(tree) orelse return null;
+            },
+            else => return null,
+        }
+    }
+    unreachable; // Parsed AST edges cannot form a cycle.
+}
+
+/// Complete named type after pointer/optional qualifiers. Compound types
+/// and incomplete paths have no named-type identity.
+pub fn typeNameFromTokens(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const u8 {
+    if (first > last) return null;
+    const tags = tree.tokens.items(.tag);
+    var token = first;
+    while (token <= last) : (token += 1) {
+        switch (tags[token]) {
+            .question_mark, .asterisk, .asterisk_asterisk, .keyword_const, .keyword_volatile, .keyword_allowzero => {},
+            .keyword_align, .keyword_addrspace => {
+                if (token + 1 > last or tags[token + 1] != .l_paren) return null;
+                token = matchParen(tags, token + 1, last) orelse return null;
+            },
+            .identifier => break,
+            else => return null,
+        }
+    }
+    if (token > last) return null;
+    const start = token;
+    var identifier = true;
+    while (token <= last) : (token += 1) {
+        if (tags[token] != (if (identifier) TokenTag.identifier else TokenTag.period)) return null;
+        identifier = !identifier;
+    }
+    if (identifier) return null;
+    const starts = tree.tokens.items(.start);
+    return tree.source[starts[start] .. starts[last] + tree.tokenSlice(last).len];
+}
+
 /// Given the `{` at `lb`, find its matching `}` within `[lb+1, last]`.
 pub fn matchBrace(tags: []const TokenTag, lb: TokenIndex, last: TokenIndex) ?TokenIndex {
     var depth: u32 = 1;
@@ -288,6 +338,28 @@ pub fn returnsType(tree: *const Ast, fn_decl: Ast.Node.Index) bool {
     if (first != last) return false;
     return tree.tokens.items(.tag)[first] == .identifier and
         std.mem.eql(u8, tree.tokenSlice(first), "type");
+}
+
+/// Exclude compile-time bodies and operands that Zig does not evaluate.
+pub fn isRuntimeUse(tree: *const Ast, fn_decl: Ast.Node.Index, anchor: Ast.TokenIndex) bool {
+    if (returnsType(tree, fn_decl)) return false;
+    const body = bodyOf(tree, fn_decl) orelse return false;
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    if (anchor < first or anchor > last) return false;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        switch (tag) {
+            .@"comptime", .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const begin = tree.firstToken(node);
+        const end = tree.lastToken(node);
+        if (begin < first or end > last or anchor < begin or anchor > end) continue;
+        if (tag == .@"comptime") return false;
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@TypeOf")) return false;
+    }
+    return true;
 }
 
 /// Extract the `FnProto` view of an `fn_decl` node, handling all
