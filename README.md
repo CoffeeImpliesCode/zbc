@@ -17,6 +17,17 @@ owner.deinit(gpa);   // frees self.data — zbc reads the body to know this
 _ = x;               // → heap-use-after-free
 ```
 
+## Integration branch status
+
+This work branch requires Zig 0.16.0. Native CLI compilation, `--list-rules`,
+and a one-file source-analysis smoke passed. Full current regression acceptance
+is deferred; nine previously recorded regressions remain unresolved.
+
+The default build also runs the whole-source self-audit. That audit did not
+finish within 600 seconds; the install target reaches the same audit and also
+timed out. To compile and exercise the CLI separately without changing the
+default audit contract, use `zig build run -- --list-rules`.
+
 ## Build integration
 
 ```sh
@@ -27,7 +38,7 @@ zig fetch --save https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.g
 // build.zig
 const zbc_dep = b.dependency("zbc", .{
     .target = target,
-    .optimize = .fast,
+    .optimize = .ReleaseFast,
 });
 
 const zbc_run = b.addRunArtifact(zbc_dep.artifact("zbc"));
@@ -41,7 +52,7 @@ b.default_step.dependOn(&zbc_run.step);
 For standalone use:
 
 ```sh
-zig build -Doptimize=fast
+zig build -Doptimize=ReleaseFast
 zbc src/
 zbc --format=compact src/   # grep-friendly
 zbc --list-rules
@@ -56,7 +67,7 @@ and ZON output and does not require a separate `which` executable.
 
 ## Rules
 
-45 rules in two families:
+Rules in two families; `zbc --list-rules` is the current catalogue:
 
 **Flow analysis** — must-not-escape / must-not-free-twice guarantees via
 per-fn CFG and abstract interpretation:

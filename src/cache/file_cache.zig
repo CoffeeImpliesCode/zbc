@@ -1140,97 +1140,97 @@ pub const FileCache = struct {
             // A real call whose callee the type engine could not
             // connect to any declaration.  The invocation still
             // happens; only its identity is unreadable.
-            const opaque = self.zls != null and self.isUnnamedCall(call.callee_token);
+            const unknown_effects = self.zls != null and self.isUnnamedCall(call.callee_token);
             const charged = paths.items.len;
             // Every summary lookup may insert into `self.summaries`
             // and invalidate earlier pointers, so each callee is read
             // before the next lookup happens.
             switch (call.kind) {
-            case .bare: {
-                if (try self.summaryByName(call.name)) |cs| {
-                    if (cs.grows_unknown_path) unknown = true;
-                    try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
-                } else {
-                    // Unresolved, so nothing is known about what
-                    // it does — but it can only reallocate what
-                    // the call handed it, and that is exactly the
-                    // path each argument was rooted at.
-                    try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, true);
-                }
-            },
-            case .qualified: {
-                if (self.qualifierModule(call.qualifier)) |module| {
-                    if (try self.summaryOfModuleFn(module, call.name)) |cs| {
+                .bare => {
+                    if (try self.summaryByName(call.name)) |cs| {
                         if (cs.grows_unknown_path) unknown = true;
                         try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
-                        break;
+                    } else {
+                        // Unresolved, so nothing is known about what
+                        // it does — but it can only reallocate what
+                        // the call handed it, and that is exactly the
+                        // path each argument was rooted at.
+                        try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, true);
                     }
-                    // The module is readable but the function in
-                    // it is not: the same blind spot as a bare call.
-                    try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, true);
-                    break;
-                }
-                // No readable module — no project, a qualifier that
-                // is not an `@import` declaration, a module this
-                // project cannot reach, or an import that failed
-                // (whose failure the session reports, so it is
-                // never a clean bill of health here).  Nothing is
-                // known about the callee, but it was handed
-                // storage this fn holds, and that storage may be
-                // the one somebody is walking.
-                try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, false);
-            },
-            case .method: {
-                // `argOwners` always prepends the receiver, but a
-                // malformed call must not index past the end.
-                if (call.args.len == 0) break;
-                const owner: fn_summary.ParamPath = switch (call.args[0]) {
-                    .unknown => break,
-                    .param => |p| p,
-                };
-                const type_name: ?[]const u8 = blk: {
-                    if (try self.receiverTypeName(proto, owner)) |name| break :blk name;
-                    if (owner.path.len == 0) {
-                        if (self.paramNameFor(proto, owner.param)) |pname| {
-                            if (std.mem.eql(u8, pname, "self") or std.mem.eql(u8, pname, "this")) {
-                                break :blk receiver_type;
+                },
+                .qualified => resolve_callee: {
+                    if (self.qualifierModule(call.qualifier)) |module| {
+                        if (try self.summaryOfModuleFn(module, call.name)) |cs| {
+                            if (cs.grows_unknown_path) unknown = true;
+                            try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
+                            break :resolve_callee;
+                        }
+                        // The module is readable but the function in
+                        // it is not: the same blind spot as a bare call.
+                        try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, true);
+                        break :resolve_callee;
+                    }
+                    // No readable module — no project, a qualifier that
+                    // is not an `@import` declaration, a module this
+                    // project cannot reach, or an import that failed
+                    // (whose failure the session reports, so it is
+                    // never a clean bill of health here).  Nothing is
+                    // known about the callee, but it was handed
+                    // storage this fn holds, and that storage may be
+                    // the one somebody is walking.
+                    try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, false);
+                },
+                .method => resolve_callee: {
+                    // `argOwners` always prepends the receiver, but a
+                    // malformed call must not index past the end.
+                    if (call.args.len == 0) break :resolve_callee;
+                    const owner: fn_summary.ParamPath = switch (call.args[0]) {
+                        .unknown => break :resolve_callee,
+                        .param => |p| p,
+                    };
+                    const type_name: ?[]const u8 = blk: {
+                        if (try self.receiverTypeName(proto, owner)) |name| break :blk name;
+                        if (owner.path.len == 0) {
+                            if (self.paramNameFor(proto, owner.param)) |pname| {
+                                if (std.mem.eql(u8, pname, "self") or std.mem.eql(u8, pname, "this")) {
+                                    break :blk receiver_type;
+                                }
                             }
                         }
+                        break :blk null;
+                    };
+                    if (type_name) |tn| {
+                        if (try self.summaryByMethod(tn, call.name)) |cs| {
+                            if (cs.grows_unknown_path) unknown = true;
+                            try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
+                            break :resolve_callee;
+                        }
+                        if (try self.summaryByMethodCrossFile(tn, call.name)) |cs| {
+                            // Cross-file summaries expose only the coarse
+                            // flags (the project cache cannot carry the
+                            // paths), so they stay conservative.
+                            if (cs.grows_unknown_path) unknown = true;
+                            try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
+                            break :resolve_callee;
+                        }
                     }
-                    break :blk null;
-                };
-                if (type_name) |tn| {
-                    if (try self.summaryByMethod(tn, call.name)) |cs| {
-                        if (cs.grows_unknown_path) unknown = true;
-                        try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
-                        break;
-                    }
-                    if (try self.summaryByMethodCrossFile(tn, call.name)) |cs| {
-                        // Cross-file summaries expose only the coarse
-                        // flags (the project cache cannot carry the
-                        // paths), so they stay conservative.
-                        if (cs.grows_unknown_path) unknown = true;
-                        try foldGrowPaths(arena, &paths, call, cs.grow_paths, &unknown);
-                        break;
-                    }
-                }
-                // Not resolved: the receiver type or the method is
-                // out of this file's reach.  A grow-vocabulary
-                // method never reaches here — it is attributed by
-                // `inferGrowEffects`'s grow-site pass — but any
-                // other name can still reallocate what the call
-                // hands it, and only that.  The coarse flag
-                // agrees: Phase 9 re-propagates it from here.
-                try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, false);
-            },
-            case .unresolved: {
-                // A method on a receiver this fn was NOT
-                // handed and cannot root on a
-                // parameter.  Its name is a method name and must not be dispatched
-                // to a file-level declaration that shares it, so
-                // all that is left is what the call hands over.
-                try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, false);
-            },
+                    // Not resolved: the receiver type or the method is
+                    // out of this file's reach.  A grow-vocabulary
+                    // method never reaches here — it is attributed by
+                    // `inferGrowEffects`'s grow-site pass — but any
+                    // other name can still reallocate what the call
+                    // hands it, and only that.  The coarse flag
+                    // agrees: Phase 9 re-propagates it from here.
+                    try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, false);
+                },
+                .unresolved => {
+                    // A method on a receiver this fn was NOT
+                    // handed and cannot root on a
+                    // parameter.  Its name is a method name and must not be dispatched
+                    // to a file-level declaration that shares it, so
+                    // all that is left is what the call hands over.
+                    try self.chargeHandedStorage(proto, arena, &paths, &unknown, call, false);
+                },
             }
             // An opaque callee that was handed nothing of this fn's is
             // not thereby harmless: an indirect invocation reaches
@@ -1239,7 +1239,7 @@ pub const FileCache = struct {
             // pointer chosen at runtime.  One that WAS handed this
             // fn's own parameter is already charged at that path,
             // which is the reach a caller comparing its buffer needs.
-            if (opaque and paths.items.len == charged) unknown = true;
+            if (unknown_effects and paths.items.len == charged) unknown = true;
         }
 
         const entry = self.summaries.getPtr(@intFromEnum(body)) orelse return false;
@@ -1276,7 +1276,6 @@ pub const FileCache = struct {
     /// is what bounds it: a declaration is entered once, so the walk
     /// terminates on the call graph rather than on a budget, and a
     /// cycle is recorded as an open question instead of an answer.
-
     fn growStateAlloc(self: *FileCache) error{OutOfMemory}!*GrowState {
         if (self.grow_state == null) {
             const state: GrowState = .{
