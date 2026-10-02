@@ -59,9 +59,14 @@ pub fn build(b: *std.Build) void {
     // ── Dogfood: self-check on every `zig build` ────────────
     const self_check = b.addRunArtifact(exe);
     self_check.addDirectoryArg(b.path("src/"));
+    // Admit the governing module wiring as well as the source it describes.
+    // A src-only policy cannot read the parent's build.zig, so named imports
+    // would otherwise stay unresolved during the self-audit.
+    self_check.addFileArg(b.path("build.zig"));
     b.default_step.dependOn(&self_check.step);
 
     const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run zbc CLI");
     run_step.dependOn(&run_cmd.step);
 

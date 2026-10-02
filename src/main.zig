@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const lib = @import("lib.zig");
-const type_resolver_mod = @import("type_resolver.zig");
+const budget_mod = @import("budget.zig");
 
 /// Silence ZLS's std.log info/debug output — zbc uses ZLS as a type
 /// oracle, not as a language server, so its informational messages
@@ -46,7 +46,15 @@ pub const std_options: std.Options = .{
     },
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    const status = run(init) catch |err| {
+        std.debug.print("zbc: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    std.process.exit(status);
+}
+
+fn run(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
@@ -62,6 +70,9 @@ pub fn main(init: std.process.Init) !void {
     var enabled_explicit = false;
     var format: Format = .rich;
     var color_off = false;
+    var jobs: ?usize = null;
+    var exclusions: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer exclusions.deinit(gpa);
 
     var arena_init_patterns: []const []const u8 = lib.DefaultConfig.arena_init_patterns;
     var arena_kill_patterns: []const []const u8 = lib.DefaultConfig.arena_kill_patterns;
@@ -74,29 +85,29 @@ pub fn main(init: std.process.Init) !void {
     while (arg_it.next()) |a| {
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             printUsage();
-            std.process.exit(0);
+            return 0;
         }
         if (std.mem.eql(u8, a, "--list-invariants")) {
-            inline for (@typeInfo(lib.Invariant).@"enum".fields) |f| {
-                std.debug.print("{s}\n", .{f.name});
+            inline for (@typeInfo(lib.Invariant).@"enum".fields) |field| {
+                std.debug.print("{s}\n", .{field.name});
             }
-            std.process.exit(0);
+            return 0;
         }
         if (std.mem.eql(u8, a, "--list-rules")) {
             for (lib.rule_catalog) |r| {
                 std.debug.print("{s} — {s}\n", .{ r.id, r.title });
             }
-            std.process.exit(0);
+            return 0;
         }
         if (std.mem.startsWith(u8, a, "--explain=")) {
-            explainAndExit(a["--explain=".len..]);
+            return explain(a["--explain=".len..]);
         }
         if (std.mem.eql(u8, a, "--explain")) {
             const id = arg_it.next() orelse {
                 std.debug.print("zbc: --explain requires a rule id (see --list-rules)\n", .{});
-                std.process.exit(2);
+                return 2;
             };
-            explainAndExit(id);
+            return explain(id);
         }
         if (std.mem.startsWith(u8, a, "--enable=")) {
             if (!enabled_explicit) {
@@ -134,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
                 format = .sarif;
             } else {
                 std.debug.print("zbc: unknown format `{s}` (expected rich, compact, json, or sarif)\n", .{v});
-                std.process.exit(2);
+                return 2;
             }
             continue;
         }
@@ -151,33 +162,38 @@ pub fn main(init: std.process.Init) !void {
             }
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--jobs=")) {
+            const count = std.fmt.parseInt(usize, a["--jobs=".len..], 10) catch return error.InvalidWorkerCount;
+            if (count == 0) return error.InvalidWorkerCount;
+            jobs = count;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--exclude=")) {
+            const path = a["--exclude=".len..];
+            if (path.len == 0) return error.EmptyExclusion;
+            try exclusions.append(gpa, path);
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             std.debug.print("zbc: unknown flag: {s}\n", .{a});
             printUsage();
-            std.process.exit(2);
+            return 2;
         }
         try paths.append(gpa, a);
     }
 
     if (paths.items.len == 0) {
         printUsage();
-        std.process.exit(2);
+        return 2;
     }
 
-    var expanded: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (expanded.items) |p| gpa.free(p);
-        expanded.deinit(gpa);
-    }
-    for (paths.items) |p| {
-        expandPath(gpa, io, p, &expanded) catch |err| {
-            std.debug.print("zbc: cannot expand {s}: {s}\n", .{ p, @errorName(err) });
-            std.process.exit(2);
-        };
-    }
-    if (expanded.items.len == 0) {
-        std.debug.print("zbc: no .zig files found in: {s}\n", .{paths.items[0]});
-        std.process.exit(0);
+    var selection = SourceSelection.init(gpa, io, exclusions.items);
+    defer selection.deinit();
+    try selection.collect(paths.items);
+    const selected_paths = selection.files.keys();
+    var failed: usize = selection.failures.items.len;
+    for (selection.failures.items) |failure| {
+        std.debug.print("zbc: cannot select {s}: {s}\n", .{ failure.path, @errorName(failure.err) });
     }
 
     const config: lib.Config = .{
@@ -186,12 +202,10 @@ pub fn main(init: std.process.Init) !void {
         .enabled = enabled.items,
     };
 
-    const tasks = try gpa.alloc(Task, expanded.items.len);
+    const tasks = try gpa.alloc(Task, selected_paths.len);
     defer gpa.free(tasks);
-    for (expanded.items, tasks) |path, *t| {
+    for (selected_paths, tasks) |path, *t| {
         t.* = .{
-            .gpa = gpa,
-            .io = io,
             .path = path,
             .config = &config,
             .problems = &.{},
@@ -199,69 +213,78 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // Work-stealing thread pool — N workers pop tasks off a shared
-    // atomic counter.  `Io.Group.concurrent` grows its thread pool
-    // lazily (only when ALL existing threads are busy), which on a
-    // fast-per-file workload like ours saturates at ~2 threads
-    // even on an 8-core machine.  Raw `std.Thread.spawn` lets us
-    // pre-allocate one worker per CPU and consume the task list
-    // in parallel.  Measured: 6:49 → ~1:00 on full Bun sweep.
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    const worker_count = @max(1, @min(cpu_count, tasks.len));
-    const workers = try gpa.alloc(std.Thread, worker_count);
-    defer gpa.free(workers);
-    var next_task: std.atomic.Value(usize) = .init(0);
-    const ctx: WorkerCtx = .{ .tasks = tasks, .next = &next_task, .gpa = gpa, .io = io };
-    // Pre-warm toolchain cache on the main thread so worker threads never
-    // race to populate it concurrently (discoverToolchain is not thread-safe).
-    type_resolver_mod.warmToolchain(gpa, io);
-    var spawned: usize = 0;
-    for (workers) |*w| {
-        w.* = std.Thread.spawn(.{}, workerLoop, .{ctx}) catch
-            // If a worker fails to spawn, fall back to serial in
-            // the main thread for remaining tasks.
-            break;
-        spawned += 1;
-    }
-    // Main thread also helps drain the queue.
-    workerLoop(ctx);
-    for (workers[0..spawned]) |w| w.join();
+    defer for (tasks) |task| {
+        lib.freeProblems(gpa, task.problems);
+        if (task.parse_failure) |failure| {
+            if (failure.source_path) |path| gpa.free(path);
+        }
+    };
+    try analyzeTasks(gpa, io, tasks, selection.policy(), jobs);
 
     var all_problems: std.ArrayListUnmanaged(IndexedProblem) = .empty;
     defer all_problems.deinit(gpa);
-    var any_problems = false;
+    var unresolved_imports: usize = 0;
     for (tasks) |*t| {
+        unresolved_imports += t.unresolved_imports;
         if (t.err) |err| {
-            std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ t.path, @errorName(err) });
-            any_problems = true;
+            if (t.parse_failure) |failure| {
+                if (failure.source_path != null)
+                    std.debug.print("zbc: analysis incomplete for {s}: imported source failed\n", .{t.path});
+                std.debug.print("{s}:{}:{}: parse error: {s} (Zig {s})\n", .{
+                    failure.source_path orelse t.path, failure.position.line,                 failure.position.column,
+                    failure.reason,                    @import("builtin").zig_version_string,
+                });
+            } else if (t.budget) |info| {
+                std.debug.print("zbc: cannot analyze {s}: {s} — {s} limit {d} reached {d}", .{
+                    t.path, @errorName(err), info.limit.label(), info.limit_value, info.reached,
+                });
+                if (info.function.slice().len != 0) {
+                    std.debug.print(" in fn `{s}`", .{info.function.slice()});
+                }
+                // Producers that hold a line table report one; the rest
+                // still get a byte offset, which locates the site exactly.
+                if (info.line != 0) {
+                    std.debug.print(" at {s}:{d}:{d}\n", .{ t.path, info.line, info.column });
+                } else {
+                    std.debug.print(" at {s}+{d}\n", .{ t.path, info.byte });
+                }
+            } else if (err == error.AnalysisBudgetExceeded) {
+                // Every bounded walk records which cap it hit before
+                // propagating the error.  Reaching here means one gave
+                // up without recording a limit, so the CLI can name the
+                // file but not the cause.  Say that instead of folding
+                // it into the generic line — a missing record is a
+                // reportable defect, not a detail to swallow.
+                std.debug.print(
+                    "zbc: cannot analyze {s}: analysis budget exhausted without a recorded limit — the walk that gave up did not report which cap it hit\n",
+                    .{t.path},
+                );
+            } else std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ t.path, @errorName(err) });
+            failed += 1;
             continue;
         }
         for (t.problems) |p| {
             try all_problems.append(gpa, .{ .path = t.path, .problem = p });
         }
     }
-    defer for (tasks) |*t| if (t.problems.len > 0) gpa.free(t.problems);
-    defer for (all_problems.items) |*ip| ip.problem.deinit(gpa);
 
     std.mem.sort(IndexedProblem, all_problems.items, {}, indexedProblemLess);
 
-    if (all_problems.items.len > 0) any_problems = true;
-    // `std.posix.system.isatty` is only exposed on platforms whose
-    // system layer carries it (macOS/Darwin); Linux's posix.system
-    // omits it.  Use the cross-platform `Io.File.isTty` instead.
     const use_color = !color_off and (std.Io.File.stderr().isTty(io) catch false);
     var src_cache: SourceCache = .{ .gpa = gpa, .io = io };
     defer src_cache.deinit();
+    var stdout_buffer: [64 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const writer = &stdout.interface;
     switch (format) {
         .json => {
-            std.debug.print("[", .{});
-            var first = true;
-            for (all_problems.items) |ip| {
-                printOneProblemJson(ip.path, ip.problem, &first);
-            }
-            std.debug.print("{s}]\n", .{if (first) "" else "\n"});
+            var json: std.json.Stringify = .{ .writer = writer };
+            try json.beginArray();
+            for (all_problems.items) |ip| try printOneProblemJson(&json, ip.path, ip.problem);
+            try json.endArray();
+            try writer.writeByte('\n');
         },
-        .sarif => try printSarif(gpa, all_problems.items),
+        .sarif => try printSarif(gpa, writer, all_problems.items, failed == 0),
         .compact => {
             for (all_problems.items) |ip| {
                 printOneProblemCompact(ip.path, ip.problem);
@@ -273,7 +296,14 @@ pub fn main(init: std.process.Init) !void {
             }
         },
     }
-    std.process.exit(if (any_problems) @as(u8, 1) else 0);
+    try writer.flush();
+    std.debug.print("zbc: selected={} analyzed={} failed={} findings={} parser=Zig-{s} unresolved-import-lookups={}\n", .{
+        tasks.len + selection.failures.items.len, tasks.len - (failed - selection.failures.items.len),
+        failed,                                   all_problems.items.len,
+        @import("builtin").zig_version_string,    unresolved_imports,
+    });
+    if (failed != 0) return 2;
+    return if (all_problems.items.len != 0) 1 else 0;
 }
 
 fn splitCsv(gpa: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
@@ -288,33 +318,156 @@ fn splitCsv(gpa: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-fn expandPath(
+const SourceSelection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    path: []const u8,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch {
-        const duped = try gpa.dupe(u8, path);
-        errdefer gpa.free(duped);
-        try out.append(gpa, duped);
-        return;
-    };
-    defer dir.close(io);
+    arena: std.heap.ArenaAllocator,
+    roots: std.StringArrayHashMapUnmanaged(void) = .empty,
+    files: std.StringArrayHashMapUnmanaged(void) = .empty,
+    directories: std.StringHashMapUnmanaged(void) = .empty,
+    failures: std.ArrayListUnmanaged(Failure) = .empty,
+    excludes: []const []const u8,
+    visited_entries: usize = 0,
 
-    var walker = try dir.walk(gpa);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        if (std.mem.indexOf(u8, entry.path, "/.") != null) continue;
-        if (std.mem.startsWith(u8, entry.path, ".")) continue;
+    const Failure = struct { path: []const u8, err: anyerror };
+    const Input = struct { path: []const u8, directory: bool };
 
-        const full = try std.fs.path.join(gpa, &.{ path, entry.path });
-        errdefer gpa.free(full);
-        try out.append(gpa, full);
+    fn init(gpa: std.mem.Allocator, io: std.Io, excludes: []const []const u8) SourceSelection {
+        return .{ .gpa = gpa, .io = io, .arena = .init(gpa), .excludes = excludes };
     }
-}
+
+    fn deinit(self: *SourceSelection) void {
+        self.failures.deinit(self.gpa);
+        self.directories.deinit(self.gpa);
+        self.files.deinit(self.gpa);
+        self.roots.deinit(self.gpa);
+        self.arena.deinit();
+    }
+
+    fn policy(self: *const SourceSelection) lib.SourcePolicy {
+        return .{ .roots = self.roots.keys(), .excludes = self.excludes };
+    }
+
+    fn fail(self: *SourceSelection, path: []const u8, err: anyerror) !void {
+        try self.failures.append(self.gpa, .{ .path = try self.arena.allocator().dupe(u8, path), .err = err });
+    }
+
+    fn canonical(self: *SourceSelection, path: []const u8) ![]const u8 {
+        var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try std.Io.Dir.cwd().realPathFile(self.io, path, &buffer);
+        return self.arena.allocator().dupe(u8, buffer[0..len]);
+    }
+
+    fn normalizeExclusions(self: *SourceSelection, cwd: []const u8) !void {
+        const arena = self.arena.allocator();
+        const normalized = try arena.alloc([]const u8, self.excludes.len);
+        for (self.excludes, normalized) |excluded, *result| {
+            if (excluded.len == 0) return error.InvalidExclusion;
+            result.* = if (std.mem.indexOfAny(u8, excluded, "/\\") != null)
+                try std.fs.path.resolve(arena, &.{ cwd, excluded })
+            else
+                excluded;
+        }
+        self.excludes = normalized;
+    }
+
+    fn collect(self: *SourceSelection, paths: []const []const u8) !void {
+        const cwd = try self.canonical(".");
+        try self.normalizeExclusions(cwd);
+        var inputs: std.ArrayListUnmanaged(Input) = .empty;
+        defer inputs.deinit(self.gpa);
+        for (paths) |path| {
+            const lexical = try std.fs.path.resolve(self.arena.allocator(), &.{ cwd, path });
+            if (self.policy().excludesPath(lexical)) continue;
+            const absolute = self.canonical(lexical) catch |err| {
+                try self.fail(path, err);
+                continue;
+            };
+            if (self.policy().excludesPath(absolute)) continue;
+            const stat = std.Io.Dir.cwd().statFile(self.io, absolute, .{}) catch |err| {
+                try self.fail(path, err);
+                continue;
+            };
+            if (stat.kind != .file and stat.kind != .directory) {
+                try self.fail(path, error.UnsupportedSourceKind);
+                continue;
+            }
+            const directory = stat.kind == .directory;
+            if (!directory and !std.mem.endsWith(u8, absolute, ".zig")) {
+                try self.fail(path, error.UnsupportedSourceFile);
+                continue;
+            }
+            if (directory) try self.roots.put(self.gpa, absolute, {});
+            try inputs.append(self.gpa, .{ .path = absolute, .directory = directory });
+        }
+        std.mem.sort(Input, inputs.items, {}, struct {
+            fn less(_: void, a: Input, b: Input) bool {
+                const left = if (a.directory) a.path else std.fs.path.dirname(a.path).?;
+                const right = if (b.directory) b.path else std.fs.path.dirname(b.path).?;
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.less);
+        for (inputs.items) |input| {
+            if (input.directory) continue;
+            const parent = std.fs.path.dirname(input.path).?;
+            if (self.policy().rootFor(parent) == null) try self.roots.put(self.gpa, parent, {});
+        }
+        for (inputs.items) |input| {
+            if (!self.policy().allowsAbsolutePath(input.path)) continue;
+            if (input.directory) try self.walk(input.path) else try self.files.put(self.gpa, input.path, {});
+        }
+    }
+
+    fn walk(self: *SourceSelection, root: []const u8) !void {
+        var pending: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer pending.deinit(self.gpa);
+        try pending.append(self.gpa, root);
+        while (pending.pop()) |path| {
+            const seen = try self.directories.getOrPut(self.gpa, path);
+            if (seen.found_existing) continue;
+            var directory = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch |err| {
+                try self.fail(path, err);
+                continue;
+            };
+            defer directory.close(self.io);
+            var entries = directory.iterate();
+            while (true) {
+                const entry = (entries.next(self.io) catch |err| {
+                    try self.fail(path, err);
+                    break;
+                }) orelse break;
+                if (self.visited_entries == 1_000_000) {
+                    try self.fail(path, error.SourceScanBudgetExceeded);
+                    return;
+                }
+                self.visited_entries += 1;
+                if (lib.SourcePolicy.isExcludedBasename(entry.name)) continue;
+                if (entry.kind != .directory and !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                const full = try std.fs.path.join(self.arena.allocator(), &.{ path, entry.name });
+                if (!self.policy().allowsAbsolutePath(full)) continue;
+                switch (entry.kind) {
+                    .directory => try pending.append(self.gpa, full),
+                    .file => try self.files.put(self.gpa, full, {}),
+                    .sym_link => try self.addLinkedFile(full),
+                    else => {},
+                }
+            }
+        }
+    }
+
+    fn addLinkedFile(self: *SourceSelection, path: []const u8) !void {
+        const target = self.canonical(path) catch |err| {
+            try self.fail(path, err);
+            return;
+        };
+        if (!self.policy().allowsAbsolutePath(target)) return;
+        const stat = std.Io.Dir.cwd().statFile(self.io, target, .{}) catch |err| {
+            try self.fail(path, err);
+            return;
+        };
+        if (stat.kind == .file) try self.files.put(self.gpa, target, {});
+    }
+};
 
 const Format = enum { rich, compact, json, sarif };
 const Op = enum { add, remove };
@@ -331,7 +484,7 @@ fn parseInvariantList(
         if (name.len == 0) continue;
         const inv = lib.invariantFromName(name) orelse {
             std.debug.print("zbc: unknown invariant `{s}`; --list-invariants for valid names\n", .{name});
-            std.process.exit(2);
+            return error.UnknownInvariant;
         };
         switch (op) {
             .add => {
@@ -354,13 +507,13 @@ fn containsInvariant(slice: []const lib.Invariant, inv: lib.Invariant) bool {
     return false;
 }
 
-fn explainAndExit(id: []const u8) noreturn {
+fn explain(id: []const u8) u8 {
     if (lib.lookupRule(id)) |r| {
         std.debug.print("{s}", .{r.body});
-        std.process.exit(0);
+        return 0;
     }
     std.debug.print("zbc: no rule named `{s}` (see --list-rules)\n", .{id});
-    std.process.exit(2);
+    return 2;
 }
 
 fn printUsage() void {
@@ -398,12 +551,17 @@ fn printUsage() void {
 }
 
 const Task = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
     path: []const u8,
     config: *const lib.Config,
     problems: []lib.Problem,
     err: ?anyerror,
+    /// Which analysis budget ran out, when `err` is
+    /// `AnalysisBudgetExceeded`.  Claimed on the worker thread that hit
+    /// it, so it is available even though the report loop runs on the
+    /// main thread after the pool joins.
+    budget: ?budget_mod.Diagnostic = null,
+    parse_failure: ?lib.ParseFailure = null,
+    unresolved_imports: usize = 0,
 };
 
 const IndexedProblem = struct {
@@ -416,7 +574,10 @@ fn indexedProblemLess(_: void, a: IndexedProblem, b: IndexedProblem) bool {
     if (path_cmp != .eq) return path_cmp == .lt;
     if (a.problem.start.line != b.problem.start.line)
         return a.problem.start.line < b.problem.start.line;
-    return a.problem.start.column < b.problem.start.column;
+    if (a.problem.start.column != b.problem.start.column) return a.problem.start.column < b.problem.start.column;
+    const rule_cmp = std.mem.order(u8, a.problem.rule_id, b.problem.rule_id);
+    if (rule_cmp != .eq) return rule_cmp == .lt;
+    return std.mem.lessThan(u8, a.problem.message, b.problem.message);
 }
 
 const WorkerCtx = struct {
@@ -424,30 +585,64 @@ const WorkerCtx = struct {
     next: *std.atomic.Value(usize),
     gpa: std.mem.Allocator,
     io: std.Io,
+    policy: lib.SourcePolicy,
 };
 
-fn workerLoop(ctx: WorkerCtx) void {
-    var type_ctx: type_resolver_mod.TypeContext = undefined;
-    const ctx_ok = blk: {
-        type_ctx.init(ctx.gpa, ctx.io) catch break :blk false;
-        break :blk true;
-    };
-    defer if (ctx_ok) type_ctx.deinit();
-    const type_ctx_ptr: ?*type_resolver_mod.TypeContext = if (ctx_ok) &type_ctx else null;
+fn analyzeTasks(gpa: std.mem.Allocator, io: std.Io, tasks: []Task, policy: lib.SourcePolicy, jobs: ?usize) !void {
+    if (tasks.len == 0) return;
+    const cpu_count = jobs orelse (std.Thread.getCpuCount() catch 1);
+    const worker_count = @max(1, @min(cpu_count, tasks.len));
+    const workers = try gpa.alloc(std.Thread, worker_count - 1);
+    defer gpa.free(workers);
+    var next: std.atomic.Value(usize) = .init(0);
+    const ctx: WorkerCtx = .{ .tasks = tasks, .next = &next, .gpa = gpa, .io = io, .policy = policy };
+    var spawned: usize = 0;
+    for (workers) |*worker| {
+        worker.* = std.Thread.spawn(.{}, workerLoop, .{ctx}) catch break;
+        spawned += 1;
+    }
+    workerLoop(ctx);
+    for (workers[0..spawned]) |worker| worker.join();
+}
 
+fn workerLoop(ctx: WorkerCtx) void {
+    var session: lib.Session = undefined;
+    session.init(ctx.gpa, ctx.io, ctx.policy) catch |err| {
+        while (true) {
+            const i = ctx.next.fetchAdd(1, .monotonic);
+            if (i >= ctx.tasks.len) return;
+            ctx.tasks[i].err = err;
+        }
+    };
+    defer session.deinit();
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.tasks.len) return;
-        runOne(&ctx.tasks[i], type_ctx_ptr) catch {};
+        runOne(&ctx.tasks[i], &session);
     }
 }
 
-fn runOne(t: *Task, type_ctx: ?*type_resolver_mod.TypeContext) std.Io.Cancelable!void {
-    const problems = lib.analyzeEscape(t.gpa, t.io, t.path, t.config, type_ctx) catch |err| {
-        t.err = err;
+fn runOne(task: *Task, session: *lib.Session) void {
+    const unresolved_before = session.project.unresolved_imports;
+    defer task.unresolved_imports = session.project.unresolved_imports - unresolved_before;
+    // Each file starts with no pending budget failure, so a worker that
+    // just succeeded cannot leak its predecessor's record into this one.
+    budget_mod.clear();
+    task.problems = lib.analyzeEscape(session, task.path, task.config) catch |err| {
+        task.err = err;
+        task.budget = if (err == error.AnalysisBudgetExceeded) budget_mod.take() else null;
+        task.parse_failure = session.parse_failure;
+        if (task.parse_failure) |*failure| {
+            if (failure.source_path) |path| {
+                failure.source_path = session.gpa.dupe(u8, path) catch {
+                    task.err = error.OutOfMemory;
+                    task.parse_failure = null;
+                    return;
+                };
+            }
+        }
         return;
     };
-    t.problems = problems;
 }
 
 fn printOneProblemCompact(path: []const u8, p: lib.Problem) void {
@@ -686,60 +881,18 @@ fn sliceLine(src: []const u8, byte_offset: u32) []const u8 {
     return src[ls..le];
 }
 
-fn printOneProblemJson(path: []const u8, p: lib.Problem, first: *bool) void {
-    if (first.*) {
-        std.debug.print("\n  ", .{});
-        first.* = false;
-    } else {
-        std.debug.print(",\n  ", .{});
-    }
-    std.debug.print("{{\"path\":\"", .{});
-    writeJsonEscaped(path);
-    std.debug.print(
-        "\",\"rule_id\":\"{s}\",\"severity\":\"{s}\"," ++
-            "\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
-            "\"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
-            "\"message\":\"",
-        .{
-            p.rule_id,
-            severityName(p.severity),
-            p.start.line, p.start.column, p.start.byte,
-            p.end.line,   p.end.column,   p.end.byte,
-        },
-    );
-    writeJsonEscaped(p.message);
-    std.debug.print("\",\"notes\":[", .{});
-    for (p.notes, 0..) |n, i| {
-        if (i > 0) std.debug.print(",", .{});
-        std.debug.print(
-            "{{\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
-                "\"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
-                "\"label\":\"",
-            .{
-                n.start.line, n.start.column, n.start.byte,
-                n.end.line,   n.end.column,   n.end.byte,
-            },
-        );
-        writeJsonEscaped(n.label);
-        std.debug.print("\"}}", .{});
-    }
-    std.debug.print("],\"verdict\":\"{s}\",\"witness\":", .{verdictName(p.verdict)});
-    if (p.witness) |w| {
-        std.debug.print("\"", .{});
-        writeJsonEscaped(w);
-        std.debug.print("\"", .{});
-    } else {
-        std.debug.print("null", .{});
-    }
-    std.debug.print("}}", .{});
-}
-
-fn verdictName(v: lib.Verdict) []const u8 {
-    return switch (v) {
-        .unknown => "unknown",
-        .confirmed => "confirmed",
-        .refuted => "refuted",
-    };
+fn printOneProblemJson(json: *std.json.Stringify, path: []const u8, problem: lib.Problem) !void {
+    try json.write(.{
+        .path = path,
+        .rule_id = problem.rule_id,
+        .severity = problem.severity,
+        .start = problem.start,
+        .end = problem.end,
+        .message = problem.message,
+        .notes = problem.notes,
+        .verdict = problem.verdict,
+        .witness = problem.witness,
+    });
 }
 
 /// SARIF 2.1.0 severity level for a zbc severity.  SARIF levels are
@@ -752,104 +905,90 @@ fn sarifLevel(s: lib.Severity) []const u8 {
     };
 }
 
-/// Emit `{startLine,startColumn,endLine,endColumn,byteOffset,byteLength}`.
-/// zbc positions are 1-indexed line/column, matching SARIF.
-fn printSarifRegion(start: lib.Pos, end: lib.Pos) void {
-    const byte_len: u32 = if (end.byte >= start.byte) end.byte - start.byte else 0;
-    std.debug.print(
-        "{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}," ++
-            "\"byteOffset\":{},\"byteLength\":{}}}",
-        .{ start.line, start.column, end.line, end.column, start.byte, byte_len },
-    );
+const SarifRegion = struct {
+    startLine: u32,
+    startColumn: u32,
+    endLine: u32,
+    endColumn: u32,
+    byteOffset: u32,
+    byteLength: u32,
+};
+const SarifPhysicalLocation = struct {
+    artifactLocation: struct { uri: []const u8 },
+    region: SarifRegion,
+};
+
+fn sarifLocation(uri: []const u8, start: lib.Pos, end: lib.Pos) SarifPhysicalLocation {
+    return .{
+        .artifactLocation = .{ .uri = uri },
+        .region = .{
+            .startLine = start.line,
+            .startColumn = start.column,
+            .endLine = end.line,
+            .endColumn = end.column,
+            .byteOffset = start.byte,
+            .byteLength = end.byte -| start.byte,
+        },
+    };
 }
 
-/// Emit all findings as a single SARIF 2.1.0 document.
-///
-/// Verdict mapping (issue #18/#19): every fired rule is `kind:"fail"`;
-/// the three-valued verdict rides in `properties.verdict`, with the
-/// `confirmed` reproducing input in `properties.witness`.  A `refuted`
-/// finding additionally carries a SARIF `suppressions[]` entry
-/// (`state:"accepted"`) so consumers treat it as a tool-dismissed
-/// false positive.
-fn printSarif(gpa: std.mem.Allocator, items: []const IndexedProblem) !void {
-    std.debug.print(
-        "{{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\"," ++
-            "\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{" ++
-            "\"name\":\"zbc\",\"informationUri\":\"https://github.com/ericsssan/zbc\"," ++
-            "\"rules\":[",
-        .{},
-    );
-
-    // rules[]: one entry per unique rule id that appears in results.
+fn printSarif(gpa: std.mem.Allocator, writer: *std.Io.Writer, items: []const IndexedProblem, complete: bool) !void {
+    try writer.writeAll("{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"zbc\",\"informationUri\":\"https://github.com/ericsssan/zbc\",\"rules\":[");
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(gpa);
-    var first_rule = true;
-    for (items) |ip| {
-        const id = ip.problem.rule_id;
+    for (items) |item| {
+        const id = item.problem.rule_id;
         if (seen.contains(id)) continue;
+        if (seen.count() != 0) try writer.writeByte(',');
         try seen.put(gpa, id, {});
-        if (!first_rule) std.debug.print(",", .{});
-        first_rule = false;
-        std.debug.print("{{\"id\":\"", .{});
-        writeJsonEscaped(id);
-        std.debug.print("\",\"name\":\"", .{});
-        writeJsonEscaped(id);
-        std.debug.print("\",\"shortDescription\":{{\"text\":\"", .{});
-        if (lib.lookupRule(id)) |r| writeJsonEscaped(r.title) else writeJsonEscaped(id);
-        std.debug.print("\"}}}}", .{});
+        const title = if (lib.lookupRule(id)) |rule| rule.title else id;
+        try std.json.Stringify.value(.{ .id = id, .name = id, .shortDescription = .{ .text = title } }, .{}, writer);
     }
-
-    std.debug.print("]}}}},\"results\":[", .{});
-
-    var first_res = true;
-    for (items) |ip| {
-        const p = ip.problem;
-        if (!first_res) std.debug.print(",", .{});
-        first_res = false;
-
-        std.debug.print("{{\"ruleId\":\"", .{});
-        writeJsonEscaped(p.rule_id);
-        std.debug.print("\",\"level\":\"{s}\",\"kind\":\"fail\",\"message\":{{\"text\":\"", .{sarifLevel(p.severity)});
-        writeJsonEscaped(p.message);
-        std.debug.print("\"}},\"locations\":[{{\"physicalLocation\":{{\"artifactLocation\":{{\"uri\":\"", .{});
-        writeJsonEscaped(ip.path);
-        std.debug.print("\"}},\"region\":", .{});
-        printSarifRegion(p.start, p.end);
-        std.debug.print("}}}}]", .{});
-
-        if (p.notes.len > 0) {
-            std.debug.print(",\"relatedLocations\":[", .{});
-            for (p.notes, 0..) |n, i| {
-                if (i > 0) std.debug.print(",", .{});
-                std.debug.print("{{\"physicalLocation\":{{\"artifactLocation\":{{\"uri\":\"", .{});
-                writeJsonEscaped(ip.path);
-                std.debug.print("\"}},\"region\":", .{});
-                printSarifRegion(n.start, n.end);
-                std.debug.print("}},\"message\":{{\"text\":\"", .{});
-                writeJsonEscaped(n.label);
-                std.debug.print("\"}}}}", .{});
-            }
-            std.debug.print("]", .{});
-        }
-
-        if (p.verdict == .refuted) {
-            std.debug.print(
-                ",\"suppressions\":[{{\"kind\":\"external\",\"state\":\"accepted\"," ++
-                    "\"justification\":\"refuted by sound static analysis\"}}]",
-                .{},
-            );
-        }
-
-        std.debug.print(",\"properties\":{{\"verdict\":\"{s}\"", .{verdictName(p.verdict)});
-        if (p.witness) |w| {
-            std.debug.print(",\"witness\":\"", .{});
-            writeJsonEscaped(w);
-            std.debug.print("\"", .{});
-        }
-        std.debug.print("}}}}", .{});
+    try writer.writeAll("]}},\"invocations\":[");
+    try std.json.Stringify.value(.{ .executionSuccessful = complete }, .{}, writer);
+    try writer.writeAll("],\"results\":[");
+    for (items, 0..) |item, index| {
+        if (index != 0) try writer.writeByte(',');
+        try printSarifResult(writer, item);
     }
+    try writer.writeAll("]}]}\n");
+}
 
-    std.debug.print("]}}]}}\n", .{});
+fn printSarifResult(writer: *std.Io.Writer, item: IndexedProblem) !void {
+    var uri_buffer: [3 * std.Io.Dir.max_path_bytes + 8]u8 = undefined;
+    var encoded: std.Io.Writer = .fixed(&uri_buffer);
+    try encoded.writeAll("file://");
+    try (std.Uri.Component{ .raw = item.path }).formatPath(&encoded);
+    const uri = encoded.buffered();
+    const problem = item.problem;
+    var json: std.json.Stringify = .{ .writer = writer };
+    try json.beginObject();
+    try json.objectField("ruleId");
+    try json.write(problem.rule_id);
+    try json.objectField("level");
+    try json.write(sarifLevel(problem.severity));
+    try json.objectField("kind");
+    try json.write("fail");
+    try json.objectField("message");
+    try json.write(.{ .text = problem.message });
+    try json.objectField("locations");
+    try json.write(.{.{ .physicalLocation = sarifLocation(uri, problem.start, problem.end) }});
+    if (problem.notes.len != 0) {
+        try json.objectField("relatedLocations");
+        try json.beginArray();
+        for (problem.notes) |note| try json.write(.{
+            .physicalLocation = sarifLocation(uri, note.start, note.end),
+            .message = .{ .text = note.label },
+        });
+        try json.endArray();
+    }
+    if (problem.verdict == .refuted) {
+        try json.objectField("suppressions");
+        try json.write(.{.{ .kind = "external", .status = "accepted", .justification = "refuted by sound static analysis" }});
+    }
+    try json.objectField("properties");
+    try json.write(.{ .verdict = problem.verdict, .witness = problem.witness });
+    try json.endObject();
 }
 
 fn severityName(s: lib.Severity) []const u8 {
@@ -858,41 +997,6 @@ fn severityName(s: lib.Severity) []const u8 {
         .warning => "warning",
         .off => "off",
     };
-}
-
-fn writeJsonEscaped(s: []const u8) void {
-    for (s) |c| {
-        switch (c) {
-            '"' => std.debug.print("\\\"", .{}),
-            '\\' => std.debug.print("\\\\", .{}),
-            '\n' => std.debug.print("\\n", .{}),
-            '\r' => std.debug.print("\\r", .{}),
-            '\t' => std.debug.print("\\t", .{}),
-            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => std.debug.print("\\u{x:0>4}", .{c}),
-            else => std.debug.print("{c}", .{c}),
-        }
-    }
-}
-
-fn jsonEscapeToBuf(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
-    var list: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer list.deinit(gpa);
-    for (s) |c| {
-        switch (c) {
-            '"' => try list.appendSlice(gpa, "\\\""),
-            '\\' => try list.appendSlice(gpa, "\\\\"),
-            '\n' => try list.appendSlice(gpa, "\\n"),
-            '\r' => try list.appendSlice(gpa, "\\r"),
-            '\t' => try list.appendSlice(gpa, "\\t"),
-            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-                var buf: [6]u8 = undefined;
-                const hex = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c});
-                try list.appendSlice(gpa, hex);
-            },
-            else => try list.append(gpa, c),
-        }
-    }
-    return list.toOwnedSlice(gpa);
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -939,27 +1043,6 @@ test "splitCsv: trims whitespace, drops empties" {
     try std.testing.expectEqual(@as(usize, 2), out.len);
     try std.testing.expectEqualStrings("Foo.parse", out[0]);
     try std.testing.expectEqualStrings("Bar.make", out[1]);
-}
-
-test "jsonEscapeToBuf: passes ASCII through unchanged" {
-    const gpa = std.testing.allocator;
-    const s = try jsonEscapeToBuf(gpa, "hello, world (idx=42)");
-    defer gpa.free(s);
-    try std.testing.expectEqualStrings("hello, world (idx=42)", s);
-}
-
-test "jsonEscapeToBuf: escapes quote, backslash, common control chars" {
-    const gpa = std.testing.allocator;
-    const s = try jsonEscapeToBuf(gpa, "a\"b\\c\nd\te");
-    defer gpa.free(s);
-    try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\te", s);
-}
-
-test "jsonEscapeToBuf: low control bytes become \\uXXXX" {
-    const gpa = std.testing.allocator;
-    const s = try jsonEscapeToBuf(gpa, &[_]u8{ 'x', 0x01, 'y', 0x1f, 'z' });
-    defer gpa.free(s);
-    try std.testing.expectEqualStrings("x\\u0001y\\u001fz", s);
 }
 
 test {

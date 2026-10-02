@@ -73,6 +73,13 @@ pub const seeds: []const []const u8 = &.{
 pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
     if (raw.len == 0) return;
 
+    // The pipeline reports positions as a byte offset plus one over a
+    // `u32`-addressed source.  `Ast` would tolerate a source of exactly
+    // `maxInt(u32)` bytes — its end-of-file token carries `source.len` as
+    // a `u32` start — but the column of that last byte would not fit, so
+    // refuse anything wider here, ahead of the sentinel copy below.
+    if (raw.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+
     // Ast.parse requires a null-terminated sentinel string.
     const src = try gpa.allocSentinel(u8, raw.len, 0);
     defer gpa.free(src);
@@ -80,11 +87,16 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
 
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     const config = &config_mod.Default;
     var problems: std.ArrayListUnmanaged(problem_mod.Problem) = .empty;
+    defer {
+        for (problems.items) |*problem| problem.deinit(gpa);
+        problems.deinit(gpa);
+    }
 
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
+    var cache = try file_cache_mod.FileCache.init(gpa, &tree);
     defer cache.deinit();
 
     var node_idx: u32 = 1;
@@ -92,7 +104,11 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         const cfg = (try cfg_builder.lowerFunctionFull(
-            gpa, &tree, node, config, &cache,
+            gpa,
+            &tree,
+            node,
+            config,
+            &cache,
         )) orelse continue;
         var cfg_mut = cfg;
         defer cfg_mut.deinit(gpa);
@@ -100,9 +116,6 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
     }
 
     try rule_catalog.runEscape(gpa, &tree, &cache, config, &problems);
-
-    for (problems.items) |*p| p.deinit(gpa);
-    problems.deinit(gpa);
 }
 
 // ── Entry point 1: smoke test ──────────────────────────────────────────
@@ -112,7 +125,7 @@ test "fuzz smoke: seeds do not crash the analysis pipeline" {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         analyzeBytes(arena.allocator(), seed) catch |err| switch (err) {
-            error.OutOfMemory => {}, // OOM on a seed is not a logic crash
+            error.OutOfMemory, error.InvalidSyntax, error.AnalysisBudgetExceeded => {},
             else => return err,
         };
     }
@@ -136,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(raw);
 
     analyzeBytes(gpa, raw) catch |err| switch (err) {
-        error.OutOfMemory => return,
+        error.OutOfMemory, error.InvalidSyntax, error.AnalysisBudgetExceeded => return,
         else => return err,
     };
 }
