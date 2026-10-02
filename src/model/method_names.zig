@@ -143,7 +143,6 @@ pub fn isContainerStoreMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "addManyAsSlice");
 }
 
-
 /// Methods in JSC (JavaScriptCore) that dispatch into user JavaScript
 /// code or otherwise trigger GC.  A raw byte slice taken from a
 /// JSC-managed ArrayBuffer or JSString that is live across one of
@@ -230,7 +229,6 @@ pub fn isScopePopMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "popNamespace") or
         std.mem.eql(u8, name, "exitNamespace");
 }
-
 
 // ── Tests ──────────────────────────────────────────────────
 

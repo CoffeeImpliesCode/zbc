@@ -11,15 +11,34 @@
 //!   is_noreturn            — "does the call terminate the basic block?"
 //!   allocates              — "does the body call into an allocator?"
 //!
-//! Anything inference can't reach is `.unknown` / null / false.
+//!   grow_paths            — "WHOSE buffer can move?": the
+//!                            parameter-rooted storage paths this fn (or
+//!                            anything it reaches) can grow, next to
+//!                            `may_grow_collections`'s "can anything move?"
+//!
+//! The two are kept CONSISTENT: after `FileCache.resolveTransitiveTakes`
+//! Phase 8, `grows_unknown_path == true` implies `may_grow_collections ==
+//! true`.  An effect that could not be attributed to a parameter is
+//! still a reallocation, and must not be one of the reasons the coarse
+//! flag says this fn grows nothing.
+//!
 //! Consumers MUST treat `.unknown` as "assume nothing" — same as
-//! today's `lowering_gap` conservative fallback.
+//! today's `lowering_gap` conservative fallback.  Storage counts as
+//! this fn's own only when the DECLARATIONS behind it prove this fn
+//! built it.  This file cannot read a declaration, so it never claims
+//! ownership: it hands the question to
+//! `FileCache.provesFreshStorage` as a `FreshClaim`, and every claim
+//! that resolver cannot prove is charged as unknown storage.  A call
+//! result, a file-level `var`, a copied header and a cast are all
+//! claims that cannot be proved, because each can hand back an
+//! allocation somebody else is walking.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const tokens = @import("../ast/tokens.zig");
 const receiver_mod = @import("method_names.zig");
+const local_bindings = @import("local_bindings.zig");
 
 /// Result-shape classification.
 pub const Returns = union(enum) {
@@ -53,6 +72,107 @@ pub const FieldFree = struct {
     /// into source.  Used by FileCache.filterMayFreeFields to verify
     /// the field's TYPE actually has this method before propagating.
     method: []const u8,
+};
+
+/// Storage reached from a parameter through a dotted field path.
+/// `path` is `""` when the parameter's OWN storage is meant.
+pub const ParamPath = struct {
+    /// 0-indexed parameter of the enclosing fn.
+    param: u32,
+    /// Dotted field path from that parameter (`""` = the whole).
+    path: []const u8,
+};
+
+/// Where a value came from, as far as this file can prove.  Anything
+/// the file cannot read — a call result, an index, a `@constCast` of a
+/// view, a loop capture, a local whose initializer it does not
+/// understand — stays `.unknown`, and consumers MUST assume it carries
+/// any storage at all.
+pub const StorageOwner = union(enum) {
+    param: ParamPath,
+    unknown,
+};
+
+/// One parameter-rooted storage path whose backing buffer a fn may
+/// grow.  `field` is `""` when the parameter's own storage is grown
+/// (`fn g(list: *List) { list.append(1); }`) and a dotted path
+/// otherwise (`fn g(o: *Oracle) { o.aliases.append(1); }`).  Slice is
+/// owned by the summary arena.
+pub const GrowPath = struct {
+    param: u32,
+    field: []const u8,
+};
+
+/// A call in the body whose callee's grow paths fold into the caller's.
+/// Produced by `inferGrowEffects`, consumed by
+/// `FileCache.resolveGrowPathsOne` — never stored in an `FnSummary`.
+pub const GrowCall = struct {
+    /// Final callee token, for exact AST and declaration lookup in this snapshot.
+    callee_token: Ast.TokenIndex,
+    /// Free-fn name (`.bare` / `.qualified`) or method name
+    /// (`.method` / `.unresolved`).
+    name: []const u8,
+    ///   `.bare`      — `growNames(list, n)`, a free call this file
+    ///                  may be able to name;
+    ///   `.method`    — `recv.grow(n)`, a method on storage this fn
+    ///                  holds, whose receiver is `args[0]`;
+    ///   `.qualified` — `helpers.grow(list, n)`, a free function in
+    ///                  the module `qualifier` names.  The qualifier
+    ///                  is not storage the caller was handed, so
+    ///                  nothing is prepended to `args`.  Only a
+    ///                  receiver that is ONE identifier reaches
+    ///                  here: `a.b.c(` names a field of something
+    ///                  else, and a module never has one.
+    ///   `.unresolved` — an invocation whose callee this fn cannot
+    ///                  root on a parameter: a method on a receiver
+    ///                  it was NOT handed (a header it built itself,
+    ///                  a global, a call result, an index), or an
+    ///                  indirect one — `@call`, a grouped or
+    ///                  computed callee — which names nothing at
+    ///                  all.  Its name is a METHOD name, or `""`,
+    ///                  and must never be dispatched to a file-level
+    ///                  declaration that happens to share it, so the
+    ///                  cache charges only what the call hands over.
+    kind: enum { bare, method, qualified, unresolved },
+    /// The declaration a `.qualified` call goes through; `""` otherwise.
+    qualifier: []const u8 = "",
+    /// One entry per callee parameter; `args[0]` of a `.method` call is
+    /// the receiver.  Slice is owned by the summary arena.
+    args: []const StorageOwner,
+};
+
+/// "This initializer may be storage this fn built for itself, and only
+/// a reader of declarations can say so."  The resolver
+/// (`FileCache.provesFreshStorage`) answers by resolving the
+/// constructor's declaration, the struct type's own fields and their
+/// defaults, or the callee's returns.  A claim it cannot prove is
+/// charged as unattributed storage, never as this fn's own.
+pub const FreshClaim = struct {
+    /// First and last token of the initializer expression.
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    /// The type the binding declared (`var x: List = .{}`), when it
+    /// spelled one.  An anonymous `.{ }` names no type of its own, so
+    /// proving its omitted fields needs this; `null` when the type was
+    /// left to inference.
+    type_first: ?Ast.TokenIndex = null,
+    type_last: ?Ast.TokenIndex = null,
+};
+
+/// What one pass over a body established about its growth effects.
+pub const GrowEffects = struct {
+    paths: []const GrowPath = &.{},
+    /// A grow site exists that is attributed to no listed path: it
+    /// reaches a global, or storage this file cannot trace.  Consumers
+    /// MUST assume such a fn may grow storage they cannot prove is
+    /// elsewhere.
+    unknown: bool = false,
+    calls: []const GrowCall = &.{},
+    /// Grow sites whose receiver may be storage this fn built for
+    /// itself.  Each is recorded here instead of in `paths` / `unknown`
+    /// so the resolver can still prove it fresh; whatever it cannot
+    /// prove becomes unknown storage.
+    claims: []const FreshClaim = &.{},
 };
 
 pub const FnSummary = struct {
@@ -110,6 +230,40 @@ pub const FnSummary = struct {
     /// `FileCache.resolveTransitiveTakes` Phase 5.
     /// Consumed by `slice-loop-reentrant-grow`.
     may_grow_collections: bool = false,
+    /// WHICH parameter-rooted storage paths this fn (or anything it
+    /// reaches) can grow, folded to a fixed point by
+    /// `FileCache.resolveTransitiveTakes` Phase 8.  `may_grow_collections`
+    /// says a reallocation is possible; this says where.  A callee
+    /// that grows its own list, or a different field of the same
+    /// owner, moves nothing the caller is iterating — that is a
+    /// DISJOINT set of effects, not a weaker type.
+    ///
+    /// A grow method used as a free function (`ensureCapacity(gpa,
+    /// &list, n)`) is covered here too, and sets
+    /// `may_grow_collections` as well: two views of the same body must
+    /// never disagree about whether a reallocation is reachable.
+    ///
+    /// A call this file CANNOT resolve — an unreadable module, a
+    /// method the receiver's type does not declare — lands here as
+    /// well, one entry per parameter-rooted argument it was handed.
+    /// Nothing is known about what such a callee does, and the only
+    /// claim its arguments support is that it can reallocate the
+    /// storage they were rooted at; that is a PATH, not unattributed
+    /// storage, so a caller can still tell a handover to one list
+    /// from a loop walking another.  An argument this file cannot
+    /// root is the one thing that carries no path, and it is what
+    /// `grows_unknown_path` records.
+    ///
+    /// `grow_paths` is NOT a promise that the listed storage is the
+    /// ONLY thing this fn grows.  `grows_unknown_path` carries that,
+    /// and it is the flag consumers must read.
+    grow_paths: []const GrowPath = &.{},
+    /// A reachable grow site is attributed to no path in
+    /// `grow_paths` — it reaches a global, or storage this file
+    /// cannot trace.  Defaults TRUE so a summary that has not been
+    /// through Phase 8 is conservative.  Consumers MUST treat it as
+    /// "may grow storage I cannot prove it does not reach".
+    grows_unknown_path: bool = true,
     /// True iff this fn (or any callee it reaches transitively within the
     /// same file) calls a JSC method that may trigger garbage collection,
     /// making raw slice/pointer borrows from ArrayBuffers or JSStrings
@@ -195,7 +349,14 @@ pub fn inferFromBody(
         if (tags[t] != .identifier) continue;
         if (tags[t + 1] != .l_paren) continue;
         if (t > first and tags[t - 1] == .period) continue;
-        if (receiver_mod.isExitCallbackRegisterName(tree.tokenSlice(t))) {
+        // A grow method used as a FREE function
+        // (`ensureCapacity(gpa, &list, n)`) reallocates just as the
+        // method form does, so the coarse flag covers it as well:
+        // leaving it out made the coarse view deny a reallocation
+        // the precise view can see.
+        const name = tree.tokenSlice(t);
+        if (receiver_mod.isArrayListGrowMethodName(name)) out.may_grow_collections = true;
+        if (receiver_mod.isExitCallbackRegisterName(name)) {
             out.may_run_on_any_thread = true;
             break;
         }
@@ -428,22 +589,53 @@ fn classifyReturnExpr(
     // classifies as .heap, not .borrowed_from(gpa).
     if (returnIsAllocCall(tree, first, last)) return .heap;
 
-    // `return <param>` / `return <param>.<field>` /
-    // `return <param>.<method>(...)` — borrowed_from(param).
-    if (tags[first] == .identifier) {
-        const head = tree.tokenSlice(first);
-        if (paramIndex(tree, proto, head)) |idx| {
-            return .{ .borrowed_from = idx };
-        }
+    if (returnIsDirectParamBorrow(tree, proto, first, last)) |idx| {
+        return .{ .borrowed_from = idx };
     }
 
-    // Body has an alloc and the return is some shape we can't pin
-    // down — conservative `.owned` (caller owns, no tracked id).
-    // Only emit when the body genuinely allocates, otherwise stay
-    // `.unknown` so callers don't assume ownership transfer.
     if (body_allocates) return .owned;
 
     return .unknown;
+}
+/// Return the parameter index when `[first, last]` is a simple
+/// parameter-rooted path (`p`, `p.field`, `p[index]`, or `p.*`).
+/// Calls are deliberately excluded: a method/function can return a
+/// detached value even when its receiver is a parameter.
+fn returnIsDirectParamBorrow(
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    first: tokens.TokenIndex,
+    last: tokens.TokenIndex,
+) ?u32 {
+    const tags = tree.tokens.items(.tag);
+    if (first > last or tags[first] != .identifier) return null;
+    const idx = paramIndex(tree, proto, tree.tokenSlice(first)) orelse return null;
+    var t = first + 1;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .period => {
+                if (t + 1 > last or tags[t + 1] != .identifier) return null;
+                t += 1;
+            },
+            .period_asterisk => {},
+            .l_bracket => {
+                var depth: u32 = 1;
+                t += 1;
+                while (t <= last and depth > 0) : (t += 1) {
+                    switch (tags[t]) {
+                        .l_bracket => depth += 1,
+                        .r_bracket => depth -= 1,
+                        .l_paren, .r_paren, .l_brace, .r_brace => return null,
+                        else => {},
+                    }
+                }
+                if (depth != 0) return null;
+                t -= 1;
+            },
+            else => return null,
+        }
+    }
+    return idx;
 }
 
 fn returnIsAllocCall(
@@ -471,11 +663,12 @@ fn returnIsAllocCall(
 const isAllocatorName = receiver_mod.isAllocatorishName;
 
 pub fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
-    var idx: u32 = 0;
     var it = proto.iterate(tree);
-    while (it.next()) |p| : (idx += 1) {
-        const name_tok = p.name_token orelse continue;
-        if (std.mem.eql(u8, tree.tokenSlice(name_tok), name)) return idx;
+    var index: u32 = 0;
+    while (it.next()) |p| : (index += 1) {
+        if (p.name_token) |nt| {
+            if (std.mem.eql(u8, tree.tokenSlice(nt), name)) return index;
+        }
     }
     return null;
 }
@@ -738,6 +931,797 @@ pub fn inferMayFreeFields(
     return out.toOwnedSlice(arena);
 }
 
+/// Deepest `<param> . <local> . …` chain followed before the answer is
+/// declared unknown.  Chains longer than this are vanishingly rare and
+/// the alternative (following them) risks not terminating on a
+/// self-referential binding.
+const max_owner_depth = 6;
+
+/// Concatenate two dotted path segments.  `arena` owns the result; an
+/// empty side is returned unchanged (it is not copied).
+pub fn joinPath(arena: std.mem.Allocator, outer: []const u8, inner: []const u8) ![]const u8 {
+    if (outer.len == 0) return inner;
+    if (inner.len == 0) return outer;
+    return std.fmt.allocPrint(arena, "{s}.{s}", .{ outer, inner });
+}
+
+/// Source text of the token range `[first, last]`, or `""` when empty.
+fn tokenText(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) []const u8 {
+    if (first > last) return "";
+    const starts = tree.tokens.items(.start);
+    return tree.source[starts[first] .. starts[last] + tree.tokenSlice(last).len];
+}
+
+/// Walk a pure `<id>(.<id>)*` chain rooted at `first`, returning one
+/// past its last token.  A `(` or `[` inside the range ends the walk
+/// early, which the caller detects by comparing against `last + 1`.
+fn pathChainEnd(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) ?Ast.TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    if (first > last or tags[first] != .identifier) return null;
+    var t: Ast.TokenIndex = first + 1;
+    while (t + 1 <= last and tags[t] == .period and tags[t + 1] == .identifier) : (t += 2) {}
+    return t;
+}
+
+/// Storage the value produced by `[first, last]` came from.
+///
+/// Recognised shapes are `&<path>`, `try <path>`, `<param>(.<field>)*`
+/// and `(<param>|<local>)(.<field>)*`, the last two with an optional
+/// `.*` deref.  A local is followed through its own initializer, so
+/// `const tree = o.tree;` reports the same owner as `o.tree` — that
+/// forwarding is what lets a call-site prove which of ITS parameters
+/// the loop's storage came from.
+///
+/// Everything else — a call result, an index, a cast, a loop capture,
+/// a local this file cannot read — is `.unknown`.  Unknown means "may
+/// carry any storage", never "carries none".
+pub fn ownerOfExpr(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    depth: u8,
+) !StorageOwner {
+    const tags = tree.tokens.items(.tag);
+    if (first > last) return .unknown;
+    // `&x` and `try x` wrap an expression without changing the storage
+    // it names.
+    switch (tags[first]) {
+        .ampersand, .keyword_try => return ownerOfExpr(
+            arena,
+            tree,
+            proto,
+            bindings,
+            first + 1,
+            last,
+            depth,
+        ),
+        else => {},
+    }
+    const chain_end = pathChainEnd(tree, first, last) orelse return .unknown;
+    var end = chain_end;
+    // `.*` is a SINGLE `period_asterisk` token in the Zig tokenizer.
+    if (end <= last and tags[end] == .period_asterisk) end += 1;
+    if (end != last + 1) return .unknown;
+
+    const fields = tokenText(tree, first + 2, chain_end - 1);
+    const root = tree.tokenSlice(first);
+    if (paramIndex(tree, proto, root)) |idx| {
+        return .{ .param = .{ .param = idx, .path = fields } };
+    }
+    if (depth >= max_owner_depth) return .unknown;
+    const binding = bindings.find(root) orelse return .unknown;
+    // A loop capture is one ELEMENT copied out of the buffer, not the
+    // list; whether that element aliases the list is its own question.
+    if (binding.origin == .loop_capture) return .unknown;
+    const inner = try ownerOfExpr(
+        arena,
+        tree,
+        proto,
+        bindings,
+        binding.rhsFirstAfterTry(tags),
+        binding.rhs_last,
+        depth + 1,
+    );
+    return switch (inner) {
+        .unknown => .unknown,
+        .param => |p| .{ .param = .{
+            .param = p.param,
+            .path = try joinPath(arena, p.path, fields),
+        } },
+    };
+}
+
+/// The storage a `<grow method>` receiver names.  `.unproven` is
+/// storage this fn may have BUILT for itself — a container
+/// constructor, a struct literal of them — which only a reader of
+/// declarations can confirm.  This file records the initializer as a
+/// `FreshClaim` and leaves the verdict to
+/// `FileCache.provesFreshStorage`; until that resolver proves one,
+/// the grow is unattributed storage, which is the conservative
+/// direction.
+pub const GrowBase = union(enum) {
+    unproven: FreshClaim,
+    storage: StorageOwner,
+};
+
+/// A token range, as `FreshClaim` and the fresh-storage resolver
+/// carry them around `FileCache`.
+pub const TokenRange = struct {
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+};
+
+/// Classify the receiver of a grow call for `inferGrowEffects`.  Its
+/// base name is followed through whatever chain of locals introduced
+/// it, so a header copy (`var copy = tally.*; copy.entries.append(x)`)
+/// is charged to the parameter whose buffer the copy shares.
+pub fn growBaseOfExpr(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) !GrowBase {
+    const tags = tree.tokens.items(.tag);
+    var root_tok = first;
+    if (root_tok <= last and tags[root_tok] == .keyword_try) root_tok += 1;
+    if (root_tok > last or tags[root_tok] != .identifier) {
+        return .{ .storage = .unknown };
+    }
+    const origin = try growOriginOfName(
+        arena,
+        tree,
+        proto,
+        bindings,
+        tree.tokenSlice(root_tok),
+        0,
+    );
+    return switch (origin) {
+        // The claim names an initializer, not a field of it, so the
+        // field path the receiver walked is not part of the question:
+        // fresh storage stays fresh one level down.
+        .unproven => |claim| .{ .unproven = claim },
+        .storage => |s| switch (s) {
+            .unknown => GrowBase{ .storage = .unknown },
+            .param => |p| .{ .storage = .{ .param = .{
+                .param = p.param,
+                .path = try joinPath(arena, p.path, tokenText(tree, root_tok + 2, last)),
+            } } },
+        },
+    };
+}
+
+/// Storage `name` was introduced from.  A local initialised from
+/// another binding inherits that binding's answer; anything else is a
+/// claim the resolver has to answer from declarations, and unknown
+/// until it does.
+fn growOriginOfName(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    name: []const u8,
+    depth: u8,
+) !GrowBase {
+    if (depth >= max_owner_depth) return .{ .storage = .unknown };
+    if (paramIndex(tree, proto, name)) |idx| {
+        return .{ .storage = .{ .param = .{ .param = idx, .path = "" } } };
+    }
+    const binding = bindings.find(name) orelse return .{ .storage = .unknown };
+    if (binding.origin == .loop_capture) return .{ .storage = .unknown };
+    const tags = tree.tokens.items(.tag);
+    const rhs_first = binding.rhsFirstAfterTry(tags);
+    const base_tok = if (rhs_first <= binding.rhs_last and tags[rhs_first] == .ampersand)
+        rhs_first + 1
+    else
+        rhs_first;
+    if (base_tok > binding.rhs_last or tags[base_tok] != .identifier) {
+        // Not a name this fn introduced: a construction, a call, a
+        // cast, `undefined`.  Whoever built it may have handed back
+        // somebody else's buffer, so this is a question for the
+        // resolver rather than an answer.
+        return .{ .unproven = claimFor(tree, binding) };
+    }
+    const base_name = tree.tokenSlice(base_tok);
+    // `var x: T = SomeType.init(…)` also starts with an identifier,
+    // but one this fn never introduced: a type, a namespace, a
+    // container-level declaration.  There is nothing here to follow,
+    // and treating it as borrowed would throw away every constructor
+    // the resolver CAN read — so it is a claim like any other.
+    if (paramIndex(tree, proto, base_name) == null and bindings.find(base_name) == null) {
+        return .{ .unproven = claimFor(tree, binding) };
+    }
+    return switch (try growOriginOfName(
+        arena,
+        tree,
+        proto,
+        bindings,
+        base_name,
+        depth + 1,
+    )) {
+        .unproven => |claim| .{ .unproven = claim },
+        .storage => |s| switch (s) {
+            .unknown => GrowBase{ .storage = .unknown },
+            .param => |p| .{
+                .storage = .{
+                    .param = .{
+                        .param = p.param,
+                        // A trailing `.*` copies the header at the path, so it
+                        // names no further field — `var copy = o.entries.*;`
+                        // shares `o.entries`'s buffer, not a field ".*".
+                        .path = try joinPath(
+                            arena,
+                            p.path,
+                            tokenText(tree, base_tok + 2, derefLast(tags, base_tok, binding.rhs_last)),
+                        ),
+                    },
+                },
+            },
+        },
+    };
+}
+
+/// Last token of a field path, with a trailing `.*` deref removed.
+/// `.*` is a SINGLE `period_asterisk` token, and it copies the header
+/// it follows rather than naming a field of it.
+fn derefLast(
+    tags: []const std.zig.Token.Tag,
+    base: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) Ast.TokenIndex {
+    if (last > base and tags[last] == .period_asterisk) return last - 1;
+    return last;
+}
+
+/// The type expression a local's declaration spelled (`var x: T = …`),
+/// or null when it left the type to be inferred.  An anonymous `.{ }`
+/// names no type of its own, so the resolver needs this to say which
+/// fields it omitted and what defaults they carry.
+fn declaredTypeRange(tree: *const Ast, binding: *const local_bindings.Binding) ?TokenRange {
+    if (binding.rhs_first == 0) return null;
+    const tags = tree.tokens.items(.tag);
+    const first = binding.name_token + 1;
+    if (first + 1 > binding.rhs_first) return null;
+    if (tags[first] != .colon) return null;
+    // A local declaration's initializer starts one token after its
+    // own `=`, so everything between the `:` and that `=` is the type.
+    // Anchoring on that `=` rather than scanning for one keeps a `=`
+    // inside a generic argument or a fn type out of the answer.
+    if (tags[binding.rhs_first - 1] != .equal) return null;
+    const type_first = first + 1;
+    const type_last = binding.rhs_first - 2;
+    if (type_last < type_first) return null;
+    return .{ .first = type_first, .last = type_last };
+}
+
+/// The claim a local's initializer leaves behind: the expression
+/// itself, plus the type its declaration spelled — an anonymous `.{ }`
+/// names no type of its own, and the resolver needs the declaration to
+/// say which fields it left out.
+fn claimFor(tree: *const Ast, binding: *const local_bindings.Binding) FreshClaim {
+    const declared = declaredTypeRange(tree, binding);
+    return .{
+        .first = binding.rhs_first,
+        .last = binding.rhs_last,
+        .type_first = if (declared) |range| range.first else null,
+        .type_last = if (declared) |range| range.last else null,
+    };
+}
+
+/// Walk back from the `.` of a method call over `<id>(.<id>)*` to the
+/// first token of the receiver.  A receiver that is not a plain path
+/// (`foo().bar`, `xs[i].bar`) yields a start token that
+/// `growBaseOfExpr` rejects as `.unknown`.
+fn receiverStart(
+    tags: []const std.zig.Token.Tag,
+    dot: Ast.TokenIndex,
+    lower: Ast.TokenIndex,
+) Ast.TokenIndex {
+    var start = dot - 1;
+    while (start >= lower + 2 and tags[start - 1] == .period and tags[start - 2] == .identifier) {
+        start -= 2;
+    }
+    return start;
+}
+
+/// The parameter-rooted storage one operand of an invocation came
+/// from, resolved by the same rooting every other argument uses.
+fn operandOwner(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    node: Ast.Node.Index,
+) !StorageOwner {
+    return ownerOfExpr(
+        arena,
+        tree,
+        proto,
+        bindings,
+        tree.firstToken(node),
+        tree.lastToken(node),
+        0,
+    );
+}
+
+/// Append the storage an invocation's CALLEE was reached through.
+/// A plain name is the function being invoked, not storage it holds,
+/// so it contributes nothing: charging it would put a function-pointer
+/// parameter on the grow list of every fn that calls through it.
+/// Anything else reaches storage — `@field(o, "push")` names a field
+/// OF what the builtin was handed, `o.make().replace(…)` hands over
+/// what the inner call was reached through — and an expression this
+/// file cannot follow (`xs[i]`, `(cb)`) stays `.unknown`, which is
+/// what it is.
+///
+/// A callee that is itself a call value chains (`f()(g())(…)`), so
+/// the walk is bounded by the same `max_owner_depth` every other
+/// chain in this file uses.  Exhausting it records `.unknown` — what
+/// an expression this deep hands over — rather than dropping the
+/// callee, whose storage would then go uncharged.
+fn appendCalleeOperands(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    callee: Ast.Node.Index,
+    out: *std.ArrayListUnmanaged(StorageOwner),
+    depth: u8,
+) !void {
+    if (depth >= max_owner_depth) {
+        try out.append(arena, .unknown);
+        return;
+    }
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(callee);
+    if (first == tree.lastToken(callee) and tags[first] == .identifier) return;
+    var call_buf: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buf, callee)) |sub| {
+        try appendCalleeOperands(arena, tree, proto, bindings, sub.ast.fn_expr, out, depth + 1);
+        for (sub.ast.params) |p| try out.append(arena, try operandOwner(arena, tree, proto, bindings, p));
+        return;
+    }
+    var params_buf: [2]Ast.Node.Index = undefined;
+    if (tree.builtinCallParams(&params_buf, callee)) |params| {
+        for (params) |p| try out.append(arena, try operandOwner(arena, tree, proto, bindings, p));
+        return;
+    }
+    // A grouped or computed callee — `(cb)`, `xs[i].replace` — is
+    // rooted as the expression it is, which is what the operand rules
+    // make of it: whatever it names, or `.unknown`.
+    try out.append(arena, try operandOwner(arena, tree, proto, bindings, callee));
+}
+
+/// The argument slots of an `@call` tuple, when the third argument is
+/// the literal `@call`'s grammar puts there: `.{ … }`, which the AST
+/// holds as an anonymous struct- or array-init, whose fields (or
+/// elements) ARE the arguments.
+///
+/// The literal's IDENTITY is what this reads, not its source text.  A
+/// search for a `{` takes the first one it finds, including one that
+/// belongs to an expression inside an argument
+/// (`@call(.auto, cb, makeArgs(.{ .a = 1 }))`), and splits that
+/// expression's own tokens into argument slots.
+///
+/// `null` means "not a literal this file can take apart": a named or
+/// forwarded tuple (`const args = .{ list, value }; @call(.auto, cb,
+/// args)`), a computed one, a typed struct init that is not an
+/// argument tuple at all.  The invocation still ran, so its caller
+/// roots the value whole rather than dropping the call.
+fn tupleArgumentSlots(
+    tree: *const Ast,
+    buf: *[2]Ast.Node.Index,
+    node: Ast.Node.Index,
+) ?[]const Ast.Node.Index {
+    // The two forms share one buffer: only one of them can match a
+    // given node's tag.
+    if (tree.fullArrayInit(buf, node)) |init| {
+        if (init.ast.type_expr != .none) return null;
+        return init.ast.elements;
+    }
+    if (tree.fullStructInit(buf, node)) |init| {
+        if (init.ast.type_expr != .none) return null;
+        return init.ast.fields;
+    }
+    return null;
+}
+
+/// True iff the token pass in `inferGrowEffects` already recorded the
+/// call whose final callee token is `callee` — its adjacency rule,
+/// asked about the token the AST named instead of about a scan.
+fn adjacencyPassReadIt(
+    tags: []const std.zig.Token.Tag,
+    callee: Ast.TokenIndex,
+) bool {
+    if (tags[callee] != .identifier) return false;
+    // A bare `name(` needs nothing before it.  A `recv.name(` needs the
+    // receiver to be a plain name for the pass to reach the call at
+    // all: `xs[i].name(` and `f().name(` are exactly the shapes it
+    // skips.
+    if (callee == 0 or tags[callee - 1] != .period) return true;
+    return callee >= 2 and tags[callee - 2] == .identifier;
+}
+
+/// True iff `tok` falls inside one of `ranges` — the token span of a
+/// declaration this body only NAMES, whose effects are its own.
+fn tokenInRanges(ranges: []const TokenRange, tok: Ast.TokenIndex) bool {
+    for (ranges) |r| {
+        if (tok >= r.first and tok <= r.last) return true;
+    }
+    return false;
+}
+
+/// True iff `tok` is in the body being analyzed rather than in a
+/// declaration that body only names.
+fn bodyOwnsToken(
+    body_first: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+    nested: []const TokenRange,
+    tok: Ast.TokenIndex,
+) bool {
+    if (tok < body_first or tok > body_last) return false;
+    return !tokenInRanges(nested, tok);
+}
+
+/// Record the invocations in `body` that no identifier runs into a
+/// `(` with: an indirect call through a value
+/// (`@call(.auto, cb, .{ … })`), a grouped or computed callee, a
+/// method reached through an index or a call result
+/// (`xs[i].push(v)`, `o.make().replace(v)`).
+///
+/// Those leave nothing behind in a token pass, so a summary built from
+/// that answer reads the fn as growing nothing at all.  They are found
+/// through the AST instead, where an invocation IS a node: an `if` /
+/// `while` condition, a grouped condition and a fn pointer merely held
+/// in a declaration are not invocations, and are not invented as ones.
+/// A nested declaration's body is skipped for the same reason the
+/// token pass skips it — that fn has an entry of its own.
+///
+/// Every one of them is recorded `.unresolved`.  Its name is a method
+/// name reached through a receiver this file cannot root, or no name
+/// at all for an indirect call, so the cache must never dispatch it to
+/// a declaration that happens to share it; what it may reallocate is
+/// the storage the invocation was handed, which is what `.unresolved`
+/// charges.
+///
+/// The `@call` argument tuple is read as the AST node it is, never as
+/// source text: the entries of a `.{ … }` literal ARE the arguments,
+/// and a tuple named, forwarded or computed is charged as the whole
+/// value it is.  How its arguments are spelled never removes the
+/// invocation from the summary.
+///
+/// `unknown` is the one thing an `@call` costs on its own.  Nothing in
+/// this file resolves the callback behind it, so what it reallocates
+/// is not only the storage it was handed — a callback reached through
+/// a global, a table, or a field may move storage this fn never held
+/// at all, and an EMPTY argument list does not stop it.  Every actual
+/// `@call` execution therefore marks the fn as having grown something
+/// unattributable, while the call entry keeps carrying the precise
+/// paths its own arguments root to.
+fn collectIndirectInvocations(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    body_first: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+    nested: []const TokenRange,
+    calls: *std.ArrayListUnmanaged(GrowCall),
+    unknown: *bool,
+) !void {
+    const tags = tree.tokens.items(.tag);
+    var idx: u32 = 1;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        // The tag decides whether this node can be an invocation at
+        // all, and both tokens below are reached without walking the
+        // node's own subtree — `firstToken` would, once per node in
+        // the file, for every fn in it.
+        switch (tree.nodeTag(node)) {
+            .call, .call_one, .call_comma, .call_one_comma => {
+                // The call's `(` is its main token, and reaching it
+                // costs a data read rather than a walk of the node's
+                // own subtree — which is what every node in the file
+                // would otherwise pay, for every fn in it.
+                if (!bodyOwnsToken(body_first, body_last, nested, tree.nodeMainToken(node))) continue;
+                var call_buf: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buf, node) orelse continue;
+                const callee = call.ast.fn_expr;
+                // The token the call's `(` follows: what a call index
+                // keys on, and what the token pass's adjacency rule
+                // reads.
+                const callee_tok = tree.lastToken(callee);
+                if (adjacencyPassReadIt(tags, callee_tok)) continue;
+                // A grow-vocabulary method is attributed by the grow
+                // pass, from the receiver ITS adjacency rules reach.
+                // Recording it again here would charge the same site
+                // from a second, weaker reading.
+                if (receiver_mod.isArrayListGrowMethodName(tree.tokenSlice(callee_tok))) continue;
+                var args: std.ArrayListUnmanaged(StorageOwner) = .empty;
+                try appendCalleeOperands(arena, tree, proto, bindings, callee, &args, 0);
+                for (call.ast.params) |p| {
+                    try args.append(arena, try operandOwner(arena, tree, proto, bindings, p));
+                }
+                try calls.append(arena, .{
+                    .callee_token = callee_tok,
+                    // A computed callee (`xs[i].push`, `(cb)`) names
+                    // nothing this file could dispatch on, and must
+                    // never be mistaken for a declaration sharing it.
+                    .name = if (tags[callee_tok] == .identifier)
+                        tree.tokenSlice(callee_tok)
+                    else
+                        "",
+                    .kind = .unresolved,
+                    .args = try args.toOwnedSlice(arena),
+                });
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                // The `@` of a builtin is the first token of the call.
+                const at = tree.nodeMainToken(node);
+                if (!bodyOwnsToken(body_first, body_last, nested, at)) continue;
+                // `@call` runs a value this body only holds: no
+                // declaration to read, and nothing in its spelling
+                // says what that value does.  What the body does know
+                // is the storage the invocation was handed — through
+                // the callee, and through the argument tuple.
+                if (!std.mem.eql(u8, tree.tokenSlice(at), "@call")) continue;
+                var params_buf: [2]Ast.Node.Index = undefined;
+                const params = tree.builtinCallParams(&params_buf, node) orelse continue;
+                if (params.len < 3) continue;
+                // The callback is a value: this file cannot resolve
+                // what it does, and what it does may reach storage
+                // past the arguments below — a global, a table, a
+                // field — which an empty `.{}` does not stop it from
+                // moving.
+                unknown.* = true;
+                var args: std.ArrayListUnmanaged(StorageOwner) = .empty;
+                try appendCalleeOperands(arena, tree, proto, bindings, params[1], &args, 0);
+                var slots_buf: [2]Ast.Node.Index = undefined;
+                if (tupleArgumentSlots(tree, &slots_buf, params[2])) |slots| {
+                    // The literal IS `@call`'s argument list, so each
+                    // of its entries is one argument.  `.{}` hands
+                    // over nothing, and leaves the invocation itself
+                    // as the only thing it proves.
+                    for (slots) |slot| {
+                        try args.append(arena, try operandOwner(arena, tree, proto, bindings, slot));
+                    }
+                } else {
+                    // A tuple named, forwarded or computed elsewhere.
+                    // Its entries cannot be read off here, but it was
+                    // still handed to something that may reallocate
+                    // what it names, so it is charged as the whole
+                    // value it is — never as "no arguments".
+                    try args.append(arena, try operandOwner(arena, tree, proto, bindings, params[2]));
+                }
+                try calls.append(arena, .{
+                    .callee_token = at,
+                    .name = "@call",
+                    .kind = .unresolved,
+                    .args = try args.toOwnedSlice(arena),
+                });
+            },
+            else => continue,
+        }
+    }
+}
+
+/// One entry per comma-separated argument in `[start, end]`, each
+/// resolved to the parameter-rooted storage it came from.  A `receiver`
+/// is prepended for a method call, whose first parameter is the
+/// receiver rather than an argument.  Shared with the rules that ask
+/// "which of my parameters does this callee reach through".
+pub fn argOwners(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    receiver: ?StorageOwner,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) ![]const StorageOwner {
+    var out: std.ArrayListUnmanaged(StorageOwner) = .empty;
+    if (receiver) |r| try out.append(arena, r);
+    if (start > end) return out.toOwnedSlice(arena);
+    const tags = tree.tokens.items(.tag);
+    var arg_start: Ast.TokenIndex = start;
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = start;
+    while (t <= end) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -= 1,
+            .comma => if (depth == 0) {
+                try out.append(arena, try ownerOfExpr(arena, tree, proto, bindings, arg_start, t - 1, 0));
+                arg_start = t + 1;
+            },
+            else => {},
+        }
+    }
+    try out.append(arena, try ownerOfExpr(arena, tree, proto, bindings, arg_start, end, 0));
+    return out.toOwnedSlice(arena);
+}
+
+/// Which of this fn's parameter-rooted storage paths its body may grow.
+///
+/// A grow method invoked as a METHOD (`o.aliases.append(…)`) is
+/// attributed to the storage its receiver names, through any number of
+/// by-value header copies — `var copy = tally.*; copy.entries.append(x)`
+/// still moves `tally`'s buffer, because the copy shares it.
+///
+/// A grow method used as a FREE function (`ensureCapacity(gpa, &list,
+/// n)`) is a reallocation too, and so is a call this file cannot
+/// resolve at all: what an arbitrary free function does with the
+/// storage it is handed is not decided by its name.  Calls are
+/// returned here rather than resolved so
+/// `FileCache.resolveGrowPathsOne` can fold the ones it CAN name in,
+/// charge the rest to what the call handed over, and drive the
+/// transitive fixed point.
+///
+/// A METHOD call whose receiver cannot be rooted on a parameter is
+/// returned for its ARGUMENTS alone (`GrowCall.kind == .unresolved`):
+/// the receiver is charged where it was built, and a fresh header
+/// proves only that the callee moves that one — never that it leaves
+/// the storage it was passed.
+///
+/// An invocation the token pass cannot see at all — a callee that is
+/// a value (`@call(.auto, cb, .{ … })`), a grouped or computed one, a
+/// method through an index or a call result — is returned the same
+/// way, from the AST: see `collectIndirectInvocations`.  What such a
+/// call does is not decided by any name in it, so it may reallocate
+/// what it was handed and nothing else.
+pub fn inferGrowEffects(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    bindings: *const local_bindings.LocalBindings,
+) !GrowEffects {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    var paths: std.ArrayListUnmanaged(GrowPath) = .empty;
+    var calls: std.ArrayListUnmanaged(GrowCall) = .empty;
+    var claims: std.ArrayListUnmanaged(FreshClaim) = .empty;
+    // Token spans of the declarations this body only names, shared
+    // with the AST pass below so it attributes their calls to them.
+    var nested: std.ArrayListUnmanaged(TokenRange) = .empty;
+    var unknown = false;
+    // Set when this body holds an invocation the token pass cannot
+    // read, so the AST pass has something to look for.  Reading the
+    // whole AST once per fn would cost more than the token pass
+    // itself, and a body that CANNOT hold one is the common case.
+    var needs_ast_pass = false;
+
+    var t = first;
+    while (t + 2 <= last) : (t += 1) {
+        // An invocation this pass cannot read is a `(` whose callee is
+        // not `<name>` after a plain-name receiver — the exact case
+        // the recording rule below skips, plus `@call`, which runs a
+        // value this body holds.  Reading the whole AST once per fn
+        // costs more than this pass itself, and a body that holds no
+        // such call is the common case.
+        if (tags[t + 1] == .l_paren) {
+            switch (tags[t]) {
+                .identifier => if (t > first and tags[t - 1] == .period and
+                    (t < first + 2 or tags[t - 2] != .identifier))
+                {
+                    needs_ast_pass = true;
+                },
+                .r_paren, .r_bracket, .r_brace => needs_ast_pass = true,
+                .builtin => if (std.mem.eql(u8, tree.tokenSlice(t), "@call")) {
+                    needs_ast_pass = true;
+                },
+                else => {},
+            }
+        }
+        if (tags[t] == .keyword_fn) {
+            const after = tokens.skipNestedFn(tags, t, last);
+            try nested.append(arena, .{ .first = t, .last = after });
+            t = after;
+            continue;
+        }
+        if (tags[t] == .period and tags[t + 1] == .identifier and tags[t + 2] == .l_paren and
+            receiver_mod.isArrayListGrowMethodName(tree.tokenSlice(t + 1)))
+        {
+            switch (try growBaseOfExpr(arena, tree, proto, bindings, receiverStart(tags, t, first), t - 1)) {
+                // Storage this fn may have built for itself: the
+                // resolver decides, and a claim it cannot prove is
+                // charged as unattributed storage below.
+                .unproven => |claim| try claims.append(arena, claim),
+                .storage => |s| switch (s) {
+                    .unknown => unknown = true,
+                    .param => |p| try paths.append(arena, .{ .param = p.param, .field = p.path }),
+                },
+            }
+            continue;
+        }
+        if (tags[t] != .identifier or tags[t + 1] != .l_paren) continue;
+
+        const call_end = tokens.matchParen(tags, t + 1, last) orelse continue;
+        const name = tree.tokenSlice(t);
+        var receiver: ?StorageOwner = null;
+        var kind: @FieldType(GrowCall, "kind") = .bare;
+        var qualifier: []const u8 = "";
+        if (t > first and tags[t - 1] == .period) {
+            if (t < first + 2 or tags[t - 2] != .identifier) continue;
+            // A grow-vocabulary method is already recorded as a grow
+            // site above, from the storage its receiver names.
+            if (receiver_mod.isArrayListGrowMethodName(name)) continue;
+            const recv_first = receiverStart(tags, t - 1, first);
+            const base = try growBaseOfExpr(
+                arena,
+                tree,
+                proto,
+                bindings,
+                recv_first,
+                t - 2,
+            );
+            switch (base) {
+                // A receiver this fn may have built for itself moves
+                // only that storage — but that says nothing about the
+                // ARGUMENTS, which the callee can reallocate whatever
+                // it was handed.  The call is kept for them, as a name
+                // that must never reach a file-level declaration
+                // sharing it.
+                .unproven => kind = .unresolved,
+                // A receiver this fn was not handed — a global, a
+                // call result, a loop capture.  When it is a single
+                // identifier it may name a MODULE, and then this is a
+                // free function in another file rather than a method
+                // on storage; the cache resolves it, and charges what
+                // the call hands over when it cannot.  A longer chain
+                // (`a.b.c(`) names a field of something else and is
+                // charged the same way.
+                .storage => |s| switch (s) {
+                    .unknown => {
+                        // `recv_first` is the FIRST token of the
+                        // receiver path and `t - 1` its `.`, so a
+                        // receiver that is exactly one identifier
+                        // spells `qualifier . name (` — two segments
+                        // from `recv_first` to `t`.  Anything longer
+                        // (`a.b.c(`) reaches a field of something
+                        // else, and a module never does.
+                        if (t == recv_first + 2) {
+                            kind = .qualified;
+                            qualifier = tree.tokenSlice(recv_first);
+                        } else {
+                            kind = .unresolved;
+                        }
+                    },
+                    // A NESTED receiver (`o.inner.method()`) is kept:
+                    // the cache resolves the field's type and folds
+                    // the callee's paths in, or charges them to the
+                    // receiver's storage when it cannot.
+                    .param => |p| {
+                        receiver = .{ .param = p };
+                        kind = .method;
+                    },
+                },
+            }
+        }
+        try calls.append(arena, .{
+            .callee_token = t,
+            .name = name,
+            .kind = kind,
+            .qualifier = qualifier,
+            .args = try argOwners(arena, tree, proto, bindings, receiver, t + 2, call_end - 1),
+        });
+    }
+    if (needs_ast_pass) {
+        try collectIndirectInvocations(arena, tree, proto, bindings, first, last, nested.items, &calls, &unknown);
+    }
+    return .{
+        .paths = try paths.toOwnedSlice(arena),
+        .unknown = unknown,
+        .calls = try calls.toOwnedSlice(arena),
+        .claims = try claims.toOwnedSlice(arena),
+    };
+}
+
 /// True iff the body contains `<x>.create(<type_name>)` or
 /// `<x>.create(Self)`.  Returns false when `type_name` is null
 /// (top-level fns have no containing type).
@@ -865,10 +1849,9 @@ pub fn inferResultHeapFields(
 /// inference uses).
 fn rhsTextLooksAlloc(text: []const u8) bool {
     const patterns = [_][]const u8{
-        ".alloc(", ".allocSentinel(", ".allocAdvanced(",
-        ".create(", ".dupe(", ".dupeZ(",
-        ".allocPrint(", ".allocPrintZ(",
-        ".toOwnedSlice(",
+        ".alloc(",      ".allocSentinel(", ".allocAdvanced(",
+        ".create(",     ".dupe(",          ".dupeZ(",
+        ".allocPrint(", ".allocPrintZ(",   ".toOwnedSlice(",
     };
     for (patterns) |p| {
         if (std.mem.indexOf(u8, text, p) != null) return true;
@@ -881,7 +1864,10 @@ fn rhsTextLooksAlloc(text: []const u8) bool {
 const testing = std.testing;
 
 fn parse(src: [:0]const u8) !Ast {
-    return try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    errdefer tree.deinit(testing.allocator);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    return tree;
 }
 
 /// Find the first fn_decl in `tree` and infer its summary.  The
@@ -921,8 +1907,7 @@ test "infer: body with .alloc() sets allocates" {
     try testing.expect(s.returns == .heap);
 }
 
-
-test "infer: return self.x classifies as borrowed_from(self)" {
+test "skript regression: direct parameter field borrow remains classified" {
     var tree = try parse(
         \\fn text(self: *Foo) []const u8 {
         \\    return self.buf;
@@ -935,7 +1920,7 @@ test "infer: return self.x classifies as borrowed_from(self)" {
     try testing.expectEqual(@as(u32, 0), s.returns.borrowed_from);
 }
 
-test "infer: return try ctx.method() classifies via ctx param" {
+test "skript regression: receiver method call is not a direct parameter borrow" {
     var tree = try parse(
         \\fn wrap(ctx: *Foo) ![]u8 {
         \\    return try ctx.makeBuf();
@@ -944,8 +1929,7 @@ test "infer: return try ctx.method() classifies via ctx param" {
     defer tree.deinit(testing.allocator);
     var buf: [1]Ast.Node.Index = undefined;
     const s = inferFirstFn(&tree, &buf);
-    try testing.expect(s.returns == .borrowed_from);
-    try testing.expectEqual(@as(u32, 0), s.returns.borrowed_from);
+    try testing.expect(s.returns == .unknown);
 }
 
 test "infer: no return statement leaves returns as unknown" {

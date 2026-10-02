@@ -114,13 +114,12 @@ fn fieldMatches(
     field: *const file_model.FieldInfo,
     pred: FieldPred,
 ) bool {
-    _ = ti_owner;
     if (pred.name_eq) |n| if (!std.mem.eql(u8, field.name, n)) return false;
     if (pred.name_pred) |p| if (!p(field.name)) return false;
     if (pred.has_default) |hd| if (field.has_default != hd) return false;
     if (pred.value_typed and !isValueTyped(tree, field)) return false;
     if (pred.type_matches) |tp| {
-        const resolved = resolveFieldType(tree, model, field) orelse return false;
+        const resolved = resolveFieldTypeScoped(tree, model, ti_owner, field) orelse return false;
         if (!typeMatches(resolved, tp)) return false;
     }
     return true;
@@ -209,52 +208,15 @@ fn isValueTyped(tree: *const Ast, field: *const file_model.FieldInfo) bool {
     return tags[t] == .identifier;
 }
 
-/// Resolve a field's type expression to a TypeInfo in `model`, if
-/// the type's first identifier-token (after peeling `?`) names a
-/// type declared in this file.  Returns null otherwise (e.g.
-/// `*T`, `[]T`, foreign types, generics, etc.).
-fn resolveFieldType(
-    tree: *const Ast,
-    model: *const file_model.FileModel,
-    field: *const file_model.FieldInfo,
-) ?*const file_model.TypeInfo {
-    const tags = tree.tokens.items(.tag);
-    var t: TokenIndex = field.type_first;
-    if (t > field.type_last) return null;
-    if (tags[t] == .question_mark) t += 1;
-    if (t > field.type_last) return null;
-    if (tags[t] != .identifier) return null;
-    const name = tree.tokenSlice(t);
-    return model.findType(name);
-}
-
-/// Like `resolveFieldType`, but uses `model.findTypeInScope` rooted
-/// at `owner` — resolves the field's type starting from `owner`'s
-/// own NESTED types, then its parent's siblings, etc.  Falls back
-/// to the simple findType behavior when `owner` is null.  Used to
-/// disambiguate name collisions where the same identifier
-/// (`Future`, `State`) names a type in multiple enclosing scopes.
+/// Resolve the entire field type in its owner's lexical scope.
 pub fn resolveFieldTypeScoped(
     tree: *const Ast,
     model: *const file_model.FileModel,
     owner: *const file_model.TypeInfo,
     field: *const file_model.FieldInfo,
 ) ?*const file_model.TypeInfo {
-    const tags = tree.tokens.items(.tag);
-    var t: TokenIndex = field.type_first;
-    if (t > field.type_last) return null;
-    if (tags[t] == .question_mark) t += 1;
-    if (t > field.type_last) return null;
-    if (tags[t] != .identifier) return null;
-    // If the type path is dotted (`Result.Pending.State`), prefer
-    // the LEAF type via qualified lookup; falls back to the
-    // first-identifier in-scope lookup when the chain doesn't
-    // resolve.
-    if (t + 2 <= field.type_last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
-        if (model.resolveFieldTypeQualifiedTi(owner, field.name)) |ti| return ti;
-    }
-    const name = tree.tokenSlice(t);
-    return model.findTypeInScope(name, owner);
+    if (!isValueTyped(tree, field)) return null;
+    return model.resolveFieldTypeQualifiedTi(owner, field.name);
 }
 
 // ── Body-pattern integration ─────────────────────────────────
@@ -432,4 +394,40 @@ test "methodBodyContains: integrates with query.zig" {
         .paren_args,
     };
     try testing.expect(!methodBodyContains(&tree, deinit, absent));
+}
+
+test "qualified fields do not inherit ownership from a namespace or sibling" {
+    const source: [:0]const u8 =
+        \\const Namespace = struct {
+        \\    pub fn deinit(self: *@This()) void { _ = self; }
+        \\    const Tree = struct {
+        \\        const Node = struct { const Index = u32; };
+        \\        const Child = struct { pub fn deinit(self: *@This()) void { _ = self; } };
+        \\    };
+        \\};
+        \\const Elsewhere = struct { const Hidden = struct {}; };
+        \\const Holder = struct {
+        \\    id: Namespace.Tree.Node.Index,
+        \\    missing: Namespace.Missing,
+        \\    inaccessible: Hidden,
+        \\    child: ?Namespace.Tree.Child,
+        \\};
+    ;
+    var tree = try Ast.parse(testing.allocator, source, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try file_model.build(testing.allocator, &tree);
+    defer model.deinit();
+    const holder = model.findType("Holder").?;
+    for ([_][]const u8{ "id", "missing", "inaccessible" }) |name| {
+        try testing.expect(resolveFieldTypeScoped(&tree, &model, holder, holder.findField(name).?) == null);
+    }
+    const child = resolveFieldTypeScoped(&tree, &model, holder, holder.findField("child").?).?;
+    try testing.expectEqualStrings("Child", child.name);
+    const owners = try findFields(testing.allocator, &model, &tree, holder, .{
+        .value_typed = true,
+        .type_matches = .{ .has_method = .{ .name_eq = "deinit" } },
+    });
+    defer testing.allocator.free(owners);
+    try testing.expectEqual(@as(usize, 1), owners.len);
+    try testing.expectEqualStrings("child", owners[0].name);
 }
