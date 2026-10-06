@@ -35,24 +35,40 @@ pub const Ctx = struct {
     /// fires from transferRet, not from a dedicated Stmt) — those
     /// consult the config to honor Config.enabled.
     config: *const config_mod.Config = &config_mod.Default,
+    report_enabled: bool = true,
 };
 
 /// Mutate `state` to reflect the effect of `stmt`.  Emit any problems
 /// to `ctx.problems`.
 pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
+    if (!state.feasible) return;
     switch (stmt.kind) {
         .decl => |d| try transferDecl(ctx, state, d, stmt.pos),
         .assign => |a| try transferAssign(ctx, state, a, stmt.pos),
+        .assume => |condition| {
+            if (booleanValue(state, condition)) |value| {
+                if (!value) state.feasible = false;
+            } else switch (condition) {
+                .local => |local| try bindBoolean(ctx, state, local, .{ .boolean = .{ .constant = true } }),
+                .not_local => |local| try bindBoolean(ctx, state, local, .{ .boolean = .{ .constant = false } }),
+                .constant => unreachable,
+            }
+        },
         .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos, stmt.end_pos),
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .pointer_write => |p| {
+            if (state.booleans.getIndex(p.target)) |index| state.booleans.swapRemoveAt(index);
             if (state.locals.get(p.target)) |origin| {
+                if (origin == .stack) {
+                    if (state.booleans.getIndex(origin.stack)) |index| state.booleans.swapRemoveAt(index);
+                }
                 if (origin == .undef) try state.locals.put(ctx.gpa, p.target, .plain);
             }
         },
         .reset_capture => |r| {
+            if (state.booleans.getIndex(r.local)) |index| state.booleans.swapRemoveAt(index);
             try state.locals.put(ctx.gpa, r.local, .plain);
             // Also clear any tracked FIELD origins for this local —
             // `for (bins) |bin| ctx.allocator.free(bin.path);` frees
@@ -77,7 +93,28 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
         .leak_warning => |l| try transferLeakWarning(ctx, l, stmt.pos, stmt.end_pos),
         .partial_union_write => |p| try transferPartialUnionWrite(ctx, p, stmt.pos, stmt.end_pos),
-        .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+        .lowering_gap => |g| transferGap(state, g),
+    }
+}
+
+fn booleanValue(state: *const AbstractState, value: cfg.BooleanValue) ?bool {
+    return switch (value) {
+        .constant => |v| v,
+        .local => |local| state.booleans.get(local),
+        .not_local => |local| if (state.booleans.get(local)) |v| !v else null,
+    };
+}
+
+fn bindBoolean(ctx: Ctx, state: *AbstractState, local: LocalId, kind: ExprKind) !void {
+    const value = if (ctx.locals[@intFromEnum(local)].address_taken) null else switch (kind) {
+        .boolean => |v| booleanValue(state, v),
+        .copy_of => |source| state.booleans.get(source),
+        else => null,
+    };
+    if (value) |v| {
+        try state.booleans.put(ctx.gpa, local, v);
+    } else {
+        if (state.booleans.getIndex(local)) |index| state.booleans.swapRemoveAt(index);
     }
 }
 
@@ -127,6 +164,7 @@ fn transferDecl(
     d: @TypeOf(@as(StmtKind, undefined).decl),
     pos: cfg.SrcPos,
 ) !void {
+    try bindBoolean(ctx, state, d.local, d.init_kind);
     const origin = try originOfInit(ctx, state, d.init_kind, pos);
     try state.locals.put(ctx.gpa, d.local, origin);
     // Clear any stale field state for this local — a fresh decl
@@ -151,6 +189,7 @@ fn transferAssign(
     a: @TypeOf(@as(StmtKind, undefined).assign),
     pos: cfg.SrcPos,
 ) !void {
+    try bindBoolean(ctx, state, a.target, a.rhs_kind);
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
     try state.locals.put(ctx.gpa, a.target, origin);
     // Whole-local reassignment invalidates any tracked field
@@ -606,11 +645,7 @@ fn transferFieldUse(
     }
 }
 
-/// Composite-escape check: fires the same escape diagnostics as
-/// transferRet would for a value-shape composite return embedding
-/// this local.  Used for the SECOND, third, ... borrow in a
-/// multi-borrow composite — the first is handled by the surrounding
-/// .ret's value_kind.
+/// Check direct stack addresses and the current origins of aggregate aliases.
 fn transferCompositeEscape(
     ctx: Ctx,
     state: *AbstractState,
@@ -618,13 +653,11 @@ fn transferCompositeEscape(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    _ = state;
-    // Walker only emits this stmt for `&local` / `array[..]`
-    // patterns — those are stack borrows by construction.  Don't
-    // consult state.locals: the address-of-write rule already
-    // collapsed the local's origin to .plain before we get here.
+    std.debug.assert(c == .stack_ref or c == .copy_of);
     if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
-    const name = ctx.locals[@intFromEnum(c.local)].name;
+    const origin = try originOfInit(ctx, state, c, pos);
+    if (origin != .stack) return;
+    const name = ctx.locals[@intFromEnum(origin.stack)].name;
     try report(ctx, "stack-escape", pos, end_pos, .@"error",
         "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
 }
@@ -753,14 +786,10 @@ fn transferUse(
 }
 
 fn transferGap(
-    ctx: Ctx,
     state: *AbstractState,
     g: @TypeOf(@as(StmtKind, undefined).lowering_gap),
-    pos: cfg.SrcPos,
-) !void {
-    _ = g;
-    _ = pos;
-    _ = ctx;
+) void {
+    if (g.may_assign_locals) state.booleans.clearRetainingCapacity();
     // Conservative: collapse .undef → .plain since an unknown stmt
     // may have written through a passed pointer to initialize the
     // local.  But PRESERVE resource origins (.heap, .arena,
@@ -788,7 +817,7 @@ fn originOfInit(
 ) !Origin {
     _ = pos;
     return switch (kind) {
-        .plain => .plain,
+        .plain, .boolean => .plain,
         .owned => .plain,
         .arena_init => |info| blk: {
             // OVERWRITE to .live on every visit — the decl represents
@@ -927,35 +956,31 @@ fn reportWithNote(
     args: anytype,
     kill_site: ?struct { site: state_mod.KillSite, label: []const u8 },
 ) !void {
+    if (!ctx.report_enabled) return;
+    // One source operation can be reached through several cleanup paths.
+    for (ctx.problems.items) |p| {
+        if (p.start.byte == pos.byte and std.mem.eql(u8, p.rule_id, rule_id)) return;
+    }
     const msg = try std.fmt.allocPrint(ctx.gpa, fmt, args);
+    errdefer ctx.gpa.free(msg);
     const real_end: cfg.SrcPos = if (end_pos.byte > pos.byte)
         end_pos
     else
         .{ .line = pos.line, .column = pos.column + 1, .byte = pos.byte + 1 };
     var notes: []problem_mod.Note = &.{};
     if (kill_site) |ks| {
-        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
         const label = try ctx.gpa.dupe(u8, ks.label);
+        errdefer ctx.gpa.free(label);
+        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
         notes[0] = .{
             .start = .{ .line = ks.site.line, .column = ks.site.column, .byte = ks.site.byte },
             .end = .{ .line = ks.site.end_line, .column = ks.site.end_column, .byte = ks.site.end_byte },
             .label = label,
         };
     }
-    // Dedupe by (rule_id, start.byte).  The cfg builder inlines
-    // defer/errdefer bodies at every exit point, so a diagnostic
-    // emitted from inside a defer body fires once per exit — one
-    // logical bug, N reports.  Linear scan is fine here: per-fn
-    // problem counts are small (rarely >50).
-    for (ctx.problems.items) |p| {
-        if (p.start.byte == pos.byte and std.mem.eql(u8, p.rule_id, rule_id)) {
-            ctx.gpa.free(msg);
-            if (notes.len > 0) {
-                for (notes) |*n| ctx.gpa.free(n.label);
-                ctx.gpa.free(notes);
-            }
-            return;
-        }
+    errdefer {
+        for (notes) |note| ctx.gpa.free(note.label);
+        ctx.gpa.free(notes);
     }
     try ctx.problems.append(ctx.gpa, .{
         .rule_id = rule_id,
@@ -1252,9 +1277,6 @@ test "transferGap: collapses .undef → .plain, preserves resource origins" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
     defer state.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "u", "h", "a" }), .problems = &problems, .path = "test" };
 
     const u: LId = @enumFromInt(0);
     const h: LId = @enumFromInt(1);
@@ -1263,7 +1285,7 @@ test "transferGap: collapses .undef → .plain, preserves resource origins" {
     try state.locals.put(gpa, h, .{ .heap = @enumFromInt(1) });
     try state.locals.put(gpa, a, .{ .arena = @enumFromInt(1) });
 
-    try transferGap(ctx, &state, .{ .note = "test" }, pos0());
+    transferGap(&state, .{ .note = "test" });
 
     try testing.expect(state.locals.get(u).? == .plain);
     try testing.expect(state.locals.get(h).? == .heap);

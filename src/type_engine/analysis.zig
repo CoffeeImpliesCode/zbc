@@ -34,8 +34,6 @@ ip: *InternPool,
 resolved_callsites: std.AutoHashMapUnmanaged(Declaration.Param, ?Type) = .empty,
 resolved_nodes: std.HashMapUnmanaged(NodeWithUri, ?Binding, NodeWithUri.Context, std.hash_map.default_max_load_percentage) = .empty,
 collect_callsite_references: bool,
-/// avoid unnecessarily parsing number literals
-resolve_number_literal_values: bool,
 /// handle of the doc where the request originated
 root_handle: ?*DocumentStore.Handle,
 max_conditional_combos: usize = 200,
@@ -57,7 +55,6 @@ pub fn init(
         .store = store,
         .ip = ip,
         .collect_callsite_references = true,
-        .resolve_number_literal_values = false,
         .root_handle = root_handle,
     };
 }
@@ -796,6 +793,7 @@ fn resolveGenericTypeInternal(
     bound_params: TokenToTypeMap,
     visiting: *Type.Data.GenericSet,
 ) error{OutOfMemory}!Type {
+    if (!ty.data.isGeneric()) return ty;
     var resolved = ty;
     if (!ty.is_type_val) {
         resolved = try resolved.typeOf(analyser);
@@ -1455,10 +1453,6 @@ fn resolveCoercedIPValue(
 }
 
 fn resolveInternPoolValue(analyser: *Analyser, options: ResolveOptions) Error!?InternPool.Index {
-    const old_resolve_number_literal_values = analyser.resolve_number_literal_values;
-    analyser.resolve_number_literal_values = true;
-    defer analyser.resolve_number_literal_values = old_resolve_number_literal_values;
-
     const resolved_length = try analyser.resolveTypeOfNode(options) orelse return null;
     switch (resolved_length.data) {
         .ip_index => |payload| return payload.index,
@@ -1520,7 +1514,7 @@ pub fn resolvePrimitive(analyser: *Analyser, identifier_name: []const u8) error{
     if (primitives.get(identifier_name)) |primitive| return primitive;
 
     if (identifier_name.len < 2) return null;
-    const signedness: std.lang.Signedness = switch (identifier_name[0]) {
+    const signedness: std.builtin.Signedness = switch (identifier_name[0]) {
         'i' => .signed,
         'u' => .unsigned,
         else => return null,
@@ -2312,6 +2306,15 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                     if (params.len != 0) return null;
                     return options.container_type orelse try analyser.innermostContainer(handle, tree.tokenStart(tree.firstToken(node)));
                 },
+                .int_cast, .int_from_float, .float_cast, .float_from_int, .bit_cast => {
+                    if (params.len != 1) return null;
+                    const source_index = tree.tokenStart(tree.nodeMainToken(node));
+                    const lineage = try ast.nodesOverlappingIndex(analyser.arena, tree, source_index);
+                    defer analyser.arena.free(lineage);
+                    if (lineage.len > 128) return null;
+                    const index = std.mem.findScalar(Ast.Node.Index, lineage, node) orelse return null;
+                    return analyser.resolveExpressionTypeFromAncestors(handle, node, lineage[index + 1 ..]);
+                },
                 .as => {
                     if (params.len < 1) return null;
                     const ty = (try analyser.resolveTypeOfNodeInternal(.of(params[0], handle))) orelse return null;
@@ -2407,6 +2410,8 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                     }
 
                     if (try analyser.resolveImportString(handle, import_string)) |ty| return ty;
+                    // A relative import belongs to its defining document.
+                    if (std.mem.endsWith(u8, import_string, ".zig")) return null;
                     if (try analyser.resolveImportString(analyser.root_handle orelse return null, import_string)) |ty| return ty;
                     return null;
                 },
@@ -2828,9 +2833,6 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                 .float => .comptime_float_type,
                 .failure => return null,
             };
-            if (!analyser.resolve_number_literal_values) {
-                return Type.fromIP(analyser, ty, null);
-            }
             const value: ?InternPool.Index = switch (result) {
                 .float => blk: {
                     break :blk try analyser.ip.get(
@@ -2950,6 +2952,26 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
             const lhs_ty = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse return null;
             if (lhs_ty.is_type_val) return null;
             return lhs_ty.withoutIPIndex(analyser);
+        },
+
+        .array_mult => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            var array = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse return null;
+            if (array.is_type_val) return null;
+            const pointer = array.pointerElementType(analyser, .one);
+            if (pointer) |pointee| array = try pointee.instanceUnchecked(analyser);
+            const count, const sentinel, const elem_ty = array.arrayInfo(analyser) orelse return null;
+            const repeat = try analyser.resolveIntegerLiteral(u64, .of(rhs, handle));
+            const length: ?u64 = if (count != null and repeat != null)
+                std.math.mul(u64, count.?, repeat.?) catch null
+            else
+                null;
+            const array_ty = try Type.createArrayType(analyser, length, sentinel, elem_ty);
+            if (pointer != null) {
+                const pointer_ty = try Type.createPointerType(analyser, .one, .none, true, array_ty);
+                return try pointer_ty.instanceUnchecked(analyser);
+            }
+            return try array_ty.instanceUnchecked(analyser);
         },
 
         .array_cat => {
@@ -3169,7 +3191,7 @@ pub const Type = struct {
         /// - `[]const T`
         /// - `[*c]T`
         pointer: struct {
-            size: std.lang.Type.Pointer.Size,
+            size: std.builtin.Type.Pointer.Size,
             /// `.none` means no sentinel, `.unknown_unknown` means unknown sentinel
             sentinel: InternPool.Index,
             is_const: bool,
@@ -3276,7 +3298,7 @@ pub const Type = struct {
 
         fn createPointer(
             analyser: *Analyser,
-            size: std.lang.Type.Pointer.Size,
+            size: std.builtin.Type.Pointer.Size,
             sentinel: InternPool.Index,
             is_const: bool,
             elem_ty: Type,
@@ -3755,7 +3777,7 @@ pub const Type = struct {
 
     fn createPointerType(
         analyser: *Analyser,
-        size: std.lang.Type.Pointer.Size,
+        size: std.builtin.Type.Pointer.Size,
         sentinel: InternPool.Index,
         is_const: bool,
         elem_ty: Type,
@@ -4384,7 +4406,7 @@ pub const Type = struct {
         };
     }
 
-    fn pointerSize(self: Type, analyser: *Analyser) ?std.lang.Type.Pointer.Size {
+    fn pointerSize(self: Type, analyser: *Analyser) ?std.builtin.Type.Pointer.Size {
         if (self.is_type_val) return null;
         return switch (self.data) {
             .pointer => |info| info.size,
@@ -4399,7 +4421,7 @@ pub const Type = struct {
     fn pointerElementType(
         self: Type,
         analyser: *Analyser,
-        size: std.lang.Type.Pointer.Size,
+        size: std.builtin.Type.Pointer.Size,
     ) ?Type {
         if (self.is_type_val) return null;
         return switch (self.data) {
@@ -4914,7 +4936,7 @@ fn resolveLangrefType(analyser: *Analyser, type_str: []const u8) Error!?Type {
 /// Useful for functionality related to builtin fns
 pub fn instanceStdBuiltinType(analyser: *Analyser, type_name: []const u8) Error!?Type {
     const zig_lib_dir = analyser.store.config.zig_lib_dir orelse return null;
-    const builtin_path = try zig_lib_dir.join(analyser.arena, &.{ "std", "lang.zig" });
+    const builtin_path = try zig_lib_dir.join(analyser.arena, &.{ "std", "builtin.zig" });
     const builtin_uri: Uri = try .fromPath(analyser.arena, builtin_path);
 
     const builtin_handle = try analyser.store.getOrLoadHandle(builtin_uri) orelse return null;

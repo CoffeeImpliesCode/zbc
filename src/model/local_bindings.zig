@@ -201,14 +201,14 @@ pub const LocalBindings = struct {
 
 };
 
-/// Build a LocalBindings for a fn body.  `proto` provides the
-/// parameter list (added as `.param` bindings before body locals).
+/// Build local bindings. A function prototype adds parameter bindings;
+/// null selects a parameterless body, such as a test block.
 /// `body` is the AST body node — typically the result of
 /// `tokens.bodyOf(tree, fn_decl)`.
 pub fn build(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    proto: Ast.full.FnProto,
+    proto: ?Ast.full.FnProto,
     body: Ast.Node.Index,
 ) !LocalBindings {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -218,24 +218,26 @@ pub fn build(
     var items: std.ArrayListUnmanaged(Binding) = .empty;
 
     // ── Pass 1: params ─────────────────────────────────────
-    var it = proto.iterate(tree);
-    while (it.next()) |param| {
-        const name_tok = param.name_token orelse continue;
-        const type_node = param.type_expr;
-        var rhs_first: TokenIndex = name_tok;
-        var rhs_last: TokenIndex = name_tok;
-        if (type_node) |tn| {
-            rhs_first = tree.firstToken(tn);
-            rhs_last = tree.lastToken(tn);
+    if (proto) |function| {
+        var it = function.iterate(tree);
+        while (it.next()) |param| {
+            const name_tok = param.name_token orelse continue;
+            const type_node = param.type_expr;
+            var rhs_first: TokenIndex = name_tok;
+            var rhs_last: TokenIndex = name_tok;
+            if (type_node) |tn| {
+                rhs_first = tree.firstToken(tn);
+                rhs_last = tree.lastToken(tn);
+            }
+            try items.append(a, .{
+                .name = tree.tokenSlice(name_tok),
+                .name_token = name_tok,
+                .is_const = true,
+                .rhs_first = rhs_first,
+                .rhs_last = rhs_last,
+                .origin = .param,
+            });
         }
-        try items.append(a, .{
-            .name = tree.tokenSlice(name_tok),
-            .name_token = name_tok,
-            .is_const = true,
-            .rhs_first = rhs_first,
-            .rhs_last = rhs_last,
-            .origin = .param,
-        });
     }
 
     // ── Pass 2: local decls + capture clauses in body ──────
@@ -499,6 +501,7 @@ const testing = std.testing;
 fn parseFn(src: [:0]const u8) !struct { tree: Ast, bindings: LocalBindings } {
     var tree = try Ast.parse(testing.allocator, src, .zig);
     errdefer tree.deinit(testing.allocator);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);

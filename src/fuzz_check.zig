@@ -80,9 +80,14 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
 
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     const config = &config_mod.Default;
     var problems: std.ArrayListUnmanaged(problem_mod.Problem) = .empty;
+    defer {
+        for (problems.items) |*problem| problem.deinit(gpa);
+        problems.deinit(gpa);
+    }
 
     var cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -101,8 +106,6 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
 
     try rule_catalog.runEscape(gpa, &tree, &cache, config, &problems);
 
-    for (problems.items) |*p| p.deinit(gpa);
-    problems.deinit(gpa);
 }
 
 // ── Entry point 1: smoke test ──────────────────────────────────────────
@@ -112,7 +115,7 @@ test "fuzz smoke: seeds do not crash the analysis pipeline" {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         analyzeBytes(arena.allocator(), seed) catch |err| switch (err) {
-            error.OutOfMemory => {}, // OOM on a seed is not a logic crash
+            error.OutOfMemory, error.InvalidSyntax, error.AnalysisBudgetExceeded => {},
             else => return err,
         };
     }
@@ -136,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(raw);
 
     analyzeBytes(gpa, raw) catch |err| switch (err) {
-        error.OutOfMemory => return,
+        error.OutOfMemory, error.InvalidSyntax, error.AnalysisBudgetExceeded => return,
         else => return err,
     };
 }

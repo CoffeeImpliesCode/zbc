@@ -99,7 +99,7 @@ pub fn check(
             // only holds a non-null T when explicitly assigned.
             // A missing outer cleanup doesn't leak when the field
             // stays null — common for "lazy/optional sub-state".
-            if (model.fieldIsOptionalNullDefault(outer.name, f.name)) continue;
+            if (model.fieldIsOptionalNullDefault(outer.qualified_name, f.name)) continue;
             // Caller-supplied skip: the type's constructor takes a
             // parameter of the same name as `f`.  The field is
             // borrowed in from the caller's value; cleanup is
@@ -327,7 +327,7 @@ fn fieldStaysNonOwnedAcrossFile(
 /// on the outer is harmless.  Uses model.unionVariantIsOwned per
 /// variant; bails on the first owned variant found.
 fn allUnionVariantsNonOwned(model: *const file_model.FileModel, ti: *const file_model.TypeInfo) bool {
-    if (!model.isTaggedUnion(ti.name)) return false;
+    if (!model.isTaggedUnion(ti.qualified_name)) return false;
     const tree = model.tree;
     const tags = tree.tokens.items(.tag);
     // Walk variant identifiers between `{` and `}`.
@@ -341,7 +341,7 @@ fn allUnionVariantsNonOwned(model: *const file_model.FileModel, ti: *const file_
         }
         if (tags[t] != .identifier) continue;
         const name = tree.tokenSlice(t);
-        if (model.unionVariantIsOwned(ti.name, name)) |is_owned| {
+        if (model.unionVariantIsOwned(ti.qualified_name, name)) |is_owned| {
             if (is_owned) return false;
         }
         // Skip past this variant's payload (if any) to the comma.

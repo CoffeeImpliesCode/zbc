@@ -26,6 +26,7 @@ const BasicBlock = cfg_types.BasicBlock;
 const Cfg = cfg_types.Cfg;
 const LocalInfo = cfg_types.LocalInfo;
 const InitHint = cfg_types.InitHint;
+const LoweringError = error{ OutOfMemory, AnalysisBudgetExceeded };
 
 /// Known-stdlib noreturn callee chains.  Hoisted so both the
 /// call-site detector (calleeIsNoreturn) and the alias detector
@@ -125,7 +126,7 @@ pub fn lowerFunctionFullWithZls(
         const c = cache orelse break :blk null;
         const model = c.fileModel() catch break :blk null;
         const ti = model.containingTypeOf(fn_decl) orelse break :blk null;
-        break :blk ti.name;
+        break :blk ti.qualified_name;
     };
 
     // Use line offsets from FileCache when available (built once per file);
@@ -153,6 +154,7 @@ pub fn lowerFunctionFullWithZls(
     const entry_id = try builder.newBlock();
     var cur_block = entry_id;
     try builder.lowerFunctionBody(body_node, &cur_block);
+    if (builder.budget_exhausted) return error.AnalysisBudgetExceeded;
 
     return try builder.finalize(tree, fn_decl, entry_id);
 }
@@ -359,11 +361,67 @@ fn localIsDereferencedAfter(
     return false;
 }
 
+/// True when the outer collection type stores pointer elements.
+///
+/// This deliberately inspects only the element position of a slice, array,
+/// or known ArrayList spelling. A pointer elsewhere in a generic type does
+/// not make an indexed element a pointer.
+fn typeRangeHasPointerElement(
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (first > last) return false;
+
+    var t = first;
+    while (t <= last and
+        (tags[t] == .question_mark or
+            tags[t] == .keyword_const or
+            tags[t] == .keyword_var)) : (t += 1)
+    {}
+
+    if (t <= last and tags[t] == .l_bracket) {
+        const close = tokens.matchBracket(tags, t, last) orelse return false;
+        return typeRangeStartsWithPointer(tags, close + 1, last);
+    }
+
+    while (t + 1 <= last) : (t += 1) {
+        if (tags[t] != .identifier or tags[t + 1] != .l_paren) continue;
+        const name = tree.tokenSlice(t);
+        if (!std.mem.eql(u8, name, "ArrayList") and
+            !std.mem.eql(u8, name, "ArrayListUnmanaged") and
+            !std.mem.eql(u8, name, "Managed"))
+        {
+            continue;
+        }
+        const close = tokens.matchParen(tags, t + 1, last) orelse return false;
+        return typeRangeStartsWithPointer(tags, t + 2, close -| 1);
+    }
+    return false;
+}
+
+fn typeRangeStartsWithPointer(
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    if (first > last) return false;
+    var t = first;
+    while (t <= last and
+        (tags[t] == .question_mark or
+            tags[t] == .keyword_const or
+            tags[t] == .keyword_var)) : (t += 1)
+    {}
+    return t <= last and tags[t] == .asterisk;
+}
+
 // ── Builder ────────────────────────────────────────────────
 
 const LoopCtx = struct {
-    header: BlockId,
+    continue_to: BlockId,
     merge: BlockId,
+    defer_depth: usize,
     /// Label slice on the source (no colon), or null for unlabeled
     /// loops.  `break :name` walks the loop stack from inside out
     /// matching this field.
@@ -376,6 +434,7 @@ const LoopCtx = struct {
 const BlockLabelCtx = struct {
     label: []const u8,
     merge: BlockId,
+    defer_depth: usize,
 };
 
 const DeferKind = enum { normal, err };
@@ -387,6 +446,9 @@ const Builder = struct {
     /// Per-file FileCache for FnSummary / FileModel queries — the
     /// per-file shared model + inference cache.
     cache: ?*file_cache.FileCache = null,
+    address_cache: ?file_cache.FileCache = null,
+    classify_depth: u8 = 0,
+    budget_exhausted: bool = false,
     /// Optional ZLS-backed type resolver.  When set, `receiverTypeOfNode`
     /// falls back to ZLS when zbc's own type-name tracking can't
     /// resolve a local (cross-module types, generic instantiations,
@@ -476,7 +538,117 @@ const Builder = struct {
     /// the slice is borrowed from FileCache (which owns and frees it).
     owns_line_offsets: bool = false,
 
+    const BorrowIterator = struct {
+        const Iterator = @import("type_engine").AstIterator;
+        builder: *Builder,
+        frames: [64]Iterator = undefined,
+        depth: usize = 1,
+        visited: usize = 0,
+
+        fn one(node: Ast.Node.Index) Iterator {
+            return .{ .array = .{ node.toOptional(), .none, .none, .none, .none } };
+        }
+
+        fn init(builder: *Builder, expression: Ast.Node.Index) BorrowIterator {
+            var result: BorrowIterator = .{ .builder = builder };
+            result.frames[0] = one(expression);
+            return result;
+        }
+
+        fn next(self: *BorrowIterator) ?ExprKind {
+            const builder = self.builder;
+            const tree = builder.tree;
+            while (self.depth != 0) {
+                const node = self.frames[self.depth - 1].next(tree) orelse {
+                    self.depth -= 1;
+                    continue;
+                };
+                if (self.visited == tree.nodes.len) return self.exhausted();
+                self.visited += 1;
+                if (self.children(node)) |child_nodes| {
+                    if (self.depth == self.frames.len) return self.exhausted();
+                    self.frames[self.depth] = child_nodes;
+                    self.depth += 1;
+                    continue;
+                }
+                switch (tree.nodeTag(node)) {
+                    .address_of, .slice, .slice_open, .slice_sentinel => {
+                        const kind = builder.classifyExpr(node);
+                        if (kind == .stack_ref or kind == .copy_of) return kind;
+                    },
+                    .identifier => {
+                        const local = builder.name_to_local.get(tree.tokenSlice(tree.nodeMainToken(node))) orelse continue;
+                        if (builder.locals.items[@intFromEnum(local)].init_hint != .other) continue;
+                        return .{ .copy_of = local };
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+
+        fn exhausted(self: *BorrowIterator) ?ExprKind {
+            self.builder.budget_exhausted = true;
+            self.depth = 0;
+            return null;
+        }
+
+        fn children(self: *BorrowIterator, node: Ast.Node.Index) ?Iterator {
+            const builder = self.builder;
+            const tree = builder.tree;
+            return switch (tree.nodeTag(node)) {
+                .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
+                .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+                .array_init, .array_init_comma, .array_init_one, .array_init_one_comma,
+                .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma,
+                .array_mult, .@"catch", .@"orelse", => Iterator.init(tree, node),
+                .grouped_expression, .unwrap_optional => one(tree.nodeData(node).node_and_token[0]),
+                .@"try" => one(tree.nodeData(node).node),
+                .@"if", .if_simple => blk: {
+                    const branch = tree.fullIf(node).?;
+                    if (tree.nodeTag(branch.ast.cond_expr) == .identifier) {
+                        const condition = tree.tokenSlice(tree.nodeMainToken(branch.ast.cond_expr));
+                        if (std.mem.eql(u8, condition, "true")) break :blk one(branch.ast.then_expr);
+                        if (std.mem.eql(u8, condition, "false")) {
+                            break :blk one(branch.ast.else_expr.unwrap() orelse return null);
+                        }
+                    }
+                    break :blk .{ .array = .{ branch.ast.then_expr.toOptional(), branch.ast.else_expr, .none, .none, .none } };
+                },
+                .@"switch", .switch_comma => blk: {
+                    var cases = Iterator.init(tree, node);
+                    const condition = cases.next(tree) orelse unreachable;
+                    std.debug.assert(condition == tree.fullSwitch(node).?.ast.condition);
+                    break :blk cases;
+                },
+                .switch_case, .switch_case_one, .switch_case_inline, .switch_case_inline_one =>
+                    one(tree.fullSwitchCase(node).?.ast.target_expr),
+                .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma =>
+                    one(builder.transparentCastSource(node) orelse return null),
+                .block, .block_two, .block_semicolon, .block_two_semicolon => blk: {
+                    const label = builder.blockLabelToken(node) orelse return null;
+                    break :blk one(builder.singleLabeledBreakValue(node, label) orelse return null);
+                },
+                else => null,
+            };
+        }
+    };
+
+    const BorrowKey = struct {
+        local: LocalId,
+        address: bool,
+
+        fn from(kind: ExprKind) BorrowKey {
+            return switch (kind) {
+                .stack_ref => |local| .{ .local = local, .address = true },
+                .copy_of, .composite_borrow => |local| .{ .local = local, .address = false },
+                else => unreachable,
+            };
+        }
+    };
+
     fn tempDeinit(self: *Builder) void {
+        if (self.address_cache) |*cache| cache.deinit();
         if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
         self.block_stmts.deinit(self.gpa);
@@ -506,6 +678,58 @@ const Builder = struct {
 
     fn appendStmt(self: *Builder, block: BlockId, stmt: Stmt) !void {
         try self.block_stmts.items[@intFromEnum(block)].append(self.gpa, stmt);
+    }
+
+    fn booleanValue(self: *Builder, expression: Ast.Node.Index) ?cfg_types.BooleanValue {
+        var node = expression;
+        var inverted = false;
+        for (0..64) |_| {
+            switch (self.tree.nodeTag(node)) {
+                .grouped_expression => node = self.tree.nodeData(node).node_and_token[0],
+                .bool_not => {
+                    inverted = !inverted;
+                    node = self.tree.nodeData(node).node;
+                },
+                .identifier => {
+                    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+                    if (std.mem.eql(u8, name, "true")) return .{ .constant = !inverted };
+                    if (std.mem.eql(u8, name, "false")) return .{ .constant = inverted };
+                    const local = self.name_to_local.get(name) orelse return null;
+                    return if (inverted) .{ .not_local = local } else .{ .local = local };
+                },
+                .equal_equal, .bang_equal => |tag| {
+                    const pair = self.tree.nodeData(node).node_and_node;
+                    var operand = pair[0];
+                    var literal = pair[1];
+                    if (self.booleanLiteral(literal) == null) {
+                        operand = pair[1];
+                        literal = pair[0];
+                    }
+                    const value = self.booleanLiteral(literal) orelse return null;
+                    inverted = inverted != (if (tag == .equal_equal) !value else value);
+                    node = operand;
+                },
+                else => return null,
+            }
+        }
+        self.budget_exhausted = true;
+        return null;
+    }
+
+    fn booleanLiteral(self: *const Builder, node: Ast.Node.Index) ?bool {
+        if (self.tree.nodeTag(node) != .identifier) return null;
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        if (std.mem.eql(u8, name, "true")) return true;
+        if (std.mem.eql(u8, name, "false")) return false;
+        return null;
+    }
+
+    fn assumeCondition(self: *Builder, block: BlockId, node: Ast.Node.Index, condition: ?cfg_types.BooleanValue, expected: bool) !void {
+        const value = condition orelse return;
+        try self.appendStmt(block, .{
+            .kind = .{ .assume = if (expected) value else value.negate() },
+            .pos = self.posOf(node), .end_pos = self.endPosOf(node),
+        });
     }
 
     fn addEdge(self: *Builder, from: BlockId, to: BlockId) !void {
@@ -605,57 +829,26 @@ const Builder = struct {
         return false;
     }
 
-    /// Walk the type expression's tokens, stripping pointer / optional
-    /// / const wrappers, and return the BASE identifier — the LAST
-    /// component of a dotted chain.  `*Foo` → "Foo"; `*const Foo` →
-    /// "Foo"; `?*Foo` → "Foo"; `*lib.Foo` → "Foo" (the namespace
-    /// prefix is discarded — the type identity is what matters for
-    /// method dispatch).  Returns null when no plain identifier is
-    /// found — e.g. slice `[]T`, function pointer, anonymous struct.
-    ///
-    /// `Self` / `@This()` resolves to the enclosing fn's containing
-    /// type when `self_type` is supplied.
+    /// Keep the complete declaration path; resolve local names in lexical scope.
     fn extractTypeName(self: *Builder, type_node: Ast.Node.Index, self_type: ?[]const u8) ?[]const u8 {
         const tree = self.tree;
         const first = tree.firstToken(type_node);
         const last = tree.lastToken(type_node);
-        const tags = tree.tokens.items(.tag);
-        var t: Ast.TokenIndex = first;
-        // Strip leading `?`, `*`, `const` tokens.
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .question_mark, .asterisk, .keyword_const => continue,
-                .l_bracket => return null,
-                .identifier, .builtin => break,
-                else => return null,
+        const name = tokens.typeNameFromTokens(tree, first, last) orelse {
+            if (last >= first + 2 and tree.tokenTag(last - 2) == .builtin and
+                std.mem.eql(u8, tree.tokenSlice(last - 2), "@This")) return self_type;
+            return null;
+        };
+        if (self_type) |enclosing| {
+            if (std.mem.eql(u8, name, "Self")) return enclosing;
+            if (self.cache) |cache| {
+                const model = cache.fileModel() catch return null;
+                if (model.findType(enclosing)) |owner| {
+                    if (model.resolveTypeNameInScope(name, owner)) |resolved| return resolved.qualified_name;
+                }
             }
         }
-        if (t > last) return null;
-        // Walk identifiers/builtins separated by dots; remember the
-        // last identifier seen.  `lib.HTMLRewriter` → "HTMLRewriter".
-        var last_name: ?[]const u8 = null;
-        var expecting_ident = true;
-        while (t <= last) : (t += 1) {
-            const tag = tags[t];
-            if (expecting_ident) {
-                if (tag == .identifier) {
-                    const n = tree.tokenSlice(t);
-                    last_name = if (std.mem.eql(u8, n, "Self")) self_type else n;
-                    expecting_ident = false;
-                } else if (tag == .builtin) {
-                    const n = tree.tokenSlice(t);
-                    if (std.mem.eql(u8, n, "@This")) {
-                        last_name = self_type;
-                        expecting_ident = false;
-                    } else return null;
-                } else return null;
-            } else {
-                if (tag == .period) {
-                    expecting_ident = true;
-                } else break;
-            }
-        }
-        return last_name;
+        return name;
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
@@ -676,17 +869,12 @@ const Builder = struct {
         _ = try self.registerCapturesImpl(payload_token, null, true);
     }
 
-    /// Heuristic: when an `if (<Type>.fromJS(...))` scrutinee
-    /// unwraps to a capture, that capture is by Bun convention a
-    /// `*Type` pointer.  Set is_pointer on the capture so
-    /// `&capture.field` doesn't fire stack-escape (the address-of
-    /// borrows into heap-owned storage reached through the
-    /// pointer).  Conservative: only fires when the scrutinee's
-    /// outermost call name is in the known-returns-pointer list,
-    /// OR when the payload uses BY-POINTER form `|*cap|` and the
-    /// scrutinee is a field access whose receiver is itself a
-    /// pointer (`&dev.vm.debugger.field` lives in dev's storage,
-    /// not the local frame).
+    /// For an optional scrutinee, prefer the type engine's instantiated
+    /// payload type: `HashMapUnmanaged(*Entry).get(key)` is `?*Entry`, so
+    /// its capture points into the entry allocation rather than this frame.
+    /// If type resolution is unavailable, retain the narrow Bun convention
+    /// fallback for known pointer-yielding calls.  A by-pointer field capture
+    /// is also accepted when its receiver is already known to be non-local.
     fn inferPointerCapture(self: *Builder, payload_token: Ast.TokenIndex, cond_expr: Ast.Node.Index) void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
@@ -702,7 +890,6 @@ const Builder = struct {
         const cap_name = tree.tokenSlice(t);
         if (std.mem.eql(u8, cap_name, "_")) return;
         const lid = self.name_to_local.get(cap_name) orelse return;
-
         // Inspect the scrutinee — peel `try`/`catch` wrappers.
         var node = cond_expr;
         while (true) {
@@ -712,11 +899,24 @@ const Builder = struct {
                 else => break,
             }
         }
-        if (self.callReturnsOptionalPointer(node)) {
+
+        // Prefer the type engine's instantiated generic result.  A call
+        // such as `HashMapUnmanaged(*Entry).get(key)` returns `?*Entry`;
+        // only that semantic payload proof may mark the capture as a
+        // pointer.  If the resolver is unavailable, retain the existing
+        // narrow Bun convention fallback.  An unresolved result must not
+        // masquerade as a proven pointer type.
+        if (self.zls) |zls| {
+            if (zls.optionalPayloadIsPointer(node) catch null) |is_pointer| {
+                if (is_pointer) {
+                    self.locals.items[@intFromEnum(lid)].is_pointer = true;
+                    return;
+                }
+            }
+        } else if (self.callReturnsOptionalPointer(node)) {
             self.locals.items[@intFromEnum(lid)].is_pointer = true;
             return;
         }
-        // By-pointer capture of a non-local field access:
         // `if (recv.field) |*cap|` where recv is a pointer-typed
         // local.  The capture points into recv's storage, not the
         // current fn's frame.
@@ -731,9 +931,9 @@ const Builder = struct {
     }
 
     /// True iff `expr_node` is a call whose method name is a
-    /// known-returns-`?*T` convention (`fromJS`, `as`).  Used by
-    /// `inferPointerCapture` to mark `if (X.fromJS(value)) |v|`'s
-    /// `v` as a pointer.
+    /// known-returns-`?*T` convention (`fromJS`, `as`).  Used only
+    /// when semantic type resolution is unavailable, to preserve the
+    /// existing fallback for `if (X.fromJS(value)) |v|`.
     fn callReturnsOptionalPointer(self: *const Builder, expr_node: Ast.Node.Index) bool {
         const tree = self.tree;
         const tag = tree.nodeTag(expr_node);
@@ -836,12 +1036,7 @@ const Builder = struct {
         }
     }
 
-    /// Lower the contents of a Zig block node into `cur` (mutated to the
-    /// last block reached — branches may have advanced past the original).
-    /// Defer statements encountered are queued and replayed in reverse
-    /// order at every `return` exit point.  Does NOT flush defers at
-    /// block exit — only the top-level function body does that, via
-    /// `lowerFunctionBody`.
+    /// Lower one lexical block and replay its normal defers at fallthrough.
     fn lowerBlock(self: *Builder, block_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         var stmt_buf: [2]Ast.Node.Index = undefined;
@@ -859,17 +1054,7 @@ const Builder = struct {
             try self.lowerStmt(stmt_idx, cur);
         }
 
-        // Fire defers added inside this block at fallthrough exit.
-        // Errdefers do NOT fire on fallthrough (success path) — they
-        // only fire on error returns, handled in flushErrAndNormalDefers.
-        var i = self.deferred.items.len;
-        while (i > save) {
-            i -= 1;
-            const entry = self.deferred.items[i];
-            if (entry.kind == .normal) {
-                try self.lowerStmt(entry.body, cur);
-            }
-        }
+        try self.flushScopeDefers(cur, save);
         self.deferred.shrinkRetainingCapacity(save);
     }
 
@@ -959,20 +1144,15 @@ const Builder = struct {
         try self.deferred.append(self.gpa, .{ .kind = .err, .body = body_node });
     }
 
-    /// Replay `defer` bodies (LIFO) into `cur`.  Doesn't pop — returns
-    /// happen mid-function and subsequent code in the same lexical
-    /// scope must still see the same defer set.  Called at function-
-    /// fallthrough exit and at every `return`.  Skips `.err` entries
-    /// since errdefers only fire on error returns (handled in
-    /// `flushErrAndNormalDefers`).
-    fn flushDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    /// Replay normal defers for the scopes crossed by a control-flow edge.
+    /// Keep registrations intact for other exits from the same lexical scope.
+    fn flushScopeDefers(self: *Builder, cur: *BlockId, first: usize) LoweringError!void {
         var i = self.deferred.items.len;
-        while (i > 0) {
+        std.debug.assert(first <= i);
+        while (i > first) {
             i -= 1;
             const entry = self.deferred.items[i];
-            if (entry.kind == .normal) {
-                try self.lowerStmt(entry.body, cur);
-            }
+            if (entry.kind == .normal) try self.lowerStmt(entry.body, cur);
         }
     }
 
@@ -982,7 +1162,7 @@ const Builder = struct {
     /// an `errdefer free(p)` runs FIRST on error exit, avoiding a
     /// spurious UAF in the synthetic err_exit sink.  Used at
     /// synthetic try-error-exit blocks.
-    fn flushErrAndNormalDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    fn flushErrAndNormalDefers(self: *Builder, cur: *BlockId) (LoweringError)!void {
         var i = self.deferred.items.len;
         while (i > 0) {
             i -= 1;
@@ -993,7 +1173,7 @@ const Builder = struct {
     /// Dispatch on statement node tag.  v1: handle decls, assigns,
     /// expression-statement calls, returns, if/while; everything else
     /// becomes a `.lowering_gap` placeholder.
-    fn lowerStmt(self: *Builder, stmt_node: Ast.Node.Index, cur: *BlockId) std.mem.Allocator.Error!void {
+    fn lowerStmt(self: *Builder, stmt_node: Ast.Node.Index, cur: *BlockId) LoweringError!void {
         const tree = self.tree;
         const tag = tree.nodeTag(stmt_node);
         switch (tag) {
@@ -1002,6 +1182,14 @@ const Builder = struct {
             },
             .assign, .assign_destructure => {
                 try self.lowerAssign(stmt_node, cur);
+            },
+            .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
+            .assign_shl, .assign_shr, .assign_shl_sat,
+            .assign_bit_and, .assign_bit_xor, .assign_bit_or,
+            .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap,
+            .assign_add_sat, .assign_sub_sat, .assign_mul_sat => {
+                try self.emitUsesInExpr(stmt_node, cur.*, null);
+                try self.emitWritesInLhs(tree.nodeData(stmt_node).node_and_node[0], cur.*);
             },
             .@"return" => {
                 // lowerReturn handles its own defer-flush ordering —
@@ -1017,7 +1205,7 @@ const Builder = struct {
                 try self.pushDefer(body);
             },
             .@"errdefer" => {
-                const body = tree.nodeData(stmt_node).node;
+                const body = tree.nodeData(stmt_node).opt_token_and_node[1];
                 try self.pushErrdefer(body);
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
@@ -1068,65 +1256,34 @@ const Builder = struct {
     /// `if (cond) THEN [else ELSE]` → fork into two successor blocks,
     /// lower each branch into its own block, then join into a fresh
     /// merge block.  Subsequent statements emit into the merge block.
-    ///
-    /// We don't model the condition's truthiness — the abstract state
-    /// must be valid on BOTH branches (this is conservative and matches
-    /// our design: don't reason about branch-specific values).
     fn lowerIf(self: *Builder, if_node: Ast.Node.Index, cur: *BlockId) !void {
-        const tree = self.tree;
-        const if_data = tree.fullIf(if_node) orelse {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "if-extract" } },
-                .pos = self.posOf(if_node),
-                .end_pos = self.endPosOf(if_node),
-            });
-            return;
-        };
-
-        // Walk the condition for any local reads / address-of writes
-        // before we branch — the condition runs before either arm and
-        // its side effects (e.g. `&out` clearing .undef) must be
-        // visible in BOTH successor states.
-        try self.emitUsesInExpr(if_data.ast.cond_expr, cur.*, null);
-
-        // Allocate the three successor blocks up-front.
+        const branch = self.tree.fullIf(if_node).?;
+        try self.emitUsesInExpr(branch.ast.cond_expr, cur.*, null);
+        const condition = if (branch.payload_token == null) self.booleanValue(branch.ast.cond_expr) else null;
         const then_block = try self.newBlock();
-        const else_block = if (if_data.ast.else_expr.unwrap() != null) try self.newBlock() else null;
-        const merge_block = try self.newBlock();
-
-        // From `cur`: branch to then-block and (else-block OR merge directly
-        // if no else clause — falling through is the same as an empty else).
+        const else_block = try self.newBlock();
+        const merge = try self.newBlock();
         try self.addEdge(cur.*, then_block);
-        try self.addEdge(cur.*, else_block orelse merge_block);
-
-        // Lower the then branch.  `if (opt) |val|` payload is in scope
-        // for the then-body only.  Reset at then-entry: when the if is
-        // inside a loop body, the capture rebinds each iteration so
-        // prior-iter state must not propagate.
-        if (if_data.payload_token) |pt| {
-            try self.registerCapturesWith(pt, then_block);
-            // Infer is_pointer for the capture when the scrutinee is a
-            // `<Type>.fromJS(...)` call (Bun convention: returns
-            // `?*Type`).  Lets `&capture.field` skip stack-escape
-            // since `capture` is a heap pointer.
-            self.inferPointerCapture(pt, if_data.ast.cond_expr);
+        try self.addEdge(cur.*, else_block);
+        try self.assumeCondition(then_block, branch.ast.cond_expr, condition, true);
+        try self.assumeCondition(else_block, branch.ast.cond_expr, condition, false);
+        const pre_capture_len: u32 = @intCast(self.locals.items.len);
+        if (branch.payload_token) |token| {
+            try self.registerCapturesWith(token, then_block);
+            self.inferPointerCapture(token, branch.ast.cond_expr);
         }
         var then_cur = then_block;
-        try self.lowerStmt(if_data.ast.then_expr, &then_cur);
-        // Then-branch exits flow into merge.
-        try self.addEdge(then_cur, merge_block);
-
-        // Lower the else branch if present.  `else |err|` payload is
-        // in scope for the else-body only.
-        if (else_block) |eb| {
-            if (if_data.error_token) |et| try self.registerErrorCapturesWith(et, eb);
-            var else_cur = eb;
-            try self.lowerStmt(if_data.ast.else_expr.unwrap().?, &else_cur);
-            try self.addEdge(else_cur, merge_block);
+        try self.lowerStmt(branch.ast.then_expr, &then_cur);
+        try self.addEdge(then_cur, merge);
+        try self.restoreCaptureNames(pre_capture_len);
+        var else_cur = else_block;
+        if (branch.ast.else_expr.unwrap()) |else_expr| {
+            if (branch.error_token) |token| try self.registerErrorCapturesWith(token, else_block);
+            try self.lowerStmt(else_expr, &else_cur);
+            try self.restoreCaptureNames(pre_capture_len);
         }
-
-        // Subsequent statements emit into the merge block.
-        cur.* = merge_block;
+        try self.addEdge(else_cur, merge);
+        cur.* = merge;
     }
 
     /// `while (cond) BODY [else ELSE]` → produces a header block (where
@@ -1139,67 +1296,45 @@ const Builder = struct {
     ///   cur ─→ header ─→ body ─→ header (back-edge)
     ///                  ↘ merge (loop exit / else)
     fn lowerWhile(self: *Builder, while_node: Ast.Node.Index, cur: *BlockId) !void {
-        const tree = self.tree;
-        const while_data = tree.fullWhile(while_node) orelse {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "while-extract" } },
-                .pos = self.posOf(while_node),
-                .end_pos = self.endPosOf(while_node),
-            });
-            return;
-        };
-
-        // Walk the loop condition for .use/.assign side effects
-        // before any branching.  Skip rules in emitUsesInExpr now
-        // tolerate `arr.len` / `arr[..]` so this no longer drowns in
-        // false positives.
-        try self.emitUsesInExpr(while_data.ast.cond_expr, cur.*, null);
-
+        const loop = self.tree.fullWhile(while_node).?;
+        const condition = if (loop.payload_token == null) self.booleanValue(loop.ast.cond_expr) else null;
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
-
-        // Edge: cur → header (loop entry)
+        const natural_exit = if (loop.ast.else_expr != .none or condition != null) try self.newBlock() else merge;
+        const continuation = if (loop.ast.cont_expr != .none) try self.newBlock() else header;
         try self.addEdge(cur.*, header);
-
-        // Header branches to body (when cond true) or merge (when false).
+        try self.emitUsesInExpr(loop.ast.cond_expr, header, null);
         try self.addEdge(header, body);
-        try self.addEdge(header, merge);
-
-        // Lower the body; on exit, back-edge to header.  Push loop
-        // context so any `break`/`continue` inside lowers correctly.
-        const label_slice: ?[]const u8 = if (while_data.label_token) |lt|
-            tree.tokenSlice(lt)
-        else
-            null;
+        try self.addEdge(header, natural_exit);
+        try self.assumeCondition(body, loop.ast.cond_expr, condition, true);
+        try self.assumeCondition(natural_exit, loop.ast.cond_expr, condition, false);
         try self.loop_stack.append(self.gpa, .{
-            .header = header,
-            .merge = merge,
-            .label = label_slice,
+            .continue_to = continuation, .merge = merge, .defer_depth = self.deferred.items.len,
+            .label = if (loop.label_token) |token| self.tree.tokenSlice(token) else null,
         });
-        // `while (opt) |x|` payload capture — register before body
-        // and emit reset stmts at body entry so back-edges don't
-        // propagate one iteration's state (e.g. .heap.dead from
-        // `free(x)`) into the next iteration's view of the capture.
         const pre_capture_len: u32 = @intCast(self.locals.items.len);
-        if (while_data.payload_token) |pt| try self.registerCapturesWith(pt, body);
+        if (loop.payload_token) |token| try self.registerCapturesWith(token, body);
         var body_cur = body;
-        try self.lowerStmt(while_data.ast.then_expr, &body_cur);
-        _ = self.loop_stack.pop();
-        try self.addEdge(body_cur, header);
+        try self.lowerStmt(loop.ast.then_expr, &body_cur);
+        const ended_loop = self.loop_stack.pop().?;
+        std.debug.assert(ended_loop.merge == merge);
+        try self.addEdge(body_cur, continuation);
+        if (loop.ast.cont_expr.unwrap()) |expression| {
+            var continuation_cur = continuation;
+            try self.lowerStmt(expression, &continuation_cur);
+            try self.addEdge(continuation_cur, header);
+        }
         try self.restoreCaptureNames(pre_capture_len);
-
-        // Optional else block (runs once when cond becomes false).
-        // We don't model the "runs only on natural exit, not on break" —
-        // treat as falling through to merge.
-        if (while_data.ast.else_expr.unwrap()) |else_expr| {
-            const else_block = try self.newBlock();
-            try self.addEdge(header, else_block);
-            var else_cur = else_block;
-            try self.lowerStmt(else_expr, &else_cur);
+        if (natural_exit != merge) {
+            var else_cur = natural_exit;
+            if (loop.ast.else_expr.unwrap()) |else_expr| {
+                if (loop.error_token) |token| try self.registerErrorCapturesWith(token, natural_exit);
+                try self.lowerStmt(else_expr, &else_cur);
+                try self.restoreCaptureNames(pre_capture_len);
+            }
             try self.addEdge(else_cur, merge);
         }
-
         cur.* = merge;
     }
 
@@ -1597,7 +1732,7 @@ const Builder = struct {
                     // which is the right type for both `|x|` and
                     // `|*x|` captures (the `*` is just a borrow modifier).
                     if (self.zls) |z| {
-                        if (z.typeNameOfNode(input) catch null) |ty| {
+                        if (z.typeReferenceOfNode(input) catch null) |ty| {
                             const li = &self.locals.items[@intFromEnum(capture_local)];
                             if (li.type_name == null) li.type_name = ty;
                         }
@@ -1610,68 +1745,33 @@ const Builder = struct {
     }
 
     fn lowerFor(self: *Builder, for_node: Ast.Node.Index, cur: *BlockId) !void {
-        const tree = self.tree;
-        const for_data = tree.fullFor(for_node) orelse {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "for-extract" } },
-                .pos = self.posOf(for_node),
-                .end_pos = self.endPosOf(for_node),
-            });
-            return;
-        };
-
-        // Walk every input expression before any branching.
-        for (for_data.ast.inputs) |input| {
-            try self.emitUsesInExpr(input, cur.*, null);
-        }
-
+        const loop = self.tree.fullFor(for_node).?;
+        for (loop.ast.inputs) |input| try self.emitUsesInExpr(input, cur.*, null);
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
-
+        const natural_exit = if (loop.ast.else_expr != .none) try self.newBlock() else merge;
         try self.addEdge(cur.*, header);
         try self.addEdge(header, body);
-        try self.addEdge(header, merge);
-
-        const for_label: ?[]const u8 = if (for_data.label_token) |lt|
-            tree.tokenSlice(lt)
-        else
-            null;
+        try self.addEdge(header, natural_exit);
         try self.loop_stack.append(self.gpa, .{
-            .header = header,
-            .merge = merge,
-            .label = for_label,
+            .continue_to = header, .merge = merge, .defer_depth = self.deferred.items.len,
+            .label = if (loop.label_token) |token| self.tree.tokenSlice(token) else null,
         });
-        // For-loops always have a payload (`|x|` or `|x, idx|`).
-        // Reset on iteration entry — see lowerWhile for rationale.
-        // Save locals count before capture registration so we can restore
-        // name_to_local after the body — see restoreCaptureNames.
         const pre_capture_len: u32 = @intCast(self.locals.items.len);
-        try self.registerCapturesWith(for_data.payload_token, body);
-        // Detect interior-pointer captures: when input N is a
-        // `<container>.<field>` access AND capture N is `|*p|`
-        // (by-pointer), mark `p` as borrowing from the container.
-        // Used by destructor-call detection to flag the oven-sh/bun#30176
-        // pattern `for (entries.items) |*r| r.destroy();`.
-        self.markInteriorCaptures(for_data, body);
+        try self.registerCapturesWith(loop.payload_token, body);
+        self.markInteriorCaptures(loop, body);
         var body_cur = body;
-        try self.lowerStmt(for_data.ast.then_expr, &body_cur);
-        _ = self.loop_stack.pop();
-        try self.addEdge(body_cur, header); // back-edge for fixed-point iteration
-        // Restore name_to_local for capture names now that the body is done.
-        // Captures are scoped to the loop body; leaving them in name_to_local
-        // after this point causes subsequent defer replays (or code after the
-        // loop) to resolve the capture name to the wrong LocalId.
+        try self.lowerStmt(loop.ast.then_expr, &body_cur);
+        const ended_loop = self.loop_stack.pop().?;
+        std.debug.assert(ended_loop.merge == merge);
+        try self.addEdge(body_cur, header);
         try self.restoreCaptureNames(pre_capture_len);
-
-        if (for_data.ast.else_expr.unwrap()) |else_expr| {
-            const else_block = try self.newBlock();
-            try self.addEdge(header, else_block);
-            var else_cur = else_block;
+        if (loop.ast.else_expr.unwrap()) |else_expr| {
+            var else_cur = natural_exit;
             try self.lowerStmt(else_expr, &else_cur);
             try self.addEdge(else_cur, merge);
         }
-
         cur.* = merge;
     }
 
@@ -1899,7 +1999,7 @@ const Builder = struct {
         const tree = self.tree;
         const label = tree.tokenSlice(label_token);
         const merge = try self.newBlock();
-        try self.block_label_stack.append(self.gpa, .{ .label = label, .merge = merge });
+        try self.block_label_stack.append(self.gpa, .{ .label = label, .merge = merge, .defer_depth = self.deferred.items.len });
         try self.lowerBlock(block_node, cur);
         _ = self.block_label_stack.pop();
         // Natural fallthrough — body completed without breaking.
@@ -1949,10 +2049,16 @@ const Builder = struct {
         if (opt_value_node.unwrap()) |v| {
             const vt = tree.nodeTag(v);
             const is_call_value = switch (vt) {
-                .call, .call_one, .call_comma, .call_one_comma,
-                .builtin_call, .builtin_call_two,
-                .builtin_call_comma, .builtin_call_two_comma,
-                .@"switch", .switch_comma,
+                .call,
+                .call_one,
+                .call_comma,
+                .call_one_comma,
+                .builtin_call,
+                .builtin_call_two,
+                .builtin_call_comma,
+                .builtin_call_two_comma,
+                .@"switch",
+                .switch_comma,
                 => true,
                 else => false,
             };
@@ -1970,6 +2076,7 @@ const Builder = struct {
                     i -= 1;
                     const ctx = self.block_label_stack.items[i];
                     if (std.mem.eql(u8, ctx.label, wanted)) {
+                        try self.flushScopeDefers(cur, ctx.defer_depth);
                         try self.addEdge(cur.*, ctx.merge);
                         cur.* = try self.newBlock();
                         return;
@@ -1985,8 +2092,9 @@ const Builder = struct {
                     if (std.mem.eql(u8, lbl, wanted)) {
                         const target = switch (kind) {
                             .@"break" => ctx.merge,
-                            .@"continue" => ctx.header,
+                            .@"continue" => ctx.continue_to,
                         };
+                        try self.flushScopeDefers(cur, ctx.defer_depth);
                         try self.addEdge(cur.*, target);
                         cur.* = try self.newBlock();
                         return;
@@ -2018,8 +2126,9 @@ const Builder = struct {
         const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
         const target = switch (kind) {
             .@"break" => ctx.merge,
-            .@"continue" => ctx.header,
+            .@"continue" => ctx.continue_to,
         };
+        try self.flushScopeDefers(cur, ctx.defer_depth);
         try self.addEdge(cur.*, target);
         cur.* = try self.newBlock();
     }
@@ -2192,6 +2301,14 @@ const Builder = struct {
                     is_pointer = true;
                 }
             }
+            // An indexed `.items` expression copies an element. When the
+            // collection's declared element type is a pointer, the copy is
+            // also a pointer into non-stack storage.
+            if (!is_pointer) {
+                if (init_opt) |init| {
+                    if (self.initArrayElementIsPointer(init)) is_pointer = true;
+                }
+            }
             // Init-shape signal: `<recv>.<method>(...)` where
             // `<method>` is one of the conventional pointer-yielding
             // cast/accessor names (`as`, `cast`, `ptrCast`,
@@ -2223,7 +2340,7 @@ const Builder = struct {
             if (!is_pointer and init_kind == .unknown) {
                 if (init_opt) |init| {
                     if (self.zls) |z| {
-                        if (z.resolvedTypeIsPointer(init) catch false) is_pointer = true;
+                        if ((z.resolvedTypeIsPointer(init) catch null) == true) is_pointer = true;
                     }
                 }
             }
@@ -2334,8 +2451,7 @@ const Builder = struct {
         // buf's freed state.  Skipped for labeled-block inits (the
         // inner stmts already lowered themselves).
         if (init_opt) |init| if (!init_was_labeled_block) {
-            try self.unpackStructInitFields(cur.*, local, null, init,
-                self.posOf(decl_node), self.endPosOf(decl_node));
+            try self.unpackStructInitFields(cur.*, local, null, init, self.posOf(decl_node), self.endPosOf(decl_node));
             // Constructor-call result with heap fields: when init is
             // `T.constructor(...)` and that fn's body returned
             // `.{ .X = <heap_alloc> }`, emit a synthetic
@@ -2343,8 +2459,7 @@ const Builder = struct {
             // downstream field-use machinery sees the right state
             // (e.g. `var u = toUtf8(a); use(u.bytes);` tracks
             // u.bytes's heap allocation).
-            try self.emitConstructorResultHeapFields(cur.*, local, init,
-                self.posOf(decl_node), self.endPosOf(decl_node));
+            try self.emitConstructorResultHeapFields(cur.*, local, init, self.posOf(decl_node), self.endPosOf(decl_node));
         };
 
         // Init-position try/catch: now that the decl has emitted, model
@@ -2357,6 +2472,65 @@ const Builder = struct {
         if (init_opt) |init| {
             try self.lowerInitSideEffects(init, cur);
         }
+    }
+
+    /// Infer pointer-ness for an indexed collection element from its
+    /// declared element type. This covers receiver fields such as
+    /// `self.handles.items[index]` and direct slice parameters.
+    fn initArrayElementIsPointer(self: *const Builder, init: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const first = tree.firstToken(init);
+        const last = tree.lastToken(init);
+
+        var items_tok: ?Ast.TokenIndex = null;
+        var t = first;
+        while (t + 2 <= last) : (t += 1) {
+            if (tags[t] != .period or tags[t + 1] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t + 1), "items")) continue;
+            if (tags[t + 2] != .l_bracket) continue;
+            items_tok = t + 1;
+            break;
+        }
+
+        if (items_tok) |items| {
+            if (items < first + 2) return false;
+            const field_tok = items - 2;
+            if (field_tok != first + 2 or tags[first] != .identifier or
+                tags[field_tok] != .identifier) return false;
+            const root = tree.tokenSlice(first);
+            const owner_type: ?[]const u8 = if (std.mem.eql(u8, root, "self") or
+                std.mem.eql(u8, root, "this"))
+                self.self_type
+            else if (self.name_to_local.get(root)) |local|
+                self.locals.items[@intFromEnum(local)].type_name
+            else
+                null;
+
+            const type_name = owner_type orelse return false;
+            const cache = self.cache orelse return false;
+            const model = cache.fileModel() catch return false;
+            const owner = model.findType(type_name) orelse return false;
+            const field = owner.findField(tree.tokenSlice(field_tok)) orelse return false;
+            return typeRangeHasPointerElement(tree, field.type_first, field.type_last);
+        }
+
+        if (first + 1 > last or tags[first] != .identifier or
+            tags[first + 1] != .l_bracket) return false;
+        const root = tree.tokenSlice(first);
+        const proto = self.fn_proto orelse return false;
+        var params = proto.iterate(tree);
+        while (params.next()) |param| {
+            const name_tok = param.name_token orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(name_tok), root)) continue;
+            const type_node = param.type_expr orelse return false;
+            return typeRangeHasPointerElement(
+                tree,
+                tree.firstToken(type_node),
+                tree.lastToken(type_node),
+            );
+        }
+        return false;
     }
 
     /// Walk an init / rhs expression for top-level catch / try / orelse
@@ -2373,7 +2547,7 @@ const Builder = struct {
     ///     plus lower orelse-BODY as a fork of its own
     ///
     /// Recursion bounded by AST depth; cheap.
-    fn lowerInitSideEffects(self: *Builder, init: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    fn lowerInitSideEffects(self: *Builder, init: Ast.Node.Index, cur: *BlockId) (LoweringError)!void {
         const tree = self.tree;
         switch (tree.nodeTag(init)) {
             .@"try" => try self.emitTryErrorExit(cur, self.posOf(init)),
@@ -2446,15 +2620,17 @@ const Builder = struct {
         // emit a .use(host) at the labeled-block's opening AFTER the
         // body already lowered an `allocator.free(host)`.  Symmetric
         // to the same guard in lowerVarDecl.
-        const rhs_was_labeled_block = try self.maybeLowerLabeledBlockExpr(rhs, cur);
-
+        if (!try self.maybeLowerLabeledBlockExpr(rhs, cur)) {
+            try self.emitUsesInExpr(rhs, cur.*, null);
+            try self.applyTopLevelCallEffects(rhs, cur);
+            switch (tree.nodeTag(rhs)) {
+                .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
+                .@"catch" => try self.emitCatchFork(rhs, cur),
+                else => {},
+            }
+        }
 
         if (target_local) |t| {
-            // .use stmts for rhs reads, skipping the LHS itself
-            // (assignment writes LHS, not reads it).
-            if (!rhs_was_labeled_block) {
-                try self.emitUsesInExpr(rhs, cur.*, t);
-            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .assign = .{
                     .target = t,
@@ -2468,16 +2644,12 @@ const Builder = struct {
             // `container = .{ .ptr = buf }` registers
             // `(container, "ptr") → buf's origin` so a later
             // `container.ptr` read sees buf's freed state.
-            try self.unpackStructInitFields(cur.*, t, null, rhs,
-                self.posOf(assign_node), self.endPosOf(assign_node));
+            try self.unpackStructInitFields(cur.*, t, null, rhs, self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (self.fieldLhsFor(lhs)) |fref| {
             // `obj.field = RHS` where obj is a known local — emit
             // .field_assign so the field's origin is tracked
             // separately.  Catches store-then-free-then-use of a
             // struct field.
-            if (!rhs_was_labeled_block) {
-                try self.emitUsesInExpr(rhs, cur.*, null);
-            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .field_assign = .{
                     .parent = fref.parent,
@@ -2490,16 +2662,14 @@ const Builder = struct {
             // Nested struct-literal unpack for the field LHS, e.g.
             // `install.ca = .{ .str = buf }` → field_assign on
             // `(install, "ca.str")`.  oven-sh/bun#25563 shape.
-            try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs,
-                self.posOf(assign_node), self.endPosOf(assign_node));
+            try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs, self.posOf(assign_node), self.endPosOf(assign_node));
             // oven-sh/bun#29422: `obj.field = .{ .tag = try ... }` leaves
             // the union with the new tag and garbage payload on the
             // error path.  Fire only on field assignments through a
             // pointer-typed parent — pure-local field writes don't
             // outlive the frame and aren't observable.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
-                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent, fref.name,
-                    self.posOf(assign_node), self.endPosOf(assign_node));
+                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent, fref.name, self.posOf(assign_node), self.endPosOf(assign_node));
             }
             // Escape-via-out-param: `out.field = X` where `out` is a
             // pointer-typed parameter writes through to caller
@@ -2538,9 +2708,6 @@ const Builder = struct {
             // Mirror the field-of-pointer case above: emit a
             // pointer_write to clear .undef on the pointer and an
             // out_param_write for the escape check.
-            if (!rhs_was_labeled_block) {
-                try self.emitUsesInExpr(rhs, cur.*, null);
-            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .pointer_write = .{ .target = out_local } },
                 .pos = self.posOf(assign_node),
@@ -2567,31 +2734,18 @@ const Builder = struct {
             // observed field LHSs ARE unions).
             const tn = self.locals.items[@intFromEnum(out_local)].type_name;
             if (tn != null and self.typeIsTaggedUnion(tn.?)) {
-                try self.maybePartialUnionWrite(cur.*, rhs, out_local, null,
-                    self.posOf(assign_node), self.endPosOf(assign_node));
+                try self.maybePartialUnionWrite(cur.*, rhs, out_local, null, self.posOf(assign_node), self.endPosOf(assign_node));
             }
             // Unpack struct-literal fields so arena/heap-field origins
             // are tracked per-field.  Needed for the "object owns its
             // own arena" pattern (`ptr.* = .{ .arena = arena, ... }`) —
             // the arena field_assign marks the arena as heap-moved,
             // suppressing the spurious arena-escape on `return ptr`.
-            try self.unpackStructInitFields(cur.*, out_local, null, rhs,
-                self.posOf(assign_node), self.endPosOf(assign_node));
+            try self.unpackStructInitFields(cur.*, out_local, null, rhs, self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (tree.nodeTag(lhs) == .identifier and
             std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
         {
-            // Discard: `_ = expr;`.  Reads the RHS, writes nothing.
-            // CRUCIALLY we must NOT emit a .lowering_gap here — gap
-            // collapses every local to .plain (since it represents
-            // "we don't know what this stmt did").  `_ = x` is a
-            // common idiom (`_ = arg; // autofix`) sprinkled all over
-            // real codebases; treating each as a state wipe defeats
-            // heap / arena tracking everywhere downstream.
-            try self.emitUsesInExpr(rhs, cur.*, null);
-            // If RHS is a call, its @takes-ownership / arena-kill
-            // side effects must still fire.  `_ = h.markInactive();`
-            // would otherwise miss the inter-procedural UAF.
-            try self.applyTopLevelCallEffects(rhs, cur);
+            // Discard reads and call effects were lowered with the RHS.
         } else {
             // Untracked target (e.g. `@field(obj, ...) = X`,
             // `arr[i] = X`).  For any known local mentioned anywhere in
@@ -2600,17 +2754,10 @@ const Builder = struct {
             // initialized, so clearing its .undef state is sound.
             try self.emitWritesInLhs(lhs, cur.*);
             try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "assign-target" } },
+                .kind = .{ .lowering_gap = .{ .note = "assign-target", .may_assign_locals = false } },
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
-        }
-
-        // Mirror the init-position try/catch dispatch.
-        switch (tree.nodeTag(rhs)) {
-            .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
-            .@"catch" => try self.emitCatchFork(rhs, cur),
-            else => {},
         }
     }
 
@@ -2630,9 +2777,15 @@ const Builder = struct {
         const full = tree.assignDestructure(assign_node);
         const rhs = full.ast.value_expr;
 
-        // Labeled-block expression rhs — lower body first.
-        if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
-
+        if (!try self.maybeLowerLabeledBlockExpr(rhs, cur)) {
+            try self.emitUsesInExpr(rhs, cur.*, null);
+            try self.applyTopLevelCallEffects(rhs, cur);
+            switch (tree.nodeTag(rhs)) {
+                .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
+                .@"catch" => try self.emitCatchFork(rhs, cur),
+                else => {},
+            }
+        }
 
         for (full.ast.variables) |var_node| {
             const vtag = tree.nodeTag(var_node);
@@ -2677,15 +2830,6 @@ const Builder = struct {
                     });
                 },
             }
-        }
-
-        // Mirror plain assign: rhs try/catch dispatch comes after the
-        // per-target emissions (so the success path has the assigns
-        // visible before the error-exit / catch fork branches off).
-        switch (tree.nodeTag(rhs)) {
-            .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
-            .@"catch" => try self.emitCatchFork(rhs, cur),
-            else => {},
         }
     }
 
@@ -2756,30 +2900,14 @@ const Builder = struct {
         if (value_is_error) {
             try self.flushErrAndNormalDefers(cur);
         } else {
-            try self.flushDefers(cur);
+            try self.flushScopeDefers(cur, 0);
         }
 
-        // Multi-borrow composite returns: classifyExpr captures only
-        // the first borrow in `value_kind`.  Walk the return value
-        // again for ANY ADDITIONAL borrows (skipping the primary)
-        // and emit a per-local .composite_escape check before the
-        // .ret.  Without this, `return .{ .a = &x, .b = &y };` would
-        // only flag x.
-        //
-        // Only run when value_kind ITSELF is a borrow-shape — that
-        // tells us the return value is a composite-borrow construct,
-        // not a call.  Skipping for .unknown / .owned / etc. avoids
-        // false positives on `return foo(alloc, &local)` where
-        // `&local` is just a call arg, not part of the return value.
-        const primary_local: ?LocalId = switch (value_kind) {
-            .stack_ref => |l| l,
-            .composite_borrow => |l| l,
-            else => null,
-        };
-        if (primary_local != null) {
-            if (value_opt) |expr| {
-                try self.emitAdditionalEscapeChecks(expr, cur.*, primary_local);
-            }
+        switch (value_kind) {
+            .stack_ref, .copy_of, .composite_borrow => {
+                if (value_opt) |expr| try self.emitAdditionalEscapeChecks(expr, cur.*, value_kind);
+            },
+            else => {},
         }
 
         // Detect `return undefined;` — a literal sentinel return,
@@ -2889,8 +3017,14 @@ const Builder = struct {
     fn initWrapsResourceLocalRef(self: *Builder, init_node: Ast.Node.Index) ?WrapHit {
         const tree = self.tree;
         switch (tree.nodeTag(init_node)) {
-            .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
-            .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
             => {},
             else => return null,
         }
@@ -3004,7 +3138,7 @@ const Builder = struct {
         init_expr: Ast.Node.Index,
         pos: SrcPos,
         end_pos: SrcPos,
-    ) std.mem.Allocator.Error!void {
+    ) LoweringError!void {
         const tree = self.tree;
         var node = init_expr;
         while (true) switch (tree.nodeTag(node)) {
@@ -3063,7 +3197,7 @@ const Builder = struct {
         }
     }
 
-    fn applyTopLevelCallEffects(self: *Builder, expr_node: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
+    fn applyTopLevelCallEffects(self: *Builder, expr_node: Ast.Node.Index, cur: *BlockId) (LoweringError)!void {
         const tree = self.tree;
         // Walk through `try` / `catch` wrappers — they don't change
         // which call's effects fire on success path.
@@ -3159,7 +3293,7 @@ const Builder = struct {
         if (anyPatternMatches(text, self.config.arena_kill_patterns)) {
             const recv_local = self.firstIdentifierLocal(text) orelse {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .lowering_gap = .{ .note = "deinit-no-receiver" } },
+                    .kind = .{ .lowering_gap = .{ .note = "deinit-no-receiver", .may_assign_locals = false } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
@@ -3191,14 +3325,22 @@ const Builder = struct {
                 switch (target) {
                     .local => |freed| {
                         try self.appendStmt(cur.*, .{
-                            .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                            .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: {
+                                const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                                self.next_heap += 1;
+                                break :blk_h h;
+                            } } },
                             .pos = self.posOf(call_node),
                             .end_pos = self.endPosOf(call_node),
                         });
                     },
                     .field => |fref| {
                         try self.appendStmt(cur.*, .{
-                            .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                            .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                                const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                                self.next_heap += 1;
+                                break :blk_hid h;
+                            } } },
                             .pos = self.posOf(call_node),
                             .end_pos = self.endPosOf(call_node),
                         });
@@ -3210,7 +3352,11 @@ const Builder = struct {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .heap_free = .{
                         .freed_local = freed,
-                        .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; },
+                        .fallback_hid = blk_h: {
+                            const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                            self.next_heap += 1;
+                            break :blk_h h;
+                        },
                         .allocator_local = self.allocReceiverLocal(call_node),
                     } },
                     .pos = self.posOf(call_node),
@@ -3221,14 +3367,18 @@ const Builder = struct {
             // `g.free(obj.field)` — field-level free.
             if (self.heapFreedField(call_node)) |fref| {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                        const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                        self.next_heap += 1;
+                        break :blk_hid h;
+                    } } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
                 return;
             }
             try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "free-untracked-arg" } },
+                .kind = .{ .lowering_gap = .{ .note = "free-untracked-arg", .may_assign_locals = false } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -3245,7 +3395,11 @@ const Builder = struct {
         var fired_any = false;
         if (self.takesOwnershipFreedLocal(call_node)) |freed| {
             try self.appendStmt(cur.*, .{
-                .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_h h;
+                } } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -3259,7 +3413,11 @@ const Builder = struct {
         // because the receiver is a field_access, not a bare ident.
         if (self.takesOwnershipFreedField(call_node)) |fref| {
             try self.appendStmt(cur.*, .{
-                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_hid h;
+                } } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -3278,7 +3436,11 @@ const Builder = struct {
             if (emissions.items.len > 0) {
                 for (emissions.items) |em| {
                     try self.appendStmt(cur.*, .{
-                        .kind = .{ .field_heap_free = .{ .parent = em.parent, .name = em.field, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                        .kind = .{ .field_heap_free = .{ .parent = em.parent, .name = em.field, .fallback_hid = blk_hid: {
+                            const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                            self.next_heap += 1;
+                            break :blk_hid h;
+                        } } },
                         .pos = self.posOf(call_node),
                         .end_pos = self.endPosOf(call_node),
                     });
@@ -3293,7 +3455,7 @@ const Builder = struct {
         // conservative gap erases tracked origins.
         try self.emitUsesInExpr(call_node, cur.*, null);
         try self.appendStmt(cur.*, .{
-            .kind = .{ .lowering_gap = .{ .note = "call-untracked" } },
+            .kind = .{ .lowering_gap = .{ .note = "call-untracked", .may_assign_locals = false } },
             .pos = self.posOf(call_node),
             .end_pos = self.endPosOf(call_node),
         });
@@ -3476,35 +3638,12 @@ const Builder = struct {
         const field_name = tree.tokenSlice(recv_fa[1]);
         const method_name = tree.tokenSlice(fa[1]);
 
-        // The receiver of the method call is the FIELD (`parent.field`).
-        // Resolve its declared type via the parent local's type +
-        // field name → Db.fieldType.  This scopes `<local>.<field>
-        // .<method>()` lookups to the field's exact type instead of
-        // falling back to bare-name (which would inherit a sibling
-        // overload's annotation across types).
-        const recv_ty: ?[]const u8 = blk: {
-            const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse break :blk null;
-            const cache = self.cache orelse break :blk null;
-            const model = cache.fileModel() catch break :blk null;
-            break :blk model.fieldType(parent_ty, field_name);
-        };
-
-        // Resolve method's @takes: same-file typed -> cross-file typed.
-        // No bare-name fallback — see takesOwnershipFreedLocal for rationale.
-        const takes_idx: u32 = blk: {
-            if (recv_ty) |ty| {
-                if (self.cache) |c| {
-                    if (c.summaryByMethod(ty, method_name) catch null) |s| {
-                        if (s.takes_ownership_of) |i| break :blk i;
-                    }
-                    if (c.summaryByMethodCrossFile(ty, method_name) catch null) |xf| {
-                        if (xf.takes_ownership_of) |i| break :blk i;
-                    }
-                }
-            }
-            return null;
-        };
-        if (takes_idx != 0) return null;
+        const cache = self.cache orelse return null;
+        const parent_name = self.locals.items[@intFromEnum(parent)].type_name orelse return null;
+        const owner = cache.findTypeAcrossImports(parent_name) orelse return null;
+        const child = cache.fieldType(owner, field_name) orelse return null;
+        const summary = (cache.summaryForType(child, method_name) catch null) orelse return null;
+        if (summary.takes_ownership_of != 0) return null;
         return .{ .parent = parent, .name = field_name };
     }
 
@@ -3524,7 +3663,7 @@ const Builder = struct {
                 // result in the local so every subsequent call on the same
                 // receiver skips ZLS entirely.
                 if (self.zls) |z| {
-                    if (z.typeNameOfNode(node) catch null) |ty| {
+                    if (z.typeReferenceOfNode(node) catch null) |ty| {
                         self.locals.items[@intFromEnum(lid)].type_name = ty;
                         return ty;
                     }
@@ -3538,7 +3677,7 @@ const Builder = struct {
         // and cross-module aliases (`const W = ns.factory.Type`)
         // where zbc's AST-only tracking can't see the type.
         if (self.zls) |z| {
-            return z.typeNameOfNode(node) catch null;
+            return z.typeReferenceOfNode(node) catch null;
         }
         return null;
     }
@@ -3800,10 +3939,22 @@ const Builder = struct {
         }
     }
 
-
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
+        if (self.classify_depth == 64) {
+            self.budget_exhausted = true;
+            return .unknown;
+        }
+        self.classify_depth += 1;
+        defer self.classify_depth -= 1;
         const tree = self.tree;
         const tag = tree.nodeTag(expr_node);
+        if (tag == .grouped_expression) {
+            return self.classifyExpr(tree.nodeData(expr_node).node_and_token[0]);
+        }
+        if (self.booleanLiteral(expr_node)) |value| return .{ .boolean = .{ .constant = value } };
+        if (tag == .bool_not or tag == .equal_equal or tag == .bang_equal) {
+            if (self.booleanValue(expr_node)) |value| return .{ .boolean = value };
+        }
 
         // `try expr` — unwrap and classify the inner expression.  The
         // error-exit edge isn't modeled yet (phase 9); for success-path
@@ -3966,7 +4117,10 @@ const Builder = struct {
         // storage; same lifetime semantics, since taking the address
         // of a field is taking a pointer into the parent.
         if (tag == .address_of) {
-            const inner = tree.nodeData(expr_node).node;
+            var inner = tree.nodeData(expr_node).node;
+            while (tree.nodeTag(inner) == .grouped_expression) {
+                inner = tree.nodeData(inner).node_and_token[0];
+            }
             if (tree.nodeTag(inner) == .identifier) {
                 const name = tree.tokenSlice(tree.nodeMainToken(inner));
                 if (self.name_to_local.get(name)) |id| {
@@ -4026,11 +4180,17 @@ const Builder = struct {
                     //      borrows through the heap pointer, not the stack.
                     if (self.zls) |zls| {
                         const child = tree.nodeData(inner).node_and_token[0];
-                        if (zls.resolvedTypeIsPointer(child) catch false) {
+                        if ((zls.resolvedTypeIsPointer(child) catch null) == true) {
                             return .unknown;
                         }
                     }
                     return .{ .stack_ref = fref.parent };
+                }
+            }
+            if (tree.nodeTag(inner) == .array_access) {
+                if (tokens.rootIdentifier(tree, inner)) |root| {
+                    const id = self.name_to_local.get(tree.tokenSlice(tree.nodeMainToken(root))) orelse return .unknown;
+                    if (self.locals.items[@intFromEnum(id)].is_array) return .{ .stack_ref = id };
                 }
             }
         }
@@ -4118,185 +4278,72 @@ const Builder = struct {
             return self.classifyCall(expr_node);
         }
 
-        // Composite escape fallback — only fires for expressions
-        // whose TOP-LEVEL shape is a composite literal (struct or
-        // array init).  For other shapes (binary ops, catch chains,
-        // parens, ifs, etc.) an `&local` token sequence inside is
-        // typically a call arg buried in the expression, not part
-        // of the return value's shape — firing would produce a
-        // flood of false positives like `return (call(&buf)) != 0`.
+        // Only value-position children can carry a borrow out of an aggregate.
         const is_composite_literal = switch (tag) {
-            .struct_init, .struct_init_comma,
-            .struct_init_one, .struct_init_one_comma,
-            .struct_init_dot, .struct_init_dot_comma,
-            .struct_init_dot_two, .struct_init_dot_two_comma,
-            .array_init, .array_init_comma,
-            .array_init_one, .array_init_one_comma,
-            .array_init_dot, .array_init_dot_comma,
-            .array_init_dot_two, .array_init_dot_two_comma,
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            .array_init,
+            .array_init_comma,
+            .array_init_one,
+            .array_init_one_comma,
+            .array_init_dot,
+            .array_init_dot_comma,
+            .array_init_dot_two,
+            .array_init_dot_two_comma,
+            .array_mult,
             => true,
             else => false,
         };
         if (is_composite_literal) {
-            if (self.firstAddressedLocal(expr_node)) |id| {
-                return .{ .stack_ref = id };
-            }
+            const borrow = self.firstCompositeBorrow(expr_node);
+            if (borrow) |kind| if (kind == .stack_ref) return kind;
             if (!self.suppress_composite_borrow) {
                 if (self.firstResourceMethodBorrow(expr_node)) |id| {
                     return .{ .composite_borrow = id };
                 }
             }
+            if (borrow) |kind| return kind;
         }
 
         return .unknown;
     }
 
-    /// Walk `expr_node`'s tokens for every borrow shape recognized
-    /// by firstAddressedLocal (`&id`, `array_local[`), skipping
-    /// `primary_local` (already handled by the surrounding .ret).
-    /// Emits one .composite_escape per additional distinct borrow
-    /// so multi-borrow composite returns get fully flagged.
+    /// Check every value-position borrow except the one checked by `.ret`.
     fn emitAdditionalEscapeChecks(
         self: *Builder,
         expr_node: Ast.Node.Index,
         cur: BlockId,
-        primary_local: ?LocalId,
+        primary_kind: ExprKind,
     ) !void {
-        const tree = self.tree;
-        const first = tree.firstToken(expr_node);
-        const last = tree.lastToken(expr_node);
-        const tags = tree.tokens.items(.tag);
-        const pos = self.posOf(expr_node);
-        const end_pos = self.endPosOf(expr_node);
-
-        var seen: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
+        var seen: std.AutoArrayHashMapUnmanaged(BorrowKey, void) = .empty;
         defer seen.deinit(self.gpa);
-        if (primary_local) |p| try seen.put(self.gpa, p, {});
-
-        // Same depth-gate as firstAddressedLocal: only direct field
-        // values of the outermost composite literal, not nested
-        // inside call args / switch arms / sub-literals.
-        var depth: i32 = 0;
-        var t: Ast.TokenIndex = first;
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .l_brace, .l_paren, .l_bracket => depth += 1,
-                .r_brace, .r_paren, .r_bracket => depth -= 1,
-                else => {},
-            }
-            if (depth != 1) continue;
-            const id_opt: ?LocalId = blk: {
-                if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
-                    if (t + 2 <= last) {
-                        const next = tags[t + 2];
-                        if (next == .period or next == .l_bracket or
-                            next == .period_asterisk) break :blk null;
-                    }
-                    const name = tree.tokenSlice(t + 1);
-                    break :blk self.name_to_local.get(name);
-                }
-                if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
-                    if (t > 0 and tags[t - 1] == .period) break :blk null;
-                    const name = tree.tokenSlice(t);
-                    const local = self.name_to_local.get(name) orelse break :blk null;
-                    if (!self.locals.items[@intFromEnum(local)].is_array) break :blk null;
-                    break :blk local;
-                }
-                break :blk null;
-            };
-            const local = id_opt orelse continue;
-            const gop = try seen.getOrPut(self.gpa, local);
-            if (gop.found_existing) continue;
+        try seen.put(self.gpa, BorrowKey.from(primary_kind), {});
+        var borrows = BorrowIterator.init(self, expr_node);
+        while (borrows.next()) |kind| {
+            const entry = try seen.getOrPut(self.gpa, BorrowKey.from(kind));
+            if (entry.found_existing) continue;
             try self.appendStmt(cur, .{
-                .kind = .{ .composite_escape = .{ .local = local } },
-                .pos = pos,
-                .end_pos = end_pos,
+                .kind = .{ .composite_escape = kind },
+                .pos = self.posOf(expr_node),
+                .end_pos = self.endPosOf(expr_node),
             });
         }
     }
 
-    /// Walk `expr_node`'s tokens looking for either:
-    ///   `&<ident>`         — address-of a known local, OR
-    ///   `<array_local>[`   — slice/index of a known `[N]T` local.
-    /// Returns the first such LocalId — caller propagates as
-    /// `.stack_ref` so transferRet can flag the escape.
-    fn firstAddressedLocal(self: *Builder, expr_node: Ast.Node.Index) ?LocalId {
-        const tree = self.tree;
-        const first = tree.firstToken(expr_node);
-        const last = tree.lastToken(expr_node);
-        const tags = tree.tokens.items(.tag);
-
-        // Bracket-depth tracker: only fire at depth == 1 (direct
-        // field values of the OUTERMOST struct/array literal).  At
-        // depth 0 we'd match expressions outside the literal (we
-        // skip that anyway since callers gate on the literal tag).
-        // At depth 2+ we're inside nested calls, switch arms,
-        // sub-literals — `&local` there is rarely a field value.
-        var depth: i32 = 0;
-        var t: Ast.TokenIndex = first;
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .l_brace, .l_paren, .l_bracket => depth += 1,
-                .r_brace, .r_paren, .r_bracket => depth -= 1,
-                else => {},
-            }
-            if (depth != 1) continue;
-
-            // Address-of pattern: `& <ident>` where `<ident>` is the
-            // WHOLE address-of operand (not `&local.field` /
-            // `&local[i]` — those address memory the local merely
-            // points INTO, typically caller-owned).
-            if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
-                if (t + 2 <= last) {
-                    const next = tags[t + 2];
-                    // Skip `&local.field`, `&local[i]`, `&local.*`
-                    // (period_asterisk is the single `.*` deref token),
-                    // and `&local.?` — those address memory the local
-                    // merely points INTO, typically caller-owned storage.
-                    if (next == .period or next == .l_bracket or
-                        next == .period_asterisk) continue;
-                }
-                const name = tree.tokenSlice(t + 1);
-                if (self.name_to_local.get(name)) |local| {
-                    // Comptime-initialized locals (`const X =
-                    // comptime ...;`) live in static memory.
-                    // `&X` inside a return composite isn't a
-                    // stack borrow.  Common for vtable returns:
-                    // `return .{ .vtable = &vtable };`.
-                    const info = self.locals.items[@intFromEnum(local)];
-                    if (info.init_hint == .type_alias) continue;
-                    return local;
-                }
-                continue;
-            }
-            // Slice of a stack array: `<ident> [ ... .. ... ]`.
-            // Bare INDEX access `<ident> [ <expr> ]` (no `..`)
-            // produces a VALUE — not a pointer.  Walk past `[`
-            // to see if `..` appears before the matching `]`.
-            if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
-                // Skip if preceded by `.` (struct field access on something).
-                if (t > 0 and tags[t - 1] == .period) continue;
-                const name = tree.tokenSlice(t);
-                const local = self.name_to_local.get(name) orelse continue;
-                if (!self.locals.items[@intFromEnum(local)].is_array) continue;
-                // Slice vs index: scan to matching `]` looking
-                // for `..`.  Only slices borrow the array's
-                // storage — index access is a value copy.
-                var u: Ast.TokenIndex = t + 2;
-                var br: i32 = 1;
-                var saw_dotdot = false;
-                while (u <= last and br > 0) : (u += 1) {
-                    switch (tags[u]) {
-                        .l_bracket => br += 1,
-                        .r_bracket => br -= 1,
-                        .ellipsis2 => saw_dotdot = true,
-                        else => {},
-                    }
-                }
-                if (saw_dotdot) return local;
-            }
+    fn firstCompositeBorrow(self: *Builder, expr_node: Ast.Node.Index) ?ExprKind {
+        var borrows = BorrowIterator.init(self, expr_node);
+        var alias: ?ExprKind = null;
+        while (borrows.next()) |kind| {
+            if (kind == .stack_ref) return kind;
+            if (alias == null) alias = kind;
         }
-        return null;
+        return alias;
     }
 
     /// Walk `expr_node`'s tokens looking for any
@@ -4357,23 +4404,19 @@ const Builder = struct {
             const method_name = tree.tokenSlice(method_tok);
             const recv_ty = self.locals.items[@intFromEnum(local)].type_name orelse continue;
 
-            // Walk the field path through the model to find the type
-            // that owns `method`.  No field segments → method is on
-            // local's own type.  With segments, each step asks the
-            // model for the next field's type.
-            const final_ty: ?[]const u8 = blk: {
-                if (field_first == 0) break :blk recv_ty;
-                const model = cache.fileModel() catch break :blk null;
-                var cur_ty: []const u8 = recv_ty;
-                var ft: Ast.TokenIndex = field_first;
-                while (ft <= field_last) : (ft += 2) {
-                    const fname = tree.tokenSlice(ft);
-                    cur_ty = model.fieldType(cur_ty, fname) orelse break :blk null;
+            var owner = cache.findTypeAcrossImports(recv_ty) orelse continue;
+            var field = field_first;
+            var resolved = true;
+            if (field_first != 0) {
+                while (field <= field_last) : (field += 2) {
+                    owner = cache.fieldType(owner, tree.tokenSlice(field)) orelse {
+                        resolved = false;
+                        break;
+                    };
                 }
-                break :blk cur_ty;
-            };
-            const ty = final_ty orelse continue;
-            const summary = (cache.summaryByMethod(ty, method_name) catch null) orelse continue;
+            }
+            if (!resolved) continue;
+            const summary = (cache.summaryForType(owner, method_name) catch null) orelse continue;
             switch (summary.returns) {
                 .borrowed_from => |idx| if (idx == 0) return local,
                 else => {},
@@ -4527,7 +4570,7 @@ const Builder = struct {
         self: *Builder,
         expr: Ast.Node.Index,
         cur: *BlockId,
-    ) (std.mem.Allocator.Error)!void {
+    ) (LoweringError)!void {
         const tree = self.tree;
         switch (tree.nodeTag(expr)) {
             .@"switch", .switch_comma => {},
@@ -4535,26 +4578,25 @@ const Builder = struct {
         }
         const sw = tree.fullSwitch(expr) orelse return;
 
-        // Discriminant uses fire from the outer cur (before any arm).
-        try self.emitUsesInExpr(sw.ast.condition, cur.*, null);
+        // Edges inherit the final state of their predecessor block. Keep
+        // switch evaluation in a predecessor that cannot also contain the
+        // outer return's deferred cleanup.
+        const eval_block = cur.*;
+        const continuation = try self.newBlock();
+        try self.emitUsesInExpr(sw.ast.condition, eval_block, null);
 
         for (sw.ast.cases) |case_node| {
             const case_full = tree.fullSwitchCase(case_node) orelse continue;
             const case_block = try self.newBlock();
-            try self.addEdge(cur.*, case_block);
-            if (case_full.payload_token) |pt| try self.registerCaptures(pt);
+            try self.addEdge(eval_block, case_block);
+            if (case_full.payload_token) |payload_token| {
+                try self.registerCaptures(payload_token);
+            }
             var case_cur = case_block;
-            // The arm body is the case's target_expr.  Block bodies
-            // (`.err => { ... }`) lower naturally; naked expressions
-            // (`.success => v`) end up as a lowering_gap, which is
-            // harmless for state preservation.
             try self.lowerStmt(case_full.ast.target_expr, &case_cur);
-            // Don't add an edge back to cur or anywhere — the arm is
-            // a forked side-path used purely to surface bugs inside
-            // diverging branches.  Adding an edge would propagate
-            // arm-local state (free, deinit) back into the outer
-            // return, causing spurious "use after free" downstream.
         }
+        try self.addEdge(eval_block, continuation);
+        cur.* = continuation;
     }
 
     /// True iff `expr` is syntactically a literal error return value
@@ -4598,7 +4640,7 @@ const Builder = struct {
 
     fn isConstructorName(name: []const u8) bool {
         const list = [_][]const u8{
-            "init", "create", "new", "open",
+            "init",           "create",    "new", "open",
             "fromOwnedSlice", "fromSlice",
         };
         for (list) |n| if (std.mem.eql(u8, n, name)) return true;
@@ -4618,9 +4660,7 @@ const Builder = struct {
     ///   - `T{ ... }` and `T.{ ... }` struct literals — but NOT
     ///     anonymous `.{ ... }`, which needs the surrounding context's
     ///     type that we don't have.
-    /// Returns the LAST identifier in a dotted chain
-    /// (`lib.Owner.init(...)` → "Owner"), matching extractTypeName's
-    /// namespace-stripping rule.
+    /// Preserve namespace qualification for method dispatch.
     fn inferTypeNameFromInit(self: *Builder, init_node: Ast.Node.Index) ?[]const u8 {
         const tree = self.tree;
         var node = init_node;
@@ -4642,7 +4682,7 @@ const Builder = struct {
                 const fa = tree.nodeData(callee).node_and_token;
                 const method_name = tree.tokenSlice(fa[1]);
                 if (!isConstructorName(method_name)) break :blk null;
-                break :blk self.lastIdentInDottedChain(fa[0]);
+                break :blk self.extractTypeName(fa[0], self.self_type);
             },
             .struct_init,
             .struct_init_comma,
@@ -4652,7 +4692,7 @@ const Builder = struct {
                 var buf: [2]Ast.Node.Index = undefined;
                 const si = tree.fullStructInit(&buf, node) orelse break :blk null;
                 const type_expr = si.ast.type_expr.unwrap() orelse break :blk null;
-                break :blk self.lastIdentInDottedChain(type_expr);
+                break :blk self.extractTypeName(type_expr, self.self_type);
             },
             else => null,
         };
@@ -4662,24 +4702,11 @@ const Builder = struct {
         // token-pattern match above can't classify because the type
         // isn't syntactically visible at the call site.
         if (self.zls) |z| {
-            return z.typeNameOfNode(init_node) catch null;
+            return z.typeReferenceOfNode(init_node) catch null;
         }
         return null;
     }
 
-    /// Return the LAST identifier token slice in a dotted chain.
-    /// `lib.Owner` → "Owner", `Owner` → "Owner", anything else → null.
-    fn lastIdentInDottedChain(self: *Builder, node: Ast.Node.Index) ?[]const u8 {
-        const tree = self.tree;
-        switch (tree.nodeTag(node)) {
-            .identifier => return tree.tokenSlice(tree.nodeMainToken(node)),
-            .field_access => {
-                const fa = tree.nodeData(node).node_and_token;
-                return tree.tokenSlice(fa[1]);
-            },
-            else => return null,
-        }
-    }
 
     /// Resolve an expression node to an arena-bound LocalId if
     /// possible: bare identifier whose init_hint is arena_local /
@@ -5067,7 +5094,7 @@ const Builder = struct {
                 };
                 if (call_recv_type) |tn| {
                     if (cache.findMethodAcrossImports(tn, fn_name)) |rm| {
-                        if (calledFnTouchesParamField(rm.tree, rm.method.fn_decl, path)) return true;
+                        if (calledFnTouchesParamField(rm.tree, rm.fn_decl, path)) return true;
                     }
                 }
             }
@@ -5520,7 +5547,7 @@ const Builder = struct {
         rhs_node: Ast.Node.Index,
         pos: SrcPos,
         end_pos: SrcPos,
-    ) std.mem.Allocator.Error!void {
+    ) LoweringError!void {
         const tree = self.tree;
         var buf: [2]Ast.Node.Index = undefined;
         const init = tree.fullStructInit(&buf, rhs_node) orelse return;
@@ -5563,20 +5590,15 @@ const Builder = struct {
     ) bool {
         const cache = self.cache orelse return false;
         const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse return false;
-        const model = cache.fileModel() catch return false;
-        var cur_ti = model.findType(parent_ty) orelse blk: {
-            // Fall back to the cross-file index for the root type.
-            break :blk cache.findTypeAcrossImports(parent_ty) orelse return false;
-        };
-        const tree = self.tree;
-        const tags = tree.tokens.items(.tag);
+        var current = cache.findTypeAcrossImports(parent_ty) orelse return false;
         var rest = path;
         // Walk the dotted path one segment at a time, descending
         // into nested field types as we go.
         while (rest.len > 0) {
+            const tags = current.model.tree.tokens.items(.tag);
             const dot_at = std.mem.indexOfScalar(u8, rest, '.');
             const seg = if (dot_at) |i| rest[0..i] else rest;
-            const field = cur_ti.findField(seg) orelse return false;
+            const field = current.info.findField(seg) orelse return false;
             const remainder = if (dot_at) |i| rest[i + 1 ..] else "";
             if (remainder.len == 0) {
                 // Last segment: check the field's type tokens for
@@ -5600,12 +5622,7 @@ const Builder = struct {
                 // number / identifier (not `]` or `*`).
                 return tags[t + 1] != .r_bracket and tags[t + 1] != .asterisk;
             }
-            // Descend into the field's TYPE for the next segment.
-            // baseTypeName + findType (or cross-file lookup).
-            const inner_name = baseTypeNameOfField(tree, field) orelse return false;
-            cur_ti = model.findType(inner_name) orelse blk: {
-                break :blk cache.findTypeAcrossImports(inner_name) orelse return false;
-            };
+            current = cache.fieldType(current, seg) orelse return false;
             rest = remainder;
         }
         return false;
@@ -5662,6 +5679,10 @@ const Builder = struct {
         const first = tree.firstToken(expr_node);
         const last = tree.lastToken(expr_node);
         const tags = tree.tokens.items(.tag);
+        if (self.cache == null and self.address_cache == null) {
+            self.address_cache = file_cache.FileCache.init(self.gpa, tree);
+        }
+        const address_cache = self.cache orelse &self.address_cache.?;
 
         // Use the whole-expression pos for every emitted stmt.  Per-
         // token positions (posOfToken) are O(byte_offset) — calling
@@ -5729,7 +5750,6 @@ const Builder = struct {
                 continue;
             }
             if (comptime_skip_active) continue;
-            if (write_dest_skip_active) continue;
             if (tag != .identifier) continue;
             // LHS of a plain `=` assignment inside a sub-expression
             // (e.g. a switch arm body or labeled block being used as
@@ -5759,31 +5779,13 @@ const Builder = struct {
                 }
                 continue;
             }
-            // Address-of: `&id` is conservatively treated as a possible
-            // write (out-param pattern).  Emit an .assign with .unknown
-            // rhs so the local's origin collapses to .plain — clears
-            // .undef and avoids spurious use-of-undefined findings on
-            // common idioms like `var x = undefined; fillOut(&x);`.
-            //
-            // EXCEPTION: arena/heap-bearing locals.  Their resource
-            // identity is stable across `&x` (the address-of doesn't
-            // re-bind the underlying allocator), so clearing would
-            // mask real escape findings — e.g. `return wrap(&arena)`
-            // depends on arena's .arena origin surviving to the .ret.
-            //
-            // Also handles `&@field(id.f, "name")` — the `&` is three
-            // tokens back (through `@field(`).  Taking the address of a
-            // field through the comptime lookup builtin does not read
-            // the value: the same "possible write, clear .undef"
-            // treatment applies.
-            const is_addr_of_field_arg = t >= 3 and
-                tags[t - 1] == .l_paren and
-                tags[t - 2] == .builtin and
-                tags[t - 3] == .ampersand and
-                std.mem.eql(u8, tree.tokenSlice(t - 2), "@field");
-            if ((t > 0 and tags[t - 1] == .ampersand) or is_addr_of_field_arg) {
+            // Taking an address is not a value read. Only an address passed
+            // into a call can act as an out-parameter write.
+            if (try address_cache.addressUseAt(t)) |address| {
                 const name = tree.tokenSlice(t);
                 const id = self.name_to_local.get(name) orelse continue;
+                self.locals.items[@intFromEnum(id)].address_taken = true;
+                if (!address.may_write) continue;
                 if (skip_local) |s| if (id == s) continue;
                 const hint = self.locals.items[@intFromEnum(id)].init_hint;
                 if (hint != .other) continue;
@@ -5809,6 +5811,7 @@ const Builder = struct {
                 });
                 continue;
             }
+            if (write_dest_skip_active) continue;
             // Field/method access: `.method` — skip; it's not a local.
             if (t > 0 and tags[t - 1] == .period) continue;
             // Structural / comptime access on the next token that
@@ -5994,10 +5997,10 @@ const Builder = struct {
         if (std.mem.startsWith(u8, name, "set")) return true;
         if (std.mem.startsWith(u8, name, "reset")) return true;
         const list = [_][]const u8{
-            "clear", "clearRetainingCapacity", "clearAndFree",
-            "deinit", "destroy", "close",
-            "open", "load", "loadFromDisk", "loadFromBytes",
-            "fillFromPackageJSON",
+            "clear",         "clearRetainingCapacity", "clearAndFree",
+            "deinit",        "destroy",                "close",
+            "open",          "load",                   "loadFromDisk",
+            "loadFromBytes", "fillFromPackageJSON",
         };
         for (list) |n| if (std.mem.eql(u8, n, name)) return true;
         return false;
@@ -6009,8 +6012,8 @@ const Builder = struct {
     fn isComptimeOnlyBuiltin(name: []const u8) bool {
         // `name` includes the leading `@`.
         const candidates = [_][]const u8{
-            "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf",
-            "@typeInfo", "@typeName", "@hasField", "@hasDecl",
+            "@TypeOf",   "@sizeOf",      "@alignOf",        "@bitSizeOf",
+            "@typeInfo", "@typeName",    "@hasField",       "@hasDecl",
             "@offsetOf", "@bitOffsetOf", "@fieldParentPtr",
         };
         for (candidates) |c| if (std.mem.eql(u8, name, c)) return true;
@@ -6043,7 +6046,7 @@ const Builder = struct {
         last: Ast.TokenIndex,
         pos: SrcPos,
         end_pos: SrcPos,
-    ) (std.mem.Allocator.Error)!void {
+    ) (LoweringError)!void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         // Caller verified tags[t+1] == `.`, tags[t+2] = ident.
@@ -6350,5 +6353,3 @@ fn blockStmts(
         else => &.{},
     };
 }
-
-

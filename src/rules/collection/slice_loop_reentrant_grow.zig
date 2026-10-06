@@ -85,12 +85,19 @@ fn checkFn(
         // Find the loop body `{...}` after the capture `|...|`.
         const body_start = findLoopBody(tags, rp + 1, last) orelse continue;
         const body_end = matchBrace(tags, body_start, last) orelse continue;
+        const capture_by_value = loopCaptureByValue(tags, rp + 1, body_start);
 
         // Scan the loop body for calls that may grow collections.
-        try checkLoopBody(gpa, tree, cache, body_start + 1, body_end - 1, recv, problems);
-
-        // Skip past the loop body to avoid re-scanning its contents.
-        t = body_end;
+        try checkLoopBody(
+            gpa,
+            tree,
+            cache,
+            body_start + 1,
+            body_end - 1,
+            recv,
+            capture_by_value,
+            problems,
+        );
     }
 }
 
@@ -129,8 +136,23 @@ fn findLoopBody(
     return null;
 }
 
+/// Return true for a by-value first loop capture (`|item|`), not
+/// pointer capture (`|*item|`). Only the former is detached before
+/// a collection growth operation.
+fn loopCaptureByValue(
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    body_start: Ast.TokenIndex,
+) bool {
+    var s = start;
+    while (s < body_start and tags[s] != .pipe) : (s += 1) {}
+    if (s >= body_start) return false;
+    s += 1;
+    return s < body_start and tags[s] == .identifier;
+}
+
 /// Scan `[start, end]` (the loop body interior) for calls that may
-/// grow a collection.  `recv` is the list being iterated.
+/// grow a collection. `recv` is the list being iterated.
 fn checkLoopBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -138,6 +160,7 @@ fn checkLoopBody(
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     recv: []const u8,
+    capture_by_value: bool,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (start > end) return;
@@ -159,7 +182,9 @@ fn checkLoopBody(
         {
             const method = tree.tokenSlice(t + 2);
             if (method_names.isArrayListGrowMethodName(method)) {
-                try report(gpa, problems, tree, t + 2, recv, method);
+                if (!(capture_by_value and callImmediatelyReturns(tags, t + 3, end))) {
+                    try report(gpa, problems, tree, t + 2, recv, method);
+                }
                 t += 3;
                 continue;
             }
@@ -175,7 +200,7 @@ fn checkLoopBody(
         if (!summary.may_grow_collections) continue;
 
         // Suppress when `recv` doesn't appear anywhere in the call's
-        // argument list.  If the callee can't reach the iterated
+        // argument list. If the callee can't reach the iterated
         // collection (it isn't passed as an argument), it cannot
         // reallocate it — the slice pointer remains valid.
         const call_rp = matchParen(tags, t + 1, end) orelse {
@@ -187,7 +212,9 @@ fn checkLoopBody(
             continue;
         }
 
-        try reportCallee(gpa, problems, tree, t, callee, recv);
+        if (!(capture_by_value and callImmediatelyReturns(tags, t + 1, end))) {
+            try reportCallee(gpa, problems, tree, t, callee, recv);
+        }
         t = call_rp;
     }
 }
@@ -205,6 +232,26 @@ fn identAppearsIn(
         if (tags[s] == .identifier and std.mem.eql(u8, tree.tokenSlice(s), name)) return true;
     }
     return false;
+}
+
+/// True when a call, with at most an empty catch block, immediately returns.
+fn callImmediatelyReturns(
+    tags: []const std.zig.Token.Tag,
+    lp: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    if (lp > end or tags[lp] != .l_paren) return false;
+    const rp = matchParen(tags, lp, end) orelse return false;
+    var next = rp + 1;
+    if (next + 2 <= end and
+        tags[next] == .keyword_catch and
+        tags[next + 1] == .l_brace and
+        tags[next + 2] == .r_brace)
+    {
+        next += 3;
+    }
+    if (next <= end and tags[next] == .semicolon) next += 1;
+    return next <= end and tags[next] == .keyword_return;
 }
 
 fn report(
@@ -337,6 +384,34 @@ test "slice-loop-reentrant-grow: may_grow callee passed recv fires" {
         \\    for (list.items) |item| {
         \\        mayGrow(list, item);
         \\    }
+        \\}
+        \\
+    );
+}
+
+test "skript regression: by-value reentrant grow returns before next iteration" {
+    try testing.expectNoFire(check,
+        \\const List = std.ArrayList(u32);
+        \\pub fn take(list: *List) u32 {
+        \\    for (list.items) |item| {
+        \\        list.append(item) catch {};
+        \\        return item;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "skript regression: pointer reentrant grow remains unsafe after return" {
+    try testing.expectFires(check, R,
+        \\const List = std.ArrayList(u32);
+        \\pub fn take(list: *List) u32 {
+        \\    for (list.items) |*item| {
+        \\        list.append(item.*) catch {};
+        \\        return item.*;
+        \\    }
+        \\    return 0;
         \\}
         \\
     );

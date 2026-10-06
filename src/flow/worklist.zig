@@ -20,6 +20,8 @@ const Problem = problem_mod.Problem;
 pub const Options = struct {
     path: []const u8,
     config: *const config_mod.Config = &config_mod.Default,
+    max_block_visits: u32 = 200_000,
+    max_path_states: u8 = 64,
 };
 
 /// Returns true when the CFG contains any statement that can affect the
@@ -31,9 +33,7 @@ fn hasTrackableStatements(cfg: *const Cfg) bool {
     for (cfg.blocks) |block| {
         for (block.stmts) |stmt| {
             switch (stmt.kind) {
-                .arena_kill, .heap_free, .field_heap_free,
-                .composite_escape, .interior_pointer_destroy,
-                .leak_warning, .partial_union_write => return true,
+                .arena_kill, .heap_free, .field_heap_free, .composite_escape, .interior_pointer_destroy, .leak_warning, .partial_union_write => return true,
                 .decl => |d| if (exprKindIsTracked(d.init_kind)) return true,
                 .assign => |a| if (exprKindIsTracked(a.rhs_kind)) return true,
                 .ret => |r| if (exprKindIsTracked(r.value_kind)) return true,
@@ -48,7 +48,7 @@ fn hasTrackableStatements(cfg: *const Cfg) bool {
 
 fn exprKindIsTracked(k: cfg_mod.ExprKind) bool {
     return switch (k) {
-        .plain, .unknown, .field_copy_of => false,
+        .plain, .unknown, .field_copy_of, .boolean => false,
         else => true,
     };
 }
@@ -59,163 +59,117 @@ pub fn check(
     opts: Options,
     out: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    // Fast-out: no trackable statements → empty fixed-point, no findings.
     if (!hasTrackableStatements(cfg)) return;
-
-    var in_states = try gpa.alloc(AbstractState, cfg.blocks.len);
-    defer {
-        for (in_states) |*s| s.deinit(gpa);
-        gpa.free(in_states);
-    }
-    for (in_states) |*s| s.* = .{};
-
-    // Pass 1 — converge the per-block in-states without reporting.
-    // Worklist visits aren't predecessor-first, so during convergence
-    // a block can be transferred from a stale in-state and emit
-    // spurious problems that later iterations would refine away.
-    // Discard pass 1's problems entirely; we only trust the FINAL
-    // in-states.
-    var scratch: std.ArrayListUnmanaged(Problem) = .empty;
-    defer {
-        for (scratch.items) |*p| p.deinit(gpa);
-        scratch.deinit(gpa);
-    }
-
-    // Seed the worklist with every reachable block in reverse
-    // postorder (RPO).  LIFO `.pop()` then visits them in RPO —
-    // predecessors before successors for the acyclic skeleton — so
-    // each block's first processing sees its predecessors' real
-    // out-states, not the initial empty state.
-    //
-    // Why this matters: the "changed in-state" guard re-queues a
-    // successor only when a predecessor's out-state actually
-    // mutated.  If entry has no state-changing stmts (e.g. just
-    // `if (cond) BODY`), joining its empty out-state into successors'
-    // empty in-states is a no-op — so they never get added, even
-    // though their OWN stmts might introduce state (a heap_free in
-    // the conditional branch).  Seeding all reachable blocks fixes
-    // that; using RPO ensures inter-procedural fallback heap ids
-    // don't conflict with real ones minted upstream by an allocation
-    // that wasn't visible yet.
-    var worklist: std.ArrayListUnmanaged(BlockId) = .empty;
-    defer worklist.deinit(gpa);
-    try computeRpoSeed(gpa, cfg, &worklist);
-
-    var iter_guard: u32 = 0;
-    const MAX_ITERS: u32 = 200_000;
-
-    // Reuse a single state buffer across both passes to avoid repeated
-    // malloc/free cycles for each worklist pop.  cloneFrom reuses
-    // existing capacity via clearRetainingCapacity + ensureTotalCapacity
-    // — only the first iteration (or capacity growth) allocates.
-    var state: state_mod.AbstractState = .{};
-    defer state.deinit(gpa);
-
-    while (worklist.pop()) |block_id| {
-        iter_guard += 1;
-        if (iter_guard > MAX_ITERS) {
-            std.debug.print("zbc: bailed after {} iterations on {s}\n", .{
-                MAX_ITERS, opts.path,
-            });
-            return;
-        }
-
-        const block = cfg.blocks[@intFromEnum(block_id)];
-        try state.cloneFrom(&in_states[@intFromEnum(block_id)], gpa);
-
-        const ctx: transfer.Ctx = .{
-            .gpa = gpa,
-            .locals = cfg.locals,
-            .problems = &scratch,
-            .path = opts.path,
-            .config = opts.config,
-        };
-
-        for (block.stmts) |stmt| {
-            try transfer.transfer(ctx, &state, stmt);
-        }
-
-        for (block.successors) |succ| {
-            const succ_idx = @intFromEnum(succ);
-            const result = try state_mod.join(&in_states[succ_idx], &state, gpa);
-            if (result == .changed) {
-                try worklist.append(gpa, succ);
-            }
-        }
-    }
-
-    // Pass 2 — replay every block from its fixed-point in-state with
-    // reporting enabled.  Unreachable blocks have empty in-state and
-    // emit nothing because their stmt list either references no locals
-    // or all lookups miss.
-    for (cfg.blocks, 0..) |block, i| {
-        try state.cloneFrom(&in_states[i], gpa);
-
-        const ctx: transfer.Ctx = .{
-            .gpa = gpa,
-            .locals = cfg.locals,
-            .problems = out,
-            .path = opts.path,
-            .config = opts.config,
-        };
-
-        for (block.stmts) |stmt| {
-            try transfer.transfer(ctx, &state, stmt);
-        }
-    }
+    const states = try gpa.alloc(Solver.States, cfg.blocks.len);
+    for (states) |*block| block.* = .empty;
+    var solver: Solver = .{ .gpa = gpa, .cfg = cfg, .opts = opts, .out = out, .states = states };
+    defer solver.deinit();
+    try solver.run();
 }
 
-/// Iterative DFS from `cfg.entry` to compute postorder, then append
-/// to `out` so that LIFO popping visits blocks in reverse postorder.
-/// Unreachable blocks are intentionally NOT included — they have no
-/// predecessor edges, so processing them contributes nothing useful
-/// to fixed-point convergence.
-fn computeRpoSeed(
+/// Keep boolean predicates with their resource histories. A bounded set of
+/// path states avoids merging "released" and "published" into a false UAF.
+const Solver = struct {
+    const Partition = struct { value: AbstractState, queued: bool };
+    const States = std.ArrayListUnmanaged(Partition);
+    const Item = struct { block: BlockId, partition: u32 };
+
     gpa: std.mem.Allocator,
     cfg: *const Cfg,
-    out: *std.ArrayListUnmanaged(BlockId),
-) !void {
-    if (cfg.blocks.len == 0) return;
-    var visited = try gpa.alloc(bool, cfg.blocks.len);
-    defer gpa.free(visited);
-    @memset(visited, false);
+    opts: Options,
+    out: *std.ArrayListUnmanaged(Problem),
+    states: []States,
+    queue: std.ArrayListUnmanaged(Item) = .empty,
+    scratch: AbstractState = .{},
 
-    const Frame = struct { block: BlockId, next_succ: u32 };
-    var stack: std.ArrayListUnmanaged(Frame) = .empty;
-    defer stack.deinit(gpa);
+    fn deinit(self: *Solver) void {
+        self.scratch.deinit(self.gpa);
+        self.queue.deinit(self.gpa);
+        for (self.states) |*block| {
+            for (block.items) |*partition| partition.value.deinit(self.gpa);
+            block.deinit(self.gpa);
+        }
+        self.gpa.free(self.states);
+    }
 
-    visited[@intFromEnum(cfg.entry)] = true;
-    try stack.append(gpa, .{ .block = cfg.entry, .next_succ = 0 });
-
-    while (stack.items.len > 0) {
-        const top = &stack.items[stack.items.len - 1];
-        const block = cfg.blocks[@intFromEnum(top.block)];
-        if (top.next_succ < block.successors.len) {
-            const succ = block.successors[top.next_succ];
-            top.next_succ += 1;
-            const succ_idx = @intFromEnum(succ);
-            if (!visited[succ_idx]) {
-                visited[succ_idx] = true;
-                try stack.append(gpa, .{ .block = succ, .next_succ = 0 });
+    fn run(self: *Solver) !void {
+        try self.propagate(self.cfg.entry, &.{});
+        var visits: u32 = 0;
+        while (self.queue.pop()) |item| {
+            if (visits == self.opts.max_block_visits) return error.AnalysisBudgetExceeded;
+            visits += 1;
+            const partition = &self.states[@intFromEnum(item.block)].items[item.partition];
+            partition.queued = false;
+            try self.scratch.cloneFrom(&partition.value, self.gpa);
+            const block = self.cfg.blocks[@intFromEnum(item.block)];
+            try self.apply(block, false);
+            if (!self.scratch.feasible) continue;
+            for (block.successors) |successor| try self.propagate(successor, &self.scratch);
+        }
+        // Only states actually reached from entry participate in replay.
+        for (self.cfg.blocks, self.states) |block, states| {
+            for (states.items) |*partition| {
+                try self.scratch.cloneFrom(&partition.value, self.gpa);
+                try self.apply(block, true);
             }
-        } else {
-            // Finished — emit in postorder.  Worklist consumes via
-            // LIFO `.pop()`, so postorder-pushed → RPO-popped.
-            const finished = stack.pop().?;
-            try out.append(gpa, finished.block);
         }
     }
-}
+
+    fn apply(self: *Solver, block: cfg_mod.BasicBlock, report_enabled: bool) !void {
+        const ctx: transfer.Ctx = .{
+            .gpa = self.gpa, .locals = self.cfg.locals, .problems = self.out,
+            .path = self.opts.path, .config = self.opts.config, .report_enabled = report_enabled,
+        };
+        for (block.stmts) |statement| {
+            try transfer.transfer(ctx, &self.scratch, statement);
+            if (!self.scratch.feasible) break;
+        }
+    }
+
+    fn propagate(self: *Solver, block_id: BlockId, incoming: *const AbstractState) !void {
+        std.debug.assert(incoming.feasible);
+        const states = &self.states[@intFromEnum(block_id)];
+        for (states.items, 0..) |*partition, index| {
+            if (!partition.value.canMerge(incoming)) continue;
+            const changed = try state_mod.join(&partition.value, incoming, self.gpa);
+            if (changed == .changed and !partition.queued) {
+                try self.queue.append(self.gpa, .{ .block = block_id, .partition = @intCast(index) });
+                partition.queued = true;
+            }
+            return;
+        }
+        if (states.items.len == self.opts.max_path_states) return error.AnalysisBudgetExceeded;
+        try states.ensureUnusedCapacity(self.gpa, 1);
+        try self.queue.ensureUnusedCapacity(self.gpa, 1);
+        const value = try incoming.clone(self.gpa);
+        const index: u32 = @intCast(states.items.len);
+        states.appendAssumeCapacity(.{ .value = value, .queued = true });
+        self.queue.appendAssumeCapacity(.{ .block = block_id, .partition = index });
+    }
+};
 
 // ── Tests ──────────────────────────────────────────────────
 
 const Ast = std.zig.Ast;
 
 fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    return analyzeImpl(gpa, src, false);
+}
+
+fn analyzeWithZls(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    return analyzeImpl(gpa, src, true);
+}
+
+fn analyzeImpl(
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    use_zls: bool,
+) !std.ArrayListUnmanaged(Problem) {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     const tio = std.testing.io;
     var own_ctx: zls_resolver_mod.ManagedContext = .{};
@@ -233,18 +187,30 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     try rule_cache.resolveTransitiveTakes();
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    errdefer freeProblems(gpa, &problems);
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_builder.lowerFunctionFull(
-            gpa,
-            &tree,
-            node,
-            &config_mod.Default,
-            &rule_cache,
-        )) orelse continue;
+        const maybe_cfg = if (use_zls)
+            try cfg_builder.lowerFunctionFullWithZls(
+                gpa,
+                &tree,
+                node,
+                &config_mod.Default,
+                &rule_cache,
+                zls_ptr,
+            )
+        else
+            try cfg_builder.lowerFunctionFull(
+                gpa,
+                &tree,
+                node,
+                &config_mod.Default,
+                &rule_cache,
+            );
+        var cfg = maybe_cfg orelse continue;
         defer cfg.deinit(gpa);
         try check(gpa, &cfg, .{ .path = "<test>" }, &problems);
     }
@@ -290,8 +256,7 @@ test "escape — return slice borrowed from a function-local arena" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, problems.items[0].message,
-        "function-local arena") != null);
+    try std.testing.expect(std.mem.indexOf(u8, problems.items[0].message, "function-local arena") != null);
 }
 
 test "value-typed return owning an arena is OK (move, not borrow)" {
@@ -457,7 +422,8 @@ test "R7 inference: wrapper-of-wrapper across source order via fixed-point" {
         \\const std = @import("std");
         \\const Ctx = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = undefined,
+        \\    pub fn text(self: *const Ctx) []const u8 { return self.bytes; }
         \\};
         \\// wrap_outer is defined BEFORE wrap_inner in source order —
         \\// requires fixed-point iteration to resolve wrap_inner first.
@@ -468,7 +434,9 @@ test "R7 inference: wrapper-of-wrapper across source order via fixed-point" {
         \\    return c.text();
         \\}
         \\pub fn caller() []const u8 {
-        \\    var local = Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    var local = Ctx{ .inner = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        \\    defer local.inner.deinit();
+        \\    local.bytes = local.inner.allocator().dupe(u8, "borrowed") catch unreachable;
         \\    return wrap_outer(&local);
         \\}
         \\
@@ -476,7 +444,7 @@ test "R7 inference: wrapper-of-wrapper across source order via fixed-point" {
     defer freeProblems(gpa, &problems);
     var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+        if (std.mem.eql(u8, p.rule_id, "arena-escape")) found = true;
     }
     try std.testing.expect(found);
 }
@@ -514,13 +482,16 @@ test "R7 inference: delegator wrap fires escape on local-arena caller" {
         \\const std = @import("std");
         \\const Ctx = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = undefined,
+        \\    pub fn text(self: *const Ctx) []const u8 { return self.bytes; }
         \\};
         \\pub fn wrap(c: *const Ctx) []const u8 {
         \\    return c.text();
         \\}
         \\pub fn callerEscape() []const u8 {
-        \\    var local_ctx = Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    var local_ctx = Ctx{ .inner = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        \\    defer local_ctx.inner.deinit();
+        \\    local_ctx.bytes = local_ctx.inner.allocator().dupe(u8, "borrowed") catch unreachable;
         \\    return wrap(&local_ctx);
         \\}
         \\
@@ -528,26 +499,29 @@ test "R7 inference: delegator wrap fires escape on local-arena caller" {
     defer freeProblems(gpa, &problems);
     var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+        if (std.mem.eql(u8, p.rule_id, "arena-escape")) found = true;
     }
     try std.testing.expect(found);
 }
 
-test "R7 inference: multi-return body — every return delegates to same param" {
+test "R7 inference: mixed static and borrowed returns retain possible escape" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const MyArena = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    pub fn text(self: *const MyArena) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = undefined,
+        \\    pub fn text(self: *const MyArena) []const u8 { return self.bytes; }
         \\};
         \\pub fn conditional(c: *const MyArena, cond: bool) []const u8 {
         \\    if (cond) return c.text();
         \\    return "";
         \\}
         \\pub fn caller() []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    const arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         \\    var ma = MyArena{ .inner = arena };
+        \\    defer ma.inner.deinit();
+        \\    ma.bytes = ma.inner.allocator().dupe(u8, "borrowed") catch unreachable;
         \\    return conditional(&ma, true);
         \\}
         \\
@@ -555,7 +529,7 @@ test "R7 inference: multi-return body — every return delegates to same param" 
     defer freeProblems(gpa, &problems);
     var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+        if (std.mem.eql(u8, p.rule_id, "arena-escape")) found = true;
     }
     try std.testing.expect(found);
 }
@@ -906,6 +880,174 @@ test "stack_escape: composite with &local.* (period_asterisk token) is NOT flagg
     for (problems.items) |p| {
         try std.testing.expect(!std.mem.eql(u8, p.rule_id, "stack-escape"));
     }
+}
+
+test "skript regression: pointer element copy is not a stack escape" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Handle = struct { value: u32 };
+        \\const Record = struct { handle: *Handle };
+        \\const State = struct {
+        \\    records: std.ArrayList(*Record),
+        \\    pub fn handleFor(self: *State, index: usize) *Handle {
+        \\        const record = self.records.items[index];
+        \\        return &record.handle;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "stack-escape"));
+    }
+}
+
+test "project cache regression: HashMap pointer payload capture is not stack storage" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Entry = struct { model: u32 };
+        \\const Cache = struct {
+        \\    entries: std.StringHashMapUnmanaged(*Entry) = .empty,
+        \\    fn model(self: *Cache, key: []const u8) ?*u32 {
+        \\        if (self.entries.get(key)) |entry| {
+        \\            return &entry.model;
+        \\        }
+        \\        return null;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "stack-escape"));
+    }
+}
+
+test "stack_escape: HashMap value payload capture is stack storage" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Entry = struct { model: u32 };
+        \\const Cache = struct {
+        \\    entries: std.StringHashMapUnmanaged(Entry) = .empty,
+        \\    fn model(self: *Cache, key: []const u8) ?*const u32 {
+        \\        if (self.entries.get(key)) |entry| {
+        \\            return &entry.model;
+        \\        }
+        \\        return null;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "stack-escape")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "stack_escape: same-named value get does not prove pointer payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const Entry = struct { model: u32 };
+        \\const FakeMap = struct {
+        \\    value: Entry,
+        \\    fn get(self: *const FakeMap, key: []const u8) ?Entry {
+        \\        _ = key;
+        \\        return self.value;
+        \\    }
+        \\};
+        \\const Cache = struct {
+        \\    entries: FakeMap,
+        \\    fn model(self: *Cache, key: []const u8) ?*const u32 {
+        \\        if (self.entries.get(key)) |entry| {
+        \\            return &entry.model;
+        \\        }
+        \\        return null;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "stack-escape")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "skript regression: by-value element address still escapes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Record = struct { value: u32 };
+        \\pub fn address(records: []Record, index: usize) *u32 {
+        \\    const record = records[index];
+        \\    return &record.value;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "stack-escape")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "skript regression: detached receiver result does not escape context" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Value = struct { n: u32 };
+        \\const Snapshot = struct {
+        \\    context: *u32,
+        \\    fn map(self: *Snapshot, n: u32) Value {
+        \\        _ = self.context;
+        \\        return .{ .n = n };
+        \\    }
+        \\    fn outcome(self: *Snapshot, n: u32) Value {
+        \\        return self.map(n);
+        \\    }
+        \\};
+        \\pub fn evaluate() Value {
+        \\    var context: u32 = 1;
+        \\    var snapshot = Snapshot{ .context = &context };
+        \\    return snapshot.outcome(7);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "stack-escape"));
+    }
+}
+
+test "skript regression: receiver borrowed result still escapes context" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Snapshot = struct {
+        \\    context: *u32,
+        \\    fn borrow(self: *Snapshot) *u32 {
+        \\        return self.context;
+        \\    }
+        \\    fn outcome(self: *Snapshot) *u32 {
+        \\        return self.borrow();
+        \\    }
+        \\};
+        \\pub fn evaluate() *u32 {
+        \\    var context: u32 = 1;
+        \\    var snapshot = Snapshot{ .context = &context };
+        \\    return snapshot.outcome();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "stack-escape")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "stack_escape: plain value return is OK" {
@@ -2177,3 +2319,593 @@ test "heap-leak: *T receiver without destroy — fires" {
     try std.testing.expect(found);
 }
 
+test "skript regression: return switch reads arena allocation before deferred deinit" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Choice = enum { left, right };
+        \\fn readByte(bytes: []const u8) u8 { return bytes[0]; }
+        \\pub fn evaluate(choice: Choice) !u8 {
+        \\    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer scratch.deinit();
+        \\    const bytes = try scratch.allocator().alloc(u8, 1);
+        \\    bytes[0] = 7;
+        \\    return switch (choice) {
+        \\        .left => readByte(bytes),
+        \\        .right => readByte(bytes),
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "arena-use-after-kill"));
+    }
+}
+
+test "skript regression: explicit arena deinit before return switch remains unsafe" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Choice = enum { left, right };
+        \\fn readByte(bytes: []const u8) u8 { return bytes[0]; }
+        \\pub fn evaluate(choice: Choice) !u8 {
+        \\    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    const bytes = try scratch.allocator().alloc(u8, 1);
+        \\    scratch.deinit();
+        \\    return switch (choice) {
+        \\        .left => readByte(bytes),
+        \\        .right => readByte(bytes),
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "arena-use-after-kill")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "skript regression: return switch reads heap allocation before deferred free" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Choice = enum { left, right };
+        \\fn readByte(bytes: []const u8) u8 { return bytes[0]; }
+        \\pub fn evaluate(allocator: std.mem.Allocator, choice: Choice) !u8 {
+        \\    const bytes = try allocator.alloc(u8, 1);
+        \\    defer allocator.free(bytes);
+        \\    bytes[0] = 7;
+        \\    return switch (choice) {
+        \\        .left => readByte(bytes),
+        \\        .right => readByte(bytes),
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "heap-use-after-free"));
+    }
+}
+
+test "skript regression: explicit heap free before return switch remains unsafe" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Choice = enum { left, right };
+        \\fn readByte(bytes: []const u8) u8 { return bytes[0]; }
+        \\pub fn evaluate(allocator: std.mem.Allocator, choice: Choice) !u8 {
+        \\    const bytes = try allocator.alloc(u8, 1);
+        \\    allocator.free(bytes);
+        \\    return switch (choice) {
+        \\        .left => readByte(bytes),
+        \\        .right => readByte(bytes),
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "heap-use-after-free")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "unreachable blocks cannot produce diagnostics" {
+    const gpa = std.testing.allocator;
+    const position: cfg_mod.SrcPos = .{ .byte = 0, .line = 1, .column = 1 };
+    var statements = [_]cfg_mod.Stmt{.{
+        .kind = .{ .leak_warning = .{ .type_name = "Unreachable" } },
+        .pos = position, .end_pos = position,
+    }};
+    var blocks = [_]cfg_mod.BasicBlock{
+        .{ .id = @enumFromInt(0), .stmts = &.{}, .successors = &.{} },
+        .{ .id = @enumFromInt(1), .stmts = &statements, .successors = &.{} },
+    };
+    const cfg: Cfg = .{ .blocks = &blocks, .entry = @enumFromInt(0), .fn_span = .{ .start = 0, .end = 1 }, .locals = &.{} };
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    try check(gpa, &cfg, .{ .path = "<test>" }, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "exhausted dataflow budget is an analysis failure" {
+    const gpa = std.testing.allocator;
+    const position: cfg_mod.SrcPos = .{ .byte = 0, .line = 1, .column = 1 };
+    var statements = [_]cfg_mod.Stmt{.{
+        .kind = .{ .leak_warning = .{ .type_name = "Reachable" } },
+        .pos = position, .end_pos = position,
+    }};
+    var blocks = [_]cfg_mod.BasicBlock{
+        .{ .id = @enumFromInt(0), .stmts = &statements, .successors = &.{} },
+    };
+    const cfg: Cfg = .{ .blocks = &blocks, .entry = @enumFromInt(0), .fn_span = .{ .start = 0, .end = 1 }, .locals = &.{} };
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectError(error.AnalysisBudgetExceeded, check(gpa, &cfg, .{
+        .path = "<test>", .max_block_visits = 0,
+    }, &problems));
+}
+
+test "address AST: a scalar bitwise field is not a stack borrow" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Pair = struct { a: u32, b: u32 };
+        \\pub fn bits(x: u32) Pair {
+        \\    const mask: u32 = 255;
+        \\    return .{ .a = x & mask, .b = 0 };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "address AST: nested scalar aggregate aliases carry no address" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Part = struct { value: u32 };
+        \\pub fn bits(x: u32) struct { part: Part } {
+        \\    const mask: u32 = 255;
+        \\    const part: Part = .{ .value = x & mask };
+        \\    const alias = part;
+        \\    return .{ .part = alias };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "address AST: a nested parenthesized address still escapes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn bad() struct { inner: struct { p: *u32 } } {
+        \\    var x: u32 = 1;
+        \\    return .{ .inner = .{ .p = (&x) } };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+}
+
+test "address AST: pointer aliases and direct addresses both escape" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn bad() struct { p: *u32, q: *u32 } {
+        \\    var x: u32 = 1;
+        \\    var y: u32 = 2;
+        \\    const p = &x;
+        \\    return .{ .p = p, .q = &y };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 2), problems.items.len);
+    for (problems.items) |problem| try std.testing.expectEqualStrings("stack-escape", problem.rule_id);
+}
+
+test "address AST: a copied array element adds no stack borrow" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn bad() struct { p: *u32, value: u32 } {
+        \\    var x: u32 = 1;
+        \\    const array: [1]u32 = .{2};
+        \\    return .{ .p = &x, .value = array[0] };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+}
+
+test "address AST: a call argument is not the returned value" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn good() struct { value: u32 } {
+        \\    var x: u32 = 1;
+        \\    return .{ .value = read(&x) };
+        \\}
+        \\fn read(x: *const u32) u32 { return x.*; }
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "address AST: taking an address does not overwrite its stored pointer" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn bad() struct { pointer: **u32, target: *u32 } {
+        \\    var x: u32 = 1;
+        \\    var p = &x;
+        \\    return .{ .pointer = &p, .target = p };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 2), problems.items.len);
+    for (problems.items) |problem| try std.testing.expectEqualStrings("stack-escape", problem.rule_id);
+}
+
+test "address AST: a bitwise operand remains a value read" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn bad(x: u32) u32 {
+        \\    const mask: u32 = undefined;
+        \\    return x & mask;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+}
+
+fn expectFlowRules(source: []const u8, expected: []const []const u8) !void {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(expected.len, problems.items.len);
+    for (expected, problems.items) |rule, problem| try std.testing.expectEqualStrings(rule, problem.rule_id);
+}
+
+test "cleanup flow: defer uses the final ownership flag" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = true;
+        \\    defer if (owned) gpa.free(p);
+        \\    gpa.free(p);
+        \\    owned = false;
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: an armed defer still detects double free" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    const owned = true;
+        \\    defer if (owned) gpa.free(p);
+        \\    gpa.free(p);
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "cleanup flow: branch cleanup stays correlated with ownership" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator, release: bool) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = true;
+        \\    defer if (owned) gpa.free(p);
+        \\    if (release) {
+        \\        gpa.free(p);
+        \\        owned = false;
+        \\    }
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: catch disarms error cleanup before returning" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\fn fail() error{Oops}!void { return error.Oops; }
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = true;
+        \\    errdefer if (owned) gpa.free(p);
+        \\    fail() catch {
+        \\        gpa.free(p);
+        \\        owned = false;
+        \\        return error.Oops;
+        \\    };
+        \\    gpa.free(p);
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: break flushes only crossed normal defers" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    defer gpa.free(p);
+        \\    while (true) {
+        \\        errdefer gpa.free(p);
+        \\        break;
+        \\    }
+        \\    _ = p;
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: break replays cleanup in reverse order" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    while (true) {
+        \\        defer gpa.free(p);
+        \\        defer _ = p;
+        \\        break;
+        \\    }
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: for exhaustion cannot bypass else" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator, values: []const u8) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var pending = true;
+        \\    for (values) |_| {} else { pending = false; }
+        \\    if (pending) gpa.free(p);
+        \\    gpa.free(p);
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: for break bypasses else cleanup" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator, values: []const u8) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var pending = true;
+        \\    for (values) |_| { break; } else { pending = false; }
+        \\    if (pending) gpa.free(p);
+        \\    gpa.free(p);
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "cleanup flow: while break bypasses unreachable else" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    while (true) { break; } else { gpa.free(p); }
+        \\    gpa.free(p);
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: a boolean return does not hide a dangling out parameter" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator, out: *[]u8, recorded: bool) !bool {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    if (recorded) gpa.free(p);
+        \\    if (!recorded) out.* = p;
+        \\    return !recorded;
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: a real out parameter use after free still reports" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator, out: *[]u8, release: bool) !bool {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    out.* = p;
+        \\    if (release) gpa.free(p);
+        \\    return true;
+        \\}
+    , &.{"heap-use-after-free"});
+}
+
+test "cleanup flow: break flushes arena cleanup" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const alloc = arena.allocator();
+        \\    const buf = try alloc.alloc(u8, 8);
+        \\    while (true) { defer arena.deinit(); break; }
+        \\    _ = buf;
+        \\}
+    , &.{"arena-use-after-kill"});
+}
+
+test "cleanup flow: labeled break crosses every nested scope" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const alloc = arena.allocator();
+        \\    const buf = try alloc.alloc(u8, 8);
+        \\    outer: while (true) {
+        \\        defer arena.deinit();
+        \\        while (true) { break :outer; }
+        \\    }
+        \\    _ = buf;
+        \\}
+    , &.{"arena-use-after-kill"});
+}
+
+test "cleanup flow: labeled block break flushes arena cleanup" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const alloc = arena.allocator();
+        \\    const buf = try alloc.alloc(u8, 8);
+        \\    done: { defer arena.deinit(); break :done; }
+        \\    _ = buf;
+        \\}
+    , &.{"arena-use-after-kill"});
+}
+
+test "cleanup flow: labeled continue flushes cleanup before continuation" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const alloc = arena.allocator();
+        \\    const buf = try alloc.alloc(u8, 8);
+        \\    var done = false;
+        \\    outer: while (!done) : (done = true) {
+        \\        defer arena.deinit();
+        \\        while (true) { continue :outer; }
+        \\    }
+        \\    _ = buf;
+        \\}
+    , &.{"arena-use-after-kill"});
+}
+
+test "cleanup flow: unrelated calls and counter updates preserve local flags" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\fn observe(value: usize) void { _ = value; }
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = true;
+        \\    defer if (owned) gpa.free(p);
+        \\    gpa.free(p);
+        \\    owned = false;
+        \\    var count: usize = 0;
+        \\    count += 1;
+        \\    observe(count);
+        \\}
+    , &.{});
+}
+
+test "cleanup flow: calls can change an address-exposed ownership flag" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\fn mutate(flag: *bool) void { flag.* = true; }
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = false;
+        \\    const alias = &owned;
+        \\    defer if (owned) gpa.free(p);
+        \\    gpa.free(p);
+        \\    mutate(alias);
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "cleanup flow: memory builtins can change an ownership flag" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = false;
+        \\    defer if (owned) gpa.free(p);
+        \\    gpa.free(p);
+        \\    @memset((&owned)[0..1], true);
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "cleanup flow: failed reassignment preserves the old cleanup target" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    var p = try gpa.alloc(u8, 8);
+        \\    errdefer gpa.free(p);
+        \\    gpa.free(p);
+        \\    p = try gpa.alloc(u8, 16);
+        \\    gpa.free(p);
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "cleanup flow: failed destructuring preserves old cleanup targets" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\fn pair(gpa: std.mem.Allocator) !struct { []u8, usize } {
+        \\    return .{ try gpa.alloc(u8, 16), 0 };
+        \\}
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    var p = try gpa.alloc(u8, 8);
+        \\    var count: usize = undefined;
+        \\    errdefer gpa.free(p);
+        \\    gpa.free(p);
+        \\    p, count = try pair(gpa);
+        \\    gpa.free(p);
+        \\    _ = count;
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "cleanup flow: calls used as values can change escaped flags" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\fn mutate(flag: *bool) usize { flag.* = true; return 0; }
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p = try gpa.alloc(u8, 8);
+        \\    var owned = false;
+        \\    const alias = &owned;
+        \\    defer if (owned) gpa.free(p);
+        \\    gpa.free(p);
+        \\    const result = mutate(alias);
+        \\    _ = result;
+        \\}
+    , &.{"heap-double-free"});
+}
+
+test "qualified types: non-consuming methods do not inherit a sibling effect" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const A = struct {
+        \\    const Owner = struct {
+        \\        pub fn release(self: *@This(), gpa: std.mem.Allocator) void { gpa.destroy(self); }
+        \\    };
+        \\};
+        \\const B = struct {
+        \\    const Owner = struct {
+        \\        pub fn release(self: *@This(), gpa: std.mem.Allocator) void { _ = self; _ = gpa; }
+        \\    };
+        \\};
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p: *B.Owner = try gpa.create(B.Owner);
+        \\    p.release(gpa);
+        \\    gpa.destroy(p);
+        \\}
+    , &.{});
+}
+
+test "qualified types: consuming methods retain their own effect" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const A = struct {
+        \\    const Owner = struct {
+        \\        pub fn release(self: *@This(), gpa: std.mem.Allocator) void { _ = self; _ = gpa; }
+        \\    };
+        \\};
+        \\const B = struct {
+        \\    const Owner = struct {
+        \\        pub fn release(self: *@This(), gpa: std.mem.Allocator) void { gpa.destroy(self); }
+        \\    };
+        \\};
+        \\pub fn f(gpa: std.mem.Allocator) !void {
+        \\    const p: *B.Owner = try gpa.create(B.Owner);
+        \\    p.release(gpa);
+        \\    gpa.destroy(p);
+        \\}
+    , &.{"heap-double-free"});
+}

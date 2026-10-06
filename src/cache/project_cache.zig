@@ -1,33 +1,14 @@
-//! Cross-file FileModel cache — lazy-loads sibling .zig files
-//! referenced by `@import("./relative.zig")` so rules can resolve
-//! type identifiers declared in other files.
-//!
-//! Scope:
-//!   - Relative-path @imports only (`@import("foo.zig")`,
-//!     `@import("../bar/baz.zig")`).  Module-name @imports
-//!     (`@import("std")`, `@import("bun")`) need build.zig
-//!     context which ZLS handles separately.
-//!   - One model per resolved absolute path; lifetime is the
-//!     ProjectCache itself.  Each model owns its own source +
-//!     tree + arena.
-//!
-//! Usage:
-//!     var pc = ProjectCache.init(gpa, io);
-//!     defer pc.deinit();
-//!     const fm = try pc.modelForRelativeImport(my_file_path, "./other.zig");
-//!     // fm.findType("OtherType") — etc.
-
+//! Worker-owned immutable source snapshots. Only imports inside the explicit
+//! first-party source policy can be loaded. No project traversal or global index.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const model_mod = @import("../model/file_model.zig");
+const SourcePolicy = @import("type_engine").SourcePolicy;
+const ParseFailure = @import("type_engine").ParseFailure;
 
-/// Cached result of a cross-file `(TypeName, methodName)` summary lookup.
-/// `.found = false` means the method was not found; `.found = true` means
-/// it was found, and `.takes` holds the `takes_ownership_of` value.
-pub const CachedTakes = struct {
-    found: bool,
+pub const CachedMethod = struct {
+    returns: @import("../model/fn_summary.zig").Returns = .unknown,
     takes: ?u32 = null,
-    // Cross-file effect flags (#20), so a cache hit doesn't lose them.
     may_grow: bool = false,
     may_gc: bool = false,
     may_thread: bool = false,
@@ -36,777 +17,327 @@ pub const CachedTakes = struct {
 pub const ProjectCache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Coarse-grained spinlock protecting entries/type_index/module_paths.
-    /// Public methods acquire it; private `*Locked` helpers assume it is
-    /// already held.  The spinlock is NOT recursive — callers must never
-    /// call a public method from within a locked section.
-    /// `std.atomic.Mutex` is a CAS spinlock (tryLock-only); we wrap it
-    /// with a busy-wait in `muLock`.  Cross-file cache misses are
-    /// infrequent so busy-wait overhead is negligible.
-    mu: std.atomic.Mutex = .unlocked,
-    /// abs_path → owned entry (source, tree, model).
+    policy: SourcePolicy,
+    /// Session documents own shared ASTs. Null permits standalone model analysis.
+    type_context: ?*@import("type_engine").TypeContext = null,
+    canonical_paths: @import("type_engine").CanonicalPaths = .{},
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
-    /// module-name → absolute path of the module's root .zig file.
-    /// Lazily populated by `discoverModulePath`.  Owned by `gpa`.
-    /// A null value means "tried and didn't find" — cache the
-    /// negative so we don't re-search on every import.
-    module_paths: std.StringHashMapUnmanaged(?[]const u8) = .empty,
-    /// Cached project root (first ancestor of any analyzed file with
-    /// a `build.zig`, `Cargo.toml`, or `.git`).  Null on first
-    /// request; set by `findProjectRoot`.  Owned by `gpa`.
-    project_root: ?[]const u8 = null,
-    project_root_searched: bool = false,
-    /// Global type index: type-name → list of (Entry, type_index).
-    /// Lazily built on first `findAllTypesByName` call; covers every
-    /// `.zig` file under `project_root`.  Empty map means "not built
-    /// yet"; built_type_index is the latch.
-    type_index: std.StringHashMapUnmanaged([]TypeEntry) = .empty,
-    type_index_built: bool = false,
-    /// Path-resolution cache: `"from_path\x00import_str"` → resolved
-    /// absolute path (both gpa-owned).  Avoids repeating
-    /// dirname + join + resolvePosix + alloc on every call to
-    /// `modelForRelativeImport` when the model is already cached.
-    import_path_cache: std.StringHashMapUnmanaged([]u8) = .empty,
-    /// Project-wide cross-file method summary cache.
-    /// Key = gpa-owned `"TypeName\x00methodName"`.
-    /// Value = `CachedTakes` — avoids `??u32` coercion ambiguity.
-    ///   `.found = false` → looked up, method not found.
-    ///   `.found = true`  → found; `.takes` holds `takes_ownership_of`.
-    /// Shared across all per-file FileCache instances so the expensive
-    /// @import-graph traversal in `summaryByMethodCrossFile` is paid at
-    /// most once globally per (type, method) pair.
-    method_summary_cache: std.StringHashMapUnmanaged(CachedTakes) = .empty,
+    imports: std.StringHashMapUnmanaged(ImportResult) = .empty,
+    summaries: std.AutoHashMapUnmanaged(MethodKey, CachedMethod) = .empty,
+    failure: ?anyerror = null,
+    parse_failure: ?ParseFailure = null,
+    parse_failures: std.StringHashMapUnmanaged(ParseFailure) = .empty,
+    unresolved_imports: usize = 0,
 
-    pub const Entry = struct {
+    const MethodKey = struct { tree: *const Ast, declaration: Ast.Node.Index };
+    const ImportResult = union(enum) {
+        model: ?*const model_mod.FileModel,
+        failed: struct { err: anyerror, parse_failure: ?ParseFailure },
+    };
+    const Entry = struct {
         abs_path: []const u8,
-        source: [:0]u8,
-        tree: Ast,
+        source: Source,
         model: model_mod.FileModel,
     };
 
-    /// A single type observation in the global index — references a
-    /// type by its model index within an Entry's `model.types`.
-    /// `Entry.model.types` is a slice owned by the Entry's arena, so
-    /// `&entry.model.types[type_index]` is stable for the Entry's
-    /// lifetime (== ProjectCache lifetime).
-    pub const TypeEntry = struct {
-        entry: *Entry,
-        type_idx: u32,
+    const Source = union(enum) {
+        owned: struct { bytes: [:0]u8, tree: Ast },
+        borrowed: *const Ast,
 
-        pub fn typeInfo(self: TypeEntry) *const model_mod.TypeInfo {
-            return &self.entry.model.types[self.type_idx];
+        fn ast(self: *const Source) *const Ast {
+            return switch (self.*) {
+                .owned => |*source| &source.tree,
+                .borrowed => |tree| tree,
+            };
         }
 
-        pub fn tree(self: TypeEntry) *const Ast {
-            return &self.entry.tree;
+        fn deinit(self: *Source, gpa: std.mem.Allocator) void {
+            switch (self.*) {
+                .owned => |*source| {
+                    source.tree.deinit(gpa);
+                    gpa.free(source.bytes);
+                },
+                .borrowed => {},
+            }
         }
     };
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io) ProjectCache {
-        return .{ .gpa = gpa, .io = io };
-    }
-
-    /// Blocking acquire via busy-wait (CAS spin).  Cross-file misses
-    /// are infrequent so busy-wait overhead is negligible.
-    inline fn muLock(self: *ProjectCache) void {
-        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    inline fn muUnlock(self: *ProjectCache) void {
-        self.mu.unlock();
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, policy: SourcePolicy) ProjectCache {
+        return .{ .gpa = gpa, .io = io, .policy = policy };
     }
 
     pub fn deinit(self: *ProjectCache) void {
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            const e = kv.value_ptr.*;
-            e.model.deinit();
-            e.tree.deinit(self.gpa);
-            self.gpa.free(e.source);
-            self.gpa.free(e.abs_path);
-            self.gpa.destroy(e);
-        }
-        self.entries.deinit(self.gpa);
-        var mit = self.module_paths.iterator();
-        while (mit.next()) |kv| {
-            self.gpa.free(kv.key_ptr.*);
-            if (kv.value_ptr.*) |p| self.gpa.free(p);
-        }
-        self.module_paths.deinit(self.gpa);
-        var tit = self.type_index.iterator();
-        while (tit.next()) |kv| {
-            // Keys borrow from Entry.model.types[*].name; only free
-            // the value slice.
-            self.gpa.free(kv.value_ptr.*);
-        }
-        self.type_index.deinit(self.gpa);
-        if (self.project_root) |p| self.gpa.free(p);
-        var iit = self.import_path_cache.iterator();
-        while (iit.next()) |e| {
-            self.gpa.free(e.key_ptr.*);
-            self.gpa.free(e.value_ptr.*);
-        }
-        self.import_path_cache.deinit(self.gpa);
-        var sit = self.method_summary_cache.iterator();
-        while (sit.next()) |e| self.gpa.free(e.key_ptr.*); // values are POD, no free needed
-        self.method_summary_cache.deinit(self.gpa);
-    }
-
-    /// Look up the cached `takes_ownership_of` result for a cross-file
-    /// method lookup.  Returns null when NOT in cache (caller must compute);
-    /// returns CachedTakes (with `.found` indicating whether the method
-    /// exists) when the result is cached.
-    pub fn getMethodSummaryCache(
-        self: *ProjectCache,
-        type_name: []const u8,
-        method_name: []const u8,
-    ) ?CachedTakes {
-        var key_buf: [256]u8 = undefined;
-        const key_len = type_name.len + 1 + method_name.len;
-        if (key_len > key_buf.len) return null;
-        @memcpy(key_buf[0..type_name.len], type_name);
-        key_buf[type_name.len] = 0;
-        @memcpy(key_buf[type_name.len + 1 ..][0..method_name.len], method_name);
-        const sk = key_buf[0..key_len];
-        self.muLock();
-        defer self.muUnlock();
-        return self.method_summary_cache.get(sk); // null = not in cache
-    }
-
-    /// Store `takes_ownership_of` for a cross-file method lookup.
-    /// No-ops on OOM (the result will be recomputed next time — safe).
-    pub fn putMethodSummaryCache(
-        self: *ProjectCache,
-        type_name: []const u8,
-        method_name: []const u8,
-        cached: CachedTakes,
-    ) void {
-        self.muLock();
-        defer self.muUnlock();
-        // Allocate heap key for storage.
-        const key = std.fmt.allocPrint(
-            self.gpa,
-            "{s}\x00{s}",
-            .{ type_name, method_name },
-        ) catch return;
-        self.method_summary_cache.put(self.gpa, key, cached) catch self.gpa.free(key);
-    }
-
-    /// Lazily-built global type index.  On first call: walks every
-    /// `.zig` file under `project_root` (excluding common vendor /
-    /// build / cache dirs), loads each via `modelForAbsolutePath`,
-    /// and indexes every top-level type by name.  Subsequent calls
-    /// are O(1) hash lookups.
-    ///
-    /// Returns an empty slice when the name has no occurrences (or
-    /// when project_root can't be determined).
-    pub fn findAllTypesByName(
-        self: *ProjectCache,
-        from_file_path: []const u8,
-        name: []const u8,
-    ) ![]const TypeEntry {
-        self.muLock();
-        defer self.muUnlock();
-        if (!self.type_index_built) try self.buildTypeIndex(from_file_path);
-        return self.type_index.get(name) orelse &.{};
-    }
-
-    fn buildTypeIndex(self: *ProjectCache, from_file_path: []const u8) !void {
-        self.type_index_built = true; // latch first so failures don't retry
-        const root = (try self.findProjectRootLocked(from_file_path)) orelse return;
-        // Collect candidate file paths.
-        var paths: std.ArrayListUnmanaged([]u8) = .empty;
-        defer {
-            for (paths.items) |p| self.gpa.free(p);
-            paths.deinit(self.gpa);
-        }
-        try collectZigFiles(self.gpa, self.io, root, &paths);
-        // For each file, load the entry (cache hit if already loaded)
-        // and index every top-level type.  Per-name lists are built
-        // in a temporary StringHashMap with []TypeEntry-typed values,
-        // then frozen into self.type_index.
-        var pending: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(TypeEntry)) = .empty;
-        defer {
-            var pit = pending.iterator();
-            while (pit.next()) |kv| kv.value_ptr.deinit(self.gpa);
-            pending.deinit(self.gpa);
-        }
-        for (paths.items) |abs_path_owned| {
-            const dup = try self.gpa.dupe(u8, abs_path_owned);
-            const fm_opt = self.modelForAbsolutePathLocked(dup) catch null;
-            const _fm = fm_opt orelse continue;
-            _ = _fm;
-            // Walk the entry's types.  The Entry pointer is stable
-            // (boxed via `*Entry` in `entries`).
-            const entry = self.entries.get(abs_path_owned) orelse continue;
-            for (entry.model.types, 0..) |*ti, i| {
-                const te: TypeEntry = .{ .entry = entry, .type_idx = @intCast(i) };
-                const gop = try pending.getOrPut(self.gpa, ti.name);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(self.gpa, te);
-            }
-        }
-        // Freeze into self.type_index.
-        var pit = pending.iterator();
-        while (pit.next()) |kv| {
-            const slice = try kv.value_ptr.toOwnedSlice(self.gpa);
-            try self.type_index.put(self.gpa, kv.key_ptr.*, slice);
-        }
-    }
-
-    /// Resolve a relative @import string against `from_file_path`
-    /// (an absolute path) and return the cached FileModel.  Loads
-    /// + parses + builds the model on first request.  Returns
-    /// null when the import doesn't resolve (module-name imports,
-    /// non-existent paths, parse failures).
-    pub fn modelForRelativeImport(
-        self: *ProjectCache,
-        from_file_path: []const u8,
-        import_str: []const u8,
-    ) !?*const model_mod.FileModel {
-        // Only handle paths ending in `.zig` or starting with
-        // `./` / `../`.  Module names route through ZLS.
-        if (!isRelativeImport(import_str)) return null;
-
-        self.muLock();
-        defer self.muUnlock();
-
-        // Fast path: check the path-resolution cache.  On a hit we skip
-        // dirname + join + resolvePosix + two allocs entirely — the common
-        // case once a corpus file has been visited once.
-        //
-        // Build the lookup key on the stack (2 × memcpy) to avoid any heap
-        // allocation on cache hits.  Falls back to a heap key for paths that
-        // exceed the stack budget (very rare in practice).
-        const key_len = from_file_path.len + 1 + import_str.len;
-        var key_buf: [512]u8 = undefined;
-        const stack_key: ?[]const u8 = if (key_len <= key_buf.len) blk: {
-            @memcpy(key_buf[0..from_file_path.len], from_file_path);
-            key_buf[from_file_path.len] = 0;
-            @memcpy(key_buf[from_file_path.len + 1 ..][0..import_str.len], import_str);
-            break :blk key_buf[0..key_len];
-        } else null;
-
-        if (stack_key) |sk| {
-            if (self.import_path_cache.get(sk)) |cached_abs| {
-                // modelForAbsolutePathLocked always takes ownership of its argument.
-                return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, cached_abs));
-            }
-        } else {
-            // Path too long for stack buffer — heap lookup.
-            const hk = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ from_file_path, import_str });
-            if (self.import_path_cache.get(hk)) |cached_abs| {
-                self.gpa.free(hk);
-                return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, cached_abs));
-            }
-            self.gpa.free(hk);
-        }
-
-        // Cache miss: resolve the path and populate the cache.
-        const dir = std.fs.path.dirname(from_file_path) orelse ".";
-        const joined = try std.fs.path.join(self.gpa, &.{ dir, import_str });
-        defer self.gpa.free(joined);
-        // Resolve `.` / `..` segments.
-        const abs = try std.fs.path.resolve(self.gpa, &.{joined});
-
-        // Heap-own the key for storage (the stack buffer doesn't outlive this call).
-        const store_key = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ from_file_path, import_str });
-        // Store (store_key → abs) — both now owned by import_path_cache.
-        // On OOM skip caching and pass abs directly (modelForAbsolutePathLocked
-        // takes ownership in all cases, so abs is always consumed).
-        self.import_path_cache.put(self.gpa, store_key, abs) catch {
-            self.gpa.free(store_key);
-            return try self.modelForAbsolutePathLocked(abs);
-        };
-        // Cache owns abs; pass a copy to modelForAbsolutePathLocked.
-        return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, abs));
-    }
-
-    /// Resolve a module-name @import (e.g. `@import("bun")`,
-    /// `@import("jsc")`) to a FileModel.  Discovers the project
-    /// root by walking ancestors of `from_file_path` looking for
-    /// `build.zig` / `Cargo.toml` / `.git`; then tries to locate
-    /// the module's root file using:
-    ///   1. `build.zig` parsing (`b.addModule("X", .{ .root_source_file = b.path("...") })`)
-    ///   2. Conventional layouts:
-    ///        `<root>/<X>.zig`
-    ///        `<root>/src/<X>.zig`
-    ///        `<root>/src/<X>/<X>.zig`
-    ///        `<root>/<X>/<X>.zig`
-    ///        `<root>/src/<X>/root.zig`
-    ///
-    /// Results (both positive and negative) are cached on
-    /// `module_paths` so subsequent imports of the same name don't
-    /// re-walk the filesystem.
-    pub fn modelForModuleImport(
-        self: *ProjectCache,
-        from_file_path: []const u8,
-        module_name: []const u8,
-    ) !?*const model_mod.FileModel {
-        if (module_name.len == 0) return null;
-        if (containsBadChar(module_name)) return null;
-        self.muLock();
-        defer self.muUnlock();
-        if (self.module_paths.get(module_name)) |cached| {
-            const path = cached orelse return null;
-            const dup = try self.gpa.dupe(u8, path);
-            return try self.modelForAbsolutePathLocked(dup);
-        }
-        const root = (try self.findProjectRootLocked(from_file_path)) orelse {
-            const name_dup = try self.gpa.dupe(u8, module_name);
-            try self.module_paths.put(self.gpa, name_dup, null);
-            return null;
-        };
-        const resolved = self.discoverModulePath(root, module_name) catch null;
-        // Cache the result (positive or negative).
-        const name_dup = try self.gpa.dupe(u8, module_name);
-        try self.module_paths.put(self.gpa, name_dup, resolved);
-        if (resolved) |p| {
-            const dup = try self.gpa.dupe(u8, p);
-            return try self.modelForAbsolutePathLocked(dup);
-        }
-        return null;
-    }
-
-    /// Public wrapper — acquires mutex then calls the locked impl.
-    fn findProjectRoot(
-        self: *ProjectCache,
-        from_file_path: []const u8,
-    ) !?[]const u8 {
-        self.muLock();
-        defer self.muUnlock();
-        return self.findProjectRootLocked(from_file_path);
-    }
-
-    /// Walk ancestors of `from_file_path` to find the project root.
-    /// Strategy: prefer the OUTERMOST `.git` ancestor (most reliable
-    /// repo-root marker), falling back to `build.zig` if no `.git`.
-    /// `Cargo.toml` alone is NOT a reliable root marker — Cargo
-    /// workspaces commonly nest `Cargo.toml` files in subprojects
-    /// (e.g. bun's `src/resolver/Cargo.toml`), so picking the FIRST
-    /// one gives a too-deep root that misses the real module layout.
-    /// Cached after first invocation.  Caller MUST hold `mu`.
-    fn findProjectRootLocked(
-        self: *ProjectCache,
-        from_file_path: []const u8,
-    ) !?[]const u8 {
-        if (self.project_root_searched) return self.project_root;
-        self.project_root_searched = true;
-        // Convert to absolute path via libc `realpath(3)` — handles
-        // both relative inputs (resolved against CWD) and symlink
-        // following.  std.fs.path.resolve does NEITHER (just
-        // normalises `./`/`../` components).
-        const abs_from = blk: {
-            if (std.fs.path.isAbsolute(from_file_path)) {
-                break :blk try self.gpa.dupe(u8, from_file_path);
-            }
-            const z = try self.gpa.dupeSentinel(u8, from_file_path, 0);
-            defer self.gpa.free(z);
-            var resolved_buf: [4096]u8 = undefined;
-            const got_opt = std.c.realpath(z.ptr, &resolved_buf);
-            const got = got_opt orelse break :blk try self.gpa.dupe(u8, from_file_path);
-            const len = std.mem.indexOfSentinel(u8, 0, got);
-            break :blk try self.gpa.dupe(u8, resolved_buf[0..len]);
-        };
-        defer self.gpa.free(abs_from);
-        var cur: []const u8 = std.fs.path.dirname(abs_from) orelse return null;
-        // First pass: walk up looking for `.git` (the outermost
-        // repo boundary).  Returns the directory that CONTAINS `.git`.
-        var first_build_zig: ?[]const u8 = null;
-        var steps: u32 = 0;
-        while (steps < 32) : (steps += 1) {
-            // Capture the first build.zig as a fallback.
-            if (first_build_zig == null) {
-                const probe = try std.fs.path.join(self.gpa, &.{ cur, "build.zig" });
-                defer self.gpa.free(probe);
-                if (pathExists(self.io, probe)) {
-                    first_build_zig = try self.gpa.dupe(u8, cur);
-                }
-            }
-            const git_probe = try std.fs.path.join(self.gpa, &.{ cur, ".git" });
-            defer self.gpa.free(git_probe);
-            if (pathExists(self.io, git_probe)) {
-                if (first_build_zig) |b| self.gpa.free(b);
-                self.project_root = try self.gpa.dupe(u8, cur);
-                return self.project_root;
-            }
-            const parent = std.fs.path.dirname(cur) orelse break;
-            if (std.mem.eql(u8, parent, cur)) break;
-            cur = parent;
-        }
-        // No `.git` found — fall back to the highest build.zig we saw.
-        self.project_root = first_build_zig;
-        return self.project_root;
-    }
-
-    /// Map `module_name` to an absolute path under `root` using
-    /// build.zig parse + conventional-layout fallback.  Returned
-    /// path is owned by `gpa`; caller is responsible for ownership.
-    fn discoverModulePath(
-        self: *ProjectCache,
-        root: []const u8,
-        module_name: []const u8,
-    ) !?[]u8 {
-        // Phase 1: build.zig parsing.  When a build.zig is PRESENT it is
-        // the authoritative source for module wiring, so we trust ONLY the
-        // parse and do NOT fall back to layout guessing — guessing against
-        // a known-but-unparsed build is exactly where mis-resolution
-        // (silently wrong cross-file analysis) comes from.  A parse miss
-        // returns null (the module is likely a dependency package or built
-        // by code we can't statically follow).
-        const build_zig = try std.fs.path.join(self.gpa, &.{ root, "build.zig" });
-        defer self.gpa.free(build_zig);
-        if (pathExists(self.io, build_zig)) {
-            if (try parseBuildZigModulePath(self.gpa, self.io, build_zig, module_name)) |rel| {
-                defer self.gpa.free(rel);
-                const joined = try std.fs.path.join(self.gpa, &.{ root, rel });
-                defer self.gpa.free(joined);
-                const abs = try std.fs.path.resolve(self.gpa, &.{joined});
-                if (pathExists(self.io, abs)) return abs;
-                self.gpa.free(abs);
-            }
-            return null;
-        }
-        // Phase 2: conventional layouts — only when there is NO build.zig
-        // (a loose project with no module system to consult, so these
-        // filename conventions are the only available signal).  Probe in
-        // priority order.
-        // Each entry is the candidate path RELATIVE to `root`,
-        // assembled at runtime from `module_name`.
-        const x = module_name;
-        const candidates_dyn = [_][]const u8{
-            try std.mem.concat(self.gpa, u8, &.{ x, ".zig" }),
-            try std.mem.concat(self.gpa, u8, &.{ "src/", x, ".zig" }),
-            try std.mem.concat(self.gpa, u8, &.{ "src/", x, "/", x, ".zig" }),
-            try std.mem.concat(self.gpa, u8, &.{ x, "/", x, ".zig" }),
-            try std.mem.concat(self.gpa, u8, &.{ "src/", x, "/root.zig" }),
-            try std.mem.concat(self.gpa, u8, &.{ "src/", x, "/main.zig" }),
-        };
-        defer for (candidates_dyn) |c| self.gpa.free(c);
-        for (candidates_dyn) |rel| {
-            const joined = try std.fs.path.join(self.gpa, &.{ root, rel });
-            defer self.gpa.free(joined);
-            const abs = try std.fs.path.resolve(self.gpa, &.{joined});
-            if (pathExists(self.io, abs)) return abs;
-            self.gpa.free(abs);
-        }
-        return null;
-    }
-
-    /// Public wrapper — acquires mutex then calls the locked impl.
-    fn modelForAbsolutePath(
-        self: *ProjectCache,
-        abs_path: []u8,
-    ) !?*const model_mod.FileModel {
-        self.muLock();
-        defer self.muUnlock();
-        return self.modelForAbsolutePathLocked(abs_path);
-    }
-
-    /// Resolve via absolute path; takes ownership of `abs_path`
-    /// (frees it on cache hit or duplicates it on miss + stores).
-    /// Caller MUST hold `mu`.
-    fn modelForAbsolutePathLocked(
-        self: *ProjectCache,
-        abs_path: []u8,
-    ) !?*const model_mod.FileModel {
-        if (self.entries.get(abs_path)) |e| {
-            self.gpa.free(abs_path);
-            return &e.model;
-        }
-        // Load the file.
-        const src_bytes = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            abs_path,
-            self.gpa,
-            std.Io.Limit.limited(16 * 1024 * 1024),
-        ) catch {
-            self.gpa.free(abs_path);
-            return null;
-        };
-        defer self.gpa.free(src_bytes);
-        const src = try self.gpa.allocSentinel(u8, src_bytes.len, 0);
-        @memcpy(src[0..src_bytes.len], src_bytes);
-        rewriteNonStandardSyntaxInPlace(src);
-        // src is now owned by the new entry.
-        var tree = Ast.parse(self.gpa, src, .zig) catch {
-            self.gpa.free(src);
-            self.gpa.free(abs_path);
-            return null;
-        };
-        const entry = self.gpa.create(Entry) catch {
-            tree.deinit(self.gpa);
-            self.gpa.free(src);
-            self.gpa.free(abs_path);
-            return error.OutOfMemory;
-        };
-        entry.* = .{
-            .abs_path = abs_path,
-            .source = src,
-            .tree = tree,
-            .model = undefined,
-        };
-        entry.model = model_mod.buildWithPath(self.gpa, &entry.tree, entry.abs_path) catch {
-            entry.tree.deinit(self.gpa);
-            self.gpa.free(entry.source);
+        self.summaries.deinit(self.gpa);
+        var imports = self.imports.keyIterator();
+        while (imports.next()) |key| self.gpa.free(key.*);
+        self.imports.deinit(self.gpa);
+        var parse_paths = self.parse_failures.keyIterator();
+        while (parse_paths.next()) |path| self.gpa.free(path.*);
+        self.parse_failures.deinit(self.gpa);
+        var entries = self.entries.valueIterator();
+        while (entries.next()) |value| {
+            const entry = value.*;
+            entry.model.deinit();
+            entry.source.deinit(self.gpa);
             self.gpa.free(entry.abs_path);
             self.gpa.destroy(entry);
-            return null;
+        }
+        self.entries.deinit(self.gpa);
+        self.canonical_paths.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    pub fn getMethodSummaryCache(self: *const ProjectCache, tree: *const Ast, declaration: Ast.Node.Index) ?CachedMethod {
+        return self.summaries.get(.{ .tree = tree, .declaration = declaration });
+    }
+
+    pub fn putMethodSummaryCache(self: *ProjectCache, tree: *const Ast, declaration: Ast.Node.Index, summary: CachedMethod) !void {
+        try self.summaries.put(self.gpa, .{ .tree = tree, .declaration = declaration }, summary);
+    }
+
+    /// The model must be a snapshot returned by this cache.
+    pub fn pathForModel(self: *const ProjectCache, model: *const model_mod.FileModel) []const u8 {
+        const entry: *const Entry = @fieldParentPtr("model", model);
+        std.debug.assert(self.entries.get(entry.abs_path).? == entry);
+        return entry.abs_path;
+    }
+
+    pub fn modelForRelativeImport(self: *ProjectCache, from_path: []const u8, import_str: []const u8) !?*const model_mod.FileModel {
+        if (!isRelativeImport(import_str)) return null;
+        return self.modelForImport(from_path, import_str);
+    }
+
+    pub fn modelForModuleImport(self: *ProjectCache, from_path: []const u8, import_str: []const u8) !?*const model_mod.FileModel {
+        if (containsBadChar(import_str) or import_str.len == 0) return null;
+        return self.modelForImport(from_path, import_str);
+    }
+
+    fn modelForImport(self: *ProjectCache, from_path: []const u8, import_str: []const u8) !?*const model_mod.FileModel {
+        const key = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ from_path, import_str });
+        errdefer self.gpa.free(key);
+        if (self.imports.get(key)) |cached| {
+            self.gpa.free(key);
+            return self.importResult(cached);
+        }
+        const model = self.loadImport(from_path, import_str) catch |err| {
+            const result: ImportResult = .{ .failed = .{
+                .err = err,
+                .parse_failure = if (err == error.ImportInvalidSyntax) self.parse_failure else null,
+            } };
+            try self.imports.put(self.gpa, key, result);
+            return self.importResult(result);
         };
-        try self.entries.put(self.gpa, abs_path, entry);
+        try self.imports.put(self.gpa, key, .{ .model = model });
+        if (model == null) self.unresolved_imports += 1;
+        return model;
+    }
+
+    fn importResult(self: *ProjectCache, result: ImportResult) ?*const model_mod.FileModel {
+        return switch (result) {
+            .model => |model| model,
+            .failed => |failed| blk: {
+                self.failure = failed.err;
+                self.parse_failure = failed.parse_failure;
+                break :blk null;
+            },
+        };
+    }
+
+    fn loadImport(self: *ProjectCache, from_path: []const u8, import_str: []const u8) !?*const model_mod.FileModel {
+        const from_absolute = if (std.fs.path.isAbsolute(from_path))
+            from_path
+        else
+            try self.canonicalPath(from_path);
+        if (!self.policy.allowsAbsolutePath(from_absolute)) return null;
+        const root = self.policy.rootFor(from_absolute) orelse return null;
+        if (isRelativeImport(import_str)) {
+            const parent = std.fs.path.dirname(from_absolute) orelse return null;
+            const path = try std.fs.path.resolve(self.gpa, &.{ parent, import_str });
+            defer self.gpa.free(path);
+            return self.modelForAbsolutePath(path);
+        }
+        const path = (try self.discoverModulePath(root, import_str)) orelse return null;
+        defer self.gpa.free(path);
+        return self.modelForAbsolutePath(path);
+    }
+
+    fn discoverModulePath(self: *ProjectCache, root: []const u8, module_name: []const u8) !?[]u8 {
+        const build_path = try std.fs.path.join(self.gpa, &.{ root, "build.zig" });
+        defer self.gpa.free(build_path);
+        if (!self.policy.allowsAbsolutePath(build_path)) return null;
+        const canonical = self.canonicalPath(build_path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        if (!self.policy.allowsAbsolutePath(canonical)) return null;
+        const relative = (try parseBuildZigModulePath(self, canonical, module_name)) orelse return null;
+        defer self.gpa.free(relative);
+        const path = try std.fs.path.resolve(self.gpa, &.{ root, relative });
+        if (self.policy.allowsAbsolutePath(path)) return path;
+        self.gpa.free(path);
+        return null;
+    }
+
+    fn canonicalPath(self: *ProjectCache, path: []const u8) ![]const u8 {
+        if (self.type_context) |context| return context.canonicalPath(path);
+        return self.canonical_paths.resolve(self.gpa, self.io, path);
+    }
+
+    fn modelForAbsolutePath(self: *ProjectCache, path: []const u8) !?*const model_mod.FileModel {
+        if (std.mem.endsWith(u8, path, ".zon")) return null;
+        if (!self.policy.allowsAbsolutePath(path)) return null;
+        const canonical = try self.canonicalPath(path);
+        if (!self.policy.allowsAbsolutePath(canonical)) return null;
+        if (self.entries.get(canonical)) |entry| return &entry.model;
+        const entry = try self.gpa.create(Entry);
+        errdefer self.gpa.destroy(entry);
+        entry.source = try self.loadSource(canonical);
+        errdefer entry.source.deinit(self.gpa);
+        const owned_path = try self.gpa.dupe(u8, canonical);
+        errdefer self.gpa.free(owned_path);
+        entry.abs_path = owned_path;
+        entry.model = try model_mod.buildWithPath(self.gpa, entry.source.ast(), owned_path);
+        errdefer entry.model.deinit();
+        try self.entries.put(self.gpa, owned_path, entry);
         return &entry.model;
+    }
+
+    fn loadSource(self: *ProjectCache, path: []const u8) !Source {
+        if (self.type_context) |context| {
+            const handle = context.sourceHandle(path) catch |err| {
+                if (err == error.ImportInvalidSyntax) self.parse_failure = context.store.parse_failure;
+                return err;
+            };
+            return .{ .borrowed = &handle.tree };
+        }
+        if (self.parse_failures.get(path)) |failure| {
+            self.parse_failure = failure;
+            return error.ImportInvalidSyntax;
+        }
+        const bytes = try std.Io.Dir.cwd().readFileAllocOptions(
+            self.io, path, self.gpa, .limited(SourcePolicy.max_source_bytes), .of(u8), 0,
+        );
+        errdefer self.gpa.free(bytes);
+        var tree = try Ast.parse(self.gpa, bytes, .zig);
+        errdefer tree.deinit(self.gpa);
+        if (tree.errors.len != 0) {
+            try self.rememberParseFailure(path, &tree);
+            return error.ImportInvalidSyntax;
+        }
+        return .{ .owned = .{ .bytes = bytes, .tree = tree } };
+    }
+
+    fn rememberParseFailure(self: *ProjectCache, path: []const u8, tree: *const Ast) !void {
+        if (self.parse_failures.get(path)) |failure| {
+            self.parse_failure = failure;
+            return;
+        }
+        const owned_path = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(owned_path);
+        const failure = ParseFailure.fromTree(owned_path, tree);
+        try self.parse_failures.put(self.gpa, owned_path, failure);
+        self.parse_failure = failure;
     }
 };
 
-/// Recursively walks `root`, appending absolute paths of every
-/// `.zig` file to `out`.  Skips common vendor / build / cache
-/// directories so the index doesn't include unrelated trees.
-fn collectZigFiles(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    root: []const u8,
-    out: *std.ArrayListUnmanaged([]u8),
-) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-    var walker = dir.walk(gpa) catch return;
-    defer walker.deinit();
-    while (walker.next(io) catch null) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                // Skip dirs we don't want to scan.  The walker
-                // currently has no built-in prune API; the cheapest
-                // workaround is to swallow opens that fail, but we
-                // can pre-filter based on basename to avoid wasted
-                // descent into known-large vendor dirs.
-                if (shouldSkipDirBasename(entry.basename)) {
-                    // Walker doesn't expose prune; let it descend
-                    // and we'll filter results.  TODO: switch to
-                    // walkSelectively when ergonomic.
-                }
-                continue;
-            },
-            .file => {
-                if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-                // Reject paths that pass through a skipped dir.
-                if (pathContainsSkippedSegment(entry.path)) continue;
-                const joined = try std.fs.path.join(gpa, &.{ root, entry.path });
-                try out.append(gpa, joined);
-            },
-            else => {},
-        }
-    }
-}
-
-fn shouldSkipDirBasename(name: []const u8) bool {
-    const skips = [_][]const u8{
-        "node_modules", ".git", "zig-cache", ".zig-cache",
-        "zig-out",      "build", "target",   "vendor",
-        ".direnv",      "dist",  "out",      ".bun",
-    };
-    for (skips) |s| if (std.mem.eql(u8, name, s)) return true;
-    return false;
-}
-
-fn pathContainsSkippedSegment(path: []const u8) bool {
-    var it = std.mem.tokenizeAny(u8, path, "/\\");
-    while (it.next()) |seg| if (shouldSkipDirBasename(seg)) return true;
-    return false;
-}
-
-fn pathExists(io: std.Io, path: []const u8) bool {
-    // Probe via access() — works for both files and directories.
-    // We can't use std.fs.Dir.accessZ here (Io.Dir API), so try
-    // openDir first (works for directories), falling back to a
-    // tiny readFile probe (works for files).
-    if (std.Io.Dir.cwd().openDir(io, path, .{})) |dir_owned| {
-        var dir = dir_owned;
-        dir.close(io);
-        return true;
-    } else |_| {}
-    var probe_buf: [1]u8 = undefined;
-    _ = std.Io.Dir.cwd().readFile(io, path, &probe_buf) catch |err| switch (err) {
-        // The probe buffer is intentionally smaller than most files;
-        // readFile may return error.StreamTooLong (or similar) yet
-        // still confirm the file's existence.  Treat any error
-        // OTHER than NotFound as "exists" — we're only after an
-        // existence check, not the contents.
-        error.FileNotFound => return false,
-        else => return true,
-    };
-    return true;
-}
-
 fn containsBadChar(s: []const u8) bool {
-    for (s) |c| {
-        if (c == '/' or c == '\\' or c == '.' or c == 0) return true;
-    }
+    for (s) |c| if (c == '/' or c == '\\' or c == '.' or c == 0) return true;
     return false;
 }
 
-fn isWsByte(c: u8) bool {
-    return c == ' ' or c == '\n' or c == '\t' or c == '\r';
-}
-fn isIdentByte(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or c == '_';
+pub fn isRelativeImport(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon");
 }
 
-/// First `"..."` string literal after the first occurrence of `key` in
-/// `hay`.  Returns a slice INTO `hay` (caller dupes if it must outlive).
-fn firstStringAfter(hay: []const u8, key: []const u8) ?[]const u8 {
-    const idx = std.mem.indexOf(u8, hay, key) orelse return null;
-    const after = hay[idx + key.len ..];
-    const q1 = std.mem.indexOfScalar(u8, after, '"') orelse return null;
-    const rest = after[q1 + 1 ..];
-    const q2 = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    return rest[0..q2];
+fn stringLiteral(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    if (tree.nodeTag(node) != .string_literal) return null;
+    const text = tree.tokenSlice(tree.nodeMainToken(node));
+    if (text.len < 2 or std.mem.indexOfScalar(u8, text, '\\') != null) return null;
+    return text[1 .. text.len - 1];
 }
 
-/// The variable wired as `@import(import_name)` via
-/// `<x>.addImport("<import_name>", <var>)`.  Slice into `src`, or null.
-/// Handles the common identifier-variable 2nd-arg form (not an inline
-/// module-construction expression) — the dominant build.zig idiom that
-/// DECOUPLES the import alias from the module's own declared name.
-fn addImportAliasVar(src: []const u8, import_name: []const u8) ?[]const u8 {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, src, from, "addImport")) |hit| {
-        from = hit + "addImport".len;
-        var j = from;
-        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
-        if (j >= src.len or src[j] != '(') continue;
-        j += 1;
-        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
-        if (j >= src.len or src[j] != '"') continue;
-        j += 1;
-        const ns = j;
-        while (j < src.len and src[j] != '"') : (j += 1) {}
-        if (j >= src.len) continue;
-        if (!std.mem.eql(u8, src[ns..j], import_name)) continue;
-        j += 1; // past the closing quote of arg1
-        while (j < src.len and src[j] != ',' and src[j] != ')') : (j += 1) {}
-        if (j >= src.len or src[j] != ',') continue;
-        j += 1;
-        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
-        const id_start = j;
-        while (j < src.len and isIdentByte(src[j])) : (j += 1) {}
-        if (j == id_start) continue; // 2nd arg wasn't a bare identifier
-        return src[id_start..j];
+fn callName(tree: *const Ast, call: Ast.full.Call) ?[]const u8 {
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    return tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+}
+
+/// Only unique, explicit module wiring is evidence. Computed paths, shadowed
+/// module variables and conflicting target aliases remain unresolved.
+fn parseBuildZigModulePath(cache: *ProjectCache, path: []const u8, name: []const u8) !?[]u8 {
+    const gpa = cache.gpa;
+    var source = try cache.loadSource(path);
+    defer source.deinit(gpa);
+    const tree = source.ast();
+    if (tree.source.len > 1024 * 1024) return error.StreamTooLong;
+    var matched: ?[]const u8 = null;
+    var alias_seen = false;
+    var index: u32 = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        var buf: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buf, @enumFromInt(index)) orelse continue;
+        const method = callName(tree, call) orelse continue;
+        if (!std.mem.eql(u8, method, "addImport") or call.ast.params.len != 2) continue;
+        const alias = stringLiteral(tree, call.ast.params[0]) orelse continue;
+        if (!std.mem.eql(u8, alias, name)) continue;
+        alias_seen = true;
+        const module_node = resolveModuleVariable(tree, call.ast.params[1]) orelse return null;
+        const candidate = moduleRootPath(tree, module_node) orelse return null;
+        if (matched) |previous| if (!std.mem.eql(u8, previous, candidate)) return null;
+        matched = candidate;
+    }
+    if (alias_seen) return if (matched) |p| try gpa.dupe(u8, p) else null;
+    index = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        var buf: [1]Ast.Node.Index = undefined;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const call = tree.fullCall(&buf, node) orelse continue;
+        const method = callName(tree, call) orelse continue;
+        if (!std.mem.eql(u8, method, "addModule") or call.ast.params.len != 2) continue;
+        const alias = stringLiteral(tree, call.ast.params[0]) orelse continue;
+        if (!std.mem.eql(u8, alias, name)) continue;
+        const candidate = moduleRootPath(tree, node) orelse return null;
+        if (matched) |previous| if (!std.mem.eql(u8, previous, candidate)) return null;
+        matched = candidate;
+    }
+    return if (matched) |p| try gpa.dupe(u8, p) else null;
+}
+
+fn resolveModuleVariable(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    if (tree.nodeTag(node) != .identifier) return node;
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    var found: ?Ast.Node.Index = null;
+    var index: u32 = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        const decl = tree.fullVarDecl(@enumFromInt(index)) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(decl.ast.mut_token + 1), name)) continue;
+        if (found != null) return null;
+        found = decl.ast.init_node.unwrap();
+    }
+    return found;
+}
+
+fn moduleRootPath(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buf, node) orelse return null;
+    const name = callName(tree, call) orelse return null;
+    const options = if (std.mem.eql(u8, name, "createModule") and call.ast.params.len == 1)
+        call.ast.params[0]
+    else if (std.mem.eql(u8, name, "addModule") and call.ast.params.len == 2)
+        call.ast.params[1]
+    else return null;
+    var init_buf: [2]Ast.Node.Index = undefined;
+    const initializer = tree.fullStructInit(&init_buf, options) orelse return null;
+    for (initializer.ast.fields) |field| {
+        const token = tree.firstToken(field);
+        if (token < 2 or !std.mem.eql(u8, tree.tokenSlice(token - 2), "root_source_file")) continue;
+        var path_buf: [1]Ast.Node.Index = undefined;
+        const path_call = tree.fullCall(&path_buf, field) orelse return null;
+        if (path_call.ast.params.len != 1) return null;
+        const path_name = callName(tree, path_call) orelse return null;
+        if (!std.mem.eql(u8, path_name, "path")) return null;
+        return stringLiteral(tree, path_call.ast.params[0]);
     }
     return null;
-}
-
-/// `root_source_file` path of a `const <var> = …createModule(.{…})` or
-/// `const <var> = …addModule(<name>, .{…})` declaration.  Slice into
-/// `src`, or null.  `<var>` must be a whole token immediately preceded
-/// by `const `/`var `, and a createModule/addModule call must appear in
-/// the decl window before the path (so we don't grab an unrelated one).
-fn declRootSourceFile(src: []const u8, var_name: []const u8) ?[]const u8 {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, src, from, var_name)) |hit| {
-        from = hit + var_name.len;
-        const tail_ok = hit + var_name.len >= src.len or !isIdentByte(src[hit + var_name.len]);
-        if (!tail_ok) continue;
-        const pre = src[0..hit];
-        if (!std.mem.endsWith(u8, pre, "const ") and !std.mem.endsWith(u8, pre, "var ")) continue;
-        const win = src[hit..@min(src.len, hit + 4096)];
-        // Anchor on whichever module-construction call comes FIRST after
-        // the decl — `indexOf(createModule) orelse …` would wrongly skip
-        // past the var's own `addModule` to a later `createModule` (e.g.
-        // an exe's root_module) elsewhere in the window.
-        const ci = std.mem.indexOf(u8, win, "createModule");
-        const ai = std.mem.indexOf(u8, win, "addModule");
-        const cm = blk: {
-            if (ci) |c| break :blk if (ai) |a| @min(c, a) else c;
-            break :blk ai orelse continue;
-        };
-        if (firstStringAfter(win[cm..], "root_source_file")) |p| return p;
-    }
-    return null;
-}
-
-/// Direct `…addModule("<module_name>", .{ .root_source_file = … })` —
-/// used when the @import name IS the declared module name (no separate
-/// addImport alias).  Slice into `src`, or null.
-fn directAddModulePath(src: []const u8, module_name: []const u8) ?[]const u8 {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, src, from, "addModule")) |hit| {
-        from = hit + "addModule".len;
-        var j = from;
-        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
-        if (j >= src.len or src[j] != '(') continue;
-        j += 1;
-        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
-        if (j >= src.len or src[j] != '"') continue;
-        j += 1;
-        const ns = j;
-        while (j < src.len and src[j] != '"') : (j += 1) {}
-        if (j >= src.len) continue;
-        if (!std.mem.eql(u8, src[ns..j], module_name)) continue;
-        const win = src[j..@min(src.len, j + 2048)];
-        if (firstStringAfter(win, "root_source_file")) |p| return p;
-    }
-    return null;
-}
-
-/// Best-effort SOUND parse of a `build.zig` for the module wired as
-/// `@import(module_name)`.  Reads only EXPLICIT declarations (no
-/// layout guessing).  Two strategies, in precision order:
-///   1. `<x>.addImport("module_name", <var>)` -> `<var>`'s
-///      createModule/addModule -> `root_source_file`.  Resolves the
-///      import-alias-vs-declared-name decoupling that the old direct
-///      match missed.
-///   2. `…addModule("module_name", .{ .root_source_file = "X" })` when
-///      the alias equals the declared name.
-/// Returns the relative-to-build.zig path on success, owned by `gpa`.
-/// Inherently incomplete — build.zig is arbitrary code (loops, deps,
-/// computed paths); correct resolution needs running the build graph.
-fn parseBuildZigModulePath(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    build_zig_path: []const u8,
-    module_name: []const u8,
-) !?[]u8 {
-    const src = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        build_zig_path,
-        gpa,
-        std.Io.Limit.limited(1024 * 1024),
-    ) catch return null;
-    defer gpa.free(src);
-
-    if (addImportAliasVar(src, module_name)) |var_name| {
-        if (declRootSourceFile(src, var_name)) |p| return try gpa.dupe(u8, p);
-    }
-    if (directAddModulePath(src, module_name)) |p| return try gpa.dupe(u8, p);
-    return null;
-}
-
-/// In-place rewrite of bun's non-standard `fn #<name>` / `.#<name>`
-/// syntax to `fn _<name>` / `._<name>`.  Length-preserving so source
-/// positions stay aligned.  See lib.zig:rewriteNonStandardSyntax
-/// for the rationale.
-fn rewriteNonStandardSyntaxInPlace(src: [:0]u8) void {
-    if (src.len < 2) return;
-    var i: usize = 0;
-    while (i + 1 < src.len) : (i += 1) {
-        if (src[i] != '#') continue;
-        const c = src[i + 1];
-        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_') {
-            src[i] = '_';
-        }
-    }
-}
-
-/// True iff `import_str` looks like a relative file-system path
-/// (ends in `.zig` / `.zon` AND uses `./` or `../` or no leading
-/// separator).  Module names like `"std"` / `"bun"` return false.
-pub fn isRelativeImport(import_str: []const u8) bool {
-    if (import_str.len < 4) return false;
-    const ext_zig = std.mem.endsWith(u8, import_str, ".zig");
-    const ext_zon = std.mem.endsWith(u8, import_str, ".zon");
-    if (!ext_zig and !ext_zon) return false;
-    return true;
 }
 
 // ── Tests ──────────────────────────────────────────────────────
@@ -814,8 +345,6 @@ pub fn isRelativeImport(import_str: []const u8) bool {
 test "ProjectCache: loads sibling .zig file" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
-    // Use a fixed tmp subdir under cwd so paths can be plain
-    // relative — std.fs.path.resolve handles `./` cleanly.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(tio, .{
@@ -835,23 +364,20 @@ test "ProjectCache: loads sibling .zig file" {
         \\
         ,
     });
-    // Synthesise a "from" path inside the tmp dir.  We don't
-    // need a real absolute path — ProjectCache uses path.dirname +
-    // path.resolve, so anything that points to the tmp dir works.
-    const from_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", "main.zig" });
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(root);
+    const from_path = try std.fs.path.join(gpa, &.{ root, "main.zig" });
     defer gpa.free(from_path);
-    var pc = ProjectCache.init(gpa, tio);
+    var pc = ProjectCache.init(gpa, tio, .{ .roots = &.{root} });
     defer pc.deinit();
-    // The test environment may not have the tmp dir in a discoverable
-    // location for the real file load — accept null too (the
-    // path-resolution code is exercised regardless).
-    _ = pc.modelForRelativeImport(from_path, "./lib.zig") catch {};
+    const model = (try pc.modelForRelativeImport(from_path, "./lib.zig")).?;
+    try std.testing.expectEqual(model_mod.TypeKind.struct_, model.findType("Foo").?.kind);
 }
 
 test "ProjectCache: module-name imports return null" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
-    var pc = ProjectCache.init(gpa, tio);
+    var pc = ProjectCache.init(gpa, tio, .{});
     defer pc.deinit();
     const fm = try pc.modelForRelativeImport("/anywhere/x.zig", "std");
     try std.testing.expect(fm == null);
@@ -879,7 +405,9 @@ test "parseBuildZigModulePath: @import alias via createModule var (#20)" {
     );
     const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
     defer gpa.free(p);
-    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    var cache = ProjectCache.init(gpa, tio, .{});
+    defer cache.deinit();
+    const rel = try parseBuildZigModulePath(&cache, p, "bun");
     defer if (rel) |r| gpa.free(r);
     try std.testing.expect(rel != null);
     try std.testing.expectEqualStrings("src/foo.zig", rel.?);
@@ -901,7 +429,9 @@ test "parseBuildZigModulePath: @import alias via addModule var (#20)" {
     );
     const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
     defer gpa.free(p);
-    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    var cache = ProjectCache.init(gpa, tio, .{});
+    defer cache.deinit();
+    const rel = try parseBuildZigModulePath(&cache, p, "bun");
     defer if (rel) |r| gpa.free(r);
     try std.testing.expect(rel != null);
     try std.testing.expectEqualStrings("src/foo.zig", rel.?);
@@ -920,7 +450,9 @@ test "parseBuildZigModulePath: direct addModule(name) still resolves (#20)" {
     );
     const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
     defer gpa.free(p);
-    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    var cache = ProjectCache.init(gpa, tio, .{});
+    defer cache.deinit();
+    const rel = try parseBuildZigModulePath(&cache, p, "bun");
     defer if (rel) |r| gpa.free(r);
     try std.testing.expect(rel != null);
     try std.testing.expectEqualStrings("lib/bun.zig", rel.?);
@@ -940,7 +472,9 @@ test "parseBuildZigModulePath: undeclared module returns null (#20)" {
     );
     const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
     defer gpa.free(p);
-    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    var cache = ProjectCache.init(gpa, tio, .{});
+    defer cache.deinit();
+    const rel = try parseBuildZigModulePath(&cache, p, "bun");
     defer if (rel) |r| gpa.free(r);
     try std.testing.expect(rel == null);
 }
@@ -956,28 +490,42 @@ test "discoverModulePath: build.zig present blocks layout guessing (#20 gating)"
         \\pub fn build(b: *@import("std").Build) void { _ = b; }
     );
     try tmp.dir.writeFile(tio, .{ .sub_path = "bun.zig", .data = "pub const X = 1;" });
-    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
     defer gpa.free(root);
-    var pc = ProjectCache.init(gpa, tio);
+    var pc = ProjectCache.init(gpa, tio, .{ .roots = &.{root} });
     defer pc.deinit();
     const r = try pc.discoverModulePath(root, "bun");
     defer if (r) |x| gpa.free(x);
     try std.testing.expect(r == null);
 }
 
-test "discoverModulePath: no build.zig allows conventional layout (#20 gating)" {
+test "discoverModulePath: absent build wiring cannot prove a module" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // No build.zig — layout conventions are the only signal, so bun.zig
-    // at root resolves.
     try tmp.dir.writeFile(tio, .{ .sub_path = "bun.zig", .data = "pub const X = 1;" });
-    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
     defer gpa.free(root);
-    var pc = ProjectCache.init(gpa, tio);
+    var pc = ProjectCache.init(gpa, tio, .{ .roots = &.{root} });
     defer pc.deinit();
     const r = try pc.discoverModulePath(root, "bun");
     defer if (r) |x| gpa.free(x);
-    try std.testing.expect(r != null);
+    try std.testing.expect(r == null);
+}
+
+test "ZON data does not become a Zig declaration model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "data.zon", .data = ".{ .value = 3 }" });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const importer = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(importer);
+    var project = ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
+    defer project.deinit();
+    try std.testing.expectEqual(null, try project.modelForRelativeImport(importer, "data.zon"));
+    try std.testing.expectEqual(null, project.failure);
 }

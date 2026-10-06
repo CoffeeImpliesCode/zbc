@@ -64,6 +64,192 @@ pub const FileCache = struct {
     /// starts.  Shared across all function analyses in this file so
     /// cfg_builder's buildLineOffsets() runs at most once per file.
     line_offsets: []const u32 = &.{},
+    address_uses: ?AddressUseMap = null,
+    call_index: ?CallIndex = null,
+    closed_callers: std.AutoHashMapUnmanaged(Ast.Node.Index, ?[]const Ast.Node.Index) = .empty,
+    max_float_bits: std.AutoHashMapUnmanaged(Ast.TokenIndex, u16) = .empty,
+
+    const CallIndex = struct {
+        by_callee: std.AutoHashMapUnmanaged(Ast.Node.Index, Ast.Node.Index) = .empty,
+        reflective: bool = false,
+    };
+
+    /// All direct callers of a private, non-escaping declaration. Null is open or unknown.
+    pub fn closedLocalCalls(self: *FileCache, declaration: Ast.Node.Index) error{OutOfMemory}!?[]const Ast.Node.Index {
+        if (self.closed_callers.get(declaration)) |cached| return cached;
+        const calls = try self.buildClosedLocalCalls(declaration);
+        errdefer if (calls) |owned| self.gpa.free(owned);
+        try self.closed_callers.put(self.gpa, declaration, calls);
+        return calls;
+    }
+
+    fn getCallIndex(self: *FileCache) error{OutOfMemory}!*const CallIndex {
+        if (self.call_index) |*index| return index;
+        var index: CallIndex = .{};
+        errdefer index.by_callee.deinit(self.gpa);
+        for (self.tree.nodes.items(.tag), 0..) |tag, raw_node| {
+            const node: Ast.Node.Index = @enumFromInt(raw_node);
+            var buffer: [1]Ast.Node.Index = undefined;
+            if (self.tree.fullCall(&buffer, node)) |call| {
+                try index.by_callee.put(self.gpa, call.ast.fn_expr, node);
+            }
+            switch (tag) {
+                .@"asm", .asm_simple => index.reflective = true,
+                .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                    if (std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(node)), "@field"))
+                        index.reflective = true;
+                },
+                else => {},
+            }
+        }
+        self.call_index = index;
+        return &self.call_index.?;
+    }
+
+    fn buildClosedLocalCalls(self: *FileCache, declaration: Ast.Node.Index) error{OutOfMemory}!?[]const Ast.Node.Index {
+        const resolver = self.zls orelse return null;
+        const tree = self.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &buffer, declaration) orelse return null;
+        if (proto.visib_token != null) return null;
+        if (proto.extern_export_inline_token) |token| {
+            if (tree.tokenTag(token) != .keyword_inline) return null;
+        }
+        const name = tree.tokenSlice(proto.name_token orelse return null);
+        const index = try self.getCallIndex();
+        if (index.reflective) return null;
+        var calls: std.ArrayList(Ast.Node.Index) = .empty;
+        defer calls.deinit(self.gpa);
+        for (tree.nodes.items(.tag), 0..) |tag, raw_node| {
+            const node: Ast.Node.Index = @enumFromInt(raw_node);
+            const token = switch (tag) {
+                .identifier => tree.nodeMainToken(node),
+                .field_access => tree.nodeData(node).node_and_token[1],
+                else => continue,
+            };
+            const spelling = tree.tokenSlice(token);
+            // Quoted aliases must be resolved, not excluded by raw spelling.
+            if (!std.mem.eql(u8, spelling, name) and spelling[0] != '@' and name[0] != '@') continue;
+            const reference = (resolver.functionReference(node) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            }) orelse return null;
+            if (reference.tree != tree or reference.fn_token != proto.ast.fn_token) continue;
+            const call = index.by_callee.get(node) orelse return null;
+            try calls.append(self.gpa, call);
+        }
+        if (calls.items.len == 0) return null;
+        return try calls.toOwnedSlice(self.gpa);
+    }
+
+    /// Maximum precision across closed generic instantiations, not an arithmetic format.
+    pub fn maxFloatBitsOf(self: *FileCache, node: Ast.Node.Index, budget: *u32) ?u16 {
+        return self.maxFloatBitsAtDepth(node, budget, 0);
+    }
+
+    fn maxFloatBitsAtDepth(self: *FileCache, node: Ast.Node.Index, budget: *u32, depth: u8) ?u16 {
+        if (depth == 8 or budget.* == 0) return null;
+        budget.* -= 1;
+        const resolver = self.zls orelse return null;
+        if (resolver.floatBits(node) catch null) |bits| return if (bits == 0) null else bits;
+        const reference = (resolver.typeParameterReference(node) catch return null) orelse return null;
+        if (reference.tree != self.tree) return null;
+        if (self.max_float_bits.get(reference.token)) |bits| return bits;
+        const declaration = tokens.enclosingFnDecl(self.tree, reference.token) orelse return null;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(self.tree, &buffer, declaration) orelse return null;
+        var parameters = proto.iterate(self.tree);
+        var parameter_index: usize = 0;
+        var found = false;
+        while (parameters.next()) |parameter| {
+            if (parameter.name_token == reference.token) {
+                found = true;
+                break;
+            }
+            parameter_index += 1;
+        }
+        if (!found) return null;
+        const calls = (self.closedLocalCalls(declaration) catch return null) orelse return null;
+        var maximum: u16 = 0;
+        for (calls) |call| {
+            const argument = (resolver.callArgument(call, parameter_index) catch return null) orelse return null;
+            const bits = self.maxFloatBitsAtDepth(argument, budget, depth + 1) orelse return null;
+            maximum = @max(maximum, bits);
+        }
+        if (maximum == 0) return null;
+        self.max_float_bits.put(self.gpa, reference.token, maximum) catch return null;
+        return maximum;
+    }
+
+    pub const AddressUse = struct { may_write: bool };
+    const AddressUseMap = std.AutoHashMapUnmanaged(Ast.TokenIndex, AddressUse);
+
+    /// Address operands, indexed once per file. Ordinary calls and memory
+    /// builtins may write through arguments; taking an address does not write.
+    pub fn addressUseAt(self: *FileCache, operand_token: Ast.TokenIndex) !?AddressUse {
+        if (self.address_uses == null) self.address_uses = try self.buildAddressUses();
+        return self.address_uses.?.get(operand_token);
+    }
+
+    fn buildAddressUses(self: *FileCache) !AddressUseMap {
+        const Iterator = @import("type_engine").AstIterator;
+        const Frame = struct {
+            children: Iterator,
+            in_argument: bool,
+            call_children: bool,
+            first_child: bool = true,
+        };
+        var result: AddressUseMap = .empty;
+        errdefer result.deinit(self.gpa);
+        var frames: [256]Frame = undefined;
+        frames[0] = .{
+            .children = .{ .array = .{ Ast.Node.Index.root.toOptional(), .none, .none, .none, .none } },
+            .in_argument = false,
+            .call_children = false,
+        };
+        var depth: usize = 1;
+        var visited: usize = 0;
+        while (depth != 0) {
+            const frame = &frames[depth - 1];
+            const node = frame.children.next(self.tree) orelse {
+                depth -= 1;
+                continue;
+            };
+            if (visited == self.tree.nodes.len) return error.AnalysisBudgetExceeded;
+            visited += 1;
+            const in_argument = frame.in_argument or (frame.call_children and !frame.first_child);
+            frame.first_child = false;
+            const tag = self.tree.nodeTag(node);
+            if (tag == .address_of) {
+                if (tokens.rootIdentifier(self.tree, self.tree.nodeData(node).node)) |operand| {
+                    try result.put(self.gpa, self.tree.nodeMainToken(operand), .{ .may_write = in_argument });
+                }
+            }
+            if (depth == frames.len) return error.AnalysisBudgetExceeded;
+            frames[depth] = .{
+                .children = Iterator.init(self.tree, node),
+                .in_argument = tag != .fn_decl and (in_argument or self.builtinWritesMemory(node)),
+                .call_children = switch (tag) {
+                    .call, .call_one, .call_comma, .call_one_comma => true,
+                    else => false,
+                },
+            };
+            depth += 1;
+        }
+        return result;
+    }
+
+    fn builtinWritesMemory(self: *const FileCache, node: Ast.Node.Index) bool {
+        switch (self.tree.nodeTag(node)) {
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+            else => return false,
+        }
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        for ([_][]const u8{ "@memcpy", "@memset", "@atomicStore", "@atomicRmw", "@cmpxchgStrong", "@cmpxchgWeak" }) |writer| {
+            if (std.mem.eql(u8, name, writer)) return true;
+        }
+        return false;
+    }
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
@@ -107,12 +293,10 @@ pub const FileCache = struct {
         return z.intInfo(node) catch null;
     }
 
-    /// Whether `node`'s type resolves to a floating-point type.  False when the
-    /// type engine is unavailable or the type isn't a float.  Floats are not
-    /// containers, so `typeNameOfNode` can't report them — use this instead.
-    pub fn isFloatType(self: *FileCache, node: std.zig.Ast.Node.Index) bool {
-        const z = self.zls orelse return false;
-        return z.isFloatType(node) catch false;
+    /// True for floating-point types; null if type resolution is unavailable.
+    pub fn isFloatType(self: *FileCache, node: std.zig.Ast.Node.Index) ?bool {
+        const z = self.zls orelse return null;
+        return z.isFloatType(node) catch null;
     }
 
     /// For `x.ptr` (x a slice): whether x's element is byte-sized (align 1) —
@@ -140,125 +324,67 @@ pub const FileCache = struct {
         self.file_path = file_path;
     }
 
-    /// Cross-file type lookup.  When `name` isn't found in the
-    /// current file's model, scan @import declarations and try
-    /// each imported file's model.  Walks one level of @import
-    /// indirection — doesn't recurse into the imported file's own
-    /// imports (a deeper search would risk diamond-load cycles and
-    /// blow up cache size for large projects).  Returns null when
-    /// the type is unresolvable in this file OR in any directly-
-    /// imported file.
-    pub fn findTypeAcrossImports(
-        self: *FileCache,
-        name: []const u8,
-    ) ?*const file_model.TypeInfo {
-        const model = self.fileModel() catch return null;
-        if (model.findType(name)) |ti| return ti;
-        const pc = self.project orelse return null;
-        if (self.file_path.len == 0) return null;
-        // Primary: global type index.  Triggers buildTypeIndex on the first
-        // call (one-time serial cost); O(1) on all subsequent calls.
-        const entries = pc.findAllTypesByName(self.file_path, name) catch {
-            // OOM fallback: traverse @import graph directly.
-            return findTypeViaImports(pc, self.tree, self.file_path, name, 4);
-        };
-        if (entries.len == 0) return null;
-        return entries[0].typeInfo();
-    }
-
-    /// Resolved cross-file method lookup result.  When the method
-    /// lives in a foreign file, `tree` points at THAT file's tree
-    /// (foreign token indices) — callers MUST use this returned
-    /// tree (not their own) for any token / node operations on
-    /// `method.fn_decl`.
-    pub const ResolvedMethod = struct {
-        tree: *const Ast,
-        method: *const file_model.MethodInfo,
+    pub const ResolvedType = struct {
+        model: *const file_model.FileModel,
+        info: *const file_model.TypeInfo,
     };
 
-    /// Look up `<type_name>.<method_name>` either in this file or
-    /// in any directly @import'd file (one hop), returning the
-    /// owning tree alongside the MethodInfo.  Used by cross-fn
-    /// lifecycle analysis to walk a called fn's body even when the
-    /// fn lives in a different file.
-    ///
-    /// Cross-file results are cached keyed by "TypeName\x00method"
-    /// so repeated lookups of the same (type, method) pair across
-    /// many call sites in one file pay the @import-traversal cost
-    /// only once.
-    pub fn findMethodAcrossImports(
-        self: *FileCache,
-        type_name: []const u8,
-        method_name: []const u8,
-    ) ?ResolvedMethod {
-        // Fast path: type lives in the current file — no traversal.
+    pub fn findTypeAcrossImports(self: *FileCache, name: []const u8) ?ResolvedType {
         const model = self.fileModel() catch return null;
-        if (model.findType(type_name)) |ti| {
-            if (ti.findMethod(method_name)) |m| return .{ .tree = self.tree, .method = m };
+        const resolved = resolveNamed(self.gpa, self.project, model, self.file_path, name, 32) orelse return null;
+        return .{ .model = resolved.model, .info = resolved.info orelse return null };
+    }
+
+    pub fn fieldType(self: *FileCache, owner: ResolvedType, field_name: []const u8) ?ResolvedType {
+        if (owner.model.resolveFieldTypeQualifiedTi(owner.info, field_name)) |info| {
+            return .{ .model = owner.model, .info = info };
         }
-        const pc = self.project orelse return null;
-        if (self.file_path.len == 0) return null;
+        const field = owner.info.findField(field_name) orelse return null;
+        const name = tokens.typeNameFromTokens(owner.model.tree, field.type_first, field.type_last) orelse return null;
+        const path = if (owner.model.tree == self.tree) self.file_path else
+            (self.project orelse return null).pathForModel(owner.model);
+        const resolved = resolveNamed(self.gpa, self.project, owner.model, path, name, 32) orelse return null;
+        return .{ .model = resolved.model, .info = resolved.info orelse return null };
+    }
 
-        // Build the cache key.  On OOM, fall through to uncached lookup.
-        const key = std.fmt.allocPrint(
-            self.gpa,
-            "{s}\x00{s}",
-            .{ type_name, method_name },
-        ) catch return findMethodCrossFile(self, pc, type_name, method_name);
+    pub fn summaryForType(self: *FileCache, owner: ResolvedType, name: []const u8) !?fn_summary.FnSummary {
+        const method = owner.info.findMethod(name) orelse return null;
+        return self.summaryOfResolvedMethod(.{ .tree = owner.model.tree, .fn_decl = method.fn_decl });
+    }
 
-        // Cache hit — free the key we just built and return the stored result.
+    pub const ResolvedMethod = struct {
+        tree: *const Ast,
+        fn_decl: Ast.Node.Index,
+    };
+
+    pub fn findMethodAcrossImports(self: *FileCache, type_name: []const u8, method_name: []const u8) ?ResolvedMethod {
+        const model = self.fileModel() catch return null;
+        const key = std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ type_name, method_name }) catch return null;
         if (self.method_lookup_cache.get(key)) |cached| {
             self.gpa.free(key);
             return cached;
         }
-
-        // Cache miss — run the expensive @import traversal.
-        const result = findMethodCrossFile(self, pc, type_name, method_name);
-
-        // Store the result (key now owned by the map on success).
+        const result: ?ResolvedMethod = blk: {
+            const resolved = resolveNamed(self.gpa, self.project, model, self.file_path, type_name, 32) orelse break :blk null;
+            if (resolved.info) |info| {
+                const method = info.findMethod(method_name) orelse break :blk null;
+                break :blk .{ .tree = resolved.model.tree, .fn_decl = method.fn_decl };
+            }
+            const function = resolved.model.findFn(method_name) orelse break :blk null;
+            break :blk .{ .tree = resolved.model.tree, .fn_decl = function.fn_decl };
+        };
         self.method_lookup_cache.put(self.gpa, key, result) catch self.gpa.free(key);
         return result;
     }
 
-    /// Slow path: global type index + @import-graph fallback.
-    /// Called only on a cache miss in findMethodAcrossImports.
-    ///
-    /// Strategy: try the global type index (findAllTypesByName) first.
-    /// The first call ever triggers buildTypeIndex (one-time serial cost);
-    /// every subsequent call is an O(1) hash lookup with no AST scanning
-    /// and no per-import lock acquisitions.  The @import-graph traversal
-    /// (findMethodViaImports) is retained only as an OOM fallback.
-    fn findMethodCrossFile(
-        self: *FileCache,
-        pc: *project_cache_mod.ProjectCache,
-        type_name: []const u8,
-        method_name: []const u8,
-    ) ?ResolvedMethod {
-        // Primary: global type index.  Triggers buildTypeIndex on the first
-        // call (one-time serial cost while other threads spin); O(1) + O(k)
-        // on all subsequent calls, eliminating the O(n_nodes × depth) AST
-        // traversal that dominated profiling (50 % of one worker's time).
-        const type_entries = pc.findAllTypesByName(self.file_path, type_name) catch null;
-        if (type_entries) |tes| {
-            for (tes) |te| {
-                const ti = te.typeInfo();
-                if (ti.findMethod(method_name)) |m| return .{ .tree = te.tree(), .method = m };
-            }
-            // No matching (type, method) in the global index.  The index
-            // omits files the project walk skips (vendor/build/cache dirs),
-            // yet such a file can still be reachable through THIS file's
-            // @import declarations.  Fall through to the @import traversal
-            // rather than giving up — a global-index miss is not proof the
-            // type is unreachable.  Bounded: findMethodAcrossImports caches
-            // this result (incl. the negative), so the traversal runs at
-            // most once per (type, method) per file.
-        }
-        // @import-graph traversal — reached on an index miss (above) or
-        // when the index was unavailable (OOM `catch null`).
-        return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4);
-    }
 
     pub fn deinit(self: *FileCache) void {
+        if (self.address_uses) |*uses| uses.deinit(self.gpa);
+        if (self.call_index) |*index| index.by_callee.deinit(self.gpa);
+        var callers = self.closed_callers.valueIterator();
+        while (callers.next()) |calls| if (calls.*) |owned| self.gpa.free(owned);
+        self.closed_callers.deinit(self.gpa);
+        self.max_float_bits.deinit(self.gpa);
         if (self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         if (self.file_model) |*m| m.deinit();
         if (self.summary_arena) |*a| a.deinit();
@@ -294,7 +420,7 @@ pub const FileCache = struct {
     /// stable for the lifetime of the cache.
     pub fn localBindings(
         self: *FileCache,
-        proto: Ast.full.FnProto,
+        proto: ?Ast.full.FnProto,
         body: Ast.Node.Index,
     ) !*const local_bindings.LocalBindings {
         const key = @intFromEnum(body);
@@ -341,70 +467,39 @@ pub const FileCache = struct {
             // Syntactic fast-path: handles `*T`, `?*T`, `T`, `ns.T`, etc.
             // without invoking ZLS. Covers the vast majority of real-world
             // parameter types; ZLS is only needed for aliases/generics.
-            if (typeNameFromTypeNode(self.tree, type_node)) |name| return name;
+            if (typeNameFromTypeNode(self.tree, type_node)) |name| {
+                const model = try self.fileModel();
+                if (model.containingTypeAtToken(proto.ast.fn_token)) |owner| {
+                    if (std.mem.eql(u8, name, "Self")) return owner.qualified_name;
+                    if (model.resolveTypeNameInScope(name, owner)) |resolved| return resolved.qualified_name;
+                }
+                return name;
+            }
             const z = self.zls orelse return null;
-            return z.typeNameOfNode(type_node) catch null;
+            return z.typeReferenceOfNode(type_node) catch null;
         }
         return null;
     }
 
-    /// Filter may_free_fields entries — an entry survives only when:
-    ///   - param's type is locally declared
-    ///   - field is not pointer-typed
-    ///   - field's declared type is locally declared
-    ///   - the field-type's method (the one recorded in ff.method)
-    ///     exists AND has takes_ownership_of != null (the method
-    ///     actually consumes its receiver — not just that it
-    ///     exists).  Without this check value-typed fields whose type
-    ///     has a non-consuming deinit get treated as freed when they
-    ///     shouldn't.
+    /// Resolve each field and its method in the declaring source snapshot.
     fn filterMayFreeFields(
         self: *FileCache,
         arena: std.mem.Allocator,
-        model: *const file_model.FileModel,
-        tree: *const Ast,
         proto: Ast.full.FnProto,
         raw: []const fn_summary.FieldFree,
     ) ![]const fn_summary.FieldFree {
-        _ = tree;
         if (raw.len == 0) return &.{};
         var out: std.ArrayListUnmanaged(fn_summary.FieldFree) = .empty;
-        for (raw) |ff| {
-            const param_ty = (try self.paramContainerName(proto, ff.param)) orelse continue;
-            if (!model.hasType(param_ty)) continue;
-            // Walk the field path one segment at a time so multi-
-            // segment chains like "inner.handle" resolve to the
-            // deepest type before looking up the method.
-            const deepest_path = walkFieldPath(model, param_ty, ff.field) orelse continue;
-            // Resolve the cleanup method on the deepest field's TYPE and
-            // decide whether to keep this field-free.  Keep iff the
-            // callee takes ownership OR is cleanup-named (deinit/close/…),
-            // in which case we presume it consumes its receiver even
-            // without an explicit takes signal — recovers external-stdlib
-            // deinit cases (e.g. HashMap.deinit) pure inference can't see.
-            //
-            // The field's type may live in another file (the common
-            // composed-owner shape `self.inner.deinit()` where `inner`'s
-            // type is imported, deepest_path.ns != null).  Same-file types
-            // resolve via summaryByMethod; cross-file types via
-            // summaryByMethodCrossFile (@import graph / global type index),
-            // which confirms the method exists across imports before we
-            // apply the cleanup-name presumption.
-            const keep: bool = blk: {
-                if (deepest_path.ns == null) {
-                    if (!model.hasType(deepest_path.type_name)) break :blk false;
-                    const ti = model.findType(deepest_path.type_name) orelse break :blk false;
-                    if (!ti.hasMethod(ff.method)) break :blk false;
-                    const cs = (try self.summaryByMethod(deepest_path.type_name, ff.method)) orelse break :blk false;
-                    break :blk cs.takes_ownership_of != null or
-                        fn_summary.isReceiverCleanupMethodName(ff.method);
-                }
-                const xf = (try self.summaryByMethodCrossFile(deepest_path.type_name, ff.method)) orelse break :blk false;
-                break :blk xf.takes_ownership_of != null or
-                    fn_summary.isReceiverCleanupMethodName(ff.method);
-            };
-            if (!keep) continue;
-            try out.append(arena, ff);
+        fields: for (raw) |field| {
+            const param_type = (try self.paramContainerName(proto, field.param)) orelse continue;
+            var owner = self.findTypeAcrossImports(param_type) orelse continue;
+            var path = std.mem.splitScalar(u8, field.field, '.');
+            while (path.next()) |part| {
+                owner = self.fieldType(owner, part) orelse continue :fields;
+            }
+            const summary = (try self.summaryForType(owner, field.method)) orelse continue;
+            if (summary.takes_ownership_of != @as(?u32, 0)) continue;
+            try out.append(arena, field);
         }
         return out.toOwnedSlice(arena);
     }
@@ -475,11 +570,11 @@ pub const FileCache = struct {
         while (iters < 16) : (iters += 1) {
             var changed = false;
             for (model.fns) |fi| {
-                if (try self.propagateTransitiveTakesOne(fi.fn_decl, null)) changed = true;
+                if (try self.propagateTransitiveTakesOne(fi.fn_decl)) changed = true;
             }
             for (model.types) |ti| {
                 for (ti.methods) |m| {
-                    if (try self.propagateTransitiveTakesOne(m.fn_decl, ti.name)) changed = true;
+                    if (try self.propagateTransitiveTakesOne(m.fn_decl)) changed = true;
                 }
             }
             if (!changed) break;
@@ -532,7 +627,7 @@ pub const FileCache = struct {
                 }
                 for (model.types) |ti| {
                     for (ti.methods) |m| {
-                        if (try self.propagateEffectOne(m.fn_decl, ti.name, eff)) changed = true;
+                        if (try self.propagateEffectOne(m.fn_decl, ti.qualified_name, eff)) changed = true;
                     }
                 }
                 if (!changed) break;
@@ -714,21 +809,19 @@ pub const FileCache = struct {
         if (k > last or tags[k] != .l_paren) return null;
 
         const method_name = tree.tokenSlice(method_tok);
-        // Typed lookup first (precise — ZLS resolves the param's type).
-        // Bare-name fallback only when the param type is unresolvable:
-        // that path finds top-level fns with the same name, which can
-        // fire on the wrong type if names collide.
-        var target_idx = try self.lookupBorrowedFromParamTypeSameFile(proto, param_idx, method_name);
-        if (target_idx == null) {
-            target_idx = try self.lookupBorrowedFromSameFile(method_name);
+        const type_name = (try self.paramContainerName(proto, param_idx)) orelse return null;
+        var owner = self.findTypeAcrossImports(type_name) orelse return null;
+        var field_tok = first + 2;
+        while (field_tok < method_tok) : (field_tok += 2) {
+            owner = self.fieldType(owner, tree.tokenSlice(field_tok)) orelse return null;
         }
-        if ((target_idx orelse return null) == 0) return param_idx;
+        const summary = (try self.summaryForType(owner, method_name)) orelse return null;
+        if (summary.returns == .borrowed_from and summary.returns.borrowed_from == 0) return param_idx;
         return null;
     }
 
-    /// `return <Path>.<method>(arg0, arg1, ...);` shape.  Fires when
-    /// `<method>` is `borrowed_from(N)` and arg N resolves to one of
-    /// our params.  Same-file first; then cross-file via namespace.
+    /// Resolve a namespace or lexical function declaration before propagating
+    /// its borrowed argument. A leaf name is not a dispatch identity.
     fn inferNamespaceStyle(
         self: *FileCache,
         proto: Ast.full.FnProto,
@@ -742,58 +835,37 @@ pub const FileCache = struct {
             else => return null,
         };
         const method_name = tree.tokenSlice(method_tok);
-        var target_idx = try self.lookupBorrowedFromSameFile(method_name);
-        if (target_idx == null) {
-            // Namespace-style: `Foo.method(arg)` where Foo is a local
-            // type — look up Foo.method via summaryByMethod.
+        const returns = result: {
             if (tree.nodeTag(callee) == .field_access) {
                 const recv = tree.nodeData(callee).node_and_token[0];
-                if (tree.nodeTag(recv) == .identifier) {
-                    const type_name = tree.tokenSlice(tree.nodeMainToken(recv));
-                    if ((try self.summaryByMethod(type_name, method_name))) |s| {
-                        target_idx = switch (s.returns) {
-                            .borrowed_from => |i| i,
-                            else => null,
-                        };
-                    }
-                }
+                const type_name = typeNameFromTypeNode(tree, recv) orelse return null;
+                const method = self.findMethodAcrossImports(type_name, method_name) orelse return null;
+                const summary = (try self.summaryOfResolvedMethod(method)) orelse return null;
+                break :result summary.returns;
             }
-        }
-        // Cross-file namespace lookup retired with remote_resolver.
-        const idx_resolved = target_idx orelse return null;
+            const model = try self.fileModel();
+            var scope: ?[]const u8 = if (model.containingTypeAtToken(proto.ast.fn_token)) |owner|
+                owner.qualified_name else null;
+            while (scope) |name| {
+                const owner = model.findType(name) orelse break;
+                if (owner.findMethod(method_name)) |method| {
+                    break :result (try self.summaryOfFn(method.fn_decl)).returns;
+                }
+                scope = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[0..dot] else null;
+            }
+            const summary = (try self.summaryByName(method_name)) orelse return null;
+            break :result summary.returns;
+        };
+        const idx_resolved = switch (returns) {
+            .borrowed_from => |idx| idx,
+            else => return null,
+        };
         const args = call_full.ast.params;
         if (idx_resolved >= args.len) return null;
         const arg = args[idx_resolved];
         if (tree.nodeTag(arg) != .identifier) return null;
         const arg_name = tree.tokenSlice(tree.nodeMainToken(arg));
         return fn_summary.paramIndex(tree, proto, arg_name);
-    }
-
-    /// Look up a top-level fn by name and return its `borrowed_from`
-    /// target index when the summary's returns is that variant.
-    fn lookupBorrowedFromSameFile(self: *FileCache, method_name: []const u8) !?u32 {
-        const s = (try self.summaryByName(method_name)) orelse return null;
-        return switch (s.returns) {
-            .borrowed_from => |idx| idx,
-            else => null,
-        };
-    }
-
-    /// Same-file typed lookup: look up `method_name` on the type of
-    /// the named param.  Catches methods on locally-declared types
-    /// that lookupBorrowedFromSameFile (top-level fns only) misses.
-    fn lookupBorrowedFromParamTypeSameFile(
-        self: *FileCache,
-        proto: Ast.full.FnProto,
-        param_idx: u32,
-        method_name: []const u8,
-    ) !?u32 {
-        const type_name = (try self.paramContainerName(proto, param_idx)) orelse return null;
-        const s = (try self.summaryByMethod(type_name, method_name)) orelse return null;
-        return switch (s.returns) {
-            .borrowed_from => |idx| idx,
-            else => null,
-        };
     }
 
     /// Multi-return-stmt variant: walk every `return EXPR;` whose
@@ -841,12 +913,12 @@ pub const FileCache = struct {
         const key = @intFromEnum(body);
         const entry = self.summaries.getPtr(key) orelse return;
         if (entry.may_free_fields.len == 0) return;
-        const model = try self.fileModel();
         if (self.summary_arena == null) {
             self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
         }
         const a = self.summary_arena.?.allocator();
-        entry.may_free_fields = try self.filterMayFreeFields(a, model, self.tree, proto, entry.may_free_fields);
+        const filtered = try self.filterMayFreeFields(a, proto, entry.may_free_fields);
+        self.summaries.getPtr(key).?.may_free_fields = filtered;
     }
 
     /// Returns true iff the fn's summary's `takes_ownership_of` was
@@ -856,7 +928,6 @@ pub const FileCache = struct {
     fn propagateTransitiveTakesOne(
         self: *FileCache,
         fn_decl: Ast.Node.Index,
-        receiver_type: ?[]const u8,
     ) !bool {
         var buf: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(self.tree, &buf, fn_decl) orelse return false;
@@ -888,41 +959,10 @@ pub const FileCache = struct {
             const pi = paramIndexFor(tree, proto, param_name) orelse continue;
             const method = tree.tokenSlice(t + 2);
 
-            // Look up callee summary on PARAM's declared type — that's
-            // the receiver of `<param>.<method>(`.  Typed paths only:
-            // bare-name lookup is omitted because it can match the same
-            // method name on a completely different type and propagate
-            // ownership where none exists.  ZLS-resolved type first
-            // (precise), then the enclosing struct's type (provably
-            // correct for self-receiver), then cross-file variants of
-            // both.
-            const param_type = try self.paramContainerName(proto, pi);
-            const callee_takes: ?u32 = blk: {
-                if (param_type) |tn| {
-                    if (try self.summaryByMethod(tn, method)) |s| {
-                        break :blk s.takes_ownership_of;
-                    }
-                }
-                if (receiver_type) |rt| {
-                    if (try self.summaryByMethod(rt, method)) |s| {
-                        break :blk s.takes_ownership_of;
-                    }
-                }
-                // Cross-file fallback: callee lives in an @import'd file.
-                // Direct-takes inference only — no transitive resolution
-                // for foreign bodies.
-                if (param_type) |tn| {
-                    if (try self.summaryByMethodCrossFile(tn, method)) |xf| {
-                        break :blk xf.takes_ownership_of;
-                    }
-                }
-                if (receiver_type) |rt| {
-                    if (try self.summaryByMethodCrossFile(rt, method)) |xf| {
-                        break :blk xf.takes_ownership_of;
-                    }
-                }
-                break :blk null;
-            };
+            const type_name = (try self.paramContainerName(proto, pi)) orelse continue;
+            const owner = self.findTypeAcrossImports(type_name) orelse continue;
+            const summary = (try self.summaryForType(owner, method)) orelse continue;
+            const callee_takes = summary.takes_ownership_of;
             if (callee_takes) |idx| {
                 if (idx == 0) {
                     // Mutate the cached entry in place.
@@ -965,85 +1005,50 @@ pub const FileCache = struct {
     }
 
     /// Look up method summary in an @import'd file.  When `type_name`
-    /// is not in the current file, searches directly @import'd files
-    /// (one hop) and the global type index via ProjectCache.
-    ///
-    /// Returns FnSummary BY VALUE — only `inferDirectTakes`-level
-    /// inference is applied (no transitive resolution for cross-file
-    /// methods; that would require loading and running the full
-    /// resolveTransitiveTakes pipeline for the imported file).
-    ///
-    /// Use case: detecting that a callee defined in another file takes
-    /// ownership of its first parameter (e.g. `bun.destroy(ptr)` where
-    /// `destroy` lives in `bun.zig`).
+    /// Resolve first, then cache by immutable source snapshot and declaration.
     pub fn summaryByMethodCrossFile(
         self: *FileCache,
         type_name: []const u8,
         method_name: []const u8,
     ) !?fn_summary.FnSummary {
-        // Project-level cache: check before the expensive @import traversal.
-        // Shared across all per-file FileCache instances — pays the traversal
-        // cost at most once globally per (type, method) pair.
-        if (self.project) |pc| {
-            if (pc.getMethodSummaryCache(type_name, method_name)) |cached| {
-                if (!cached.found) return null;
-                var s: fn_summary.FnSummary = .{};
-                s.takes_ownership_of = cached.takes;
-                s.may_grow_collections = cached.may_grow;
-                s.may_invoke_gc = cached.may_gc;
-                s.may_run_on_any_thread = cached.may_thread;
-                return s;
-            }
-        }
+        const resolved = self.findMethodAcrossImports(type_name, method_name) orelse return null;
+        return self.summaryOfResolvedMethod(resolved);
+    }
 
-        const rm = self.findMethodAcrossImports(type_name, method_name) orelse {
-            if (self.project) |pc| pc.putMethodSummaryCache(type_name, method_name, .{ .found = false });
-            return null;
-        };
-        var buf: [1]Ast.Node.Index = undefined;
-        const proto = tokens.fnProto(rm.tree, &buf, rm.method.fn_decl) orelse return null;
-        const body = tokens.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
-        var summary: fn_summary.FnSummary = .{};
-        summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
-        // Cross-file EFFECT flags (#20): the foreign method's DIRECT effects
-        // (a `.append(` grows, a gc-trigger / exit-callback-register call).
-        // Body-level only — cheap, no foreign-file propagation — so a
-        // foreign method that merely DELEGATES the effect to its own callee
-        // isn't seen (a documented bound; effects are narrow-value).
-        const direct = fn_summary.inferFromBody(rm.tree, proto, body);
-        summary.may_grow_collections = direct.may_grow_collections;
-        summary.may_invoke_gc = direct.may_invoke_gc;
-        summary.may_run_on_any_thread = direct.may_run_on_any_thread;
-        // Transitive takes WITHIN the foreign file: if direct inference
-        // found nothing, the method may DELEGATE ownership to a same-file
-        // callee (`pub fn kill(self, g) { self.reallyFree(g); }`).  Run the
-        // foreign file's own same-file fixed-point propagation over a
-        // throwaway, PROJECT-LESS FileCache and read the method's resolved
-        // takes.  Project-less is the termination guarantee: with no
-        // project the foreign cache's own cross-file fallback is a no-op,
-        // so there is no mutual recursion.  Bounded to one foreign file —
-        // a foreign method that delegates across yet ANOTHER file is not
-        // followed (a deeper, cycle-guarded version is future work).
-        if (summary.takes_ownership_of == null) {
-            var fc = FileCache.init(self.gpa, rm.tree);
-            defer fc.deinit();
-            fc.resolveTransitiveTakes() catch {};
-            if (fc.summaryByMethod(type_name, method_name) catch null) |ts| {
-                summary.takes_ownership_of = ts.takes_ownership_of;
-            }
+    fn summaryOfResolvedMethod(self: *FileCache, resolved: ResolvedMethod) !?fn_summary.FnSummary {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(resolved.tree, &buffer, resolved.fn_decl) orelse return null;
+        const body = tokens.bodyOf(resolved.tree, resolved.fn_decl) orelse return null;
+        if (resolved.tree == self.tree) return (try self.summaryOf(proto, body)).*;
+        const project = self.project orelse return null;
+        if (project.getMethodSummaryCache(resolved.tree, resolved.fn_decl)) |cached| {
+            return .{
+                .returns = cached.returns,
+                .takes_ownership_of = cached.takes,
+                .may_grow_collections = cached.may_grow,
+                .may_invoke_gc = cached.may_gc,
+                .may_run_on_any_thread = cached.may_thread,
+            };
         }
-        if (self.project) |pc| pc.putMethodSummaryCache(
-            type_name,
-            method_name,
-            .{
-                .found = true,
-                .takes = summary.takes_ownership_of,
-                .may_grow = summary.may_grow_collections,
-                .may_gc = summary.may_invoke_gc,
-                .may_thread = summary.may_run_on_any_thread,
-            },
-        );
-        return summary;
+        var foreign = FileCache.init(self.gpa, resolved.tree);
+        defer foreign.deinit();
+        try foreign.resolveTransitiveTakes();
+        const summary = try foreign.summaryOf(proto, body);
+        const result: fn_summary.FnSummary = .{
+            .returns = summary.returns,
+            .takes_ownership_of = summary.takes_ownership_of,
+            .may_grow_collections = summary.may_grow_collections,
+            .may_invoke_gc = summary.may_invoke_gc,
+            .may_run_on_any_thread = summary.may_run_on_any_thread,
+        };
+        try project.putMethodSummaryCache(resolved.tree, resolved.fn_decl, .{
+            .returns = result.returns,
+            .takes = result.takes_ownership_of,
+            .may_grow = result.may_grow_collections,
+            .may_gc = result.may_invoke_gc,
+            .may_thread = result.may_run_on_any_thread,
+        });
+        return result;
     }
 
     /// True iff any method on the file's type `type_name` has a
@@ -1078,22 +1083,14 @@ pub const FileCache = struct {
         end_tok: Ast.TokenIndex,
     ) !?[]const u8 {
         const zls = self.zls orelse return null;
-        const tree = self.tree;
-        // For any node: firstToken(n) <= main_token(n) <= lastToken(n).
-        // Filter candidates to main_token in [start_tok, end_tok] before
-        // calling the expensive firstToken/lastToken on each node.
-        const main_toks = tree.nodes.items(.main_token);
-        var idx: u32 = 1;
-        while (idx < tree.nodes.len) : (idx += 1) {
-            const mt = main_toks[idx];
-            if (mt < start_tok or mt > end_tok) continue;
-            const node: Ast.Node.Index = @enumFromInt(idx);
-            const ft = tree.firstToken(node);
-            const lt = tree.lastToken(node);
-            if (ft != start_tok or lt != end_tok) continue;
-            return zls.typeNameOfNode(node) catch null;
-        }
-        return null;
+        const node = self.nodeForExactSpan(start_tok, end_tok) orelse return null;
+        return zls.typeNameOfNode(node) catch null;
+    }
+
+    pub fn typeReferenceOfExpr(self: *FileCache, first: Ast.TokenIndex, last: Ast.TokenIndex) !?[]const u8 {
+        const resolver = self.zls orelse return null;
+        const node = self.nodeForExactSpan(first, last) orelse return null;
+        return resolver.typeReferenceOfNode(node);
     }
 
     /// Signedness + bit-width of the integer-typed expression spanning exactly
@@ -1105,6 +1102,25 @@ pub const FileCache = struct {
         end_tok: Ast.TokenIndex,
     ) ?zls_resolver_mod.TypeResolver.IntInfo {
         const zls = self.zls orelse return null;
+        const node = self.nodeForExactSpan(start_tok, end_tok) orelse return null;
+        return zls.intInfo(node) catch null;
+    }
+
+    pub fn isEnumTypeOfExpr(
+        self: *FileCache,
+        start_tok: Ast.TokenIndex,
+        end_tok: Ast.TokenIndex,
+    ) ?bool {
+        const zls = self.zls orelse return null;
+        const node = self.nodeForExactSpan(start_tok, end_tok) orelse return null;
+        return zls.isEnumType(node) catch null;
+    }
+
+    fn nodeForExactSpan(
+        self: *const FileCache,
+        start_tok: Ast.TokenIndex,
+        end_tok: Ast.TokenIndex,
+    ) ?Ast.Node.Index {
         const tree = self.tree;
         const main_toks = tree.nodes.items(.main_token);
         var idx: u32 = 1;
@@ -1112,8 +1128,8 @@ pub const FileCache = struct {
             const mt = main_toks[idx];
             if (mt < start_tok or mt > end_tok) continue;
             const node: Ast.Node.Index = @enumFromInt(idx);
-            if (tree.firstToken(node) != start_tok or tree.lastToken(node) != end_tok) continue;
-            return zls.intInfo(node) catch null;
+            if (tree.firstToken(node) == start_tok and tree.lastToken(node) == end_tok)
+                return node;
         }
         return null;
     }
@@ -1266,183 +1282,107 @@ pub const FileCache = struct {
 /// multi-segment "f.g.h", walks outer.f -> field-type-of-f, then
 /// Extract the bare container name from an AST type-expression node without
 /// invoking ZLS.  Strips leading `?`, `*`, `const` qualifiers, then walks
-/// a dotted identifier chain and returns the last component.
+/// a dotted identifier chain and retains its namespace.
 ///
-/// Examples: `*Foo` → "Foo", `?*const ns.Foo` → "Foo", `Foo` → "Foo".
+/// Examples: `*Foo` → "Foo", `?*const ns.Foo` → "ns.Foo".
 /// Returns null for slices (`[]T`), function pointers, anonymous structs,
 /// or any shape that doesn't reduce to a plain dotted identifier chain.
 fn typeNameFromTypeNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
-    const first = tree.firstToken(type_node);
-    const last = tree.lastToken(type_node);
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .asterisk, .keyword_const => continue,
-            .l_bracket => return null,
-            .identifier => break,
-            else => return null,
-        }
-    }
-    if (t > last) return null;
-    var last_name: ?[]const u8 = null;
-    var expecting_ident = true;
-    while (t <= last) : (t += 1) {
-        const tag = tags[t];
-        if (expecting_ident) {
-            if (tag == .identifier) {
-                last_name = tree.tokenSlice(t);
-                expecting_ident = false;
-            } else return null;
-        } else {
-            if (tag == .period) expecting_ident = true else break;
-        }
-    }
-    return last_name;
+    return tokens.typeNameFromTokens(tree, tree.firstToken(type_node), tree.lastToken(type_node));
 }
 
-/// that.g, then that.h, returning the leaf type.
-///
-/// Stops + returns null when any intermediate field's type isn't
-/// resolvable in the local model (cross-file intermediates that
-/// aren't loaded yet — uncommon, and the conservative answer is to
-/// drop the entry).
-fn walkFieldPath(
+
+
+const Namespace = struct {
     model: *const file_model.FileModel,
-    outer_type: []const u8,
-    path: []const u8,
-) ?file_model.FileModel.FieldTypePath {
-    var it = std.mem.splitScalar(u8, path, '.');
-    var cur_outer: []const u8 = outer_type;
-    var last_result: ?file_model.FileModel.FieldTypePath = null;
-    while (it.next()) |segment| {
-        const ftp = model.fieldTypePath(cur_outer, segment) orelse return null;
-        last_result = ftp;
-        // For the next iteration we need a bare type name — if this
-        // segment's type was `<ns>.<Type>` we'd need to load the
-        // remote file to walk further.  We don't have a remote
-        // pointer here; conservative: stop and return null if there
-        // are more segments to walk.
-        if (it.peek() == null) break;
-        if (ftp.ns != null) return null;
-        cur_outer = ftp.type_name;
-    }
-    return last_result;
-}
+    info: ?*const file_model.TypeInfo = null,
+};
 
-/// Walk every `@import("./...")` builtin call in `tree` and try
-/// finding `name` in the target file's model.  Recurses up to
-/// `depth_left` more hops to follow re-export aliases (`pub const
-/// Tag = @import("./Tag.zig").Tag;` is a common 2-hop pattern in
-/// Bun's protocol modules).
-///
-/// Depth-bounded to prevent diamond-load cycles on highly
-/// interconnected projects.  Returns the FIRST hit across imports
-/// at that depth; ambiguity (same name in multiple imports) is
-/// fine for the rule's purposes (which only needs "has this
-/// method on this type" — re-exports of the SAME type produce
-/// the same answer).
-/// Walk every `@import("./...")` builtin call in `tree` and try
-/// finding `name` in the target file's model.  Recurses up to
-/// `depth_left` more hops to follow re-export aliases.
-///
-/// The recursive call uses `@fieldParentPtr` to recover the
-/// ProjectCache.Entry from the sub-model pointer — zero cost,
-/// no path-resolution allocation, no extra lock acquisition.
-fn findTypeViaImports(
-    pc: *project_cache_mod.ProjectCache,
-    tree: *const Ast,
+fn resolveNamed(
+    gpa: std.mem.Allocator,
+    project: ?*project_cache_mod.ProjectCache,
+    model: *const file_model.FileModel,
     from_path: []const u8,
     name: []const u8,
-    depth_left: u32,
-) ?*const file_model.TypeInfo {
-    if (depth_left == 0) return null;
-    const tags = tree.tokens.items(.tag);
-    var idx: u32 = 1;
-    while (idx < tree.nodes.len) : (idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(idx);
-        switch (tree.nodeTag(node)) {
-            .builtin_call,
-            .builtin_call_two,
-            .builtin_call_comma,
-            .builtin_call_two_comma,
-            => {},
-            else => continue,
-        }
-        const main = tree.nodeMainToken(node);
-        if (main >= tree.tokens.len) continue;
-        if (tags[main] != .builtin) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
-        if (main + 2 >= tree.tokens.len) continue;
-        if (tags[main + 2] != .string_literal) continue;
-        const lit = tree.tokenSlice(main + 2);
-        if (lit.len < 2) continue;
-        const import_str = lit[1 .. lit.len - 1];
-        const sub_model_opt: ?*const file_model.FileModel = blk: {
-            if (project_cache_mod.isRelativeImport(import_str)) {
-                break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
-            }
-            break :blk pc.modelForModuleImport(from_path, import_str) catch null;
-        };
-        const sub_model = sub_model_opt orelse continue;
-        if (sub_model.findType(name)) |ti| return ti;
-        // Recover the Entry via fieldParentPtr (zero cost, no alloc, no lock).
-        // sub_entry.abs_path is the resolved next_from for the recursive hop.
-        const sub_entry: *const project_cache_mod.ProjectCache.Entry =
-            @fieldParentPtr("model", sub_model);
-        if (findTypeViaImports(pc, &sub_entry.tree, sub_entry.abs_path, name, depth_left - 1)) |ti| return ti;
+    depth: u32,
+) ?Namespace {
+    if (depth == 0) {
+        if (project) |pc| pc.failure = error.ImportResolutionDepthExceeded;
+        return null;
+    }
+    var path: [32][]const u8 = undefined;
+    var segments = std.mem.splitScalar(u8, name, '.');
+    var count: usize = 0;
+    while (segments.next()) |segment| {
+        if (count == path.len) return null;
+        path[count] = std.mem.trim(u8, segment, &std.ascii.whitespace);
+        count += 1;
+    }
+    if (model.findQualifiedType(path[0..count])) |info| {
+        if (count != 1 or info.parent == null) return .{ .model = model, .info = info };
+    }
+    const first_dot = std.mem.indexOfScalar(u8, name, '.');
+    const head = if (first_dot) |dot| name[0..dot] else name;
+    const suffix = if (first_dot) |dot| name[dot + 1 ..] else "";
+    for (model.tree.rootDecls()) |node| {
+        const decl = model.tree.fullVarDecl(node) orelse continue;
+        if (!std.mem.eql(u8, model.tree.tokenSlice(decl.ast.mut_token + 1), std.mem.trim(u8, head, &std.ascii.whitespace))) continue;
+        const initializer = decl.ast.init_node.unwrap() orelse return null;
+        return resolveExpression(gpa, project, model, from_path, initializer, suffix, depth - 1);
     }
     return null;
 }
 
-fn findMethodViaImports(
-    pc: *project_cache_mod.ProjectCache,
-    tree: *const Ast,
+fn resolveExpression(
+    gpa: std.mem.Allocator,
+    project: ?*project_cache_mod.ProjectCache,
+    model: *const file_model.FileModel,
     from_path: []const u8,
-    type_name: []const u8,
-    method_name: []const u8,
-    depth_left: u32,
-) ?FileCache.ResolvedMethod {
-    if (depth_left == 0) return null;
-    const tags = tree.tokens.items(.tag);
-    var idx: u32 = 1;
-    while (idx < tree.nodes.len) : (idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(idx);
-        switch (tree.nodeTag(node)) {
-            .builtin_call,
-            .builtin_call_two,
-            .builtin_call_comma,
-            .builtin_call_two_comma,
-            => {},
-            else => continue,
-        }
-        const main = tree.nodeMainToken(node);
-        if (main >= tree.tokens.len) continue;
-        if (tags[main] != .builtin) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
-        if (main + 2 >= tree.tokens.len) continue;
-        if (tags[main + 2] != .string_literal) continue;
-        const lit = tree.tokenSlice(main + 2);
-        if (lit.len < 2) continue;
-        const import_str = lit[1 .. lit.len - 1];
-        const sub_model_opt: ?*const file_model.FileModel = blk: {
-            if (project_cache_mod.isRelativeImport(import_str)) {
-                break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
-            }
-            break :blk pc.modelForModuleImport(from_path, import_str) catch null;
-        };
-        const sub_model = sub_model_opt orelse continue;
-        if (sub_model.findType(type_name)) |ti| {
-            if (ti.findMethod(method_name)) |m| return .{ .tree = sub_model.tree, .method = m };
-        }
-        // Recover the Entry via fieldParentPtr — no alloc, no lock, no path resolution.
-        const sub_entry: *const project_cache_mod.ProjectCache.Entry =
-            @fieldParentPtr("model", sub_model);
-        if (findMethodViaImports(pc, &sub_entry.tree, sub_entry.abs_path, type_name, method_name, depth_left - 1)) |rm| return rm;
+    node: Ast.Node.Index,
+    suffix: []const u8,
+    depth: u32,
+) ?Namespace {
+    if (depth == 0) {
+        if (project) |pc| pc.failure = error.ImportResolutionDepthExceeded;
+        return null;
     }
-    return null;
+    const tree = model.tree;
+    switch (tree.nodeTag(node)) {
+        .identifier, .field_access => {
+            const field = tree.nodeTag(node) == .field_access;
+            const token = if (field) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
+            const segment = tree.tokenSlice(token);
+            const name = if (suffix.len != 0) std.fmt.allocPrint(gpa, "{s}.{s}", .{ segment, suffix }) catch return null else segment;
+            defer if (suffix.len != 0) gpa.free(name);
+            if (field) return resolveExpression(gpa, project, model, from_path, tree.nodeData(node).node_and_token[0], name, depth - 1);
+            return resolveNamed(gpa, project, model, from_path, name, depth - 1);
+        },
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+            const pc = project orelse return null;
+            const token = tree.nodeMainToken(node);
+            if (!std.mem.eql(u8, tree.tokenSlice(token), "@import")) return null;
+            if (tree.tokens.items(.tag)[token + 2] != .string_literal) return null;
+            const literal = tree.tokenSlice(token + 2);
+            if (std.mem.indexOfScalar(u8, literal, '\\') != null) return null;
+            const import_path = literal[1 .. literal.len - 1];
+            const imported = (if (project_cache_mod.isRelativeImport(import_path))
+                pc.modelForRelativeImport(from_path, import_path)
+            else pc.modelForModuleImport(from_path, import_path)) catch |err| {
+                pc.failure = err;
+                return null;
+            };
+            const target = imported orelse return null;
+            if (suffix.len == 0) {
+                for (target.types) |*info| {
+                    if (info.body_first == 0) return .{ .model = target, .info = info };
+                }
+                return .{ .model = target };
+            }
+            return resolveNamed(gpa, pc, target, pc.pathForModel(target), suffix, depth - 1);
+        },
+        else => return null,
+    }
 }
-
 
 // ── Tests ──────────────────────────────────────────────────
 
@@ -1634,7 +1574,7 @@ test "FileCache: summaryByMethodCrossFile finds direct takes in imported file" {
 
     // Build consumer's path string.
     const from_path = try std.fs.path.join(gpa, &.{
-        ".zig-cache", "tmp", "consumer.zig",
+        ".zig-cache", "tmp", &tmp.sub_path, "consumer.zig",
     });
     defer gpa.free(from_path);
 
@@ -1645,21 +1585,17 @@ test "FileCache: summaryByMethodCrossFile finds direct takes in imported file" {
     var consumer_tree = try Ast.parse(gpa, consumer_src, .zig);
     defer consumer_tree.deinit(gpa);
 
-    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    const project_root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(project_root);
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio, .{ .roots = &.{project_root} });
     defer pc.deinit();
 
     var cache = FileCache.init(gpa, &consumer_tree);
     defer cache.deinit();
     cache.setProject(&pc, from_path);
 
-    // Cross-file lookup: `Node` is in destroyer.zig, not consumer.zig.
-    const xf = try cache.summaryByMethodCrossFile("Node", "kill");
-    if (xf) |s| {
-        // inferDirectTakes should see `gpa.destroy(self)` → takes_ownership_of = 0.
-        try std.testing.expectEqual(@as(?u32, 0), s.takes_ownership_of);
-    }
-    // If xf is null the tmp-dir path didn't resolve — acceptable on CI
-    // where tmp paths may not be discoverable; the lookup code is exercised.
+    const summary = (try cache.summaryByMethodCrossFile("destroyer.Node", "kill")).?;
+    try std.testing.expectEqual(@as(?u32, 0), summary.takes_ownership_of);
 }
 
 test "FileCache: resolveTransitiveTakes propagates through cross-file callee" {
@@ -1693,7 +1629,7 @@ test "FileCache: resolveTransitiveTakes propagates through cross-file callee" {
     });
 
     const from_path = try std.fs.path.join(gpa, &.{
-        ".zig-cache", "tmp", "wrapper.zig",
+        ".zig-cache", "tmp", &tmp.sub_path, "wrapper.zig",
     });
     defer gpa.free(from_path);
 
@@ -1706,7 +1642,9 @@ test "FileCache: resolveTransitiveTakes propagates through cross-file callee" {
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
 
-    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    const project_root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(project_root);
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio, .{ .roots = &.{project_root} });
     defer pc.deinit();
 
     var cache = FileCache.init(gpa, &tree);
@@ -1718,39 +1656,10 @@ test "FileCache: resolveTransitiveTakes propagates through cross-file callee" {
     // `wrapper` calls `node.kill(gpa)` where `kill` takes ownership of
     // its receiver (param 0).  After transitive propagation, `wrapper`
     // should also have takes_ownership_of = 0 (its first param `node`).
-    const s = try cache.summaryByName("wrapper");
-    if (s) |ws| {
-        // If cross-file lookup succeeded, takes_ownership_of is 0.
-        // If tmp paths didn't resolve, ws.takes_ownership_of is null —
-        // still a valid test: we're verifying no crash or wrong result.
-        if (ws.takes_ownership_of) |idx| {
-            try std.testing.expectEqual(@as(u32, 0), idx);
-        }
-    }
+    const summary = (try cache.summaryByName("wrapper")).?;
+    try std.testing.expectEqual(@as(?u32, 0), summary.takes_ownership_of);
 }
 
-test "FileCache: may_free_fields keeps same-file field deinit (refactor regression)" {
-    const gpa = std.testing.allocator;
-    const src: [:0]const u8 =
-        \\const Inner = struct {
-        \\    pub fn deinit(self: *Inner) void { _ = self; }
-        \\};
-        \\const Outer = struct {
-        \\    inner: Inner,
-        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
-        \\};
-    ;
-    var tree = try Ast.parse(gpa, src, .zig);
-    defer tree.deinit(gpa);
-    var cache = FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try cache.resolveTransitiveTakes();
-
-    // `self.inner.deinit()` — Inner.deinit is cleanup-named → field kept.
-    const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
-    try std.testing.expect(s.may_free_fields.len >= 1);
-    try std.testing.expectEqualStrings("inner", s.may_free_fields[0].field);
-}
 
 test "FileCache: may_free_fields drops field whose type lacks the method" {
     const gpa = std.testing.allocator;
@@ -1772,67 +1681,6 @@ test "FileCache: may_free_fields drops field whose type lacks the method" {
     try std.testing.expectEqual(@as(usize, 0), s.may_free_fields.len);
 }
 
-test "FileCache: may_free_fields resolves CROSS-FILE field deinit (#20)" {
-    // The composed-owner shape `self.inner.deinit()` where `inner`'s type
-    // lives in an @import'd file.  Before #20 the field was unconditionally
-    // dropped at the file boundary; now filterMayFreeFields resolves the
-    // cleanup method cross-file via summaryByMethodCrossFile.
-    const gpa = std.testing.allocator;
-    const tio = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(tio, .{
-        .sub_path = "inner.zig",
-        .data =
-        \\pub const Inner = struct {
-        \\    pub fn deinit(self: *Inner) void { _ = self; }
-        \\};
-        ,
-    });
-    try tmp.dir.writeFile(tio, .{
-        .sub_path = "outer.zig",
-        .data =
-        \\const innermod = @import("./inner.zig");
-        \\pub const Outer = struct {
-        \\    inner: innermod.Inner,
-        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
-        \\};
-        ,
-    });
-
-    // Use the REAL tmp sub-path so @import resolution actually finds
-    // inner.zig (the random subdir under .zig-cache/tmp/).
-    const from_path = try std.fs.path.join(gpa, &.{
-        ".zig-cache", "tmp", &tmp.sub_path, "outer.zig",
-    });
-    defer gpa.free(from_path);
-
-    const outer_src: [:0]const u8 =
-        \\const innermod = @import("./inner.zig");
-        \\pub const Outer = struct {
-        \\    inner: innermod.Inner,
-        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
-        \\};
-    ;
-    var tree = try Ast.parse(gpa, outer_src, .zig);
-    defer tree.deinit(gpa);
-
-    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
-    defer pc.deinit();
-    var cache = FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    cache.setProject(&pc, from_path);
-
-    try cache.resolveTransitiveTakes();
-
-    // Deterministic: the @import-fallback-on-index-miss fix resolves the
-    // tmp file even though it sits outside the project walk's global index.
-    // The cross-file field-free must be KEPT.
-    const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
-    try std.testing.expect(s.may_free_fields.len >= 1);
-    try std.testing.expectEqualStrings("inner", s.may_free_fields[0].field);
-}
 
 test "FileCache: summaryByMethodCrossFile resolves TRANSITIVE takes in foreign file (#20)" {
     // `kill` doesn't free directly — it DELEGATES to a same-file
@@ -1877,18 +1725,15 @@ test "FileCache: summaryByMethodCrossFile resolves TRANSITIVE takes in foreign f
     var tree = try Ast.parse(gpa, consumer_src, .zig);
     defer tree.deinit(gpa);
 
-    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    const project_root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(project_root);
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio, .{ .roots = &.{project_root} });
     defer pc.deinit();
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
     cache.setProject(&pc, from_path);
 
-    // Deterministic since the @import-fallback-on-index-miss fix:
-    // findMethodCrossFile now falls through to the @import traversal when
-    // the global index has no match (the tmp file is outside the project
-    // walk), so this resolves reliably.  `kill`'s takes_ownership_of must be
-    // 0 — inherited transitively from `reallyFree` inside the foreign file.
-    const s = (try cache.summaryByMethodCrossFile("Xf20Node", "kill")) orelse
+    const s = (try cache.summaryByMethodCrossFile("destroyer.Xf20Node", "kill")) orelse
         return error.CrossFileResolutionFailed;
     try std.testing.expectEqual(@as(?u32, 0), s.takes_ownership_of);
 }
@@ -1976,7 +1821,9 @@ test "effect: may_grow propagates across @import via method call (#20)" {
     ;
     var tree = try Ast.parse(gpa, caller_src, .zig);
     defer tree.deinit(gpa);
-    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    const project_root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(project_root);
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio, .{ .roots = &.{project_root} });
     defer pc.deinit();
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1986,4 +1833,87 @@ test "effect: may_grow propagates across @import via method call (#20)" {
     // collection in the imported file, so `run` inherits may_grow.
     const s = (try cache.summaryByName("run")).?;
     try std.testing.expect(s.may_grow_collections);
+}
+
+test "qualified imports distinguish identical type and method names" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "owner.zig", .data =
+        \\pub const Node = struct {
+        \\    pub fn kill(self: *Node, allocator: anytype) void { allocator.destroy(self); }
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "borrower.zig", .data =
+        \\pub const Node = struct {
+        \\    pub fn kill(self: *Node, allocator: anytype) void { _ = self; _ = allocator; }
+        \\};
+    });
+    const src: [:0]const u8 =
+        \\const owned = @import("owner.zig");
+        \\const borrowed = @import("borrower.zig");
+    ;
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
+    defer project.deinit();
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    cache.setProject(&project, path);
+    const owner = (try cache.summaryByMethodCrossFile("owned.Node", "kill")) orelse
+        return error.TestUnexpectedResult;
+    const borrower = (try cache.summaryByMethodCrossFile("borrowed.Node", "kill")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 0), owner.takes_ownership_of);
+    try std.testing.expectEqual(@as(?u32, null), borrower.takes_ownership_of);
+    try std.testing.expect((try cache.summaryByMethodCrossFile("Node", "kill")) == null);
+}
+
+test "qualified fields retain the defining model through imported wrappers" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "leaf.zig", .data =
+        \\pub const Space = struct {
+        \\    pub const Item = struct {
+        \\        bytes: []const u8,
+        \\        pub fn view(self: *const Item) []const u8 { return self.bytes; }
+        \\        pub fn kill(self: *Item, allocator: anytype) void { allocator.destroy(self); }
+        \\    };
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "holder.zig", .data =
+        \\const Self = @This();
+        \\const leaf = @import("leaf.zig");
+        \\item: ?*leaf.Space.Item,
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var tree = try Ast.parse(gpa,
+        \\const Holder = @import("holder.zig");
+        \\const Item = struct { pub fn kill(self: *Item, allocator: anytype) void { _ = self; _ = allocator; } };
+    , .zig);
+    defer tree.deinit(gpa);
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
+    defer project.deinit();
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    cache.setProject(&project, path);
+    const holder = cache.findTypeAcrossImports("Holder").?;
+    const item = cache.fieldType(holder, "item").?;
+    try std.testing.expectEqual(@as(?u32, 0), (try cache.summaryForType(item, "kill")).?.takes_ownership_of);
+    for (0..2) |_| {
+        const summary = (try cache.summaryForType(item, "view")).?;
+        try std.testing.expect(summary.returns == .borrowed_from);
+        try std.testing.expectEqual(@as(u32, 0), summary.returns.borrowed_from);
+    }
+    try std.testing.expectEqual(@as(?u32, null), (try cache.summaryByMethod("Item", "kill")).?.takes_ownership_of);
 }

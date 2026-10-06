@@ -17,6 +17,11 @@ const DocumentStore = @This();
 
 io: std.Io,
 allocator: std.mem.Allocator,
+source_policy: @import("source_policy.zig").SourcePolicy = .{},
+canonical_paths: @import("source_policy.zig").CanonicalPaths = .{},
+source_aliases: Uri.ArrayHashMap(Uri) = .empty,
+source_failure: ?anyerror = null,
+parse_failure: ?@import("source_policy.zig").ParseFailure = null,
 /// the DocumentStore assumes that `config` is not modified while calling one of its functions.
 config: Config,
 mutex: std.Io.Mutex = .init,
@@ -203,7 +208,7 @@ pub const Handle = struct {
                 /// to avoid checking build files multiple times, a bitset stores whether or
                 /// not the build file should be skipped because it has previously been
                 /// found to be "unassociated" with the handle.
-                has_been_checked: std.bit_set.Dynamic,
+                has_been_checked: std.DynamicBitSetUnmanaged,
             },
             /// The Handle has no associated build file (build.zig).
             none,
@@ -246,7 +251,7 @@ pub const Handle = struct {
                     return .none;
                 }
 
-                var has_been_checked: std.bit_set.Dynamic = try .initEmpty(document_store.allocator, potential_build_files.len);
+                var has_been_checked: std.DynamicBitSetUnmanaged = try .initEmpty(document_store.allocator, potential_build_files.len);
                 errdefer has_been_checked.deinit(document_store.allocator);
 
                 self.impl.associated_build_file = .{ .unresolved = .{
@@ -344,7 +349,7 @@ pub const Handle = struct {
 
         const modules = &build_config.modules.map;
 
-        var visted: std.bit_set.Dynamic = try .initEmpty(allocator, modules.count());
+        var visted: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, modules.count());
         defer visted.deinit(allocator);
 
         var queue: std.ArrayList(usize) = try .initCapacity(allocator, 1);
@@ -650,6 +655,9 @@ pub fn deinit(self: *DocumentStore) void {
         self.allocator.destroy(future);
     }
     self.handles.deinit(self.allocator);
+    for (self.source_aliases.keys()) |uri| uri.deinit(self.allocator);
+    self.source_aliases.deinit(self.allocator);
+    self.canonical_paths.deinit(self.allocator);
 
     if (supports_build_system) {
         for (self.build_files.values()) |build_file| {
@@ -669,12 +677,25 @@ pub fn getHandle(self: *DocumentStore, uri: Uri) ?*Handle {
     const future = future: {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        break :future self.handles.get(uri) orelse return null;
+        break :future self.handles.get(self.source_aliases.get(uri) orelse uri) orelse return null;
     };
-    return future.await(self.io) catch return null;
+    const handle = future.await(self.io) catch |err| {
+        if (err != error.SourceExcluded) {
+            self.source_failure = err;
+            self.parse_failure = null;
+        }
+        return null;
+    };
+    if (handle.tree.errors.len != 0) {
+        self.source_failure = error.ImportInvalidSyntax;
+        self.parse_failure = .fromTree(handle.uri.raw, &handle.tree);
+        return null;
+    }
+    return handle;
 }
 
-const ReadFileError = std.mem.Allocator.Error || std.Io.Cancelable || std.Io.File.OpenError || std.Io.File.Reader.Error || error{StreamTooLong};
+const ReadFileError = std.mem.Allocator.Error || std.Io.Cancelable || std.Io.File.OpenError ||
+    std.Io.File.Reader.Error || std.Io.Dir.RealPathFileError || error{ StreamTooLong, SourceExcluded };
 
 /// Must satisfy `uri.isFileScheme()`.
 fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
@@ -686,6 +707,9 @@ fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer self.allocator.free(file_path);
+    if (!self.allowsSource(file_path)) return error.SourceExcluded;
+    const canonical = try self.canonical_paths.resolve(self.allocator, self.io, file_path);
+    if (!self.allowsSource(canonical)) return error.SourceExcluded;
 
     const dir, const sub_path = blk: {
         if (builtin.target.cpu.arch.isWasm() and !builtin.link_libc) {
@@ -693,23 +717,64 @@ fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
                 const preopen_dir: std.Io.Dir = .{ .handle = @intCast(i) };
                 const preopen_path = std.mem.trimEnd(u8, name, "/");
 
-                if (!std.mem.startsWith(u8, file_path, preopen_path)) continue;
-                if (!std.mem.startsWith(u8, file_path[preopen_path.len..], "/")) continue;
+                if (!std.mem.startsWith(u8, canonical, preopen_path)) continue;
+                if (!std.mem.startsWith(u8, canonical[preopen_path.len..], "/")) continue;
 
-                break :blk .{ preopen_dir, std.mem.trimStart(u8, file_path[preopen_path.len..], "/") };
+                break :blk .{ preopen_dir, std.mem.trimStart(u8, canonical[preopen_path.len..], "/") };
             }
         }
-        break :blk .{ std.Io.Dir.cwd(), file_path };
+        break :blk .{ std.Io.Dir.cwd(), canonical };
     };
 
     return try dir.readFileAllocOptions(
         self.io,
         sub_path,
         self.allocator,
-        .limited(std.zig.max_src_size),
+        .limited(@import("source_policy.zig").SourcePolicy.max_source_bytes),
         .of(u8),
         0,
     );
+}
+
+fn allowsSource(self: *const DocumentStore, path: []const u8) bool {
+    if (self.source_policy.allowsAbsolutePath(path)) return true;
+    const zig_lib = self.config.zig_lib_dir orelse return false;
+    const root = zig_lib.path orelse return false;
+    return @import("source_policy.zig").within(root, path);
+}
+
+fn canonicalUri(self: *DocumentStore, uri: Uri) ReadFileError!Uri {
+    const path = uri.toFsPath(self.allocator) catch |err| switch (err) {
+        error.UnsupportedScheme => unreachable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer self.allocator.free(path);
+    if (!self.allowsSource(path)) return error.SourceExcluded;
+    const canonical = try self.canonical_paths.resolve(self.allocator, self.io, path);
+    if (!self.allowsSource(canonical)) return error.SourceExcluded;
+    return Uri.fromPath(self.allocator, canonical);
+}
+
+fn rememberSourceAlias(self: *DocumentStore, uri: Uri, canonical: Uri) !void {
+    if (std.mem.eql(u8, uri.raw, canonical.raw)) return;
+    try self.mutex.lock(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.source_aliases.contains(uri)) return;
+    const key = try uri.dupe(self.allocator);
+    errdefer key.deinit(self.allocator);
+    try self.source_aliases.putNoClobber(self.allocator, key, canonical);
+}
+
+fn loadFailed(self: *DocumentStore, err: ReadFileError) error{ Canceled, OutOfMemory }!?*Handle {
+    switch (err) {
+        error.Canceled, error.OutOfMemory => |e| return e,
+        error.SourceExcluded => return null,
+        else => {
+            self.source_failure = err;
+            self.parse_failure = null;
+            return null;
+        },
+    }
 }
 
 /// Returns a handle to the given document
@@ -721,18 +786,31 @@ pub fn getOrLoadHandle(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMem
     defer tracy_zone.end();
 
     if (!uri.isFileScheme()) return self.getHandle(uri);
-    return self.createAndStoreDocument(
-        uri,
+    const known_uri, const cached = known: {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        const known = self.source_aliases.get(uri) orelse uri;
+        break :known .{ known, self.handles.contains(known) };
+    };
+    const canonical: ?Uri = if (cached) null else
+        self.canonicalUri(known_uri) catch |err| return self.loadFailed(err);
+    defer if (canonical) |value| value.deinit(self.allocator);
+    const handle = self.createAndStoreDocument(
+        canonical orelse known_uri,
         .uri,
         .{
             .lsp_synced = false,
             .override = false,
             .load_build_file_behaviour = .never,
         },
-    ) catch |err| switch (err) {
-        error.Canceled, error.OutOfMemory => |e| return e,
-        else => return null,
-    };
+    ) catch |err| return self.loadFailed(err);
+    try self.rememberSourceAlias(uri, handle.uri);
+    if (handle.tree.errors.len != 0) {
+        self.source_failure = error.ImportInvalidSyntax;
+        self.parse_failure = .fromTree(handle.uri.raw, &handle.tree);
+        return null;
+    }
+    return handle;
 }
 
 /// **Thread safe** takes a shared lock
@@ -1172,6 +1250,7 @@ fn collectPotentialBuildFiles(self: *DocumentStore, uri: Uri) error{ Canceled, O
             did_check_root = true;
             break :blk it.root();
         } orelse break;
+        if (!self.source_policy.allowsAbsolutePath(dir_path)) break;
         if (!try buildDotZigExists(self.io, dir_path)) continue;
 
         const build_path = try std.Io.Dir.path.join(self.allocator, &.{ dir_path, "build.zig" });
@@ -1326,7 +1405,7 @@ fn createAndStoreDocument(
     const text: [:0]const u8 = switch (file_source) {
         .text => |text| text,
         .uri => store.readFile(uri) catch |err| {
-            const should_log = err != error.Canceled and err != error.FileNotFound;
+            const should_log = err != error.Canceled and err != error.FileNotFound and err != error.SourceExcluded;
             if (should_log) log.err("failed to read document '{s}': {}", .{ uri.raw, err });
             handle_future.handle = undefined;
             handle_future.err = err;

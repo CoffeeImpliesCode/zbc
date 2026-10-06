@@ -42,6 +42,7 @@ fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
     errdefer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {

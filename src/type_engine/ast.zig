@@ -9,8 +9,8 @@ const Node = Ast.Node;
 const full = Ast.full;
 
 fn fullPtrTypeComponents(tree: *const Ast, info: full.PtrType.Components) full.PtrType {
-    const size: std.lang.Type.Pointer.Size = switch (tree.tokenTag(info.main_token)) {
-        .asterisk => .one,
+    const size: std.builtin.Type.Pointer.Size = switch (tree.tokenTag(info.main_token)) {
+        .asterisk, .asterisk_asterisk => .one,
         .l_bracket => switch (tree.tokenTag(info.main_token + 1)) {
             .asterisk => if (tree.tokenTag(info.main_token + 2) == .identifier) .c else .many,
             else => .slice,
@@ -466,6 +466,7 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) Ast.TokenIndex {
         .add,
         .sub,
         .array_cat,
+        .array_mult,
         .add_wrap,
         .sub_wrap,
         .add_sat,
@@ -489,7 +490,8 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) Ast.TokenIndex {
         => n = tree.nodeData(n).node_and_node[1],
 
         .test_decl => n = tree.nodeData(n).opt_token_and_node[1],
-        .@"errdefer", .@"defer" => n = tree.nodeData(n).node,
+        .@"errdefer" => n = tree.nodeData(n).opt_token_and_node[1],
+        .@"defer" => n = tree.nodeData(n).node,
         .anyframe_type => n = tree.nodeData(n).token_and_node[1],
 
         .switch_case_one,
@@ -1085,10 +1087,10 @@ pub const Iterator = union(enum) {
             .@"resume",
             .@"comptime",
             .@"nosuspend",
-            .@"errdefer",
             .@"defer",
             => return .initArray(.{tree.nodeData(node).node}),
             .@"return" => return .initArray(.{tree.nodeData(node).opt_node}),
+            .@"errdefer" => return .initArray(.{tree.nodeData(node).opt_token_and_node[1]}),
 
             .@"catch",
             .equal_equal,
@@ -1124,6 +1126,7 @@ pub const Iterator = union(enum) {
             .add,
             .sub,
             .array_cat,
+            .array_mult,
             .add_wrap,
             .sub_wrap,
             .add_sat,

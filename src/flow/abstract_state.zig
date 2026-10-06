@@ -131,6 +131,9 @@ pub const ArenaState = struct {
 // ── AbstractState ──────────────────────────────────────────
 
 pub const AbstractState = struct {
+    feasible: bool = true,
+    booleans: std.AutoArrayHashMapUnmanaged(LocalId, bool) = .empty,
+
     /// Per-local origin tracking.
     locals: std.AutoArrayHashMapUnmanaged(LocalId, Origin) = .empty,
 
@@ -156,6 +159,7 @@ pub const AbstractState = struct {
     out_param_writes: std.AutoArrayHashMapUnmanaged(LocalId, HeapId) = .empty,
 
     pub fn deinit(self: *AbstractState, gpa: std.mem.Allocator) void {
+        self.booleans.deinit(gpa);
         self.locals.deinit(gpa);
         self.arenas.deinit(gpa);
         self.heaps.deinit(gpa);
@@ -165,6 +169,7 @@ pub const AbstractState = struct {
 
     pub fn clone(self: *const AbstractState, gpa: std.mem.Allocator) !AbstractState {
         var out: AbstractState = .{};
+        errdefer out.deinit(gpa);
         try out.cloneFrom(self, gpa);
         return out;
     }
@@ -173,6 +178,12 @@ pub const AbstractState = struct {
     /// Maps are cleared then refilled; if capacity is already
     /// sufficient, no allocator call is made for that map.
     pub fn cloneFrom(self: *AbstractState, src: *const AbstractState, gpa: std.mem.Allocator) !void {
+        self.feasible = src.feasible;
+        self.booleans.clearRetainingCapacity();
+        try self.booleans.ensureTotalCapacity(gpa, src.booleans.count());
+        for (src.booleans.keys(), src.booleans.values()) |key, value| {
+            self.booleans.putAssumeCapacity(key, value);
+        }
         self.locals.clearRetainingCapacity();
         try self.locals.ensureTotalCapacity(gpa, src.locals.count());
         for (src.locals.keys(), src.locals.values()) |k, v| {
@@ -198,6 +209,50 @@ pub const AbstractState = struct {
         for (src.out_param_writes.keys(), src.out_param_writes.values()) |k, v| {
             self.out_param_writes.putAssumeCapacity(k, v);
         }
+    }
+
+    /// Join path predicates only when their union is exact, or the predicates
+    /// are identical. Distinct resource histories then remain correlated.
+    pub fn canMerge(self: *const AbstractState, other: *const AbstractState) bool {
+        var different: usize = 0;
+        var only_self: usize = 0;
+        var only_other: usize = 0;
+        for (self.booleans.keys(), self.booleans.values()) |key, value| {
+            if (other.booleans.get(key)) |other_value| {
+                if (value != other_value) different += 1;
+            } else only_self += 1;
+        }
+        for (other.booleans.keys()) |key| {
+            if (!self.booleans.contains(key)) only_other += 1;
+        }
+        if (different == 0 and only_self == 0 and only_other == 0) return true;
+        if (!self.sameResources(other)) return false;
+        return (different == 0 and (only_self == 0 or only_other == 0)) or
+            (different == 1 and only_self == 0 and only_other == 0);
+    }
+
+    fn sameResources(self: *const AbstractState, other: *const AbstractState) bool {
+        if (self.locals.count() != other.locals.count() or
+            self.arenas.count() != other.arenas.count() or
+            self.heaps.count() != other.heaps.count() or
+            self.fields.count() != other.fields.count() or
+            self.out_param_writes.count() != other.out_param_writes.count()) return false;
+        for (self.locals.keys(), self.locals.values()) |key, value| {
+            if (!value.eql(other.locals.get(key) orelse return false)) return false;
+        }
+        for (self.arenas.keys(), self.arenas.values()) |key, value| {
+            if (!std.meta.eql(value, other.arenas.get(key) orelse return false)) return false;
+        }
+        for (self.heaps.keys(), self.heaps.values()) |key, value| {
+            if (!std.meta.eql(value, other.heaps.get(key) orelse return false)) return false;
+        }
+        for (self.fields.keys(), self.fields.values()) |key, value| {
+            if (!value.eql(other.fields.get(key) orelse return false)) return false;
+        }
+        for (self.out_param_writes.keys(), self.out_param_writes.values()) |key, value| {
+            if (value != (other.out_param_writes.get(key) orelse return false)) return false;
+        }
+        return true;
     }
 };
 
@@ -228,6 +283,16 @@ pub fn join(
     gpa: std.mem.Allocator,
 ) !JoinResult {
     var changed = false;
+    std.debug.assert(self.feasible);
+    std.debug.assert(other.feasible);
+    var boolean_index: usize = 0;
+    while (boolean_index < self.booleans.count()) {
+        const key = self.booleans.keys()[boolean_index];
+        if (other.booleans.get(key) != self.booleans.values()[boolean_index]) {
+            self.booleans.swapRemoveAt(boolean_index);
+            changed = true;
+        } else boolean_index += 1;
+    }
 
     for (other.locals.keys(), other.locals.values()) |local, other_val| {
         const gop = try self.locals.getOrPut(gpa, local);
@@ -236,7 +301,7 @@ pub fn join(
             changed = true;
             continue;
         }
-        if (!gop.value_ptr.eql(other_val)) {
+        if (gop.value_ptr.* != .plain and !gop.value_ptr.eql(other_val)) {
             gop.value_ptr.* = .plain;
             changed = true;
         }
@@ -275,7 +340,7 @@ pub fn join(
             changed = true;
             continue;
         }
-        if (!gop.value_ptr.eql(other_val)) {
+        if (gop.value_ptr.* != .plain and !gop.value_ptr.eql(other_val)) {
             gop.value_ptr.* = .plain;
             changed = true;
         }

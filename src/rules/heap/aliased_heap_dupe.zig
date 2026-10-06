@@ -66,8 +66,8 @@ fn checkFn(
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = fnProto(tree, &buf, fn_decl) orelse return;
     const return_type = fn_proto.ast.return_type.unwrap() orelse return;
-    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
-    const T = stripReturnType(tree, return_type, self_type) orelse return;
+    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.qualified_name else null;
+    const T = stripReturnType(tree, model, return_type, self_type) orelse return;
 
     // Collect flag-owned field names on T via inference (any field
     // `X` with a sibling `X_allocated: bool`).  No entries → nothing
@@ -238,60 +238,34 @@ const Dup = struct {
 /// destination must hold its own copy of the source's heap fields).
 fn stripReturnType(
     tree: *const Ast,
+    model: *const file_model.FileModel,
     type_node: Ast.Node.Index,
     self_type: ?[]const u8,
 ) ?[]const u8 {
-    const first = tree.firstToken(type_node);
-    const last = tree.lastToken(type_node);
-    const tags = tree.tokens.items(.tag);
-
-    // If the return type is an error union `E!T`, skip past the `!`
-    // and resume parsing from there.  The error-set side can be
-    // arbitrary (`anyerror`, named set, dotted chain like
-    // `bun.JSError`), so we scan for the first top-level `!` and
-    // start over after it.
-    var start: Ast.TokenIndex = first;
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        if (tags[t] == .bang) {
-            start = t + 1;
-            break;
-        }
-    }
-
-    t = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .keyword_const => continue,
-            .l_bracket, .asterisk => return null,
-            .identifier, .builtin => break,
+    var node = type_node;
+    for (0..32) |_| {
+        switch (tree.nodeTag(node)) {
+            .error_union => node = tree.nodeData(node).node_and_node[1],
+            .optional_type => node = tree.nodeData(node).node,
+            .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+            .identifier, .field_access => {
+                const name = tokens.typeNameFromTokens(tree, tree.firstToken(node), tree.lastToken(node)) orelse return null;
+                if (self_type) |scope_name| {
+                    if (std.mem.eql(u8, name, "Self")) return scope_name;
+                    if (model.findType(scope_name)) |scope| {
+                        if (model.resolveTypeNameInScope(name, scope)) |resolved| return resolved.qualified_name;
+                    }
+                }
+                return name;
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@This")) return self_type;
+                return null;
+            },
             else => return null,
         }
     }
-    if (t > last) return null;
-    var last_name: ?[]const u8 = null;
-    var expecting_ident = true;
-    while (t <= last) : (t += 1) {
-        const tag = tags[t];
-        if (expecting_ident) {
-            if (tag == .identifier) {
-                const n = tree.tokenSlice(t);
-                last_name = if (std.mem.eql(u8, n, "Self")) self_type else n;
-                expecting_ident = false;
-            } else if (tag == .builtin) {
-                const n = tree.tokenSlice(t);
-                if (std.mem.eql(u8, n, "@This")) {
-                    last_name = self_type;
-                    expecting_ident = false;
-                } else return null;
-            } else return null;
-        } else {
-            if (tag == .period) {
-                expecting_ident = true;
-            } else break;
-        }
-    }
-    return last_name;
+    return null;
 }
 
 fn report(

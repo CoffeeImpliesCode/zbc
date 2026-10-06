@@ -98,8 +98,8 @@ pub const Declaration = union(enum) {
     error_token: Ast.TokenIndex,
 
     comptime {
-        for (std.meta.fields(Declaration)) |field| {
-            std.debug.assert(@sizeOf(field.type) <= 8); // a Declaration without the union tag must be less than 8 bytes
+        for (@typeInfo(Declaration).@"union".fields) |field| {
+            std.debug.assert(@sizeOf(field.type) <= 8);
         }
     }
 
@@ -613,7 +613,7 @@ fn walkNode(
         .switch_comma,
         => walkSwitchNode(context, tree, node_idx),
 
-        .@"errdefer",
+        .@"errdefer" => walkNode(context, tree, tree.nodeData(node_idx).opt_token_and_node[1]),
         .@"defer",
         .bool_not,
         .negation,
@@ -662,6 +662,7 @@ fn walkNode(
         .add,
         .sub,
         .array_cat,
+        .array_mult,
         .add_wrap,
         .sub_wrap,
         .add_sat,

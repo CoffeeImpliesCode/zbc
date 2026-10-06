@@ -238,7 +238,7 @@ fn elementTypeDeinitSelfDestroys(
 ) bool {
     const elem_name = elementTypeNameOfField(tree, field_name) orelse return false;
     const rm = cache.findMethodAcrossImports(elem_name, "deinit") orelse return false;
-    return methodBodyContainsSelfDestroy(rm.tree, rm.method);
+    return methodBodyContainsSelfDestroy(rm.tree, rm.fn_decl);
 }
 
 /// Extract the element-type identifier from a field whose type is a
@@ -302,13 +302,17 @@ fn elementTypeNameOfField(tree: *const Ast, field_name: []const u8) ?[]const u8 
 /// where `<self>` is the method's receiver parameter name.
 fn methodBodyContainsSelfDestroy(
     tree: *const Ast,
-    method: *const @import("../../model/file_model.zig").MethodInfo,
+    declaration: Ast.Node.Index,
 ) bool {
     const tags = tree.tokens.items(.tag);
-    const recv = method.receiver orelse return false;
-    const recv_name = recv.name;
-    var t: Ast.TokenIndex = method.body_first;
-    const end = method.body_last;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return false;
+    var params = proto.iterate(tree);
+    const receiver = params.next() orelse return false;
+    const recv_name = tree.tokenSlice(receiver.name_token orelse return false);
+    const body = tokens.bodyOf(tree, declaration) orelse return false;
+    var t = tree.firstToken(body);
+    const end = tree.lastToken(body);
     while (t + 3 <= end) : (t += 1) {
         // Pattern A: `bun.destroy(<recv>)` — identifier `bun`,
         // period, `destroy`, `(`, identifier `<recv>`, `)`.

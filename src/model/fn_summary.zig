@@ -428,22 +428,53 @@ fn classifyReturnExpr(
     // classifies as .heap, not .borrowed_from(gpa).
     if (returnIsAllocCall(tree, first, last)) return .heap;
 
-    // `return <param>` / `return <param>.<field>` /
-    // `return <param>.<method>(...)` — borrowed_from(param).
-    if (tags[first] == .identifier) {
-        const head = tree.tokenSlice(first);
-        if (paramIndex(tree, proto, head)) |idx| {
-            return .{ .borrowed_from = idx };
-        }
+    if (returnIsDirectParamBorrow(tree, proto, first, last)) |idx| {
+        return .{ .borrowed_from = idx };
     }
 
-    // Body has an alloc and the return is some shape we can't pin
-    // down — conservative `.owned` (caller owns, no tracked id).
-    // Only emit when the body genuinely allocates, otherwise stay
-    // `.unknown` so callers don't assume ownership transfer.
     if (body_allocates) return .owned;
 
     return .unknown;
+}
+/// Return the parameter index when `[first, last]` is a simple
+/// parameter-rooted path (`p`, `p.field`, `p[index]`, or `p.*`).
+/// Calls are deliberately excluded: a method/function can return a
+/// detached value even when its receiver is a parameter.
+fn returnIsDirectParamBorrow(
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    first: tokens.TokenIndex,
+    last: tokens.TokenIndex,
+) ?u32 {
+    const tags = tree.tokens.items(.tag);
+    if (first > last or tags[first] != .identifier) return null;
+    const idx = paramIndex(tree, proto, tree.tokenSlice(first)) orelse return null;
+    var t = first + 1;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .period => {
+                if (t + 1 > last or tags[t + 1] != .identifier) return null;
+                t += 1;
+            },
+            .period_asterisk => {},
+            .l_bracket => {
+                var depth: u32 = 1;
+                t += 1;
+                while (t <= last and depth > 0) : (t += 1) {
+                    switch (tags[t]) {
+                        .l_bracket => depth += 1,
+                        .r_bracket => depth -= 1,
+                        .l_paren, .r_paren, .l_brace, .r_brace => return null,
+                        else => {},
+                    }
+                }
+                if (depth != 0) return null;
+                t -= 1;
+            },
+            else => return null,
+        }
+    }
+    return idx;
 }
 
 fn returnIsAllocCall(
@@ -471,11 +502,12 @@ fn returnIsAllocCall(
 const isAllocatorName = receiver_mod.isAllocatorishName;
 
 pub fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
-    var idx: u32 = 0;
     var it = proto.iterate(tree);
-    while (it.next()) |p| : (idx += 1) {
-        const name_tok = p.name_token orelse continue;
-        if (std.mem.eql(u8, tree.tokenSlice(name_tok), name)) return idx;
+    var index: u32 = 0;
+    while (it.next()) |p| : (index += 1) {
+        if (p.name_token) |nt| {
+            if (std.mem.eql(u8, tree.tokenSlice(nt), name)) return index;
+        }
     }
     return null;
 }
@@ -865,10 +897,9 @@ pub fn inferResultHeapFields(
 /// inference uses).
 fn rhsTextLooksAlloc(text: []const u8) bool {
     const patterns = [_][]const u8{
-        ".alloc(", ".allocSentinel(", ".allocAdvanced(",
-        ".create(", ".dupe(", ".dupeZ(",
-        ".allocPrint(", ".allocPrintZ(",
-        ".toOwnedSlice(",
+        ".alloc(",      ".allocSentinel(", ".allocAdvanced(",
+        ".create(",     ".dupe(",          ".dupeZ(",
+        ".allocPrint(", ".allocPrintZ(",   ".toOwnedSlice(",
     };
     for (patterns) |p| {
         if (std.mem.indexOf(u8, text, p) != null) return true;
@@ -881,7 +912,10 @@ fn rhsTextLooksAlloc(text: []const u8) bool {
 const testing = std.testing;
 
 fn parse(src: [:0]const u8) !Ast {
-    return try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    errdefer tree.deinit(testing.allocator);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    return tree;
 }
 
 /// Find the first fn_decl in `tree` and infer its summary.  The
@@ -921,8 +955,7 @@ test "infer: body with .alloc() sets allocates" {
     try testing.expect(s.returns == .heap);
 }
 
-
-test "infer: return self.x classifies as borrowed_from(self)" {
+test "skript regression: direct parameter field borrow remains classified" {
     var tree = try parse(
         \\fn text(self: *Foo) []const u8 {
         \\    return self.buf;
@@ -935,7 +968,7 @@ test "infer: return self.x classifies as borrowed_from(self)" {
     try testing.expectEqual(@as(u32, 0), s.returns.borrowed_from);
 }
 
-test "infer: return try ctx.method() classifies via ctx param" {
+test "skript regression: receiver method call is not a direct parameter borrow" {
     var tree = try parse(
         \\fn wrap(ctx: *Foo) ![]u8 {
         \\    return try ctx.makeBuf();
@@ -944,8 +977,7 @@ test "infer: return try ctx.method() classifies via ctx param" {
     defer tree.deinit(testing.allocator);
     var buf: [1]Ast.Node.Index = undefined;
     const s = inferFirstFn(&tree, &buf);
-    try testing.expect(s.returns == .borrowed_from);
-    try testing.expectEqual(@as(u32, 0), s.returns.borrowed_from);
+    try testing.expect(s.returns == .unknown);
 }
 
 test "infer: no return statement leaves returns as unknown" {

@@ -11,6 +11,7 @@ fn proveAt(src: [:0]const u8, target: []const u8, arr: []const u8) !bool {
     const gpa = std.testing.allocator;
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
@@ -361,6 +362,7 @@ fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !b
     const gpa = std.testing.allocator;
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
     return value_range.provesNonempty(gpa, &tree, body, container, lbracket, null);
@@ -371,6 +373,7 @@ fn proveMinLenAt(src: [:0]const u8, container: []const u8, n: u64, arr: []const 
     const gpa = std.testing.allocator;
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
     return value_range.provesMinLen(gpa, &tree, body, container, n, lbracket, null);
@@ -543,13 +546,27 @@ test "nonempty: reassignment after guard is unsafe" {
     , "arr", "arr"));
 }
 
-test "nonempty: early-return with OR guard (len==0 or empty)" {
+test "nonempty: early-return with OR guard and immutable predicate" {
     try std.testing.expect(try proveNonemptyAt(
         \\fn tail(self: *Foo) u8 {
-        \\    if (self.buffer.len == 0 or self.empty()) return 0;
+        \\    if (self.buffer.len == 0 or self.empty) return 0;
         \\    return self.buffer[(self.index) % self.buffer.len];
         \\}
         \\
+    , "self.buffer", "buffer"));
+}
+
+test "nonempty: a mutating OR predicate invalidates the earlier length comparison" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn tail(self: *Foo) u8 {
+        \\    if (self.buffer.len == 0 or self.empty()) return 0;
+        \\    return self.buffer[self.index % self.buffer.len];
+        \\}
+        \\const Foo = struct {
+        \\    buffer: []u8,
+        \\    index: usize,
+        \\    fn empty(self: *Foo) bool { self.buffer.len = 0; return false; }
+        \\};
     , "self.buffer", "buffer"));
 }
 
@@ -764,4 +781,210 @@ test "nonzero: loop var reset to 0 then accessed is UNPROVEN (no false-negative)
         \\    }
         \\}
     , "p", "buf"));
+}
+
+test "nonzero: if-condition OR descent refines a later operand" {
+    try std.testing.expect(try proveAt(
+        \\fn f(tags: []const u8, other: []const u8, t: usize) bool {
+        \\    if (t < 3 or other[t - 3] != 0 or tags[t - 1] != 0) return false;
+        \\    return true;
+        \\}
+    , "t", "tags"));
+}
+
+test "nonzero: guarded decrement preserves the remaining lower bound" {
+    try std.testing.expect(try proveAt(
+        \\fn f(tags: []const u8, anchor: usize) u8 {
+        \\    const start: usize = 0;
+        \\    var k = anchor;
+        \\    while (k > start + 1) {
+        \\        k -= 1;
+        \\        return tags[k - 1];
+        \\    }
+        \\    return 0;
+        \\}
+    , "k", "tags"));
+}
+
+test "nonzero: unsigned relational guard refines its then branch" {
+    try std.testing.expect(try proveAt(
+        \\fn f(tags: []const u8, lhs_start: usize) u8 {
+        \\    const first: usize = 0;
+        \\    if (lhs_start > first) return tags[lhs_start - 1];
+        \\    return 0;
+        \\}
+    , "lhs_start", "tags"));
+}
+
+test "nonzero: early-return offset guard flows through subtraction aliases" {
+    try std.testing.expect(try proveAt(
+        \\fn f(tags: []const u8, other: []const u8, alias_tok: usize) u8 {
+        \\    const first: usize = 0;
+        \\    if (alias_tok < first + 3 or other[alias_tok - 1] != 0) return 0;
+        \\    const name_tok = alias_tok - 2;
+        \\    return tags[name_tok - 1];
+        \\}
+    , "name_tok", "tags"));
+}
+
+test "nonzero: increment before every infinite-loop break refines loop exit" {
+    try std.testing.expect(try proveAt(
+        \\fn f(names: []const u8, stop: bool) u8 {
+        \\    var len: usize = 0;
+        \\    while (true) {
+        \\        len += 1;
+        \\        if (stop) break;
+        \\    }
+        \\    return names[len - 1];
+        \\}
+    , "len", "names"));
+}
+
+test "nonzero: an infinite-loop break before increment keeps zero possible" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(names: []const u8, stop_early: bool, stop_late: bool) u8 {
+        \\    var len: usize = 0;
+        \\    while (true) {
+        \\        if (stop_early) break;
+        \\        len += 1;
+        \\        if (stop_late) break;
+        \\    }
+        \\    return names[len - 1];
+        \\}
+    , "len", "names"));
+}
+
+test "nonzero: signed addition can reach zero and remains unproven" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(tags: []const u8) u8 {
+        \\    var k: isize = -1;
+        \\    k += 1;
+        \\    return tags[k - 1];
+        \\}
+    , "k", "tags"));
+}
+
+test "nonzero: a while-body guard does not escape the loop" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(names: []const u8, initial: usize) u8 {
+        \\    var len = initial;
+        \\    while (len > 0) {
+        \\        len -= 1;
+        \\    }
+        \\    return names[len - 1];
+        \\}
+    , "len", "names"));
+}
+
+test "nonzero: a labeled block break does not prove the enclosing loop exit" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(names: []const u8) u8 {
+        \\    var len: usize = 0;
+        \\    while (true) {
+        \\        inner: {
+        \\            len = 1;
+        \\            break :inner;
+        \\        }
+        \\        len = 0;
+        \\        break;
+        \\    }
+        \\    return names[len - 1];
+        \\}
+    , "len", "names"));
+}
+
+test "nonzero: an address argument invalidates a scalar-only guard" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(bytes: []const u8, initial: usize) u8 {
+        \\    var i = initial;
+        \\    if (i == 0) return 0;
+        \\    mutate(&i);
+        \\    return bytes[i - 1];
+        \\}
+        \\fn mutate(i: *usize) void { i.* = 0; }
+    , "i", "bytes"));
+}
+
+test "nonzero: a bitwise value argument preserves the scalar guard" {
+    try std.testing.expect(try proveAt(
+        \\fn f(bytes: []const u8, i: usize, mask: usize) u8 {
+        \\    if (i == 0) return 0;
+        \\    consume(mask & i);
+        \\    return bytes[i - 1];
+        \\}
+        \\fn consume(value: usize) void { _ = value; }
+    , "i", "bytes"));
+}
+
+test "nonzero: wrapping callee arithmetic can return zero" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(bytes: []const u8, x: u8) u8 {
+        \\    if (x == 0) return 0;
+        \\    const n = cancel(x);
+        \\    return bytes[@intCast(n - 1)];
+        \\}
+        \\fn cancel(x: u8) u8 { return x +% (0 -% x); }
+    , "n", "bytes"));
+}
+
+test "nonzero: signed callee addition can cancel a nonzero argument" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(bytes: []const u8, x: isize) u8 {
+        \\    if (x == 0) return 0;
+        \\    const n = increment(x);
+        \\    return bytes[@intCast(n - 1)];
+        \\}
+        \\fn increment(x: isize) isize { return x + 1; }
+    , "n", "bytes"));
+}
+
+test "nonzero: signed saturating callee addition can return zero" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(bytes: []const u8, x: isize) u8 {
+        \\    if (x == 0) return 0;
+        \\    const n = increment(x);
+        \\    return bytes[@intCast(n - 1)];
+        \\}
+        \\fn increment(x: isize) isize { return x +| 1; }
+    , "n", "bytes"));
+}
+
+test "nonzero: ceiling offset at the u64 boundary remains comparable" {
+    try std.testing.expect(try proveAt(
+        \\fn f(bytes: []const u8, x: u128) u8 {
+        \\    if (x == 0) return 0;
+        \\    const n = rounded(x);
+        \\    return bytes[@intCast(n - 1)];
+        \\}
+        \\fn rounded(x: u128) u128 {
+        \\    return (x + 18446744073709551615) / 2;
+        \\}
+    , "n", "bytes"));
+}
+
+test "nonzero: an indirect callee cannot borrow a namespace postcondition" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(bytes: []const u8, x: u8, helper: *const fn (u8) u8) u8 {
+        \\    if (x == 0) return 0;
+        \\    const n = helper(x);
+        \\    return bytes[@intCast(n - 1)];
+        \\}
+        \\const Other = struct {
+        \\    fn helper(x: u8) u8 { return x; }
+        \\};
+    , "n", "bytes"));
+}
+
+test "nonzero: a direct callee ignores unrelated namespace functions" {
+    try std.testing.expect(try proveAt(
+        \\fn f(bytes: []const u8, x: u8) u8 {
+        \\    if (x == 0) return 0;
+        \\    const n = helper(x);
+        \\    return bytes[@intCast(n - 1)];
+        \\}
+        \\const Other = struct {
+        \\    fn helper(x: u8) u8 { _ = x; return 0; }
+        \\};
+        \\fn helper(x: u8) u8 { return x; }
+    , "n", "bytes"));
 }

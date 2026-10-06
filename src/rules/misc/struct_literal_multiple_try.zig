@@ -32,6 +32,7 @@ const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const testing = @import("../../testing.zig");
+const file_model = @import("../../model/file_model.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -100,6 +101,8 @@ pub fn check(
         // visible allocator operand (`x.clone()`).
         if (!firstTryUsesAllocator(cache, &ident_nodes, tags, t + 4, i) and
             !tryExprAllocates(tree, tags, t + 4, i)) continue;
+        if (firstTryReturnsValue(tree, cache, t + 4, i)) continue;
+        if (firstTryUsesScopedArena(tree, cache, t + 4, i)) continue;
 
         // If the surrounding function uses an arena-backed allocator (i.e.
         // there is a `const X = ARENA.allocator()` within 200 tokens before
@@ -125,6 +128,163 @@ pub fn check(
 
         try report(gpa, problems, tree, next, field1, field2);
     }
+}
+
+fn firstTryReturnsValue(tree: *const Ast, cache: *file_cache_mod.FileCache, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
+    if (start + 1 >= end or tree.tokenTag(start) != .identifier or tree.tokenTag(start + 1) != .l_paren) return false;
+    const model = cache.fileModel() catch return false;
+    const function = model.findFn(tree.tokenSlice(start)) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, function.fn_decl) orelse return false;
+    var result_type = proto.ast.return_type.unwrap() orelse return false;
+    if (tree.nodeTag(result_type) == .error_union) result_type = tree.nodeData(result_type).node_and_node[1];
+    if (tree.nodeTag(result_type) != .identifier) return false;
+    return isValueOnlyType(tree, model, tree.tokenSlice(tree.nodeMainToken(result_type)), 0);
+}
+
+fn isValueOnlyType(tree: *const Ast, model: *const file_model.FileModel, name: []const u8, depth: u8) bool {
+    if (depth >= 16) return false;
+    if (std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "void") or
+        std.mem.eql(u8, name, "usize") or std.mem.eql(u8, name, "isize")) return true;
+    if (name.len > 1 and (name[0] == 'u' or name[0] == 'i' or name[0] == 'f')) {
+        if (std.fmt.parseInt(u16, name[1..], 10)) |_| return true else |_| {}
+    }
+    const info = model.findType(name) orelse {
+        for (tree.rootDecls()) |node| {
+            const decl = tree.fullVarDecl(node) orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(decl.ast.mut_token + 1), name)) continue;
+            const initializer = decl.ast.init_node.unwrap() orelse return false;
+            if (tree.nodeTag(initializer) != .identifier) return false;
+            return isValueOnlyType(tree, model, tree.tokenSlice(tree.nodeMainToken(initializer)), depth + 1);
+        }
+        return false;
+    };
+    if (info.hasMethod("deinit") or info.hasMethod("close") or info.hasMethod("destroy") or
+        info.hasMethod("free") or info.hasMethod("release")) return false;
+    if (info.kind == .enum_) return true;
+    if (info.kind != .struct_ or info.fields.len == 0) return false;
+    for (info.fields) |field| {
+        if (field.type_first != field.type_last or tree.tokenTag(field.type_first) != .identifier) return false;
+        if (!isValueOnlyType(tree, model, tree.tokenSlice(field.type_first), depth + 1)) return false;
+    }
+    return true;
+}
+
+fn firstTryUsesScopedArena(tree: *const Ast, cache: *file_cache_mod.FileCache, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
+    if (start + 2 >= end or tree.tokenTag(start) != .identifier or tree.tokenTag(start + 1) != .period) return false;
+    const model = cache.fileModel() catch return false;
+    for (model.fns) |function| {
+        if (start < function.body_first or start > function.body_last) continue;
+        if (function.is_pub) return false;
+        if (function.name_token >= 2 and tree.tokenTag(function.name_token - 2) == .keyword_export) return false;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, function.fn_decl) orelse return false;
+        var params = proto.iterate(tree);
+        var index: usize = 0;
+        while (params.next()) |param| : (index += 1) {
+            const name_token = param.name_token orelse continue;
+            if (std.mem.eql(u8, tree.tokenSlice(name_token), tree.tokenSlice(start))) {
+                return allCallsUseScopedArena(tree, function, index);
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+fn allCallsUseScopedArena(tree: *const Ast, function: file_model.FnInfo, parameter: usize) bool {
+    var references: usize = 0;
+    for (tree.tokens.items(.tag), 0..) |tag, index| {
+        const token: Ast.TokenIndex = @intCast(index);
+        if (tag == .builtin and (std.mem.eql(u8, tree.tokenSlice(token), "@field") or
+            std.mem.eql(u8, tree.tokenSlice(token), "@export"))) return false;
+        if (tag != .identifier or token == function.name_token) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(token), function.name)) references += 1;
+    }
+    var calls: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        switch (tag) {
+            .call, .call_comma, .call_one, .call_one_comma => {},
+            else => continue,
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, @enumFromInt(index)) orelse continue;
+        if (tree.nodeTag(call.ast.fn_expr) != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr)), function.name)) continue;
+        if (parameter >= call.ast.params.len or !argumentHasArenaCleanup(tree, call.ast.params[parameter])) return false;
+        calls += 1;
+    }
+    return calls != 0 and calls == references;
+}
+
+fn argumentHasArenaCleanup(tree: *const Ast, argument: Ast.Node.Index) bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, argument) orelse return false;
+    if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const access = tree.nodeData(call.ast.fn_expr).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(access[1]), "allocator") or tree.nodeTag(access[0]) != .identifier) return false;
+    const receiver = tree.tokenSlice(tree.nodeMainToken(access[0]));
+    const anchor = tree.firstToken(argument);
+    const body_start = enclosingBodyStart(tree, anchor) orelse return false;
+    var declaration: ?Ast.full.VarDecl = null;
+    for (tree.nodes.items(.tag), 0..) |_, index| {
+        const candidate = tree.fullVarDecl(@enumFromInt(index)) orelse continue;
+        const name_token = candidate.ast.mut_token + 1;
+        if (name_token < body_start or name_token >= anchor) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(name_token), receiver)) continue;
+        if (declaration) |previous| {
+            if (previous.ast.mut_token > candidate.ast.mut_token) continue;
+        }
+        declaration = candidate;
+    }
+    const decl = declaration orelse return false;
+    const initializer = decl.ast.init_node.unwrap() orelse return false;
+    const init_call = tree.fullCall(&buffer, initializer) orelse return false;
+    if (tree.nodeTag(init_call.ast.fn_expr) != .field_access) return false;
+    const init_access = tree.nodeData(init_call.ast.fn_expr).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(init_access[1]), "init")) return false;
+    if (!std.mem.eql(u8, tree.getNodeSource(init_access[0]), "std.heap.ArenaAllocator")) return false;
+    if (!importsStandardLibrary(tree)) return false;
+    return hasImmediateCleanup(tree, tree.lastToken(initializer) + 1, anchor, receiver);
+}
+
+fn enclosingBodyStart(tree: *const Ast, anchor: Ast.TokenIndex) ?Ast.TokenIndex {
+    var result: ?Ast.TokenIndex = null;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .fn_decl) continue;
+        const body = tree.nodeData(@enumFromInt(index)).node_and_node[1];
+        const start = tree.firstToken(body);
+        if (start > anchor or tree.lastToken(body) < anchor) continue;
+        if (result == null or start > result.?) result = start;
+    }
+    return result;
+}
+
+fn importsStandardLibrary(tree: *const Ast) bool {
+    for (tree.rootDecls()) |node| {
+        const decl = tree.fullVarDecl(node) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(decl.ast.mut_token + 1), "std")) continue;
+        const initializer = decl.ast.init_node.unwrap() orelse return false;
+        return std.mem.eql(u8, tree.getNodeSource(initializer), "@import(\"std\")");
+    }
+    return false;
+}
+
+fn hasImmediateCleanup(tree: *const Ast, start: Ast.TokenIndex, anchor: Ast.TokenIndex, receiver: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    if (start + 7 >= anchor) return false;
+    if (tags[start] != .semicolon or tags[start + 1] != .keyword_defer or
+        tags[start + 2] != .identifier or tags[start + 3] != .period or
+        tags[start + 4] != .identifier or tags[start + 5] != .l_paren or
+        tags[start + 6] != .r_paren or tags[start + 7] != .semicolon) return false;
+    if (!std.mem.eql(u8, tree.tokenSlice(start + 2), receiver) or
+        !std.mem.eql(u8, tree.tokenSlice(start + 4), "deinit")) return false;
+    var token = start + 8;
+    while (token < anchor) : (token += 1) {
+        if (tags[token] == .l_brace or tags[token] == .r_brace) return false;
+        if (tags[token] == .identifier and std.mem.eql(u8, tree.tokenSlice(token), receiver)) return false;
+    }
+    return true;
 }
 
 /// SEMANTIC allocation signal: returns true iff some identifier operand in the
@@ -534,5 +694,77 @@ test "struct-literal-multiple-try: no errdefer arena still fires" {
         \\}
         \\const Pair = struct { a: []u8, b: []u8 };
         \\
+    );
+}
+
+test "skript residual: private copy helper uses caller-owned arena" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Pair = struct { first: []u8, second: []u8 };
+        \\fn duplicate(memory: std.mem.Allocator) !Pair {
+        \\    return .{
+        \\        .first = try memory.dupe(u8, "first"),
+        \\        .second = try memory.dupe(u8, "second"),
+        \\    };
+        \\}
+        \\pub fn run(gpa: std.mem.Allocator) !void {
+        \\    var scope = std.heap.ArenaAllocator.init(gpa);
+        \\    defer scope.deinit();
+        \\    const pair = try duplicate(scope.allocator());
+        \\    _ = pair;
+        \\}
+    );
+}
+
+test "skript residual: private copy helper also called with owned allocator" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { first: []u8, second: []u8 };
+        \\fn duplicate(memory: std.mem.Allocator) !Pair {
+        \\    return .{
+        \\        .first = try memory.dupe(u8, "first"),
+        \\        .second = try memory.dupe(u8, "second"),
+        \\    };
+        \\}
+        \\pub fn run(gpa: std.mem.Allocator) !Pair {
+        \\    var scope = std.heap.ArenaAllocator.init(gpa);
+        \\    defer scope.deinit();
+        \\    _ = try duplicate(scope.allocator());
+        \\    return duplicate(gpa);
+        \\}
+    );
+}
+
+test "skript residual: cloned range values do not own allocations" {
+    try testing.expectNoFire(check,
+        \\const Range = struct { start: u32, len: u32 };
+        \\const RangeAlias = Range;
+        \\const Pair = struct { first: Range, second: Range };
+        \\fn cloneRange(start: u32) !RangeAlias {
+        \\    return .{ .start = start, .len = 1 };
+        \\}
+        \\pub fn run() !Pair {
+        \\    return .{
+        \\        .first = try cloneRange(0),
+        \\        .second = try cloneRange(1),
+        \\    };
+        \\}
+    );
+}
+
+test "skript residual: cloned buffer values still own allocations" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct { bytes: []u8 };
+        \\const Pair = struct { first: Buffer, second: Buffer };
+        \\fn cloneBuffer(memory: std.mem.Allocator) !Buffer {
+        \\    return .{ .bytes = try memory.dupe(u8, "buffer") };
+        \\}
+        \\pub fn run(memory: std.mem.Allocator) !Pair {
+        \\    return .{
+        \\        .first = try cloneBuffer(memory),
+        \\        .second = try cloneBuffer(memory),
+        \\    };
+        \\}
     );
 }

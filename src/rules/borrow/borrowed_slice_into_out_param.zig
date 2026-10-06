@@ -104,7 +104,7 @@ fn checkFn(
     // slice and must not fire.
     const model = try cache.fileModel();
     // Containing type for `*@This()` / `*Self` resolution.
-    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
+    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.qualified_name else null;
 
     var pointer_params: std.ArrayListUnmanaged(PointerParam) = .empty;
     defer pointer_params.deinit(gpa);
@@ -113,7 +113,7 @@ fn checkFn(
         if (!isPointerType(tags, b.rhs_first, b.rhs_last)) continue;
         try pointer_params.append(gpa, .{
             .name = b.name,
-            .type_name = extractTypeName(tree, tags, b.rhs_first, b.rhs_last, self_type),
+            .type_name = extractTypeName(tree, model, b.rhs_first, b.rhs_last, self_type),
         });
     }
     if (pointer_params.items.len == 0) return;
@@ -169,7 +169,7 @@ fn checkFn(
     if (deferred.items.len == 0) return;
 
     // Find writes through pointer params; check RHS for any deferred name.
-    try scanWrites(gpa, tree, cache, write_via_out, first, last, model, pointer_params.items, deferred.items, problems);
+    try scanWrites(gpa, tree, cache, write_via_out, first, last, pointer_params.items, deferred.items, problems);
 }
 
 fn scanWrites(
@@ -179,7 +179,6 @@ fn scanWrites(
     atoms: []const Atom,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
-    model: *const file_model.FileModel,
     pointer_params: []const PointerParam,
     deferred: []const DeferredItem,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -200,28 +199,13 @@ fn scanWrites(
         if (w.start + 2 <= last and tags[w.start + 1] == .period and tags[w.start + 2] == .identifier) {
             const field_name = tree.tokenSlice(w.start + 2);
             if (pp.type_name) |ty| {
-                if (model.fieldType(ty, field_name)) |ft| {
-                    if (isPrimitiveTypeName(ft)) continue;
-                }
-                // Qualified-path resolution: when the field's
-                // declared type is dotted (`Result.Pending.State`),
-                // resolve to the LEAF TypeInfo and skip when it's
-                // an enum (no payload, can't borrow) or a struct
-                // whose fields are all primitives / pointers.
-                if (model.resolveFieldTypeQualified(ty, field_name)) |leaf_ti| {
-                    if (leaf_ti.kind == .enum_) continue;
-                    if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
-                }
-                // Cross-file fallback: when the field's type is a
-                // simple identifier that resolves through the
-                // global type index to an enum (or pointer/primitive-
-                // only struct), the field can't hold a borrowed
-                // slice.  Handles \`field: AuthMethod\` where
-                // AuthMethod is an enum defined in another file.
-                if (model.fieldType(ty, field_name)) |ft| {
-                    if (cache.findTypeAcrossImports(ft)) |leaf_ti| {
-                        if (leaf_ti.kind == .enum_) continue;
-                        if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
+                if (cache.findTypeAcrossImports(ty)) |owner| {
+                    if (owner.model.fieldType(owner.info.qualified_name, field_name)) |name| {
+                        if (isPrimitiveTypeName(name)) continue;
+                    }
+                    if (cache.fieldType(owner, field_name)) |leaf| {
+                        if (leaf.info.kind == .enum_) continue;
+                        if (leaf.info.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(leaf.model.tree, leaf.info)) continue;
                     }
                 }
             }
@@ -347,45 +331,26 @@ fn findPointerParam(name: []const u8, params: []const PointerParam) ?PointerPara
 }
 
 
-/// Walk type tokens for `(?)?*(const)?<id>(.<id>)?` and return the
-/// last identifier — the container type's name.  Handles `*T`,
-/// `?*T`, `*const T`, `*ns.T`, and `*@This()` / `*Self` (resolved
-/// to `self_type` when provided).  Returns null on shapes we can't
-/// confidently classify (slice/array/anytype/inline-struct).
+/// Preserve namespace qualification and the enclosing type's lexical scope.
 fn extractTypeName(
     tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
+    model: *const file_model.FileModel,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
     self_type: ?[]const u8,
 ) ?[]const u8 {
-    if (first > last) return null;
-    var t = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .asterisk, .keyword_const => continue,
-            .l_bracket => return null,
-            .identifier, .builtin => break,
-            else => return null,
+    const name = tokens.typeNameFromTokens(tree, first, last) orelse {
+        if (last >= first + 2 and tree.tokenTag(last - 2) == .builtin and
+            std.mem.eql(u8, tree.tokenSlice(last - 2), "@This")) return self_type;
+        return null;
+    };
+    if (self_type) |scope_name| {
+        if (std.mem.eql(u8, name, "Self")) return scope_name;
+        if (model.findType(scope_name)) |scope| {
+            if (model.resolveTypeNameInScope(name, scope)) |resolved| return resolved.qualified_name;
         }
     }
-    if (t > last) return null;
-    // `@This()` → self_type.
-    if (tags[t] == .builtin) {
-        if (std.mem.eql(u8, tree.tokenSlice(t), "@This")) return self_type;
-        return null;
-    }
-    if (tags[t] != .identifier) return null;
-    var last_id = tree.tokenSlice(t);
-    // `Self` → self_type.
-    if (std.mem.eql(u8, last_id, "Self")) {
-        if (self_type) |st| return st;
-        return null;
-    }
-    while (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) : (t += 2) {
-        last_id = tree.tokenSlice(t + 2);
-    }
-    return last_id;
+    return name;
 }
 
 fn isPrimitiveTypeName(name: []const u8) bool {

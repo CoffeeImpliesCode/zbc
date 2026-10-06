@@ -29,58 +29,88 @@ pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
 pub const lookupRule = rule_catalog_mod.lookup;
 pub const trace = @import("trace.zig");
-pub fn analyzeEscape(
+pub const SourcePolicy = @import("type_engine").SourcePolicy;
+
+pub const ParseFailure = @import("type_engine").ParseFailure;
+
+/// One worker and one source snapshot. Initialize in place; never share or move.
+pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    project: project_cache_mod.ProjectCache,
+    type_context: zls_resolver_mod.TypeContext,
+    parse_failure: ?ParseFailure = null,
+
+    pub fn init(self: *Session, gpa: std.mem.Allocator, io: std.Io, policy: SourcePolicy) !void {
+        self.* = .{
+            .gpa = gpa, .io = io,
+            .project = project_cache_mod.ProjectCache.init(gpa, io, policy),
+            .type_context = undefined,
+        };
+        errdefer self.project.deinit();
+        try self.type_context.init(gpa, io);
+        self.type_context.store.source_policy = policy;
+        self.project.type_context = &self.type_context;
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.project.deinit();
+        self.type_context.deinit();
+        self.* = undefined;
+    }
+
+    fn sourcePath(self: *Session, path: []const u8) ![]const u8 {
+        var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cwd = if (std.fs.path.isAbsolute(path)) "" else
+            cwd_buffer[0..try std.Io.Dir.cwd().realPathFile(self.io, ".", &cwd_buffer)];
+        const lexical = try std.fs.path.resolve(self.gpa, &.{ cwd, path });
+        defer self.gpa.free(lexical);
+        if (!self.project.policy.allowsAbsolutePath(lexical)) return error.SourceExcluded;
+        const canonical = try self.type_context.canonicalPath(lexical);
+        if (!self.project.policy.allowsAbsolutePath(canonical)) return error.SourceExcluded;
+        return canonical;
+    }
+};
+
+pub fn analyzeEscape(
+    session: *Session,
     path: []const u8,
     config: *const Config,
-    type_ctx: ?*zls_resolver_mod.TypeContext,
 ) ![]Problem {
+    const gpa = session.gpa;
+    session.parse_failure = null;
+    session.project.failure = null;
+    session.project.parse_failure = null;
+    session.type_context.store.source_failure = null;
+    session.type_context.store.parse_failure = null;
+    const canonical = try session.sourcePath(path);
     trace.setFile(path);
-    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        gpa,
-        std.Io.Limit.limited(16 * 1024 * 1024),
-    );
-    defer gpa.free(src_bytes);
-
-    const src = try gpa.allocSentinel(u8, src_bytes.len, 0);
-    defer gpa.free(src);
-    @memcpy(src[0..src_bytes.len], src_bytes);
-    rewriteNonStandardSyntax(src);
-
-    var tree = try Ast.parse(gpa, src, .zig);
-    defer tree.deinit(gpa);
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);
 
-    // Type resolver backed by the extracted type engine.  TypeContext is
-    // per-thread (see main.zig workerLoop); falls through to AST-only
-    // analysis when unavailable or when init fails.
-    var own_ctx: zls_resolver_mod.ManagedContext = .{};
-    if (type_ctx == null) own_ctx.tryInit(gpa, io);
-    defer own_ctx.deinit();
-    const ctx = type_ctx orelse own_ctx.get();
-
-    var own_resolver: zls_resolver_mod.ManagedResolver = .{};
-    if (ctx) |c| own_resolver.tryInit(c, gpa, path, src);
-    defer own_resolver.deinit();
-    const zls_ptr = own_resolver.get();
+    var resolver: zls_resolver_mod.TypeResolver = undefined;
+    resolver.init(&session.type_context, gpa, canonical, null) catch |err| {
+        if (err == error.ImportInvalidSyntax) {
+            session.parse_failure = session.type_context.store.parse_failure;
+            if (session.parse_failure) |*failure| failure.source_path = null;
+            return error.InvalidSyntax;
+        }
+        return err;
+    };
+    defer resolver.deinit();
+    const zls_ptr = &resolver;
+    const tree = &resolver.handle.tree;
+    if (tree.mode != .zig) return error.UnsupportedSourceLanguage;
+    const src = tree.source;
 
     // Per-file shared cache, used by both flow analysis (cfg) and
     // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary
     // across every consumer.
-    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
+    var rule_cache = file_cache_mod.FileCache.init(gpa, tree);
     defer rule_cache.deinit();
     rule_cache.setZls(zls_ptr);
-    // Project-wide ProjectCache for cross-file model lookups via
-    // relative `@import("./X.zig")` declarations.  Static across
-    // the process so subsequent analyzeEscape calls reuse the
-    // loaded models — saves re-parsing the same shared headers
-    // across every file in a sweep.
-    rule_cache.setProject(getProjectCache(gpa, io), path);
+    rule_cache.setProject(&session.project, canonical);
     try rule_cache.resolveTransitiveTakes();
 
     // Flow analysis — per-fn CFG + worklist fixed-point.
@@ -92,7 +122,7 @@ pub fn analyzeEscape(
         if (tree.nodeTag(node) != .fn_decl) continue;
         var cfg = (try cfg_builder.lowerFunctionFullWithZls(
             gpa,
-            &tree,
+            tree,
             node,
             config,
             &rule_cache,
@@ -104,7 +134,15 @@ pub fn analyzeEscape(
 
     // Pattern detectors — dispatched via the comptime registry so
     // adding a rule is a one-file change (see rule_catalog.zig).
-    try rule_catalog_mod.runEscape(gpa, &tree, &rule_cache, config, &problems);
+    try rule_catalog_mod.runEscape(gpa, tree, &rule_cache, config, &problems);
+    if (session.project.failure) |failure| {
+        session.parse_failure = session.project.parse_failure;
+        return failure;
+    }
+    if (session.type_context.store.source_failure) |failure| {
+        session.parse_failure = session.type_context.store.parse_failure;
+        return failure;
+    }
 
     // Apply per-line suppressions parsed from `// zbc-disable-line` /
     // `// zbc-disable-next-line` source comments.  Filter happens at
@@ -114,43 +152,6 @@ pub fn analyzeEscape(
     return try filterSuppressed(gpa, &problems, &supp);
 }
 
-/// Bun's codebase uses a non-standard `fn #<name>(...)` method-name
-/// syntax (their build pipeline preprocesses it).  The stock Zig
-/// tokenizer chokes on `#` and emits `invalid` tokens, which causes
-/// the AST past the first such fn to be lost — entire types appear
-/// to have no methods, masking real cleanup methods like `finalize`
-/// and producing cascades of FPs (missing-deinit, owned-field-no-
-/// outer-cleanup, etc.) on every file that touches the pattern.
-///
-/// Workaround: in-place byte-level rewrite of `fn #` → `fn _` and
-/// `.#<ident>(` → `._<ident>(` (call-site form).  Both replacements
-/// are length-preserving so source positions remain stable.
-/// Replacing only after `fn ` or `.` avoids touching `#`-containing
-/// string literals or comments that happen to start a line.
-fn rewriteNonStandardSyntax(src: [:0]u8) void {
-    if (src.len < 2) return;
-    // `#` is not a valid token start in Zig 0.17.  Bun uses it as
-    // a private-name prefix in three positions:
-    //   1. method decls:  `fn #foo(...)`
-    //   2. field decls:   `#foo: Foo = .{}`
-    //   3. accesses:      `this.#foo` / `this.#foo()`
-    // In all three, `#` is immediately followed by an identifier
-    // character (letter or `_`).  Rewriting `#<id-char>` → `_<id-char>`
-    // covers all three positions and is length-preserving.  The only
-    // false-positive is a `#` inside a STRING LITERAL whose next char
-    // is a letter — but the analyzer doesn't track string CONTENTS,
-    // so it's harmless.
-    var i: usize = 0;
-    while (i + 1 < src.len) : (i += 1) {
-        if (src[i] != '#') continue;
-        const next = src[i + 1];
-        if (isIdentStart(next)) src[i] = '_';
-    }
-}
-
-fn isIdentStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
-}
 
 /// Drop any Problems whose start.line matches an active suppression.
 /// Frees dropped problems immediately; the caller still owns the
@@ -175,33 +176,6 @@ fn filterSuppressed(
     return kept.toOwnedSlice(gpa);
 }
 
-/// Process-static ProjectCache.  Holds parsed FileModels for
-/// sibling `.zig` files reached via relative `@import("./X.zig")`
-/// declarations.  Initialised on first analyzeEscape call,
-/// persists for the process lifetime — multi-file sweeps reuse
-/// the loaded models.  Lives on the heap (page_allocator) so test
-/// gpa boundaries don't reclaim it.
-var global_project: ?*project_cache_mod.ProjectCache = null;
-
-fn getProjectCache(gpa: std.mem.Allocator, io: std.Io) *project_cache_mod.ProjectCache {
-    _ = gpa;
-    if (global_project) |p| return p;
-    const pa = std.heap.page_allocator;
-    const p = pa.create(project_cache_mod.ProjectCache) catch unreachable;
-    p.* = project_cache_mod.ProjectCache.init(pa, io);
-    global_project = p;
-    return p;
-}
-
-/// Test-only: clear the process-static project cache so leak
-/// detectors don't see the cached entries between test gpas.
-pub fn clearProjectCacheForTesting() void {
-    if (global_project) |p| {
-        p.deinit();
-        std.heap.page_allocator.destroy(p);
-        global_project = null;
-    }
-}
 
 pub fn freeProblems(gpa: std.mem.Allocator, slice: []Problem) void {
     for (slice) |*p| p.deinit(gpa);
@@ -235,12 +209,15 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
         \\
     });
 
-    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base_dir = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
     defer gpa.free(base_dir);
     const path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
     defer gpa.free(path);
 
-    const problems = try analyzeEscape(gpa, tio, path, &DefaultConfig, null);
+    var session: Session = undefined;
+    try session.init(gpa, tio, .{ .roots = &.{base_dir} });
+    defer session.deinit();
+    const problems = try analyzeEscape(&session, path, &DefaultConfig);
     defer freeProblems(gpa, problems);
 
     var found = false;
@@ -266,11 +243,14 @@ fn analyzeSrc(
 ) ![]Problem {
     const name = "check.zig";
     try tmp.dir.writeFile(io, .{ .sub_path = name, .data = src });
-    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(base_dir);
     const path = try std.fs.path.join(gpa, &.{ base_dir, name });
     defer gpa.free(path);
-    return analyzeEscape(gpa, io, path, &DefaultConfig, null);
+    var session: Session = undefined;
+    try session.init(gpa, io, .{ .roots = &.{base_dir} });
+    defer session.deinit();
+    return analyzeEscape(&session, path, &DefaultConfig);
 }
 
 fn countByRule(problems: []const Problem, rule_id: []const u8) usize {
@@ -407,4 +387,447 @@ test {
     _ = @import("model/model_query.zig");
     _ = @import("cache/project_cache.zig");
     std.testing.refAllDecls(@This());
+}
+
+test "invalid source is not a clean analysis" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.InvalidSyntax, analyzeSrc(
+        std.testing.allocator, std.testing.io, &tmp, "pub fn broken( {",
+    ));
+}
+
+test "stable array repetition is analyzed without rewriting source" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const problems = try analyzeSrc(
+        std.testing.allocator, std.testing.io, &tmp, "pub const values = [_]u8{0} ** 4;",
+    );
+    defer freeProblems(std.testing.allocator, problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.len);
+}
+
+test "extreme ceiling offset does not corrupt analysis" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const problems = try analyzeSrc(std.testing.allocator, std.testing.io, &tmp,
+        \\fn ceil(x: u64) u64 {
+        \\    return (x + 18446744073709551615) / 2;
+        \\}
+        \\pub fn f(x: u64, bytes: []const u8) u8 {
+        \\    if (x != 0) {
+        \\        const n = ceil(x);
+        \\        return bytes[n - 1];
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    defer freeProblems(std.testing.allocator, problems);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "index-minus-one-without-zero-guard"));
+}
+
+test "a scalar write invalidates the index guard in public analysis" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const problems = try analyzeSrc(std.testing.allocator, std.testing.io, &tmp,
+        \\fn mutate(p: *usize) void { p.* = 0; }
+        \\pub fn f(initial: usize, bytes: []const u8) u8 {
+        \\    var i = initial;
+        \\    if (i != 0) {
+        \\        mutate(&i);
+        \\        return bytes[i - 1];
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    defer freeProblems(std.testing.allocator, problems);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "index-minus-one-without-zero-guard"));
+}
+
+test "a fresh session sees repaired imports and a live snapshot does not" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data =
+        \\const dep = @import("dep.zig");
+        \\pub fn copy(value: dep.Box) f32 { return @floatFromInt(value.value); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dep.zig", .data = "// dependency\npub const Box = struct { value: ; };" });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var session: Session = undefined;
+    try session.init(gpa, io, .{ .roots = &.{directory} });
+    defer session.deinit();
+    try std.testing.expectEqual(null, try session.project.modelForRelativeImport(path, "dep.zig"));
+    try std.testing.expectEqual(error.ImportInvalidSyntax, session.project.failure.?);
+    try std.testing.expectEqual(@as(u32, 2), session.project.parse_failure.?.position.line);
+    try std.testing.expectError(error.ImportInvalidSyntax, analyzeEscape(&session, path, &DefaultConfig));
+    try std.testing.expect(session.parse_failure != null);
+    try std.testing.expectEqual(@as(u32, 2), session.parse_failure.?.position.line);
+    try std.testing.expectEqualStrings("dep.zig", std.fs.path.basename(session.parse_failure.?.source_path.?));
+    try tmp.dir.writeFile(io, .{ .sub_path = "dep.zig", .data = "pub const Box = struct { value: u8 };" });
+    session.project.failure = null;
+    session.project.parse_failure = null;
+    try std.testing.expectEqual(null, try session.project.modelForRelativeImport(path, "dep.zig"));
+    try std.testing.expectEqual(error.ImportInvalidSyntax, session.project.failure.?);
+    try std.testing.expectEqual(@as(u32, 2), session.project.parse_failure.?.position.line);
+    try std.testing.expectError(error.ImportInvalidSyntax, analyzeEscape(&session, path, &DefaultConfig));
+    try std.testing.expectEqual(@as(u32, 2), session.parse_failure.?.position.line);
+    var fresh: Session = undefined;
+    try fresh.init(gpa, io, .{ .roots = &.{directory} });
+    defer fresh.deinit();
+    const findings = try analyzeEscape(&fresh, path, &DefaultConfig);
+    defer freeProblems(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "library analysis enforces the session source boundary" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "denied.zig", .data = "pub fn broken( {" });
+    const path = try tmp.dir.realPathFileAlloc(io, "denied.zig", gpa);
+    defer gpa.free(path);
+    var session: Session = undefined;
+    try session.init(gpa, io, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.SourceExcluded, analyzeEscape(&session, path, &DefaultConfig));
+}
+
+test "an optional output slot may hold an optional value" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const problems = try analyzeSrc(std.testing.allocator, std.testing.io, &tmp,
+        \\pub fn report(out: ?*?u32) void {
+        \\    if (out) |p| p.* = null;
+        \\}
+    );
+    defer freeProblems(std.testing.allocator, problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.len);
+}
+
+test "a no-op child cleanup does not consume its borrowed pointer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const problems = try analyzeSrc(std.testing.allocator, std.testing.io, &tmp,
+        \\const std = @import("std");
+        \\const Child = struct {
+        \\    value: u8,
+        \\    fn deinit(self: *Child) void { _ = self; }
+        \\};
+        \\const Parent = struct {
+        \\    child: *Child,
+        \\    fn deinit(self: *Parent) void { self.child.deinit(); }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    const child = try gpa.create(Child);
+        \\    child.* = .{ .value = 7 };
+        \\    var parent = Parent{ .child = child };
+        \\    parent.deinit();
+        \\    const result = child.value;
+        \\    gpa.destroy(child);
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(std.testing.allocator, problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.len);
+}
+
+test "same-file and imported destructors still expose a double free" {
+    const child_source =
+        \\pub const Child = struct {
+        \\    gpa: @import("std").mem.Allocator,
+        \\    pub fn deinit(self: *Child) void { self.gpa.destroy(self); }
+        \\};
+        \\
+    ;
+    const consumer =
+        \\const Parent = struct {
+        \\    child: *Child,
+        \\    fn deinit(self: *Parent) void { self.child.deinit(); }
+        \\};
+        \\pub fn use(gpa: @import("std").mem.Allocator) !void {
+        \\    const child = try gpa.create(Child);
+        \\    child.* = .{ .gpa = gpa };
+        \\    var parent = Parent{ .child = child };
+        \\    parent.deinit();
+        \\    gpa.destroy(child);
+        \\}
+    ;
+    for ([_][]const u8{
+        child_source ++ consumer,
+        "const Child = @import(\"child.zig\").Child;\n" ++ consumer,
+    }) |source| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "child.zig", .data = child_source });
+        const problems = try analyzeSrc(std.testing.allocator, std.testing.io, &tmp, source);
+        defer freeProblems(std.testing.allocator, problems);
+        try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "heap-double-free"));
+    }
+}
+
+test "Marker and Node ownership stays import-scoped in either project order" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    const resources = [_][]const u8{
+        \\const Allocator = @import("std").mem.Allocator;
+        \\pub const Marker = struct {
+        \\    gpa: Allocator,
+        \\    pub fn deinit(self: *Marker) void { self.gpa.destroy(self); }
+        \\};
+        \\pub const Node = struct {
+        \\    gpa: Allocator,
+        \\    pub fn deinit(self: *Node) void { self.gpa.destroy(self); }
+        \\};
+        ,
+        \\const Allocator = @import("std").mem.Allocator;
+        \\pub const Marker = struct {
+        \\    gpa: Allocator,
+        \\    pub fn deinit(self: *Marker) void { _ = self; }
+        \\};
+        \\pub const Node = struct {
+        \\    gpa: Allocator,
+        \\    pub fn release(self: *Node) void { self.gpa.destroy(self); }
+        \\};
+        ,
+    };
+    const bodies =
+        \\pub fn use(gpa: @import("std").mem.Allocator) !void {
+        \\    const marker = try gpa.create(leaf.Marker);
+        \\    errdefer gpa.destroy(marker);
+        \\    marker.* = .{ .gpa = gpa };
+        \\    const node = try gpa.create(leaf.Node);
+        \\    node.* = .{ .gpa = gpa };
+        \\    var parent = Parent{ .marker = marker, .node = node };
+        \\    parent.deinit();
+        \\    gpa.destroy(marker);
+        \\    gpa.destroy(node);
+        \\}
+    ;
+    const consumers = [_][]const u8{
+        "const leaf = @import(\"resource.zig\");\n" ++
+            "const Parent = struct { marker: *leaf.Marker, node: *leaf.Node,\n" ++
+            "fn deinit(self: *Parent) void { self.marker.deinit(); self.node.deinit(); } };\n" ++ bodies,
+        "const leaf = @import(\"resource.zig\");\n" ++
+            "const Parent = struct { marker: *leaf.Marker, node: *leaf.Node,\n" ++
+            "fn deinit(self: *Parent) void { self.marker.deinit(); self.node.release(); } };\n" ++ bodies,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/resource.zig", .data = resources[0] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/resource.zig", .data = resources[1] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/main.zig", .data = consumers[0] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/main.zig", .data = consumers[1] });
+    const a = try tmp.dir.realPathFileAlloc(io, "a", gpa);
+    defer gpa.free(a);
+    const b = try tmp.dir.realPathFileAlloc(io, "b", gpa);
+    defer gpa.free(b);
+    const main_a = try tmp.dir.realPathFileAlloc(io, "a/main.zig", gpa);
+    defer gpa.free(main_a);
+    const main_b = try tmp.dir.realPathFileAlloc(io, "b/main.zig", gpa);
+    defer gpa.free(main_b);
+    const paths = [_][]const u8{ main_a, main_b };
+    const expected = [_]usize{ 2, 1 };
+    for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }) |order| {
+        var session: Session = undefined;
+        try session.init(gpa, io, .{ .roots = &.{ a, b } });
+        defer session.deinit();
+        for (order) |index| {
+            const problems = try analyzeEscape(&session, paths[index], &DefaultConfig);
+            defer freeProblems(gpa, problems);
+            try std.testing.expectEqual(expected[index], countByRule(problems, "heap-double-free"));
+            var locations: u8 = 0;
+            for (problems) |finding| {
+                if (!std.mem.eql(u8, finding.rule_id, "heap-double-free")) continue;
+                locations |= switch (finding.start.line) {
+                    12 => @as(u8, 1),
+                    13 => @as(u8, 2),
+                    else => return error.UnexpectedFreeLocation,
+                };
+            }
+            try std.testing.expectEqual(@as(u8, if (index == 0) 3 else 2), locations);
+        }
+    }
+}
+
+test "root source stays immutable until a fresh session" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data = "pub const answer = 1;" });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try tmp.dir.realPathFileAlloc(io, "root.zig", gpa);
+    defer gpa.free(path);
+    var snapshot: Session = undefined;
+    try snapshot.init(gpa, io, .{ .roots = &.{directory} });
+    defer snapshot.deinit();
+    const original = try analyzeEscape(&snapshot, path, &DefaultConfig);
+    defer freeProblems(gpa, original);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data = "pub fn broken( {" });
+    const unchanged = try analyzeEscape(&snapshot, path, &DefaultConfig);
+    defer freeProblems(gpa, unchanged);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.len);
+    var fresh: Session = undefined;
+    try fresh.init(gpa, io, .{ .roots = &.{directory} });
+    defer fresh.deinit();
+    try std.testing.expectError(error.InvalidSyntax, analyzeEscape(&fresh, path, &DefaultConfig));
+    try tmp.dir.deleteFile(io, "root.zig");
+    const retained = try analyzeEscape(&snapshot, path, &DefaultConfig);
+    defer freeProblems(gpa, retained);
+    try std.testing.expectEqual(@as(usize, 0), retained.len);
+}
+
+test "root and imported models use the same source snapshot" {
+    try checkSharedSourceSnapshot(false);
+}
+
+test "symlink imports retain the same source snapshot" {
+    try checkSharedSourceSnapshot(true);
+}
+
+fn checkSharedSourceSnapshot(import_alias: bool) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const declaration =
+        \\pub const Count = u8;
+        \\pub const Node = struct {
+        \\    gpa: @import("std").mem.Allocator,
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "resource.zig", .data = declaration ++
+        "pub fn deinit(self: *Node) void { _ = self; }\n};" });
+    const consumer_source =
+        \\const Node = @import("resource.zig").Node;
+        \\const Parent = struct {
+        \\    node: *Node,
+        \\    fn deinit(self: *Parent) void { self.node.deinit(); }
+        \\};
+        \\pub fn use(gpa: @import("std").mem.Allocator) !void {
+        \\    const node = try gpa.create(Node);
+        \\    node.* = .{ .gpa = gpa };
+        \\    var parent = Parent{ .node = node };
+        \\    parent.deinit();
+        \\    gpa.destroy(node);
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "consumer.zig", .data = consumer_source });
+    if (import_alias) {
+        try tmp.dir.symLink(io, "resource.zig", "alias.zig", .{});
+        try tmp.dir.writeFile(io, .{ .sub_path = "probe.zig", .data =
+            \\pub fn probe(value: @import("alias.zig").Count) f32 {
+            \\    return @floatFromInt(value);
+            \\}
+        });
+    }
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const first_path = try tmp.dir.realPathFileAlloc(io, if (import_alias) "probe.zig" else "resource.zig", gpa);
+    defer gpa.free(first_path);
+    const consumer = try tmp.dir.realPathFileAlloc(io, "consumer.zig", gpa);
+    defer gpa.free(consumer);
+    var snapshot: Session = undefined;
+    try snapshot.init(gpa, io, .{ .roots = &.{directory} });
+    defer snapshot.deinit();
+    const original = try analyzeEscape(&snapshot, first_path, &DefaultConfig);
+    defer freeProblems(gpa, original);
+    try tmp.dir.writeFile(io, .{ .sub_path = "resource.zig", .data = declaration ++
+        "pub fn deinit(self: *Node) void { self.gpa.destroy(self); }\n};" });
+    const unchanged = try analyzeEscape(&snapshot, consumer, &DefaultConfig);
+    defer freeProblems(gpa, unchanged);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(unchanged, "heap-double-free"));
+    var fresh: Session = undefined;
+    try fresh.init(gpa, io, .{ .roots = &.{directory} });
+    defer fresh.deinit();
+    const changed = try analyzeEscape(&fresh, consumer, &DefaultConfig);
+    defer freeProblems(gpa, changed);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(changed, "heap-double-free"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "after_delete.zig", .data = consumer_source });
+    const after_delete = try tmp.dir.realPathFileAlloc(io, "after_delete.zig", gpa);
+    defer gpa.free(after_delete);
+    try tmp.dir.deleteFile(io, "resource.zig");
+    const retained = try analyzeEscape(&snapshot, after_delete, &DefaultConfig);
+    defer freeProblems(gpa, retained);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(retained, "heap-double-free"));
+}
+
+test "borrowed-return summaries do not cross declaration scopes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = std.testing.allocator;
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Buffer = struct {
+        \\    bytes: [1]u8,
+        \\    fn slice(_: *const Buffer) []const u8 { return "static"; }
+        \\};
+        \\fn slice(b: *const Buffer) []const u8 { return b.bytes[0..]; }
+        \\const Ns = struct { fn slice(_: *const Buffer) []const u8 { return "static"; } };
+        \\fn viaMethod(b: *const Buffer) []const u8 { return b.slice(); }
+        \\fn viaNamespace(b: *const Buffer) []const u8 { return Ns.slice(b); }
+        \\pub fn safeMethod() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    const p = &b;
+        \\    const result = viaMethod(p);
+        \\    return result;
+        \\}
+        \\pub fn safeNamespace() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    const p = &b;
+        \\    const result = viaNamespace(p);
+        \\    return result;
+        \\}
+        \\pub fn bad() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    const p = &b;
+        \\    const result = slice(p);
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "stack-escape"));
+    for (problems) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "stack-escape")) {
+            try std.testing.expectEqual(@as(u32, 25), problem.start.line);
+        }
+    }
+}
+
+test "generic arguments do not inherit the enclosing receiver destructor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = std.testing.allocator;
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Allocator = @import("std").mem.Allocator;
+        \\const Borrowed = struct {
+        \\    value: u8,
+        \\    fn deinit(_: *Borrowed) void {}
+        \\};
+        \\const Owner = struct {
+        \\    gpa: Allocator,
+        \\    fn deinit(self: *Owner) void { self.gpa.destroy(self); }
+        \\    fn clean(self: *Owner, other: anytype) void {
+        \\        _ = self;
+        \\        other.deinit();
+        \\    }
+        \\};
+        \\pub fn safe(gpa: Allocator) !void {
+        \\    const other = try gpa.create(Borrowed);
+        \\    other.* = .{ .value = 1 };
+        \\    var owner = Owner{ .gpa = gpa };
+        \\    owner.clean(other);
+        \\    gpa.destroy(other);
+        \\}
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "heap-double-free"));
 }

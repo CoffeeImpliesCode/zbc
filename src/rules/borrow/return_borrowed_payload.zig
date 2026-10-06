@@ -30,6 +30,7 @@ const Ast = std.zig.Ast;
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
+const resolver_mod = @import("../../type_resolver.zig");
 
 const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
@@ -91,7 +92,7 @@ fn checkBody(
         // by payload-type: pointer-payload arms return the cached
         // pointer (not a borrow into the input), so they're safe.
         const scrut_union = scrutineeUnionType(tree, cache, t + 3, cp - 1);
-        try checkSwitchArms(gpa, tree, scrut_union, sw_body_start + 1, sw_body_end - 1, problems);
+        try checkSwitchArms(gpa, tree, cache, scrut_union, sw_body_start + 1, sw_body_end - 1, problems);
         t = sw_body_end;
     }
 }
@@ -116,7 +117,7 @@ fn scrutineeUnionType(
     cache: *file_cache_mod.FileCache,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-) ?*const @import("../../model/file_model.zig").TypeInfo {
+) ?file_cache_mod.FileCache.ResolvedType {
     const tags = tree.tokens.items(.tag);
     if (start > end) return null;
     // Handle `<ident>.*` (deref).  Zig lexes `.*` as one token,
@@ -144,7 +145,7 @@ fn resolveLocalTypeAsUnion(
     cache: *file_cache_mod.FileCache,
     ident_tok: Ast.TokenIndex,
     ident: []const u8,
-) ?*const @import("../../model/file_model.zig").TypeInfo {
+) ?file_cache_mod.FileCache.ResolvedType {
     const fn_decl = enclosingFnDecl(tree, ident_tok) orelse return null;
     var proto_buf: [1]Ast.Node.Index = undefined;
     const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return null;
@@ -154,12 +155,9 @@ fn resolveLocalTypeAsUnion(
         if (!std.mem.eql(u8, tree.tokenSlice(nt), ident)) continue;
         const type_node = p.type_expr orelse return null;
         const type_name = baseTypeNameOfNode(tree, type_node) orelse return null;
-        const model = cache.fileModel() catch return null;
-        const ti = model.findType(type_name) orelse blk: {
-            break :blk cache.findTypeAcrossImports(type_name) orelse return null;
-        };
-        if (ti.kind != .union_) return null;
-        return ti;
+        const resolved = cache.findTypeAcrossImports(type_name) orelse return null;
+        if (resolved.info.kind != .union_) return null;
+        return resolved;
     }
     return null;
 }
@@ -207,9 +205,7 @@ fn baseTypeNameOfNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
 }
 
 /// True iff the union variant `tag_name`'s declared payload type
-/// is a pointer (`*T` / `?*T`).  Pointer payloads in a switch arm
-/// `.tag => |v| v` are STABLE — `v` IS the pointer, returning it
-/// doesn't borrow from any caller input.
+/// is a pointer (`*T` / `?*T`). Pointer payloads are returned by value.
 fn unionVariantHasPointerPayload(
     tree: *const Ast,
     un_ti: *const @import("../../model/file_model.zig").TypeInfo,
@@ -224,11 +220,64 @@ fn unionVariantHasPointerPayload(
     }
     return false;
 }
+/// True for scalar and enum payloads that are copied by value.  Slices,
+/// structs, and unknown types stay conservative and are not filtered.
+fn unionVariantHasImmediateValuePayload(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    un_ti: *const @import("../../model/file_model.zig").TypeInfo,
+    tag_name: []const u8,
+) bool {
+    const field = un_ti.findField(tag_name) orelse return false;
+    const model = cache.fileModel() catch return false;
+    if (model.findType(un_ti.qualified_name) != un_ti) return false;
+    if (cache.isEnumTypeOfExpr(field.type_first, field.type_last) == true) return true;
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = field.type_first;
+    while (t <= field.type_last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .keyword_const => continue,
+            .asterisk, .l_bracket => return false,
+            .identifier => {
+                if (t != field.type_last) return false;
+                const name = tree.tokenSlice(t);
+                if (isImmediateBuiltin(name)) return true;
+                const type_info = model.findType(name) orelse return false;
+                return type_info.kind == .enum_;
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn isImmediateBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "bool") or
+        std.mem.eql(u8, name, "usize") or
+        std.mem.eql(u8, name, "isize") or
+        std.mem.eql(u8, name, "void") or
+        std.mem.eql(u8, name, "f16") or
+        std.mem.eql(u8, name, "f32") or
+        std.mem.eql(u8, name, "f64") or
+        std.mem.eql(u8, name, "f80") or
+        std.mem.eql(u8, name, "f128") or
+        std.mem.eql(u8, name, "u8") or
+        std.mem.eql(u8, name, "u16") or
+        std.mem.eql(u8, name, "u32") or
+        std.mem.eql(u8, name, "u64") or
+        std.mem.eql(u8, name, "u128") or
+        std.mem.eql(u8, name, "i8") or
+        std.mem.eql(u8, name, "i16") or
+        std.mem.eql(u8, name, "i32") or
+        std.mem.eql(u8, name, "i64") or
+        std.mem.eql(u8, name, "i128");
+}
 
 fn checkSwitchArms(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    scrut_union: ?*const @import("../../model/file_model.zig").TypeInfo,
+    cache: *file_cache_mod.FileCache,
+    scrut_union: ?file_cache_mod.FileCache.ResolvedType,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -285,11 +334,16 @@ fn checkSwitchArms(
         // pointer.  Returning it bare doesn't borrow from any
         // caller input — it returns the cached heap pointer.
         if (is_bare and scrut_union != null and
-            unionVariantHasPointerPayload(tree, scrut_union.?, tag_name))
+            unionVariantHasPointerPayload(scrut_union.?.model.tree, scrut_union.?.info, tag_name))
         {
             is_bare = false;
         }
-        const has_clone = armHasClone(tree, scan_start, scan_end);
+        if (is_bare and scrut_union != null and
+            unionVariantHasImmediateValuePayload(scrut_union.?.model.tree, cache, scrut_union.?.info, tag_name))
+        {
+            is_bare = false;
+        }
+        const has_clone = armHasClone(tree, scan_start, scan_end, capture_name);
         try arms.append(gpa, .{
             .tag_tok = tag_tok,
             .is_bare_return = is_bare,
@@ -333,19 +387,43 @@ fn armIsBareReturn(
     return true;
 }
 
-/// True iff the arm contains a clone/allocate method call.
-fn armHasClone(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
+/// True iff the arm contains a clone/allocate method call or a named
+/// free helper that consumes the captured payload.
+fn armHasClone(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    capture: ?[]const u8,
+) bool {
     const tags = tree.tokens.items(.tag);
     if (start > end) return false;
     var t: Ast.TokenIndex = start;
     while (t + 2 <= end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        const m = tree.tokenSlice(t + 1);
-        if (isAllocOrCloneMethodName(m)) return true;
+        if (tags[t] == .period and tags[t + 1] == .identifier and tags[t + 2] == .l_paren) {
+            if (isAllocOrCloneMethodName(tree.tokenSlice(t + 1))) return true;
+            continue;
+        }
+        if (tags[t] != .identifier or tags[t + 1] != .l_paren) continue;
+        if (t > start and tags[t - 1] == .period) continue;
+        if (!isAllocOrCloneFunctionName(tree.tokenSlice(t))) continue;
+        const close = matchParen(tags, t + 1, end) orelse continue;
+        const cap = capture orelse continue;
+        var arg = t + 2;
+        while (arg < close) : (arg += 1) {
+            if (tags[arg] != .identifier or !std.mem.eql(u8, tree.tokenSlice(arg), cap)) continue;
+            if (arg == t + 2 or tags[arg - 1] != .period) return true;
+        }
+        t = close;
     }
     return false;
+}
+
+fn isAllocOrCloneFunctionName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "clone") or
+        std.mem.startsWith(u8, name, "copy") or
+        std.mem.startsWith(u8, name, "dupe") or
+        std.mem.startsWith(u8, name, "alloc") or
+        std.mem.startsWith(u8, name, "owned");
 }
 
 fn isAllocOrCloneMethodName(name: []const u8) bool {
@@ -491,4 +569,86 @@ test "return-borrowed-payload: clone via .clone(alloc) also recognized" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "skript regression: enum payload copy is not a borrowed slice" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const ValueId = enum { invalid, valid };
+        \\const Choice = union(enum) { residual: ValueId, generated: ValueId };
+        \\fn cloneValue(value: ValueId) ValueId { return value; }
+        \\pub fn extract(choice: Choice) ValueId {
+        \\    return switch (choice) {
+        \\        .residual => |value| value,
+        \\        .generated => |value| cloneValue(value),
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "skript regression: slice payload still requires ownership copy" {
+    try testing.expectFires(check, "return-borrowed-payload",
+        \\const Choice = union(enum) { residual: []const u8, generated: []const u8 };
+        \\fn cloneBytes(value: []const u8) []const u8 { return value; }
+        \\pub fn extract(choice: Choice) []const u8 {
+        \\    return switch (choice) {
+        \\        .residual => |value| value,
+        \\        .generated => |value| cloneBytes(value),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "qualified enum payloads are resolved by their declared type" {
+    const source: [:0]const u8 =
+        \\const Code = struct { pub const ValueId = enum(u32) { invalid, valid }; };
+        \\const Choice = union(enum) { residual: Code.ValueId, generated: Code.ValueId };
+        \\fn cloneValue(value: Code.ValueId) Code.ValueId { return value; }
+        \\pub fn extract(choice: Choice) Code.ValueId {
+        \\    return switch (choice) {
+        \\        .residual => |value| value,
+        \\        .generated => |value| cloneValue(value),
+        \\    };
+        \\}
+        \\
+    ;
+    try expectTypedPayloadProblems(source, 0);
+}
+
+test "qualified enum namespace does not make a slice payload scalar" {
+    const source: [:0]const u8 =
+        \\const Code = enum { tag, pub const ValueId = []const u8; };
+        \\const Choice = union(enum) { residual: Code.ValueId, generated: Code.ValueId };
+        \\fn cloneValue(value: Code.ValueId) Code.ValueId { return value; }
+        \\pub fn extract(choice: Choice) Code.ValueId {
+        \\    return switch (choice) {
+        \\        .residual => |value| value,
+        \\        .generated => |value| cloneValue(value),
+        \\    };
+        \\}
+        \\
+    ;
+    try expectTypedPayloadProblems(source, 1);
+}
+
+fn expectTypedPayloadProblems(source: [:0]const u8, expected: usize) !void {
+    const gpa = std.testing.allocator;
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: resolver_mod.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-qualified-enum-regression.zig", source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer testing.freeProblems(gpa, &problems);
+    try check(gpa, tree, &cache, &config_mod.Default, &problems);
+    try std.testing.expectEqual(expected, problems.items.len);
 }

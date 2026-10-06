@@ -119,19 +119,18 @@ fn xPtrFieldIsNonSentinel(
     const fn_decl = enclosingFnDecl(tree, x_token) orelse return false;
     const model = cache.fileModel() catch return false;
     const type_name = bindingTypeName(tree, model, fn_decl, x_name) orelse return false;
-    const ti = model.findType(type_name) orelse blk: {
-        break :blk cache.findTypeAcrossImports(type_name) orelse return false;
-    };
-    const ptr_field = ti.findField("ptr") orelse return false;
+    const resolved = cache.findTypeAcrossImports(type_name) orelse return false;
+    const ptr_field = resolved.info.findField("ptr") orelse return false;
+    const field_tags = resolved.model.tree.tokens.items(.tag);
     // Sentinel check: type tokens start with `[` `*`.  If the next
     // token is `:`, it's sentinel-terminated.  If it's `]`, it's
     // non-sentinel.  Anything else (numeric arrays etc.) doesn't
     // match the rule's pattern anyway — let the rule fire.
     const t = ptr_field.type_first;
     if (t + 2 > ptr_field.type_last) return false;
-    if (tags[t] != .l_bracket) return false;
-    if (tags[t + 1] != .asterisk) return false;
-    return tags[t + 2] == .r_bracket;
+    if (field_tags[t] != .l_bracket) return false;
+    if (field_tags[t + 1] != .asterisk) return false;
+    return field_tags[t + 2] == .r_bracket;
 }
 
 /// Find the fn_decl AST node enclosing a given token by walking
@@ -161,62 +160,27 @@ fn bindingTypeName(
     return null;
 }
 
-/// Walk a type AST node, strip `?`/`*`/`const`/`[N]`/`[*]` wrappers
-/// and return the LAST identifier in a dotted chain.  Resolves
-/// `Self` / `@This()` to the model's containing-type-of-node (when
-/// available).  Returns null when the chain can't be parsed.
+/// Preserve the entire declared name and its lexical owner.
 fn baseTypeNameOfNode(
     tree: *const Ast,
     model: *const @import("../../model/file_model.zig").FileModel,
     type_node: Ast.Node.Index,
 ) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(type_node);
     const last = tree.lastToken(type_node);
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .asterisk, .keyword_const => continue,
-            .l_bracket => {
-                var d: u32 = 1;
-                t += 1;
-                while (t <= last and d > 0) : (t += 1) {
-                    if (tags[t] == .l_bracket) d += 1;
-                    if (tags[t] == .r_bracket) d -= 1;
-                }
-                if (t > last) return null;
-                t -= 1;
-            },
-            .identifier, .builtin => break,
-            else => return null,
+    const owner = model.containingTypeOf(type_node);
+    const name = tokens.typeNameFromTokens(tree, first, last) orelse {
+        if (owner) |scope| {
+            if (last >= first + 2 and tree.tokenTag(last - 2) == .builtin and
+                std.mem.eql(u8, tree.tokenSlice(last - 2), "@This")) return scope.qualified_name;
         }
+        return null;
+    };
+    if (owner) |scope| {
+        if (std.mem.eql(u8, name, "Self")) return scope.qualified_name;
+        if (model.resolveTypeNameInScope(name, scope)) |resolved| return resolved.qualified_name;
     }
-    if (t > last) return null;
-    var last_name: ?[]const u8 = null;
-    var expecting_ident: bool = true;
-    while (t <= last) : (t += 1) {
-        if (expecting_ident) {
-            if (tags[t] == .identifier) {
-                const n = tree.tokenSlice(t);
-                last_name = n;
-                expecting_ident = false;
-            } else if (tags[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@This")) {
-                // Resolve @This() to the containing type's name.
-                if (model.containingTypeOf(type_node)) |ti| last_name = ti.name;
-                expecting_ident = false;
-            } else return last_name;
-        } else {
-            if (tags[t] == .period) {
-                expecting_ident = true;
-            } else break;
-        }
-    }
-    if (last_name) |n| {
-        if (std.mem.eql(u8, n, "Self")) {
-            if (model.containingTypeOf(type_node)) |ti| return ti.name;
-        }
-    }
-    return last_name;
+    return name;
 }
 
 fn report(

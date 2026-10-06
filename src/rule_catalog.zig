@@ -202,7 +202,7 @@ pub const all = [_]Rule{
     },
     .{
         .id = "memset-undef-after-len-truncation",
-        .title = "`@memset(<X>.<field>..., undefined)` AFTER `<X>.<field>.len = ...` truncation — memset is a no-op on the now-empty slice",
+        .title = "Empty undefined fill after a proved slice-length reduction",
         .body = @embedFile("rules/collection/memset-undef-after-len-truncation.md"),
     },
     .{
@@ -521,11 +521,6 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/collection/hashmap-getentry-forced-unwrap.md"),
     },
     .{
-        .id = "double-optional-ptr",
-        .title = "`?*?T` — doubly-optional pointer; almost always a copy-paste error; for nullable out-params use `?*T`, for non-null pointer to optional use `*?T`",
-        .body = @embedFile("rules/misc/double-optional-ptr.md"),
-    },
-    .{
         .id = "aligncast-on-optional-unwrap",
         .title = "`@alignCast(x.?)` — forced `.?` panics on null; alignment assertion panics on misalignment; two panic sources in one expression",
         .body = @embedFile("rules/misc/aligncast-on-optional-unwrap.md"),
@@ -654,7 +649,6 @@ const memcpy_overlapping_slices_mod = @import("rules/misc/memcpy_overlapping_sli
 const cmpxchgweak_orelse_break_mod = @import("rules/misc/cmpxchgweak_orelse_break.zig");
 const slice_write_at_len_mod = @import("rules/misc/slice_write_at_len.zig");
 const clamp_wrong_direction_mod = @import("rules/misc/clamp_wrong_direction.zig");
-const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const aligncast_on_optional_unwrap_mod = @import("rules/misc/aligncast_on_optional_unwrap.zig");
 const adjacent_decl_same_source_field_mod = @import("rules/misc/adjacent_decl_same_source_field.zig");
 const intcast_of_negated_signed_mod = @import("rules/misc/intcast_of_negated_signed.zig");
@@ -761,7 +755,6 @@ const escape_detectors = [_]Detector{
     .{ .id = "lessthan-uses-leq",                       .check = lessthan_uses_leq_mod.check },
     .{ .id = "duplicate-defer-free",                    .check = duplicate_defer_free_mod.check },
     .{ .id = "hashmap-getentry-forced-unwrap",          .check = hashmap_getentry_forced_unwrap_mod.check },
-    .{ .id = "double-optional-ptr",                    .check = double_optional_ptr_mod.check },
     .{ .id = "aligncast-on-optional-unwrap",           .check = aligncast_on_optional_unwrap_mod.check },
     .{ .id = "adjacent-decl-same-source-field",        .check = adjacent_decl_same_source_field_mod.check },
     .{ .id = "intcast-of-negated-signed",               .check = intcast_of_negated_signed_mod.check },
@@ -925,7 +918,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = lessthan_uses_leq_mod;
     _ = duplicate_defer_free_mod;
     _ = hashmap_getentry_forced_unwrap_mod;
-    _ = double_optional_ptr_mod;
     _ = aligncast_on_optional_unwrap_mod;
     _ = adjacent_decl_same_source_field_mod;
     _ = intcast_of_negated_signed_mod;

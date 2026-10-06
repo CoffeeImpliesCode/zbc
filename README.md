@@ -27,7 +27,7 @@ zig fetch --save https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.g
 // build.zig
 const zbc_dep = b.dependency("zbc", .{
     .target = target,
-    .optimize = .ReleaseFast,
+    .optimize = .fast,
 });
 
 const zbc_run = b.addRunArtifact(zbc_dep.artifact("zbc"));
@@ -41,7 +41,7 @@ b.default_step.dependOn(&zbc_run.step);
 For standalone use:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zbc src/
 zbc --format=compact src/   # grep-friendly
 zbc --list-rules
@@ -49,6 +49,10 @@ zbc --explain <rule-id>
 ```
 
 Exit 0 if clean, 1 if problems found.
+
+Put the analyzed project's Zig compiler on `PATH`. The type engine runs
+`zig env` to locate that compiler and its standard library. It accepts JSON
+and ZON output and does not require a separate `which` executable.
 
 ## Rules
 

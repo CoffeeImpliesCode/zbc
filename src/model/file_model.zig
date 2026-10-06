@@ -97,6 +97,7 @@ pub const MethodInfo = struct {
 pub const TypeInfo = struct {
     /// Type's declared name (`const Name = struct { ... }` → "Name").
     name: []const u8,
+    qualified_name: []const u8,
     /// Token index of the name (the `Name` identifier).
     name_token: TokenIndex,
     /// struct / union / enum / opaque.
@@ -211,7 +212,7 @@ pub const FileModel = struct {
     /// Find a type by name (linear scan; types lists are small per file).
     pub fn findType(self: *const FileModel, name: []const u8) ?*const TypeInfo {
         for (self.types) |*t| {
-            if (std.mem.eql(u8, t.name, name)) return t;
+            if (std.mem.eql(u8, t.qualified_name, name)) return t;
         }
         return null;
     }
@@ -259,9 +260,7 @@ pub const FileModel = struct {
             if (parent_idx >= self.types.len) break;
             scope_parent = self.types[parent_idx].parent;
         }
-        // Fallback: any like-named type in the file (existing
-        // findType behavior).
-        return self.findType(name);
+        return null;
     }
 
     /// Resolve a qualified type path like `["Result", "Pending", "State"]`
@@ -275,7 +274,7 @@ pub const FileModel = struct {
     /// verify the chain's names match the path's earlier segments
     /// (right-to-left).  Returns the first candidate whose chain
     /// matches.
-    fn findQualifiedType(
+    pub fn findQualifiedType(
         self: *const FileModel,
         path: []const []const u8,
     ) ?*const TypeInfo {
@@ -315,7 +314,7 @@ pub const FileModel = struct {
             if (!std.mem.eql(u8, parent_ti.name, path[i])) return false;
             cur = parent_ti.parent;
         }
-        return true;
+        return cur == null;
     }
 
     /// Resolve a field's full type-path (`Result.Pending.State`) to
@@ -342,27 +341,29 @@ pub const FileModel = struct {
         ti: *const TypeInfo,
         field_name: []const u8,
     ) ?*const TypeInfo {
-        const f = ti.findField(field_name) orelse return null;
-        const tags = self.tree.tokens.items(.tag);
-        // Collect identifier chain inside the field's type-tokens.
-        var path_buf: [8][]const u8 = undefined;
-        var n: u32 = 0;
-        var t: TokenIndex = f.type_first;
-        while (t <= f.type_last) : (t += 1) {
-            switch (tags[t]) {
-                .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-                .identifier => {
-                    if (n < path_buf.len) {
-                        path_buf[n] = self.tree.tokenSlice(t);
-                        n += 1;
-                    }
-                },
-                .period => {},
-                else => break,
-            }
+        const field = ti.findField(field_name) orelse return null;
+        const name = tokens.typeNameFromTokens(self.tree, field.type_first, field.type_last) orelse return null;
+        return self.resolveTypeNameInScope(name, ti);
+    }
+
+    pub fn resolveTypeNameInScope(self: *const FileModel, name: []const u8, owner: *const TypeInfo) ?*const TypeInfo {
+        var segments = std.mem.splitScalar(u8, name, '.');
+        const first = std.mem.trim(u8, segments.next() orelse return null, &std.ascii.whitespace);
+        var current = self.findTypeInScope(first, owner) orelse return null;
+        var depth: u8 = 0;
+        while (segments.next()) |part| : (depth += 1) {
+            if (depth == 32) return null;
+            const segment = std.mem.trim(u8, part, &std.ascii.whitespace);
+            current = child: {
+                for (self.types) |*candidate| {
+                    const parent = candidate.parent orelse continue;
+                    if (&self.types[parent] != current) continue;
+                    if (std.mem.eql(u8, candidate.name, segment)) break :child candidate;
+                }
+                return null;
+            };
         }
-        if (n == 0) return null;
-        return self.findQualifiedType(path_buf[0..n]);
+        return current;
     }
 
     /// Convenience: type exists AND has the named method.
@@ -390,7 +391,10 @@ pub const FileModel = struct {
     /// not the outer — methods on nested types should associate
     /// with their declaring type, not its container.
     pub fn containingTypeOf(self: *const FileModel, fn_decl: Ast.Node.Index) ?*const TypeInfo {
-        const fn_tok = self.tree.firstToken(fn_decl);
+        return self.containingTypeAtToken(self.tree.firstToken(fn_decl));
+    }
+
+    pub fn containingTypeAtToken(self: *const FileModel, fn_tok: TokenIndex) ?*const TypeInfo {
         var best: ?*const TypeInfo = null;
         var best_span: u32 = std.math.maxInt(u32);
         for (self.types) |*ti| {
@@ -405,46 +409,14 @@ pub const FileModel = struct {
         return best;
     }
 
-    /// (struct_name, field_name) -> the field's declared base type
-    /// name with `*` / `?` / `const` / `[]` wrappers stripped.
-    /// Returns null when the struct or field isn't known, or when the
-    /// type has no resolvable base name (slice/array/fn-pointer
-    /// shapes).  Matches the old `Db.fieldType` query shape.
+    /// Complete declared name after pointer/optional qualifiers.
+    /// Arrays, slices, function types, and unresolved shapes return null.
     pub fn fieldType(self: *const FileModel, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
         const ti = self.findType(struct_name) orelse return null;
         const f = ti.findField(field_name) orelse return null;
-        return baseTypeName(self.tree, f.type_first, f.type_last);
+        return tokens.typeNameFromTokens(self.tree, f.type_first, f.type_last);
     }
 
-    pub const FieldTypePath = struct { ns: ?[]const u8, type_name: []const u8 };
-
-    /// Like `fieldType` but returns the `<ns>.<Type>` split when the
-    /// field's type references an imported namespace.  Used by R10
-    /// Case B cross-file filtering: `inner: *lib.Item` needs to look
-    /// up `Item` in `lib`'s FileCache, not in this file.
-    pub fn fieldTypePath(
-        self: *const FileModel,
-        struct_name: []const u8,
-        field_name: []const u8,
-    ) ?FieldTypePath {
-        const ti = self.findType(struct_name) orelse return null;
-        const f = ti.findField(field_name) orelse return null;
-        const tags = self.tree.tokens.items(.tag);
-        var t: TokenIndex = f.type_first;
-        while (t <= f.type_last) : (t += 1) {
-            switch (tags[t]) {
-                .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-                .identifier => break,
-                else => return null,
-            }
-        }
-        if (t > f.type_last or tags[t] != .identifier) return null;
-        const first_id = self.tree.tokenSlice(t);
-        if (t + 2 <= f.type_last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
-            return .{ .ns = first_id, .type_name = self.tree.tokenSlice(t + 2) };
-        }
-        return .{ .ns = null, .type_name = first_id };
-    }
 
     /// True iff the field's declared type starts with `*` (after
     /// stripping `?` / `const`).  Heuristic for "this field is a
@@ -824,24 +796,6 @@ fn braceOpenerKind(tags: []const std.zig.Token.Tag, brace_tok: TokenIndex) Brace
     return .unknown;
 }
 
-/// Strip pointer / optional / const / slice wrappers from a type
-/// expression token range and return the base identifier.  Returns
-/// null when the base isn't a single identifier (fn-pointer, anon
-/// struct, etc.).
-fn baseTypeName(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    var t: TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            // Strip leading wrappers and keep scanning.
-            .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-            .identifier => return tree.tokenSlice(t),
-            // Anything else (paren, dot, etc.) — give up.
-            else => return null,
-        }
-    }
-    return null;
-}
 
 /// Build a FileModel for the given Ast.  `tree` must outlive the model.
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
@@ -856,6 +810,7 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
 /// used) so cross-file lookups can resolve types named after their
 /// containing file.
 pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]const u8) !FileModel {
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -978,6 +933,7 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
             const fs_name_tok = findFileStructNameToken(tree, fs_name) orelse 0;
             try types.append(a, .{
                 .name = fs_name,
+                .qualified_name = fs_name,
                 .name_token = fs_name_tok,
                 .kind = .struct_,
                 .body_first = 0,
@@ -1126,6 +1082,9 @@ fn collectTypesInRange(
         const this_index: u32 = @intCast(types.items.len);
         try types.append(a, .{
             .name = tree.tokenSlice(t + 1),
+            .qualified_name = if (parent) |index|
+                try std.fmt.allocPrint(a, "{s}.{s}", .{ types.items[index].qualified_name, tree.tokenSlice(t + 1) })
+            else tree.tokenSlice(t + 1),
             .name_token = t + 1,
             .kind = kind,
             .body_first = b,
@@ -1709,7 +1668,7 @@ test "build: empty source" {
     try testing.expectEqual(@as(usize, 0), model.fns.len);
 }
 
-test "build: nested type decls collected with parent link" {
+test "nested declarations require their qualified lookup path" {
     const src: [:0]const u8 =
         \\const Outer = struct {
         \\    x: u32,
@@ -1725,14 +1684,10 @@ test "build: nested type decls collected with parent link" {
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
 
-    try testing.expectEqual(@as(usize, 2), model.types.len);
     const outer = model.findType("Outer").?;
-    const inner = model.findType("Inner").?;
-    try testing.expect(outer.parent == null);
-    try testing.expect(inner.parent != null);
-    // Inner's parent index points to Outer.
-    try testing.expectEqual(outer, &model.types[inner.parent.?]);
-    // Both pick up their methods so hasCleanupMethod works.
+    const inner = model.findType("Outer.Inner").?;
+    try testing.expect(model.findType("Inner") == null);
+    try testing.expect(model.findTypeInScope("Inner", outer) == inner);
     try testing.expect(outer.hasMethod("deinit"));
     try testing.expect(inner.hasMethod("close"));
     try testing.expect(inner.hasCleanupMethod());
@@ -1795,7 +1750,7 @@ test "containingTypeOf: method's fn_decl resolves to its struct" {
     try testing.expect(model.containingTypeOf(top_node.?) == null);
 }
 
-test "fieldType: strips pointer/optional/const/slice wrappers" {
+test "named field types distinguish wrappers from slices" {
     const src: [:0]const u8 =
         \\const Bar = struct {
         \\    a: Inner,
@@ -1814,7 +1769,7 @@ test "fieldType: strips pointer/optional/const/slice wrappers" {
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "a").?);
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "b").?);
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "c").?);
-    try testing.expectEqualStrings("u8", model.fieldType("Bar", "d").?);
+    try testing.expect(model.fieldType("Bar", "d") == null);
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "e").?);
 }
 
@@ -1859,7 +1814,7 @@ test "flagOwnedFields: returns the field-name set" {
     try testing.expectEqualStrings("two", flagged[1]);
 }
 
-test "build: doubly-nested type chains parent links" {
+test "qualified paths traverse multiple container scopes" {
     const src: [:0]const u8 =
         \\const A = struct {
         \\    const B = struct {
@@ -1872,11 +1827,11 @@ test "build: doubly-nested type chains parent links" {
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
 
-    try testing.expectEqual(@as(usize, 3), model.types.len);
     const a = model.findType("A").?;
-    const b = model.findType("B").?;
-    const c = model.findType("C").?;
-    try testing.expect(a.parent == null);
-    try testing.expectEqual(a, &model.types[b.parent.?]);
-    try testing.expectEqual(b, &model.types[c.parent.?]);
+    const b = model.findType("A.B").?;
+    const c = model.findType("A.B.C").?;
+    try testing.expect(model.resolveTypeNameInScope("B.C", a) == c);
+    try testing.expect(model.findTypeInScope("C", b) == c);
+    try testing.expect(model.findType("B") == null);
+    try testing.expect(model.findType("C") == null);
 }

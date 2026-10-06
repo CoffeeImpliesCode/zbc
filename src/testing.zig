@@ -44,9 +44,11 @@ pub fn runRule(
     defer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    errdefer freeProblems(gpa, &problems);
     try check_fn(gpa, &tree, &cache, &config_mod.Default, &problems);
     return problems;
 }
@@ -63,11 +65,52 @@ pub fn runRuleWithConfig(
     defer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    errdefer freeProblems(gpa, &problems);
     try check_fn(gpa, &tree, &cache, config, &problems);
     return problems;
+}
+
+/// Exercise rules whose contract depends on actual declaration and type identity.
+pub fn runRuleTyped(
+    gpa: std.mem.Allocator,
+    check_fn: CheckFn,
+    src: []const u8,
+) !std.ArrayListUnmanaged(Problem) {
+    const engine = @import("type_engine");
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    const source = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(source);
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-typed-rule.zig", source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.tree;
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    var cache = FileCache.init(gpa, tree);
+    cache.zls = &resolver;
+    defer cache.deinit();
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    errdefer freeProblems(gpa, &problems);
+    try check_fn(gpa, tree, &cache, &config_mod.Default, &problems);
+    return problems;
+}
+
+pub fn expectNoFireTyped(check_fn: CheckFn, src: []const u8) !void {
+    var problems = try runRuleTyped(std.testing.allocator, check_fn, src);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+pub fn expectFiresTyped(check_fn: CheckFn, rule_id: []const u8, src: []const u8) !void {
+    var problems = try runRuleTyped(std.testing.allocator, check_fn, src);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings(rule_id, problems.items[0].rule_id);
 }
 
 /// Free a list of Problems and the list itself.  Each problem owns
@@ -181,4 +224,10 @@ test "expectFires passes when rule reports 1" {
 
 test "expectNoFire passes when rule reports 0" {
     try expectNoFire(test_rule_silent, "fn f() void {}");
+}
+
+test "invalid rule fixtures cannot pass silently" {
+    try std.testing.expectError(error.InvalidSyntax, runRule(
+        std.testing.allocator, test_rule_silent, "pub fn broken( {",
+    ));
 }
