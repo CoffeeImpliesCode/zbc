@@ -1,25 +1,22 @@
 # intfromfloat-without-clamp
 
-**Severity:** error  
-**Category:** integer overflow / UB  
-**Tier:** 1 (token walk)
+**Severity:** warning
+**Category:** integer conversion / undefined behavior
+**Analysis:** typed AST and shared numeric range analysis
 
 ## What this checks
 
-`@intFromFloat(expr)` where the argument expression does not contain a
-`@min`, `@max`, `@round`, `@floor`, `@ceil`, `@trunc`, or `std.math.clamp`
-guard.
+The rule checks runtime `@intFromFloat` conversions.
+It reports when the argument is not proved finite and within the destination integer's conversion range.
+The destination comes from the conversion's context, including a return type or a parameter type.
 
-`@intFromFloat` panics in Debug/ReleaseSafe when the float is:
-- greater than the target integer's max value
-- less than the target integer's min value
-- `+Inf` / `-Inf`
-- `NaN`
+NaN, infinity, and an out-of-range conversion trap in Debug and ReleaseSafe.
+In unchecked builds, the operation has undefined behavior.
+A warning means the analyzer did not prove safe conversion for every reachable input.
 
-In ReleaseFast these cases produce silent undefined behaviour.  JS timer
-values, peer-advertised timeouts, and GC-scheduler delays are all floats
-that can legitimately be very large (or infinite), so they must be clamped
-before the cast.
+Rounding does not prove finiteness or range.
+`@floor`, `@ceil`, `@round`, and `@trunc` can still produce NaN, infinity, or an out-of-range value.
+A one-sided `@min` or `@max` does not establish both required bounds.
 
 ## Example (fires)
 
@@ -36,18 +33,30 @@ const int: i64 = @intFromFloat(float_from_js);
 
 ## Fix
 
-Clamp the float before conversion:
+Check a finite domain before conversion:
 
 ```zig
-const clamped = @min(@max(seconds, 0.0), @as(f64, std.math.maxInt(i32)));
-interval.sec += @intFromFloat(clamped);
+fn convert(value: f64) ?u8 {
+    if (!(value >= 0.0 and value < 256.0)) return null;
+    return @intFromFloat(value);
+}
 ```
 
-Or use `std.math.lossyCast` which handles out-of-range and NaN gracefully:
+This comparison also rejects NaN and both infinities.
+By contrast, `if (value < 0 or value >= 256) return null;` does not reject NaN.
 
-```zig
-interval.sec += std.math.lossyCast(i64, modf.ipart);
-```
+Use clipping only when the application permits a changed value.
+The actual bounds must fit the destination, and the clipping operation's NaN behavior matters.
+Converting an integer maximum to a float can round it upward; that rounded value is not a safe inclusive maximum.
+
+## Analysis boundary
+
+- Dominating finite comparisons, resolved arithmetic, and supported source-proved helper contracts can supply bounds.
+- Trusted standard-library clipping is checked against its declaration and actual arguments. A user helper named `clamp` has no implied contract.
+- Input masks and arithmetic can prove a finite result without any clipping call.
+- Effects are evaluated in source order. Mutation before conversion can invalidate earlier facts.
+- Compile-time-only expressions are not runtime conversion sites.
+- Analysis budget exhaustion is incomplete analysis, not a clean result.
 
 ## Real-world instances
 

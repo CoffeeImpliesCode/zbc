@@ -1,28 +1,25 @@
-//! Detects integer division or modulo by a container length — `x / c.len`
-//! or `x % c.len` — where `c` is not proven non-empty.  When `c.len == 0`
-//! (an empty slice/list), the `/` or `%` is division by zero: safety-checked
-//! illegal behaviour that panics in Debug/ReleaseSafe and is UB in ReleaseFast.
+//! Detect integer division by a container length — `x / c.len` — where
+//! the container is not proved non-empty. Division by zero can panic in
+//! Debug and ReleaseSafe; unchecked builds have undefined behavior.
 //!
-//! Classic shape: averaging or distributing over a possibly-empty collection —
-//!   const avg = total / items.len;            // panics when items is empty
-//!   const slot = hash % buckets.len;          // panics when buckets is empty
+//! Classic shape: averaging over a possibly-empty collection —
+//!   const avg = total / items.len;
 //!
-//! This is a **semantics-first** rule: a pure token walk firing on every
-//! `/ c.len` / `% c.len` would be unusable (most such divisions are over
-//! provably-non-empty containers — fixed arrays, guarded slices).  Precision
-//! comes from two sound semantic queries:
+//! This is a semantics-first rule: a token walk firing on every `/ c.len`
+//! would flag fixed arrays, guarded slices, and product-bounded loops.
+//! Precision comes from two semantic queries:
 //!   - the value-range oracle (`value_range.provesNonempty`): a dominating
-//!     guard `if (c.len > 0)` / `if (c.len == 0) return` / `c.len != 0`, or a
-//!     `const n = c.len; if (n > 0)` length-snapshot, proves `c` non-empty;
+//!     guard `if (c.len > 0)` / `if (c.len == 0) return` / `c.len != 0`,
+//!     a `const n = c.len` length-snapshot, a non-empty iterable loop, or
+//!     an AST-backed product count whose range/equality relation proves the
+//!     divisor factor nonzero;
 //!   - the type engine (`FileCache.fixedArrayLenOf`): `c` is a fixed array
 //!     `[N]T` with N >= 1 — its length is a non-zero compile-time constant.
 //! Only divisions the analyzer cannot prove safe fire.
 //!
-//! Scope (v1): the divisor must be exactly `<path>.len` (an integer length)
-//! appearing immediately after a binary `/` or `%`.  A parenthesized or
-//! arithmetic divisor (`/ (c.len + 1)`) is not matched — it can't be zero —
-//! and float division (`@as(f64, …) / …`) never traps, so it's excluded by
-//! construction (`.len` is `usize`).
+//! The divisor must be exactly `<path>.len` immediately after binary `/`.
+//! Modulo, assignment operators, grouped divisors, and arithmetic divisors
+//! are outside this detector's scope, not proved safe by their exclusion.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -93,12 +90,7 @@ fn checkBody(
             t = skipNestedFn(tags, t, last);
             continue;
         }
-        // Binary `/` only (not `/=`).  `%` is intentionally excluded in v1:
-        // corpus evidence shows modulo-by-`.len` is dominated by ring-buffer /
-        // index-wrap idioms over containers that are non-empty by construction
-        // (capacity asserted in a constructor the analyzer can't see), which
-        // would be false positives.  Division-by-`.len` (averaging/distributing
-        // over a possibly-empty collection) is the high-precision case.
+        // Only binary `/` is in scope. Modulo and `/=` are not checked.
         if (tags[t] != .slash) continue;
 
         const div = parseLenDivisor(tree, tags, t + 1, last) orelse continue;
@@ -112,7 +104,7 @@ fn checkBody(
 
         // Suppress: container proven non-empty by a dominating guard.
         const path = tree.source[tree.tokens.items(.start)[div.container_first] .. tree.tokens.items(.start)[div.container_last] + tree.tokenSlice(div.container_last).len];
-        if (value_range.provesNonempty(gpa, tree, body, path, div.len_tok, cache)) continue;
+        if (try value_range.provesNonempty(gpa, tree, body, path, div.len_tok, cache)) continue;
 
         try report(gpa, problems, tree, t, div.container_first, div.len_tok, path);
     }
@@ -271,5 +263,228 @@ test "divmod-by-len: multiply by len does not fire" {
         \\    return x * items.len;
         \\}
         \\
+    );
+}
+
+test "skript residual: product-bounded outer loop suppresses len division" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\fn apply(operation: Operation, left: Holder, right: Holder) !void {
+        \\    const count = if (operation == .outer)
+        \\        std.math.mul(usize, left.data.len, right.data.len) catch return error.Unsupported
+        \\    else
+        \\        left.data.len;
+        \\    for (0..count) |index| {
+        \\        const indexes: [2]usize = if (operation == .outer)
+        \\            .{ index / right.data.len, index % right.data.len }
+        \\        else
+        \\            .{ index, index };
+        \\        _ = indexes;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "skript residual: equal product-bounded iterable suppresses len division" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\fn apply(operation: Operation, left: Holder, right: Holder, cot: Holder) !void {
+        \\    const count =
+        \\        std.math.mul(usize, left.data.len, right.data.len) catch return error.Unsupported;
+        \\    if (operation == .outer and cot.data.len != count) return error.TypeMismatch;
+        \\    for (cot.data, 0..) |value, index| {
+        \\        const indexes: [2]usize = if (operation == .outer)
+        \\            .{ index / right.data.len, index % right.data.len }
+        \\        else
+        \\            .{ index, index };
+        \\        _ = value;
+        \\        _ = indexes;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "skript residual: unrelated product loop still reports empty divisor" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn apply(left: Holder, source: Holder, divisor: Holder) !void {
+        \\    const count =
+        \\        std.math.mul(usize, left.data.len, source.data.len) catch return error.Unsupported;
+        \\    for (0..count) |index| {
+        \\        consume(index / divisor.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: AST multiplication proves divisor nonempty" {
+    try testing.expectNoFire(check,
+        \\fn apply(left: Holder, right: Holder) void {
+        \\    const count = left.data.len * right.data.len;
+        \\    for (0..count) |index| {
+        \\        _ = index / right.data.len;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: length alias operand proves divisor nonempty" {
+    try testing.expectNoFire(check,
+        \\fn apply(left: Holder, right: Holder) void {
+        \\    const right_count = right.data.len;
+        \\    const count = left.data.len * right_count;
+        \\    for (0..count) |index| {
+        \\        _ = index / right.data.len;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: additive occurrence of divisor does not prove nonempty" {
+    try testing.expectFires(check, R,
+        \\fn apply(left: Holder, right: Holder) void {
+        \\    const count = left.data.len * 2 + right.data.len;
+        \\    for (0..count) |index| {
+        \\        consume(index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+test "product loop: conditional product does not cross branch mismatch" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn apply(operation: Operation, left: Holder, right: Holder) !void {
+        \\    const count = if (operation == .outer)
+        \\        std.math.mul(usize, left.data.len, right.data.len) catch return error.Unsupported
+        \\    else
+        \\        left.data.len;
+        \\    for (0..count) |index| {
+        \\        if (operation != .outer) consume(index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: reassigned count invalidates product proof" {
+    try testing.expectFires(check, R,
+        \\fn apply(left: Holder, right: Holder) void {
+        \\    var count = left.data.len * right.data.len;
+        \\    count = left.data.len;
+        \\    for (0..count) |index| {
+        \\        consume(index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: compound count mutation invalidates product proof" {
+    try testing.expectFires(check, R,
+        \\fn apply(left: Holder, right: Holder) void {
+        \\    var count = left.data.len * right.data.len;
+        \\    count -= 1;
+        \\    for (0..count) |index| {
+        \\        consume(index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: divisor mutation invalidates product proof" {
+    try testing.expectFires(check, R,
+        \\fn apply(left: Holder, right: Holder) void {
+        \\    const count = left.data.len * right.data.len;
+        \\    right.data.clearRetainingCapacity();
+        \\    for (0..count) |index| {
+        \\        consume(index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: iterable equality does not survive mutation" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn apply(left: Holder, right: Holder, cot: Holder) !void {
+        \\    const count =
+        \\        std.math.mul(usize, left.data.len, right.data.len) catch return error.Unsupported;
+        \\    if (cot.data.len != count) return error.TypeMismatch;
+        \\    cot.data.appendAssumeCapacity(0);
+        \\    for (cot.data, 0..) |value, index| {
+        \\        consume(value, index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: shadowed std math mul does not prove nonempty" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn apply(left: Holder, right: Holder) !void {
+        \\    const std = FakeStd;
+        \\    const count =
+        \\        std.math.mul(usize, left.data.len, right.data.len) catch return error.Unsupported;
+        \\    for (0..count) |index| {
+        \\        consume(index / right.data.len);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: nonzero range fact does not escape loop body" {
+    try testing.expectFires(check, R,
+        \\fn apply(left: Holder, right: Holder, total: usize) void {
+        \\    const count = left.data.len * right.data.len;
+        \\    for (0..count) |_| {}
+        \\    consume(total / right.data.len);
+        \\}
+        \\
+    );
+}
+
+test "product-sized iterable carries an existing length equality" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\fn apply(operation: Operation, left: Holder, right: Holder, cot: Holder) !void {
+        \\    const count = if (operation == .outer)
+        \\        std.math.mul(usize, left.data.len, right.data.len) catch return error.Unsupported
+        \\    else
+        \\        left.data.len;
+        \\    if (cot.data.len != count) return error.TypeMismatch;
+        \\    for (cot.data, 0..) |value, index| {
+        \\        const indexes: [2]usize = if (operation == .outer)
+        \\            .{ index / right.data.len, index % right.data.len }
+        \\        else
+        \\            .{ index, index };
+        \\        _ = value;
+        \\        _ = indexes;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "product loop: a later call can empty a borrowed divisor before the next iteration" {
+    try testing.expectFiresTyped(check, R,
+        \\const Holder = struct { data: []const usize };
+        \\fn clear(holder: *Holder) void { holder.data = &.{}; }
+        \\fn apply(left: *Holder, right: *Holder) void {
+        \\    const count = left.data.len * right.data.len;
+        \\    for (0..count) |index| {
+        \\        _ = index / right.data.len;
+        \\        clear(right);
+        \\    }
+        \\}
     );
 }

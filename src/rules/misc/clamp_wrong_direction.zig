@@ -47,7 +47,7 @@ pub fn check(
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 9) return;
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     var t: Ast.TokenIndex = 0;
     while (t + 8 <= last_tok) : (t += 1) {
@@ -113,11 +113,13 @@ fn report(
     is_max: bool,
 ) !void {
     const msg = if (is_max)
-        try gpa.dupe(u8,
+        try gpa.dupe(
+            u8,
             "`@max(expr, std.math.maxInt(T))` ensures the result is AT LEAST maxInt(T), making it larger than T can hold; use `@min(expr, std.math.maxInt(T))` to clamp to T's maximum before `@intCast`",
         )
     else
-        try gpa.dupe(u8,
+        try gpa.dupe(
+            u8,
             "`@min(expr, std.math.minInt(T))` ensures the result is AT MOST minInt(T), making it the minimum of T; use `@max(expr, std.math.minInt(T))` to clamp to T's minimum before `@intCast`",
         );
     errdefer gpa.free(msg);

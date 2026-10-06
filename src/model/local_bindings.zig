@@ -36,6 +36,11 @@ const tokens = @import("../ast/tokens.zig");
 const TokenIndex = tokens.TokenIndex;
 const TokenTag = tokens.TokenTag;
 
+/// `Binding.scope_open` before the walk that fills it in.  Token 0 is
+/// a legal token index, so "no block yet" has to be a value no real
+/// scope can take.
+const unset_scope = std.math.maxInt(TokenIndex);
+
 pub const OriginKind = enum {
     /// Fn parameter binding (declared in the proto).
     param,
@@ -143,6 +148,13 @@ pub const Binding = struct {
     /// Last token of the RHS expression (inclusive, before `;`).
     /// For params, the type's last token.
     rhs_last: TokenIndex,
+    /// The block this binding is written in — the `{` that opens it
+    /// and the `}` that closes it, or the whole body for a
+    /// parameter.  A binding names a value only from its own
+    /// `name_token` to `scope_close`, and that range is what tells a
+    /// shadowing local and the declaration it shadows apart.
+    scope_open: TokenIndex,
+    scope_close: TokenIndex,
     origin: Origin,
 
     /// If the binding originated from a call (any form), return the
@@ -199,16 +211,35 @@ pub const LocalBindings = struct {
         return null;
     }
 
+    /// The binding a USE of `name` written at `use_token` names.
+    ///
+    /// One spelling can be two declarations — a local shadowing
+    /// another, or the same name declared by two fns of this file —
+    /// and the one a use names is the declaration whose own block
+    /// still spans the use, written before it, innermost last.
+    /// `find` answers for the FIRST declaration of the name instead,
+    /// which is the question "is this name here at all", not "what
+    /// does this name mean right here".
+    pub fn findAt(self: *const LocalBindings, name: []const u8, use_token: TokenIndex) ?*const Binding {
+        var found: ?*const Binding = null;
+        for (self.items) |*b| {
+            if (!std.mem.eql(u8, b.name, name)) continue;
+            if (b.name_token > use_token) continue;
+            if (use_token < b.scope_open or use_token > b.scope_close) continue;
+            if (found == null or b.name_token > found.?.name_token) found = b;
+        }
+        return found;
+    }
 };
 
-/// Build a LocalBindings for a fn body.  `proto` provides the
-/// parameter list (added as `.param` bindings before body locals).
+/// Build local bindings. A function prototype adds parameter bindings;
+/// null selects a parameterless body, such as a test block.
 /// `body` is the AST body node — typically the result of
 /// `tokens.bodyOf(tree, fn_decl)`.
 pub fn build(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    proto: Ast.full.FnProto,
+    proto: ?Ast.full.FnProto,
     body: Ast.Node.Index,
 ) !LocalBindings {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -216,32 +247,39 @@ pub fn build(
     const a = arena.allocator();
 
     var items: std.ArrayListUnmanaged(Binding) = .empty;
-
-    // ── Pass 1: params ─────────────────────────────────────
-    var it = proto.iterate(tree);
-    while (it.next()) |param| {
-        const name_tok = param.name_token orelse continue;
-        const type_node = param.type_expr;
-        var rhs_first: TokenIndex = name_tok;
-        var rhs_last: TokenIndex = name_tok;
-        if (type_node) |tn| {
-            rhs_first = tree.firstToken(tn);
-            rhs_last = tree.lastToken(tn);
-        }
-        try items.append(a, .{
-            .name = tree.tokenSlice(name_tok),
-            .name_token = name_tok,
-            .is_const = true,
-            .rhs_first = rhs_first,
-            .rhs_last = rhs_last,
-            .origin = .param,
-        });
-    }
-
-    // ── Pass 2: local decls + capture clauses in body ──────
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
+
+    // ── Pass 1: params ─────────────────────────────────────
+    if (proto) |function| {
+        var it = function.iterate(tree);
+        while (it.next()) |param| {
+            const name_tok = param.name_token orelse continue;
+            const type_node = param.type_expr;
+            var rhs_first: TokenIndex = name_tok;
+            var rhs_last: TokenIndex = name_tok;
+            if (type_node) |tn| {
+                rhs_first = tree.firstToken(tn);
+                rhs_last = tree.lastToken(tn);
+            }
+            try items.append(a, .{
+                .name = tree.tokenSlice(name_tok),
+                .name_token = name_tok,
+                .is_const = true,
+                .rhs_first = rhs_first,
+                .rhs_last = rhs_last,
+                // A parameter is written above the body's `{`, so the
+                // walk below leaves it the whole body — which is
+                // exactly its scope.
+                .scope_open = unset_scope,
+                .scope_close = unset_scope,
+                .origin = .param,
+            });
+        }
+    }
+
+    // ── Pass 2: local decls + capture clauses in body ──────
     var t: TokenIndex = first;
     while (t < last) : (t += 1) {
         // Capture clauses on for/while/if/catch.  Pattern:
@@ -310,16 +348,68 @@ pub fn build(
             .is_const = tags[t] == .keyword_const,
             .rhs_first = rhs_first,
             .rhs_last = rhs_last,
+            .scope_open = unset_scope,
+            .scope_close = unset_scope,
             .origin = origin,
         });
         t = sc;
     }
+
+    try assignScopes(a, tags, first, last, &items);
 
     return .{
         .arena = arena,
         .tree = tree,
         .items = try items.toOwnedSlice(a),
     };
+}
+
+/// Give every binding the block it is written in.
+///
+/// `items` is in source order, so ONE walk answers all of them: the
+/// `{` under the walk's feet is the block the next binding is written
+/// in, and the `}` that closes a block ends the reach of exactly the
+/// bindings written inside it — which are the ones appended since
+/// that `{` was pushed, so each frame carries where those began.
+fn assignScopes(
+    a: std.mem.Allocator,
+    tags: []const TokenTag,
+    first: TokenIndex,
+    last: TokenIndex,
+    items: *std.ArrayListUnmanaged(Binding),
+) !void {
+    if (items.items.len == 0) return;
+    const Frame = struct { open: TokenIndex, first_inside: usize };
+    var open: std.ArrayListUnmanaged(Frame) = .empty;
+    var next: usize = 0;
+    var t: TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        // Bindings are appended in source order, so the cursor never
+        // goes back and each one is seen exactly once.
+        while (next < items.items.len and items.items[next].name_token <= t) {
+            if (items.items[next].scope_open == unset_scope) {
+                items.items[next].scope_open = if (open.items.len == 0) first else open.items[open.items.len - 1].open;
+            }
+            next += 1;
+        }
+        switch (tags[t]) {
+            .l_brace => try open.append(a, .{ .open = t, .first_inside = next }),
+            .r_brace => {
+                const frame = open.pop() orelse continue;
+                // A binding already closed by a `}` of its own keeps
+                // that one: an enclosing block must not widen it.
+                for (items.items[frame.first_inside..next]) |*binding| {
+                    if (binding.scope_close == unset_scope) binding.scope_close = t;
+                }
+            },
+            else => {},
+        }
+    }
+    // A parameter was written above the body and a `{` the walk never
+    // closed leaves its bindings open; both run to the body's end.
+    for (items.items) |*binding| {
+        if (binding.scope_close == unset_scope) binding.scope_close = last;
+    }
 }
 
 /// Parse a `|name|` / `|name, name|` capture clause starting at
@@ -349,9 +439,14 @@ fn captureItemsBetween(
         try items.append(a, .{
             .name = name,
             .name_token = t,
+            // A by-value loop capture is an immutable copy of the
+            // element, like a parameter; the `*` pointer capture that
+            // can be written through is skipped above.
             .is_const = true,
             .rhs_first = iter_first,
             .rhs_last = iter_last,
+            .scope_open = unset_scope,
+            .scope_close = unset_scope,
             .origin = .loop_capture,
         });
     }
@@ -499,6 +594,7 @@ const testing = std.testing;
 fn parseFn(src: [:0]const u8) !struct { tree: Ast, bindings: LocalBindings } {
     var tree = try Ast.parse(testing.allocator, src, .zig);
     errdefer tree.deinit(testing.allocator);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);

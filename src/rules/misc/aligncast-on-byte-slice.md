@@ -11,6 +11,42 @@ The rule fires on two forms:
 
 `@ptrCast(@alignCast(expr.ptr))` also contains Form A or B as a sub-expression and fires.
 
+## Suppressions
+
+The rule is quiet when the cast is provably safe:
+
+- **An explicitly aligned receiver** — `recv: []align(N) u8`, or a buffer
+  from `alignedAlloc`, is aligned by construction.
+- **A non-byte slice** — `[]u32`, `[]Struct`, … is already wider than one
+  byte, so `.ptr` is not the bug class this rule names.
+- **A guarded allocator context.** Recovering an allocator back out of its
+  `ptr` (`@ptrCast(@alignCast(alloc.ptr))`) is safe only after a vtable
+  check that dominates the cast:
+
+  ```zig
+  if (alloc.vtable != &AccountAllocator.vtable) return false;
+  const account: *const AccountAllocator = @ptrCast(@alignCast(alloc.ptr));
+  ```
+
+  The receiver type must resolve to the real `std.mem.Allocator`.
+  Direct `@import("std")` expressions and `const` namespace or type aliases
+  can establish this identity. The rule follows each alias in its declaring
+  scope. A caller-chosen `std` parameter or a custom allocator namespace
+  does not establish the standard-library identity.
+
+  The guard must share the cast's block and compare against the cast
+  target's declaration. Nothing between them may rebind or escape the
+  allocator. A helper can replace the inline guard only when the call
+  resolves to that helper's declaration. That helper must return `bool`,
+  take the allocator first, and return `false` for a vtable mismatch.
+  A same-named function, an unresolved call target, or a caller-supplied
+  function value cannot supply another declaration's proof.
+
+  The block structure is resolved by a fixed 128-entry brace stack. Code
+  nested deeper than that yields an **unknown** scope, not "outside any
+  block": a guard whose scope cannot be determined is refused, so deep nesting
+  reports rather than silently suppressing.
+
 ## Why it matters
 
 In Zig, `.ptr` on a `[]const u8` slice returns a raw `[*]const u8` pointer whose alignment depends on where the data came from — the allocator, memory-mapping offset, or network socket buffer position. There is no guarantee it is aligned to anything other than `align(1)`.

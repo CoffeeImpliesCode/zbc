@@ -1,18 +1,29 @@
 # intcast-of-negated-signed
 
-`@intCast(-VAR)` — casting a negated runtime integer without guarding against the minimum-value overflow. If `VAR` is a signed integer at its minimum value (`minInt(T)`), the negation `-VAR` overflows before the cast even runs: it panics in Debug/ReleaseSafe and silently wraps to the wrong value in ReleaseFast.
+**Severity:** warning
+**Analysis:** typed AST and shared numeric range analysis
+
+The rule checks the negation before the destination conversion.
+Negating a signed integer's minimum value overflows before `@intCast` runs.
+Checked builds can trap; unchecked builds have undefined behavior, not defined wrapping.
 
 ## What the rule checks
 
-The rule fires on the 5-token pattern `@intCast ( - identifier )` — any `@intCast` call whose single argument is a unary negation of an identifier. It does not fire for:
-- Integer literals: `@intCast(-1)` — comptime-known, compiler checks overflow
-- Non-identifier expressions: `@intCast(-(a + b))` — no match
+The rule finds runtime `@intCast` calls whose single argument is a unary negation,
+including grouped expressions, field accesses, and arithmetic operands.
+It reports unless both the negation and the destination conversion are proved in range.
+Resolved constants, types, dominating guards, and supported helper contracts can provide that proof.
+Compile-time-only expressions are not runtime conversion sites.
+A negative-sign guard alone does not exclude the signed minimum.
 
 ## Why it matters
 
-The expression `-VAR` for a signed integer is only defined when `VAR != minInt(T)`. For `i64`, `minInt(i64) == -9223372036854775808`; negating that value overflows the `i64` range and wraps to the same negative value in ReleaseFast.
+The expression `-VAR` for a signed integer is only defined when `VAR != minInt(T)`.
+For `i64`, `minInt(i64)` is −9,223,372,036,854,775,808.
+The positive magnitude does not fit in `i64`, so negation overflows in that type.
 
-The pattern `@intCast(-VAR)` usually appears in code that wants the unsigned magnitude of a signed value (e.g., converting a negative duration to a positive count). The correct form is `@abs(VAR)`, which is defined for all signed integers including `minInt`.
+Use `@abs(VAR)` for an unsigned magnitude; it is defined for the signed minimum too.
+Then check any narrower destination separately.
 
 ## Real-world instance
 
@@ -26,7 +37,7 @@ fn formatDuration(ns: i64) u64 {
     if (ns < 0) {
         return @as(u64, @intCast(-ns));
     }
-    return @as(u64, ns);
+    return @intCast(ns);
 }
 
 // Use @abs which handles minInt correctly:

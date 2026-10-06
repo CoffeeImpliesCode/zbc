@@ -8,6 +8,27 @@ The rule fires when the pattern `. identifier = try` appears inside an initializ
 - Only one field uses `try`
 - The second field does not use `try` (no interleaved allocation risk)
 
+## Ownership proofs
+
+The rule does not report a value-only first result. This proof reads the
+called file-level function's declared return type. It accepts scalars,
+enums without cleanup methods, and structs with value-only fields and no
+cleanup methods. It follows `const` type aliases in their declaring scope.
+An alias to a struct with owned pointer or slice fields does not make
+that struct value-only.
+
+A separate proof covers a private helper whose allocator parameter receives
+storage from a scoped standard-library arena at every recognized call.
+The caller must construct the real `std.heap.ArenaAllocator` and place
+`defer scope.deinit()` immediately after its declaration. The cleanup must
+remain valid through the helper call.
+
+Direct `@import("std")` expressions and `const` namespace or type aliases
+can establish the arena's identity. The rule follows each alias in its
+declaring scope. A custom `ArenaAllocator`, a caller-chosen `std` parameter,
+or a custom namespace does not establish this identity. A method named
+`allocator` or `deinit` is not sufficient evidence.
+
 ## Why it matters
 
 `errdefer` works at statement level — it is not legal inside a struct literal expression. This means:

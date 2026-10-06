@@ -225,6 +225,37 @@ fn unionVariantHasPointerPayload(
     return false;
 }
 
+/// Token window covered by one switch arm's body.  A block arm
+/// (`.tag => { ... }`) is scanned between its braces; an inline arm
+/// (`.tag => expr`) is scanned from its first token through
+/// `end_inclusive`.
+const ArmBodySpan = struct {
+    end_inclusive: Ast.TokenIndex,
+    scan_start: Ast.TokenIndex,
+    scan_end: Ast.TokenIndex,
+};
+
+/// Resolve the span of an arm body starting at `body_start`, looking
+/// no further than `end`.  Strips the braces of a block arm so the
+/// span holds only the arm's own tokens.  Null when a block arm's
+/// braces never close within `end`.
+fn armBodySpan(
+    tags: []const std.zig.Token.Tag,
+    body_start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) ?ArmBodySpan {
+    const body_is_block = tags[body_start] == .l_brace;
+    const end_inclusive = if (body_is_block)
+        (matchBrace(tags, body_start, end) orelse return null)
+    else
+        (findArmEndInclusive(tags, body_start, end) orelse return null);
+    return .{
+        .end_inclusive = end_inclusive,
+        .scan_start = if (body_is_block) body_start + 1 else body_start,
+        .scan_end = if (body_is_block) end_inclusive - 1 else end_inclusive,
+    };
+}
+
 fn checkSwitchArms(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -262,18 +293,9 @@ fn checkSwitchArms(
         }
         if (body_start > end) break;
         // Arm body — block or inline.
-        const body_end_inclusive = if (tags[body_start] == .l_brace)
-            (matchBrace(tags, body_start, end) orelse break)
-        else
-            (findArmEndInclusive(tags, body_start, end) orelse break);
-        const scan_start = if (tags[body_start] == .l_brace)
-            body_start + 1
-        else
-            body_start;
-        const scan_end = if (tags[body_start] == .l_brace)
-            body_end_inclusive - 1
-        else
-            body_end_inclusive;
+        const span = armBodySpan(tags, body_start, end) orelse break;
+        const scan_start = span.scan_start;
+        const scan_end = span.scan_end;
 
         const tag_name = tree.tokenSlice(tag_tok);
         var is_bare = if (capture_name) |cap|
@@ -295,7 +317,7 @@ fn checkSwitchArms(
             .is_bare_return = is_bare,
             .has_clone = has_clone,
         });
-        t = body_end_inclusive;
+        t = span.end_inclusive;
     }
 
     // If ANY arm has clone AND there's a bare-return arm, fire on

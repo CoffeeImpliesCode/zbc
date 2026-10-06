@@ -22,6 +22,92 @@ const Ast = std.zig.Ast;
 pub const TokenIndex = Ast.TokenIndex;
 pub const TokenTag = std.zig.Token.Tag;
 
+/// Root binding of an lvalue path. Arithmetic expressions have no such root.
+pub fn rootIdentifier(tree: *const Ast, expression: Ast.Node.Index) ?Ast.Node.Index {
+    var node = expression;
+    for (0..tree.nodes.len) |_| {
+        switch (tree.nodeTag(node)) {
+            .identifier => return node,
+            .field_access, .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+            .array_access, .slice_open => node = tree.nodeData(node).node_and_node[0],
+            .slice, .slice_sentinel => node = tree.nodeData(node).node_and_extra[0],
+            .deref => node = tree.nodeData(node).node,
+            .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return null;
+                var children = @import("type_engine").AstIterator.init(tree, node);
+                node = children.next(tree) orelse return null;
+            },
+            else => return null,
+        }
+    }
+    unreachable; // Parsed AST edges cannot form a cycle.
+}
+
+/// Complete named type after pointer/optional qualifiers. Compound types
+/// and incomplete paths have no named-type identity.
+pub fn typeNameFromTokens(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const u8 {
+    if (first > last) return null;
+    const tags = tree.tokens.items(.tag);
+    var token = first;
+    while (token <= last) : (token += 1) {
+        switch (tags[token]) {
+            .question_mark, .asterisk, .asterisk_asterisk, .keyword_const, .keyword_volatile, .keyword_allowzero => {},
+            .keyword_align, .keyword_addrspace => {
+                if (token + 1 > last or tags[token + 1] != .l_paren) return null;
+                token = matchParen(tags, token + 1, last) orelse return null;
+            },
+            .identifier => break,
+            else => return null,
+        }
+    }
+    if (token > last) return null;
+    const start = token;
+    var identifier = true;
+    while (token <= last) : (token += 1) {
+        if (tags[token] != (if (identifier) TokenTag.identifier else TokenTag.period)) return null;
+        identifier = !identifier;
+    }
+    if (identifier) return null;
+    const starts = tree.tokens.items(.start);
+    return tree.source[starts[start] .. starts[last] + tree.tokenSlice(last).len];
+}
+
+/// The path an `@import("…")` call spells in `[first, last]`, quotes
+/// removed, or null when the tokens are not one.  ONE reader for every
+/// caller in the tool: what an import spells, and whether an escape
+/// makes it a path this tool cannot resolve, is decided here once
+/// rather than drifting apart in three hand-rolled copies.
+///
+/// Two shapes are one import: `@import` `(` STRING `)` and the same
+/// with Zig's OPTIONAL TRAILING COMMA before the `)` — both are valid
+/// Zig and both name the path.  A second ARGUMENT is not: that call
+/// spans more tokens than either shape and its first argument is not
+/// the path, so it reads null rather than name a file nobody wrote.
+///
+/// The span is borrowed from `tree` and lives exactly as long as it
+/// does — the returned slice is `tree.source` re-sliced, never a copy,
+/// so no caller may outlive the parse it read.
+pub fn importLiteralFromTokens(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const u8 {
+    if (tree.tokenTag(first) != .builtin) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(first), "@import")) return null;
+    // The span must END at a `)` that actually closes this call, and
+    // the only thing allowed between the literal and that `)` is a
+    // single comma.  Checking the tags and not just the length is what
+    // stops a five-token window slid over `@import("a", "b")` from
+    // naming "a" — the window there ends on a string, not a `)`.
+    const closes_plain = last == first + 3 and tree.tokenTag(first + 3) == .r_paren;
+    const closes_comma = last == first + 4 and
+        tree.tokenTag(first + 3) == .comma and
+        tree.tokenTag(first + 4) == .r_paren;
+    if (!closes_plain and !closes_comma) return null;
+    if (tree.tokenTag(first + 2) != .string_literal) return null;
+    const literal = tree.tokenSlice(first + 2);
+    // An escape means this is not a spelling whose text can be taken for
+    // a path; decoding it here would name a file nobody wrote.
+    if (std.mem.indexOfScalar(u8, literal, '\\') != null) return null;
+    return literal[1 .. literal.len - 1];
+}
+
 /// Given the `{` at `lb`, find its matching `}` within `[lb+1, last]`.
 pub fn matchBrace(tags: []const TokenTag, lb: TokenIndex, last: TokenIndex) ?TokenIndex {
     var depth: u32 = 1;
@@ -169,6 +255,19 @@ pub fn isIdentByte(c: u8) bool {
         (c >= '0' and c <= '9') or c == '_';
 }
 
+/// True iff `name` is a known memory-writing builtin whose FIRST operand
+/// is written through in place and is not retained as a pointer.  `name`
+/// is a builtin's token slice and includes the leading `@`.
+///
+/// This is the NAME test only — proving a mention sits at the destination
+/// POSITION is the caller's own position test.  A builtin not listed here
+/// gets no exemption.
+pub fn isWriteFirstArgBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@memset") or
+        std.mem.eql(u8, name, "@memcpy") or
+        std.mem.eql(u8, name, "@memmove");
+}
+
 /// True iff any token in `[start, end]` has tag `needle`.
 pub fn hasTokenInRange(tags: []const TokenTag, start: TokenIndex, end: TokenIndex, needle: TokenTag) bool {
     if (start > end) return false;
@@ -288,6 +387,116 @@ pub fn returnsType(tree: *const Ast, fn_decl: Ast.Node.Index) bool {
     if (first != last) return false;
     return tree.tokens.items(.tag)[first] == .identifier and
         std.mem.eql(u8, tree.tokenSlice(first), "type");
+}
+
+/// The token ranges of one source snapshot that Zig never evaluates at
+/// runtime: every `comptime` block and every `@TypeOf(…)` operand.  A
+/// reference inside one of them is a compile-time value whatever it is
+/// spelled like, and a reference outside all of them is a runtime one.
+///
+/// Built once per file in one pass over the node table, so the answer a
+/// rule needs for each of its candidate anchors costs a search over a
+/// handful of sorted ranges instead of another whole-file walk.  The
+/// ranges are file-global, so one index answers every consumer of the
+/// same snapshot.
+pub const RuntimeUse = struct {
+    /// Sorted by `first`, non-overlapping, merged.
+    ranges: []const Range,
+
+    pub const Range = struct { first: TokenIndex, last: TokenIndex };
+
+    /// The excluded ranges of `tree`.  `gpa` owns the result; release it
+    /// with `deinit`.  A file with nothing to exclude returns an empty
+    /// slice that still belongs to the caller.
+    pub fn collect(gpa: std.mem.Allocator, tree: *const Ast) error{OutOfMemory}!RuntimeUse {
+        var list: std.ArrayListUnmanaged(Range) = .empty;
+        errdefer list.deinit(gpa);
+        for (tree.nodes.items(.tag), 0..) |tag, raw_node| {
+            switch (tag) {
+                .@"comptime", .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+                else => continue,
+            }
+            const node: Ast.Node.Index = @enumFromInt(raw_node);
+            if (tag != .@"comptime" and
+                !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@TypeOf")) continue;
+            try list.append(gpa, .{ .first = tree.firstToken(node), .last = tree.lastToken(node) });
+        }
+        std.mem.sort(Range, list.items, {}, rangeBefore);
+        // Merging walks the sorted list once and writes the merged run
+        // back over the FRONT of the same buffer: a merged run is never
+        // longer than what it merges, so the input and the output can
+        // be one allocation and no second list copies the ranges out
+        // of it.  `read` only ever runs ahead of `write`, which is
+        // what makes writing behind it safe.
+        var read: usize = 0;
+        var write: usize = 0;
+        while (read < list.items.len) : (read += 1) {
+            const range = list.items[read];
+            if (write == 0) {
+                list.items[write] = range;
+                write += 1;
+                continue;
+            }
+            const previous = &list.items[write - 1];
+            if (range.first <= previous.last) {
+                if (range.last > previous.last) previous.last = range.last;
+                continue;
+            }
+            list.items[write] = range;
+            write += 1;
+        }
+        // Shortening the slice is what hands back only the merged run,
+        // and `toOwnedSlice` keeps the allocation the sort already paid
+        // for instead of copying the ranges into a second one.
+        list.items.len = write;
+        return .{ .ranges = try list.toOwnedSlice(gpa) };
+    }
+
+    pub fn deinit(self: *RuntimeUse, gpa: std.mem.Allocator) void {
+        gpa.free(self.ranges);
+        self.* = undefined;
+    }
+
+    /// True iff `anchor` sits inside one of the excluded ranges.
+    pub fn excludes(self: RuntimeUse, anchor: TokenIndex) bool {
+        var low: usize = 0;
+        var high: usize = self.ranges.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.ranges[middle].last < anchor) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if (low == self.ranges.len) return false;
+        return self.ranges[low].first <= anchor;
+    }
+
+    fn rangeBefore(_: void, lhs: Range, rhs: Range) bool {
+        if (lhs.first != rhs.first) return lhs.first < rhs.first;
+        return lhs.last < rhs.last;
+    }
+};
+
+/// True iff `anchor` is a runtime reference of `fn_decl`, given the
+/// snapshot's `excluded` ranges (see `RuntimeUse.collect`).
+///
+/// A declaration whose result is the literal `type` builds a type: its
+/// body runs at comptime, so nothing in it is a runtime reference.  An
+/// anchor outside the declaration's own body belongs to no runtime code.
+pub fn isRuntimeUse(
+    tree: *const Ast,
+    fn_decl: Ast.Node.Index,
+    anchor: Ast.TokenIndex,
+    excluded: RuntimeUse,
+) bool {
+    if (returnsType(tree, fn_decl)) return false;
+    const body = bodyOf(tree, fn_decl) orelse return false;
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    if (anchor < first or anchor > last) return false;
+    return !excluded.excludes(anchor);
 }
 
 /// Extract the `FnProto` view of an `fn_decl` node, handling all
@@ -456,6 +665,102 @@ pub fn isTrivialBody(tree: *const Ast, body_first: TokenIndex, body_last: TokenI
 
 // ── Tests ──────────────────────────────────────────────────
 
+test "importLiteralFromTokens reads an import's own span, comma or not" {
+    const src: [:0]const u8 =
+        \\const plain = @import("std");
+        \\const path = @import("./lib.zig");
+        \\const comma = @import("trailing.zig",);
+        \\const two_args = @import("first.zig", "second.zig");
+        \\const not_a_literal = @import(other.zig);
+        \\const escaped = @import("esc\\aped.zig");
+    ;
+    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    // Every `@import` call in `src`, each read over the span the AST
+    // gives the call itself — the same range every consumer passes.
+    var read: usize = 0;
+    var paths: [8][]const u8 = undefined;
+    var found: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw_node| {
+        switch (tag) {
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(raw_node);
+        read += 1;
+        const path = importLiteralFromTokens(&tree, tree.nodeMainToken(node), tree.lastToken(node)) orelse continue;
+        paths[found] = path;
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), read);
+    // A bare module name, a path, and the SAME import written with
+    // Zig's optional trailing comma all spell one path each.  That
+    // comma form is valid Zig, so dropping it would lose a real edge.
+    try std.testing.expectEqual(@as(usize, 3), found);
+    var saw = [_]bool{ false, false, false };
+    for (paths[0..found]) |path| {
+        if (std.mem.eql(u8, path, "std")) {
+            saw[0] = true;
+        } else if (std.mem.eql(u8, path, "./lib.zig")) {
+            saw[1] = true;
+        } else if (std.mem.eql(u8, path, "trailing.zig")) {
+            saw[2] = true;
+        } else {
+            try std.testing.expect(false); // an unexpected path was named
+        }
+    }
+    try std.testing.expect(saw[0] and saw[1] and saw[2]);
+}
+
+test "importLiteralFromTokens refuses a second argument, and a blind comma window" {
+    const src: [:0]const u8 = "const a = @import(\"first.zig\", \"second.zig\");";
+    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    defer tree.deinit(std.testing.allocator);
+    var t: TokenIndex = 0;
+    while (t < tree.tokens.len and
+        !(tree.tokens.items(.tag)[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@import"))) : (t += 1)
+    {}
+    // The call's real span ends on the `)` after BOTH arguments.
+    try std.testing.expect(importLiteralFromTokens(&tree, t, t + 5) == null);
+    // A five-token window slid over the same call ends on the second
+    // string, not a `)`.  Accepting it would name "first.zig" out of a
+    // two-argument import, so the comma form must be read by what
+    // CLOSES the call and never by the length alone.
+    try std.testing.expect(importLiteralFromTokens(&tree, t, t + 4) == null);
+}
+
+test "importLiteralFromTokens refuses a span that is not the whole call" {
+    const src: [:0]const u8 = "const a = @import(\"lib.zig\");";
+    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    defer tree.deinit(std.testing.allocator);
+    var t: TokenIndex = 0;
+    while (t < tree.tokens.len and
+        !(tree.tokens.items(.tag)[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@import"))) : (t += 1)
+    {}
+    // Truncated at the `(` and extended past the `)` are both spans
+    // that do not end on this call's own `)`, so neither names the
+    // path — and the four-token form still reads it.
+    try std.testing.expect(importLiteralFromTokens(&tree, t, t + 1) == null);
+    try std.testing.expect(importLiteralFromTokens(&tree, t, t + 4) == null);
+    try std.testing.expectEqualStrings("lib.zig", importLiteralFromTokens(&tree, t, t + 3).?);
+}
+
+test "importLiteralFromTokens reads a comma import only at its own closing paren" {
+    const src: [:0]const u8 = "const a = @import(\"lib.zig\",);";
+    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    defer tree.deinit(std.testing.allocator);
+    var t: TokenIndex = 0;
+    while (t < tree.tokens.len and
+        !(tree.tokens.items(.tag)[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@import"))) : (t += 1)
+    {}
+    // Four tokens stop at the comma and name nothing; five reach the
+    // `)` and name the path; six run past it and name nothing again.
+    try std.testing.expect(importLiteralFromTokens(&tree, t, t + 3) == null);
+    try std.testing.expectEqualStrings("lib.zig", importLiteralFromTokens(&tree, t, t + 4).?);
+    try std.testing.expect(importLiteralFromTokens(&tree, t, t + 5) == null);
+}
+
 test "matchBrace pairs simple braces" {
     const src: [:0]const u8 = "fn f() void { { } }";
     var tree = try Ast.parse(std.testing.allocator, src, .zig);
@@ -568,4 +873,97 @@ test "skipFnDecl: skips proto+body and handles extern protos" {
         const end = skipFnDecl(tags, t, last);
         try std.testing.expectEqual(TokenTag.semicolon, tags[end]);
     }
+}
+
+/// Token index of the `n`th occurrence of `spelling` in `tree`.
+fn nthToken(tree: *const Ast, spelling: []const u8, n: usize) ?TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    var seen: usize = 0;
+    var t: TokenIndex = 0;
+    while (t < tags.len) : (t += 1) {
+        if (tags[t] != .builtin and tags[t] != .identifier and tags[t] != .keyword_comptime) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), spelling)) continue;
+        if (seen == n) return t;
+        seen += 1;
+    }
+    return null;
+}
+
+test "RuntimeUse: one index answers every reference in the file" {
+    const gpa = std.testing.allocator;
+    // Three kinds of reference Zig does not evaluate at runtime, and one it
+    // does, in one file: the point of the index is that a rule asking about
+    // any of them pays for one whole-file pass, not one per question.
+    const src: [:0]const u8 =
+        \\fn scaled(x: u32) u32 {
+        \\    comptime {
+        \\        const marker = 1;
+        \\        _ = marker;
+        \\    }
+        \\    return @intCast(x);
+        \\}
+        \\
+        \\fn measured(x: u32) u32 {
+        \\    _ = @TypeOf(x);
+        \\    return @intCast(x);
+        \\}
+        \\
+        \\fn Wrapper(comptime T: type) type {
+        \\    return struct { field: @TypeOf(@as(T, 0)) };
+        \\}
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var index = try RuntimeUse.collect(gpa, &tree);
+    defer index.deinit(gpa);
+
+    var fns = FnDeclIter{ .tree = &tree, .skip_type_builders = false };
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var decls: [3]Ast.Node.Index = undefined;
+    var count: usize = 0;
+    while (fns.next(&proto_buf)) |entry| : (count += 1) decls[count] = entry.node;
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    // The cast each body really runs.
+    const first_cast = nthToken(&tree, "@intCast", 0).?;
+    try std.testing.expect(isRuntimeUse(&tree, decls[0], first_cast, index));
+    try std.testing.expect(isRuntimeUse(&tree, decls[1], nthToken(&tree, "@intCast", 1).?, index));
+    // A statement inside `comptime { … }`, and a `@TypeOf` operand, are
+    // values the compiler resolves before the program runs.
+    const comptime_block = nthToken(&tree, "comptime", 0).?;
+    try std.testing.expect(!isRuntimeUse(&tree, decls[0], comptime_block + 3, index));
+    try std.testing.expect(!isRuntimeUse(&tree, decls[1], nthToken(&tree, "@TypeOf", 0).?, index));
+    // A declaration that builds a type has no runtime body at all.
+    try std.testing.expect(!isRuntimeUse(&tree, decls[2], nthToken(&tree, "@TypeOf", 1).?, index));
+    // An anchor outside the declaration it is asked about belongs to no
+    // runtime code of that declaration.
+    try std.testing.expect(!isRuntimeUse(&tree, decls[1], first_cast, index));
+}
+
+test "RuntimeUse: ranges that touch are one range, and a gap is not covered" {
+    const gpa = std.testing.allocator;
+    // Two comptime groups with one runtime statement between them: the index
+    // has to answer on both sides of the gap, not merely "is there a range".
+    const src: [:0]const u8 =
+        \\fn split(x: u32) u32 {
+        \\    comptime {
+        \\        _ = 0;
+        \\    }
+        \\    const middle = x + 1;
+        \\    comptime {
+        \\        _ = 1;
+        \\    }
+        \\    return middle;
+        \\}
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var index = try RuntimeUse.collect(gpa, &tree);
+    defer index.deinit(gpa);
+    try std.testing.expect(index.excludes(nthToken(&tree, "_", 0).?));
+    try std.testing.expect(!index.excludes(nthToken(&tree, "middle", 0).?));
+    try std.testing.expect(index.excludes(nthToken(&tree, "_", 1).?));
+    try std.testing.expect(!index.excludes(nthToken(&tree, "x", 0).?));
 }

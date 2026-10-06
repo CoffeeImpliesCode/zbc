@@ -6,14 +6,12 @@
 
 ## What this checks
 
-Integer division or modulo by a container length — `x / c.len` or `x % c.len` —
-where `c` is not proven non-empty. When `c.len == 0`, the `/` or `%` is a
-division by zero: in Zig this is safety-checked illegal behaviour — it panics
-in Debug/ReleaseSafe and is undefined behaviour in ReleaseFast.
+The rule checks integer division by a container length — `x / c.len` —
+where the container is not proved non-empty. Division by zero can panic
+in Debug and ReleaseSafe; unchecked builds have undefined behavior.
 
 ```zig
 const avg = total / items.len;     // panics when items is empty
-const slot = hash % buckets.len;   // panics when buckets is empty
 ```
 
 ## Why a semantics-first rule
@@ -25,7 +23,9 @@ is non-empty, using two sound queries:
 
 - **value-range oracle** — a dominating guard establishes non-emptiness:
   `if (c.len > 0)`, `if (c.len != 0)`, `if (c.len == 0) return`, or a
-  length-snapshot `const n = c.len; if (n > 0)`.
+  length snapshot `const n = c.len; if (n > 0)`.
+  A non-empty iterable, or a supported product-count loop relation, can
+  prove that a length factor is nonzero while the loop body runs.
 - **type engine** — `c` is a fixed array `[N]T` with `N >= 1`, so `c.len` is a
   non-zero compile-time constant.
 
@@ -68,13 +68,12 @@ const avg = total / items.len;
 
 ## Scope
 
-v1 matches only a bare `<path>.len` divisor immediately after a binary `/`
-(integer division). Modulo (`%`) by `.len` is intentionally excluded: in
-practice it is dominated by ring-buffer / index-wrap idioms over containers that
-are non-empty by construction (capacity asserted in a constructor the analyzer
-cannot see), which would be false positives. Extending to `%` cleanly needs
-cross-method capacity-invariant tracking.
+The divisor must be exactly `<path>.len` immediately after a binary `/`.
+The rule does not check `%`, `/=`, grouped divisors, or arithmetic divisors.
+Those exclusions are analysis boundaries, not proofs that the operations are safe.
+A grouped divisor such as `/ (c.len)` can still divide by zero.
 
-A parenthesized or arithmetic divisor (`/ (c.len + 1)`) cannot be zero and is
-not matched; float division never traps and is excluded by construction
-(`.len` is `usize`).
+The non-empty proof must apply at the division site.
+Mutation or address escape can invalidate a prior length fact.
+A product-count proof must name this divisor's factor; an unrelated product does not prove it nonzero.
+Analysis budget exhaustion is incomplete analysis, not a clean result.

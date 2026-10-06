@@ -46,6 +46,11 @@ pub const Config = config_mod.Config;
 
 pub const BlockId = abstract_state.BlockId;
 pub const LocalId = abstract_state.LocalId;
+/// Identity of an `if` condition within one function.  Two `if`s
+/// reading the same condition get the same id, so the transfer can
+/// remember which paths had it true — see
+/// [AbstractState.facts].  Function-scoped like every other id here.
+pub const GuardId = abstract_state.GuardId;
 
 // ── Source position ─────────────────────────────────────────
 
@@ -66,6 +71,9 @@ pub const StmtKind = union(enum) {
 
     /// `LHS = RHS;` — overwrite local with new RHS.
     assign: struct { target: LocalId, rhs_kind: ExprKind },
+
+    /// Require a boolean condition on this path.
+    assume: BooleanValue,
 
     /// `<receiver>.deinit()` on an arena.  Marks the arena dead.
     arena_kill: struct { arena_local: LocalId },
@@ -114,15 +122,9 @@ pub const StmtKind = union(enum) {
     /// the field's tracked origin (separate from the parent local's).
     field_use: struct { parent: LocalId, name: []const u8 },
 
-    /// Synthetic check emitted before a `.ret` when the return-value
-    /// expression contains MORE than one borrow of a local
-    /// (composite literal embedding multiple `&local` / array-slice
-    /// references).  The primary value_kind on `.ret` fires for the
-    /// first; one `.composite_escape` per additional one catches
-    /// the rest.  Fires escape checks against `local`'s current
-    /// origin regardless of return type — same model as transferRet
-    /// for composite-borrow value-shape returns.
-    composite_escape: struct { local: LocalId },
+    /// Additional value-position borrow in a returned aggregate. The origin
+    /// can be a direct address or a runtime alias, not an ampersand token.
+    composite_escape: ExprKind,
 
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
@@ -201,10 +203,21 @@ pub const StmtKind = union(enum) {
         /// .arena origins, the call still counts as a real use.
         from_method_call: bool = false,
     },
+    /// A bare `if (COND)` whose condition carries a [GuardId].  The
+    /// arm that COND holds records that fact; the arm it does not
+    /// records the opposite.  Pruning the second kind of path when a
+    /// later `if` assumes the same condition is what lets a local
+    /// initialised under one guard be read under a later, re-tested
+    /// spelling of the same condition.
+    guard_fact: struct {
+        guard: abstract_state.GuardId,
+        /// True in the arm where the condition HOLDS, false in the
+        /// other one.
+        holds: bool,
+    },
 
-    /// Statement shape we couldn't lower precisely.  Conservative:
-    /// analyzer collapses every local's origin to .plain.
-    lowering_gap: struct { note: []const u8 },
+    /// Unknown operation. Calls cannot assign unexposed local variables.
+    lowering_gap: struct { note: []const u8, may_assign_locals: bool = true },
 };
 
 pub const Stmt = struct {
@@ -227,6 +240,7 @@ pub const Stmt = struct {
 pub const ExprKind = union(enum) {
     /// Literal, arithmetic, value-typed call — no lifetime constraint.
     plain,
+    boolean: BooleanValue,
     /// Call to a fn annotated `// @returns borrowed_from(<param>)`.
     /// `borrowed_from_local` is the local that the lifetime is tied to.
     borrowed_from: LocalId,
@@ -269,6 +283,20 @@ pub const ExprKind = union(enum) {
     field_copy_of: struct { parent: LocalId, name: []const u8 },
     /// Couldn't classify — conservative .plain at use site.
     unknown,
+};
+
+pub const BooleanValue = union(enum) {
+    constant: bool,
+    local: LocalId,
+    not_local: LocalId,
+
+    pub fn negate(value: BooleanValue) BooleanValue {
+        return switch (value) {
+            .constant => |v| .{ .constant = !v },
+            .local => |v| .{ .not_local = v },
+            .not_local => |v| .{ .local = v },
+        };
+    }
 };
 
 // ── Basic block ────────────────────────────────────────────
@@ -327,6 +355,8 @@ pub const LocalInfo = struct {
     /// Address-of classification gates on this to avoid spurious
     /// stack-escape on the common `return &self.field` shape.
     is_pointer: bool = false,
+    /// Aliases can mutate this local; do not retain boolean path facts.
+    address_taken: bool = false,
     /// Coarse classification of the init expression — lets the
     /// composite-borrow walker decide at classify time whether a
     /// bare reference to this local in a returned struct should be
@@ -361,6 +391,18 @@ pub const LocalInfo = struct {
     /// result.destroy();` — destroying an interior pointer is UB
     /// under typical allocators (oven-sh/bun#30166).
     from_container: ?LocalId = null,
+    /// The frame local this one holds the ADDRESS of, when its own
+    /// initializer produced a borrow of this frame
+    /// (`const alias = &local;`).  Null for every other initializer.
+    ///
+    /// `&local` is not the only way a `catch` / `orelse` fallback can
+    /// hand out frame storage — naming a binding that holds it produces
+    /// exactly the same pointer — and the alias is resolved at
+    /// LOWERING time, so the hop has to be recorded here rather than
+    /// left to a consumer that never sees the initializer.  A fallback
+    /// naming this local binds the local named by this field, so the
+    /// stack escape the direct spelling reports is not lost.
+    frame_borrow_origin: ?LocalId = null,
 };
 
 pub const InitHint = enum {
@@ -387,7 +429,11 @@ pub const InitHint = enum {
 };
 
 // ── Tests ──────────────────────────────────────────────────
-// Test bodies live in cfg_tests.zig to keep this file navigable.
+// Test bodies live in cfg_tests.zig to keep this file navigable.  The
+// one carve-out: a test that must assert against a MODULE-PRIVATE
+// limit stays with that module rather than moving here against an
+// exported copy of the number — asserting the copy tests the copy.
+// `cfg_builder.zig` keeps its lowering-budget tests for that reason.
 
 test {
     _ = @import("cfg_tests.zig");

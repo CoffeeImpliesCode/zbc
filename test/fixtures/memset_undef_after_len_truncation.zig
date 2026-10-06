@@ -9,12 +9,14 @@ const ShrinkableList = struct {
 
     // Bug — `len` truncated BEFORE memset.  Fires on @memset.
     pub fn shrinkBuggy(self: *ShrinkableList, new_len: usize) void {
+        if (new_len >= self.items.len) return;
         self.items.len = new_len;
         @memset(self.items[new_len..], undefined);
     }
 
     // Bug — clear variant.
     pub fn clearBuggy(self: *ShrinkableList) void {
+        if (self.items.len == 0) return;
         self.items.len = 0;
         @memset(self.items, undefined);
     }

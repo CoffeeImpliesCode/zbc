@@ -597,9 +597,13 @@ pub const SourceIndexToTokenIndexResult = union(enum) {
         }
     }
 
+    /// The token to the right of the source index.  A source index with no
+    /// token to its right sits at or past the end of the file, where the
+    /// token to the right is the EOF token — the last token of the root node,
+    /// which spans the whole file.
     pub fn preferRight(result: SourceIndexToTokenIndexResult, tree: *const Ast) Ast.TokenIndex {
         switch (result) {
-            .none => |data| return data.right orelse @intCast(tree.tokens.len - 1),
+            .none => |data| return data.right orelse ast.lastToken(tree, .root),
             .one => |token| return token,
             .between => |data| return data.right,
         }
@@ -609,7 +613,9 @@ pub const SourceIndexToTokenIndexResult = union(enum) {
 pub fn sourceIndexToTokenIndex(tree: *const Ast, source_index: usize) SourceIndexToTokenIndexResult {
     std.debug.assert(source_index <= tree.source.len);
 
-    var upper_index: Ast.TokenIndex = @intCast(tree.tokens.len - 1);
+    // The search window always contains the last token, the EOF token, which
+    // is the last token of the root node.
+    var upper_index: Ast.TokenIndex = ast.lastToken(tree, .root);
     var lower_index: Ast.TokenIndex = 0;
     while (upper_index - lower_index > 64) {
         const mid = lower_index + (upper_index - lower_index) / 2;
@@ -706,6 +712,58 @@ test "sourceIndexToTokenIndex - token at end" {
     try expectEqual(Result{ .none = .{ .left = null, .right = 0 } }, sourceIndexToTokenIndex(&tree, 0));
     try expectEqual(Result{ .one = 0 }, sourceIndexToTokenIndex(&tree, 1));
     try expectEqual(Result{ .one = 0 }, sourceIndexToTokenIndex(&tree, 2));
+}
+
+test "sourceIndexToTokenIndex - empty source" {
+    var tree: Ast = try .parse(std.testing.allocator, "", .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    const Result = SourceIndexToTokenIndexResult;
+    const expectEqual = std.testing.expectEqual;
+
+    // An empty file is nothing but its EOF token, so the only source index
+    // there is has no token on either side of it.
+    const result = sourceIndexToTokenIndex(&tree, 0);
+    try expectEqual(Result{ .none = .{ .left = null, .right = null } }, result);
+    try expectEqual(@as(Ast.TokenIndex, 0), Result.preferLeft(result));
+
+    // The token to the right of such a source index is the EOF token.
+    const right = Result.preferRight(result, &tree);
+    try expectEqual(@as(Ast.TokenIndex, 0), right);
+    try expectEqual(std.zig.Token.Tag.eof, tree.tokenTag(right));
+}
+
+test "sourceIndexToTokenIndex - past the binary search window" {
+    // An identifier, a semicolon and two spaces, 200 times over: 400 tokens
+    // plus EOF, which is well past the 64 token wide window the search
+    // narrows down to.
+    const source = "a0;  " ** 200;
+    var tree: Ast = try .parse(std.testing.allocator, source, .zig);
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 401), tree.tokens.len);
+
+    const Result = SourceIndexToTokenIndexResult;
+    const expectEqual = std.testing.expectEqual;
+
+    // In the second space of the first repetition, between the semicolon
+    // (token 1) and the identifier that follows it (token 2).
+    try expectEqual(Result{ .none = .{ .left = 1, .right = 2 } }, sourceIndexToTokenIndex(&tree, 4));
+    // Inside the identifier of the second repetition.
+    try expectEqual(Result{ .one = 2 }, sourceIndexToTokenIndex(&tree, 6));
+    // On the semicolon that follows it, which is the second token there.
+    const between = sourceIndexToTokenIndex(&tree, 7);
+    try expectEqual(Result{ .between = .{ .left = 2, .right = 3 } }, between);
+    try expectEqual(@as(Ast.TokenIndex, 2), Result.preferLeft(between));
+    try expectEqual(@as(Ast.TokenIndex, 3), Result.preferRight(between, &tree));
+
+    // Past the last token the only token to the left is the last real token,
+    // and the token to the right is the EOF token.
+    const end_of_file = sourceIndexToTokenIndex(&tree, source.len);
+    try expectEqual(Result{ .none = .{ .left = 399, .right = null } }, end_of_file);
+    try expectEqual(@as(Ast.TokenIndex, 399), Result.preferLeft(end_of_file));
+    const eof = Result.preferRight(end_of_file, &tree);
+    try expectEqual(@as(Ast.TokenIndex, 400), eof);
+    try expectEqual(std.zig.Token.Tag.eof, tree.tokenTag(eof));
 }
 
 pub const IdentifierIndexRange = enum {
