@@ -58,9 +58,12 @@ fn checkBody(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
-    const n = @as(Ast.TokenIndex, @intCast(tree.tokens.len));
-    if (n < 7) return;
-    const last = n - 1;
+    // The last token index is already a `TokenIndex` — a `u32` — so the
+    // scan bound needs no conversion of the token count to re-narrow.
+    // The pattern spans seven tokens, so a file with fewer than that
+    // holds none.
+    const last = tree.lastToken(.root);
+    if (last < 6) return;
 
     // Pure token-pattern scan over the entire file.  No fn-body
     // scoping needed — the pattern is unambiguous enough that false

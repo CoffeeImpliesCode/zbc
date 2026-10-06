@@ -81,6 +81,13 @@ fn checkFn(
     try checkBody(gpa, tree, cache, fn_proto, T, flag_fields, body, problems);
 }
 
+/// Upper bound on the `var <dst> = <src>.*` bindings phase 1 records
+/// for a single fn body, and therefore on the parallel "was this
+/// dup returned?" flags phase 2 fills in.  Bodies with more bitwise
+/// copies than this are truncated at the cap; keeping the window
+/// fixed-size keeps the whole scan on the stack.
+const max_dup_candidates = 8;
+
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -98,7 +105,7 @@ fn checkBody(
     // local.zig's pre-built bindings instead of re-parsing the
     // var/=/; sequence by hand.
     const bindings = try cache.localBindings(proto, body);
-    var dups_buf: [8]Dup = undefined;
+    var dups_buf: [max_dup_candidates]Dup = undefined;
     var dup_count: usize = 0;
     for (bindings.items) |b| {
         if (b.is_const) continue;
@@ -131,7 +138,7 @@ fn checkBody(
     // appears immediately after a `return` keyword in the body, with
     // an optional `.<...>` field chain accepted — `return dup;` and
     // `return dup;` only for v1, no `return wrap(dup);` style).
-    var returned_buf: [8]bool = @splat(false);
+    var returned_buf: [max_dup_candidates]bool = @splat(false);
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] != .keyword_return) continue;

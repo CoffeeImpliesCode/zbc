@@ -220,9 +220,12 @@ const FileCtx = struct {
         // per-position minimum.  Counting extra/spurious call sites only lowers a
         // minimum, so it is conservative; missing a real caller would not be —
         // hence the uniqueness/visibility restrictions in Pass A.
-        const n: u32 = @intCast(tree.tokens.len);
+        // The last token index is already a `TokenIndex` — a `u32` — so
+        // the call-site scan bound needs no conversion of the token
+        // count to re-narrow.  The scan reads `i` and `i + 1`.
+        const last_tok = tree.lastToken(.root);
         var i: u32 = 0;
-        while (i + 1 < n) : (i += 1) {
+        while (i < last_tok) : (i += 1) {
             if (tags[i] != .identifier) continue;
             if (tags[i + 1] != .l_paren) continue;
             if (i > 0 and tags[i - 1] == .keyword_fn) continue; // definition, not a call
@@ -233,7 +236,7 @@ const FileCtx = struct {
             var ai: u32 = 0;
             var astart: u32 = lp + 1;
             var k: u32 = lp;
-            while (k < n) : (k += 1) {
+            while (k <= last_tok) : (k += 1) {
                 switch (tags[k]) {
                     .l_paren, .l_brace, .l_bracket => d += 1,
                     .r_brace, .r_bracket => d -= 1,
@@ -502,7 +505,7 @@ fn checkBody(
             // whose scalar has a known value (e.g. an enclosing `switch (rem_len)`
             // arm K bounds `rem_key = b[0..rem_len]` to len K). Covers the wyhash
             // hash-tail family `switch (rem_len) { K => rem_key[N..] }` (K >= N).
-            if (value_range.provesMinLen(gpa, tree, body, buf_name, off, t, cache)) continue;
+            if (try value_range.provesMinLen(gpa, tree, body, buf_name, off, t, cache)) continue;
         }
 
         // Suppression: a prefix-check guard `startsWith*/hasPrefix*(…, buf,

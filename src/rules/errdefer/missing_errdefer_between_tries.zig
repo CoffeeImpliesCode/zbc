@@ -574,19 +574,32 @@ fn rhsTypeViaZlsLacksDeinit(
     while (end >= start) : (end -= 1) {
         const name_opt = cache.typeNameOfExpr(start, end) catch null;
         if (name_opt) |name| {
-            if (model.hasType(name)) {
-                if (!model.typeHasMethod(name, "deinit")) return true;
-                return false;
-            }
-            if (model.fileIsTypeNamed(name)) {
-                return !model.typeOrFileHasMethod(name, "deinit");
-            }
-            // Resolved to a cross-file type name we can't refute.
+            // Locally resolvable?  Then the shared two-rung probe
+            // answers it; a name we can't see locally (cross-file)
+            // stays unrefuted so the rule keeps firing.
+            if (localTypeHasDeinit(model, name)) |has_deinit| return !has_deinit;
             return false;
         }
         if (end == start) break;
     }
     return false;
+}
+
+/// Two-rung local-model deinit probe shared by the ZLS refinement
+/// (`rhsTypeViaZlsLacksDeinit`) and the project-wide lookup
+/// (`typeHasDeinitProject`): a `types[]` entry first, then the
+/// `@This()` file-struct alias.  Null when this file declares
+/// neither, so each caller applies its own conservative default to
+/// the cross-file / unknown case.
+fn localTypeHasDeinit(
+    model: *const file_model.FileModel,
+    type_name: []const u8,
+) ?bool {
+    if (model.hasType(type_name)) return model.typeHasMethod(type_name, "deinit");
+    if (model.fileIsTypeNamed(type_name)) {
+        return model.typeOrFileHasMethod(type_name, "deinit");
+    }
+    return null;
 }
 
 /// True iff `type_name` has a `deinit` method, with cross-file
@@ -597,12 +610,7 @@ fn typeHasDeinitProject(
     model: *const file_model.FileModel,
     type_name: []const u8,
 ) bool {
-    if (model.hasType(type_name)) {
-        return model.typeHasMethod(type_name, "deinit");
-    }
-    if (model.fileIsTypeNamed(type_name)) {
-        return model.typeOrFileHasMethod(type_name, "deinit");
-    }
+    if (localTypeHasDeinit(model, type_name)) |has_deinit| return has_deinit;
     // Cross-file: scan @import("./...") declarations.
     if (cache.findTypeAcrossImports(type_name)) |ti| {
         return ti.hasMethod("deinit");

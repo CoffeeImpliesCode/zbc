@@ -64,10 +64,7 @@ pub fn check(
 
     var test_ranges: std.ArrayListUnmanaged(Range) = .empty;
     defer test_ranges.deinit(gpa);
-    {
-        const tags = tree.tokens.items(.tag);
-        try collectTestRanges(gpa, tags, &test_ranges);
-    }
+    try collectTestRanges(gpa, tree, &test_ranges);
 
     var state = State{ .problems = problems, .test_ranges = &test_ranges };
     try tokens.forEachFnBody(gpa, tree, &state, checkBody);
@@ -160,27 +157,33 @@ fn report(
 
 fn collectTestRanges(
     gpa: std.mem.Allocator,
-    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
     out: *std.ArrayListUnmanaged(Range),
 ) !void {
-    const n: u32 = @intCast(tags.len);
+    if (tree.tokens.len == 0) return;
+    const tags = tree.tokens.items(.tag);
+    // The root decl ends on the final token of the stream, so `last` is the
+    // index the old half-open `@intCast(tags.len)` bound stood for.  Every
+    // loop below is therefore inclusive of it, and no `usize` stream length
+    // is narrowed into the token index type.
+    const last: Ast.TokenIndex = tree.lastToken(.root);
     var i: Ast.TokenIndex = 0;
-    while (i < n) : (i += 1) {
+    while (i <= last) : (i += 1) {
         if (tags[i] != .keyword_test) continue;
         var j = i + 1;
-        while (j < n and tags[j] != .l_brace) : (j += 1) {
+        while (j <= last and tags[j] != .l_brace) : (j += 1) {
             if (tags[j] == .semicolon or tags[j] == .r_brace) break;
         }
-        if (j >= n or tags[j] != .l_brace) continue;
+        if (j > last or tags[j] != .l_brace) continue;
         var depth: u32 = 0;
         var k = j;
-        while (k < n) : (k += 1) {
+        while (k <= last) : (k += 1) {
             if (tags[k] == .l_brace) depth += 1 else if (tags[k] == .r_brace) {
                 depth -= 1;
                 if (depth == 0) break;
             }
         }
-        if (k >= n) break;
+        if (k > last) break;
         try out.append(gpa, .{ .start = i, .end = k });
         i = k;
     }
@@ -270,6 +273,30 @@ test "catch-error-panic: catch |e| @panic(fixed-string) still fires" {
         \\    _ = e;
         \\}
         \\fn encode(_: []const u8) !void {}
+        \\
+    );
+}
+
+test "catch-error-panic: a nested helper in a trailing test block is suppressed" {
+    // The `test` block is the LAST decl in the file, so its range closes only
+    // if the scan's upper bound includes the final token — the span the old
+    // half-open `@intCast(tags.len)` walk covered.  Both functions carry the
+    // same pattern, so the count separates a lost test range (2 findings)
+    // from a body walk that never reached either function (0 findings).
+    try testing.expectCount(check, R, 1,
+        \\const std = @import("std");
+        \\fn encode(input: []const u8) !void { _ = input; }
+        \\fn report(input: []const u8) void {
+        \\    encode(input) catch |err| std.debug.panic("encode failed: {s}", .{@errorName(err)});
+        \\}
+        \\test "nested helper" {
+        \\    const Helpers = struct {
+        \\        fn helper(input: []const u8) void {
+        \\            encode(input) catch |err| std.debug.panic("encode failed: {s}", .{@errorName(err)});
+        \\        }
+        \\    };
+        \\    Helpers.helper("x");
+        \\}
         \\
     );
 }

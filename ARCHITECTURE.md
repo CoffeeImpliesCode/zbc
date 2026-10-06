@@ -1,6 +1,6 @@
 # zbc architecture
 
-zbc is a static analyzer for Zig.  Its 46 rules fall into two
+zbc is a static analyzer for Zig.  Its 113 rules fall into two
 families distinguished by the analysis they require:
 
 1. **Flow analysis** — full per-fn control-flow graph and abstract
@@ -13,6 +13,22 @@ families distinguished by the analysis they require:
    exact shape" classes.
 
 Both families produce `Problem` values for the same reporter.
+
+Those 113 rule ids are declared in three places, and the three
+agree:
+
+- `src/rule_catalog.zig:32` — `all`, the documented catalog behind
+  `--list-rules` / `--explain`.  100 entries.
+- `src/rule_catalog.zig:674` — `escape_detectors`, the dispatch
+  table for pattern detectors.  103 entries.  Invariants emitted by
+  the CFG / worklist pipeline are NOT in it.
+- `src/config.zig:832` — `all_invariants: [113]Invariant`, the 113
+  toggles `Config.enabled` filters on.
+
+The first two overlap on 90 ids (100 + 103 - 90 = 113).  Ten flow
+invariants appear only in `all`; the other 13 pattern rules are
+dispatched but have no `Rule` entry, so `--explain` does not reach
+them.
 
 This document focuses on the pattern-detector infrastructure
 (`lexer.zig` / `scope.zig` / `receiver.zig` / `model.zig` /
@@ -28,8 +44,8 @@ zbc/
 ├── main.zig                  — CLI
 ├── problem.zig               — Problem / Note / Pos / Severity
 ├── config.zig                — Config + Invariant enum
-├── rule_registry.zig         — comptime list of pattern rules + dispatch
-├── file_cache.zig            — per-file shared state (FileModel + LocalBindings)
+├── rule_catalog.zig          — catalog metadata (`all`) + detector dispatch (`escape_detectors`)
+├── cache/file_cache.zig      — per-file shared state (see "Per-file shared state" below)
 │
 ├── lexer.zig                 — token primitives (matchBrace, FnDeclIter, …)
 ├── scope.zig                 — scope-aware iterators (findIdentUseInEnclosingScope)
@@ -62,20 +78,43 @@ const query      = @import("../query.zig");     // token patterns
 const mq         = @import("../model_query.zig"); // AST-level queries
 const testing    = @import("../testing.zig");
 const trace      = @import("../trace.zig");      // optional
-const file_cache_mod = @import("../file_cache.zig");
+const file_cache_mod = @import("../cache/file_cache.zig");
 ```
 
 No umbrella module.  Each module is a clean dependency.
 
-## Per-file dispatch + amortized shared state
+## Per-file shared state + dispatch
 
-`lib.zig::analyzeEscape` owns one `FileCache` per file.  After CFG
-analysis runs over every fn, it calls
-`rule_registry.runEscape(gpa, &tree, &cache, config, &problems)` —
-ONE call that iterates the comptime `escape_rules` list and dispatches
-each rule.
+`lib.zig::analyzeEscape` builds ONE `FileCache` for the file
+(`src/lib.zig:75`) and owns it until the analysis returns.  Both
+halves of the analyzer read that one cache: the flow loop lowers
+each fn against it (`src/lib.zig:98`), and then a single
+`rule_catalog_mod.runEscape(gpa, &tree, &rule_cache, config,
+&problems)` call (`src/lib.zig:107`) walks `escape_detectors`
+(`src/rule_catalog.zig:674`) and dispatches every pattern rule.
 
-Every rule's `check` signature is uniform-ish:
+Ownership: the cache is created and `deinit`'d inside
+`analyzeEscape`, one per call, and never crosses a thread — the
+worker pool in `main.zig` runs one file per `workerLoop` pass,
+each with its own.  The one cross-file structure is the
+`ProjectCache` (`src/lib.zig:178`), which is process-static, so a
+sibling file reached through a relative `@import("./X.zig")` is
+parsed once per process instead of once per referencing file.
+
+Everything expensive a consumer needs is memoised in that cache
+and built on first use, so rules that need the same answer share
+one build instead of each repeating it:
+
+- `cache.fileModel()` — the FileModel, once per file.
+- `cache.localBindings(proto, body)` — LocalBindings, once per fn
+  body, keyed by `Ast.Node.Index`.
+- `cache.summaryOfFn(...)` — the FnSummary, same key and contract.
+- `cache.getLineOffsets()` — the line-start table, once per file.
+- `cache.fileConstInitializer(name)` — the file-level `const`
+  table, built once behind the accessor.
+- the cross-file method-lookup memo, keyed by type and method name.
+
+Every rule's `check` signature is the same:
 
 ```zig
 pub fn check(
@@ -87,19 +126,7 @@ pub fn check(
 ) !void { ... }
 ```
 
-All rules have the same signature.  Rules that don't use `cache` can
-`_ = cache;` and move on.
-
-`FileCache` is lazy:
-
-- `cache.fileModel()` builds the FileModel on first call, caches it.
-- `cache.localBindings(proto, body)` builds LocalBindings on first
-  call per-body, caches by `Ast.Node.Index`.
-
-This is what ARCHITECTURE.md historically promised but didn't deliver:
-rules that need bindings for the same fn share one build instead of
-rebuilding per rule.  Measured ~40-50% sweep speedup vs. the
-pre-cache version on the bun corpus.
+Rules that need none of it take `cache` and `_ = cache;` it.
 
 ## Shared infrastructure for pattern detectors
 
@@ -356,7 +383,7 @@ A clean diff that adds a new rule without trace calls is fine.
    const problem = @import("../problem.zig");
    const testing = @import("../testing.zig");
    const config_mod = @import("../config.zig");
-   const file_cache_mod = @import("../file_cache.zig");
+   const file_cache_mod = @import("../cache/file_cache.zig");
 
    const R = "my-rule-id";
 
@@ -383,14 +410,14 @@ A clean diff that adds a new rule without trace calls is fine.
    canonical bug + the most likely false-positive shape +
    2-3 edge cases.
 
-5. **Register it** in `rule_registry.zig`:
+5. **Register it** in `rule_catalog.zig`:
    - `const my_rule_mod = @import("rules/my_rule_name.zig");`
-   - Append `.{ .id = "my-rule-id", .check = .{ .plain = my_rule_mod.check } }`
-     to `escape_rules` (or `.with_db = ...` if your rule takes a Db arg).
+   - Append `.{ .id = "my-rule-id", .check = my_rule_mod.check }` to
+     `escape_detectors` (the dispatch table).
    - Append `_ = my_rule_mod;` to the test block at the bottom of
      the file (refAllDecls includes inline tests in the test binary).
 
-   No edit to `lib.zig` needed — the dispatch loop iterates the registry.
+   No edit to `lib.zig` needed — the dispatch loop iterates the table.
 
 6. **Add to the rule catalog** in `rule_catalog.zig`:
    ```zig

@@ -30,6 +30,14 @@ through the same name before re-use:
   through an unrecognised builder method, the prior free state may
   persist.  Naming the constructor `init`/`create`/`new`/`open`
   helps the classifier recognise the fresh allocation.
+- **A slice argument is not automatically a read, and a copy out of
+  one is.**  `free(buf); use(buf[0..1]);` is a genuine
+  use-after-free — the slice aliases the freed allocation — and a
+  single index is reported for the same reason.  What zbc does NOT
+  do is report every `buf[a..b]`: building a slice reads nothing,
+  so passing one to a function that only writes through it is
+  silent, while `@memcpy(ptr, buf[0..])` on the source side is a
+  whole-array read and fires.
 
 ## Borrow-tracking via inference
 
@@ -57,6 +65,21 @@ Example:
     const borrowed = owner.data; // borrowed origin tied to owner
     owner.die(gpa);              // inferred as takes ownership(self)
     _ = borrowed;                // ← heap-use-after-free fires
+
+## Turning other rules off
+
+This rule answers to its own `--disable` / `--enable` entry and to
+nothing else.  A neighbouring rule being off never silences it: with
+`use_undefined` disabled, reading a field whose payload was already
+freed still fires here, even when the owner holding that field was
+never initialised.  That owner's own finding is simply not reported,
+and this one takes the site instead.
+
+The two are not in tension — they name different facts about the same
+read.  The owner's liveness is about whether the bytes being read
+exist at all; this rule is about the allocation the field points at.
+When both hold, the owner's is the better report and is the one you
+get.
 
 ## Related
 

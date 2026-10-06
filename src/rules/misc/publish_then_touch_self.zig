@@ -404,7 +404,7 @@ test "publish-then-touch-self: compound queue name (task_queue) caught" {
         // heap-managed Self with task_queue publish then access
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
-        \\    installer: anytype,
+        \\    installer: *Installer,
         \\    pub fn complete(this: *Self) void {
         \\        this.installer.task_queue.push(this);
         \\        this.installer.manager.wake();
@@ -424,7 +424,7 @@ test "publish-then-touch-self: patch_task_queue (compound name) caught" {
         // Mirrors patch_install.zig: push on compound queue name
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
-        \\    manager: anytype,
+        \\    manager: *Manager,
         \\    pub fn complete(this: *Self) void {
         \\        this.manager.patch_task_queue.push(this);
         \\        this.manager.wake();
@@ -443,7 +443,7 @@ test "publish-then-touch-self: defer this.X before push fires after (inline)" {
         // Mirrors patch_install.zig notify(): defer fires AFTER push at fn exit
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
-        \\    manager: anytype,
+        \\    manager: *Manager,
         \\    pub fn notify(this: *Self) void {
         \\        defer this.manager.wake();
         \\        this.manager.patch_task_queue.push(this);
@@ -463,7 +463,7 @@ test "publish-then-touch-self: defer this.X before push fires after (block)" {
         // Block-form defer — same hazard
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
-        \\    manager: anytype,
+        \\    manager: *Manager,
         \\    pub fn notify(this: *Self) void {
         \\        defer { this.manager.wake(); }
         \\        this.manager.task_queue.push(this);
@@ -481,7 +481,7 @@ test "publish-then-touch-self: non-self defer before push doesn't fire" {
     var problems = try testing.runRule(gpa, check,
         // `defer other.cleanup()` — not `this`/`self`, safe
         \\const Self = struct {
-        \\    manager: anytype,
+        \\    manager: *Manager,
         \\    pub fn notify(this: *Self, other: anytype) void {
         \\        defer other.cleanup();
         \\        this.manager.task_queue.push(this);
@@ -499,7 +499,7 @@ test "publish-then-touch-self: type with no self-destructor suppressed (Installe
         // Mirrors Installer.zig: Task lives in `tasks: []Task` (slice element,
         // never bun.destroy'd).  No self-freeing method → suppress.
         \\const Task = struct {
-        \\    installer: anytype,
+        \\    installer: *Installer,
         \\    pub fn complete(this: *Task) void {
         \\        this.installer.task_queue.push(this);
         \\        this.installer.manager.wake();
@@ -518,7 +518,7 @@ test "publish-then-touch-self: type with bun.destroy(this) kept (PatchTask TP)" 
         // in deinit() — self-freeing destructor → keep the finding.
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const PatchTask = struct {
-        \\    manager: anytype,
+        \\    manager: *Manager,
         \\    pub fn notify(this: *PatchTask) void {
         \\        this.manager.patch_task_queue.push(this);
         \\        this.manager.wake();

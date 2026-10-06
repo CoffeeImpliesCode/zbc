@@ -53,7 +53,7 @@ pub fn check(
     _ = cache;
 
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     var test_ranges: std.ArrayListUnmanaged(Range) = .empty;
     defer test_ranges.deinit(gpa);
@@ -112,13 +112,16 @@ fn collectTestRanges(
     tags: []const std.zig.Token.Tag,
     out: *std.ArrayListUnmanaged(Range),
 ) !void {
-    const n: u32 = @intCast(tags.len);
+    // `lastToken` returns a `TokenIndex` — a `u32` — so the scan bound
+    // is the width every index below already uses, with no conversion
+    // of the token count to re-narrow.
+    const last_tok = tree.lastToken(.root);
     var i: Ast.TokenIndex = 0;
-    while (i < n) : (i += 1) {
+    while (i <= last_tok) : (i += 1) {
         const is_test_decl = tags[i] == .keyword_test;
         const is_test_fn = blk: {
             if (tags[i] != .keyword_fn) break :blk false;
-            if (i + 1 >= n or tags[i + 1] != .identifier) break :blk false;
+            if (i + 1 > last_tok or tags[i + 1] != .identifier) break :blk false;
             const name = tree.tokenSlice(i + 1);
             // Match fn names that start with "test" (lowercase) followed by
             // an uppercase letter — the Zig convention for test helper fns.
@@ -130,16 +133,16 @@ fn collectTestRanges(
 
         // Find the body's opening `l_brace` (skipping header tokens).
         var j = i + 1;
-        while (j < n and tags[j] != .l_brace) : (j += 1) {
+        while (j <= last_tok and tags[j] != .l_brace) : (j += 1) {
             // Defensive: a well-formed header has no `;`/`}` before `{`.
             if (tags[j] == .semicolon or tags[j] == .r_brace) break;
         }
-        if (j >= n or tags[j] != .l_brace) continue;
+        if (j > last_tok or tags[j] != .l_brace) continue;
 
         // Brace-match forward from the opening brace.
         var depth: u32 = 0;
         var k = j;
-        while (k < n) : (k += 1) {
+        while (k <= last_tok) : (k += 1) {
             if (tags[k] == .l_brace) {
                 depth += 1;
             } else if (tags[k] == .r_brace) {
@@ -147,7 +150,7 @@ fn collectTestRanges(
                 if (depth == 0) break;
             }
         }
-        if (k >= n) break; // unbalanced — only possible on a malformed tree
+        if (k > last_tok) break; // unbalanced — only possible on a malformed tree
 
         try out.append(gpa, .{ .start = i, .end = k });
         i = k; // resume past this body

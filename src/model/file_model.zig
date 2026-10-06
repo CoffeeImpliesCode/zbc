@@ -97,11 +97,34 @@ pub const MethodInfo = struct {
 pub const TypeInfo = struct {
     /// Type's declared name (`const Name = struct { ... }` → "Name").
     name: []const u8,
+    qualified_name: []const u8,
     /// Token index of the name (the `Name` identifier).
+    ///
+    /// 0 FOR THE SYNTHESIZED FILE-STRUCT ENTRY, and 0 for nothing
+    /// else.  `buildWithPath` writes one `TypeInfo` for the
+    /// `@This()` file struct that no source token names, so its anchor
+    /// is 0 rather than a token a reader could dereference; every
+    /// other entry records the identifier that declares it.  A reader
+    /// that wants the file struct tests for 0 — or, better, for the
+    /// `body_first` sentinel below, which is the one that means it.
     name_token: TokenIndex,
     /// struct / union / enum / opaque.
     kind: TypeKind,
     /// Token index of the body's opening `{`.
+    ///
+    /// 0 MARKS THE SYNTHESIZED FILE-STRUCT ENTRY.  The `@This()`
+    /// struct a file's own top-level declarations are reached through
+    /// is not written anywhere in the source, so there is no `{` to
+    /// point at; `buildWithPath` records 0 and spans `body_last` over
+    /// the whole snapshot, which is exactly what the one consumer of
+    /// the sentinel wants — it reads 0 as "this is the module itself"
+    /// and nothing else, and every other builder fills this from the
+    /// declaration's own tokens.
+    ///
+    /// TOKEN 0 IS A REAL TOKEN, so this invariant holds because the
+    /// ONE builder that can emit this value spells the sentinel here,
+    /// not because 0 is unreachable.  A second builder added without
+    /// that spelling would be silently misread as a file-struct alias.
     body_first: TokenIndex,
     /// Token index of the body's closing `}`.
     body_last: TokenIndex,
@@ -147,10 +170,28 @@ pub const TypeInfo = struct {
 pub const FnInfo = struct {
     name: []const u8,
     name_token: TokenIndex,
+    /// The declaration node.  A bodied `fn` is an `Ast.fn_decl`; a
+    /// bodyless `extern`/`export` declaration is a BARE `fn_proto*`
+    /// node, because the parser only allocates a `fn_decl` when a
+    /// `{ ... }` body follows.  `tokens.fnProto` and `tokens.bodyOf`
+    /// both answer null for the bare form, which is how every caller
+    /// already tells the two shapes apart.
     fn_decl: Ast.Node.Index,
+    /// The body AST node.  For a bodyless declaration this is the
+    /// declaration node itself — there is no other node to name — and
+    /// `has_body` is false, which is the flag every caller must read.
     body: Ast.Node.Index,
+    /// First token of the body (`{`).  For a bodyless declaration the
+    /// range is INVERTED (`body_first > body_last`), so the
+    /// `token <= body_last` scans that walk a body range all reject it
+    /// without a special case.  `has_body` says so outright.
     body_first: TokenIndex,
+    /// Last token of the body (`}`); see `body_first`.
     body_last: TokenIndex,
+    /// False for a bodyless `extern`/`export` declaration.  Such a
+    /// declaration IS in `fns` — it names formals, and a call to it
+    /// resolves against it — but it has no body to read.
+    has_body: bool,
     is_pub: bool,
     returns_error_union: bool,
 };
@@ -164,6 +205,12 @@ pub const FileModel = struct {
     /// All top-level fn_decl nodes.  Methods live in `types[].methods`,
     /// NOT here.
     fns: []const FnInfo,
+    /// The RELATIVE `@import("…")` spellings this file writes, borrowed
+    /// from its own source — the same lifetime as `types` and `fns`, and no
+    /// copies.  A NAMED import is deliberately absent: a bare alias says
+    /// nothing about which module owns this document, so collecting one
+    /// here would record the very thing a membership walk must not assume.
+    relative_imports: []const []const u8 = &.{},
 
     pub fn deinit(self: *FileModel) void {
         self.arena.deinit();
@@ -211,20 +258,24 @@ pub const FileModel = struct {
     /// Find a type by name (linear scan; types lists are small per file).
     pub fn findType(self: *const FileModel, name: []const u8) ?*const TypeInfo {
         for (self.types) |*t| {
-            if (std.mem.eql(u8, t.name, name)) return t;
+            if (std.mem.eql(u8, t.qualified_name, name)) return t;
         }
         return null;
     }
 
     /// Scope-aware type lookup.  Find `name` starting from
     /// `start_ti`'s scope (sibling types in the same parent), then
-    /// walk OUTWARD through ancestor scopes, falling back to a
-    /// file-level scan.  Resolves the canonical
+    /// walk OUTWARD through ancestor scopes.  Resolves the canonical
     /// "outer.Inner.Outer.Inner" collision where a field in
     /// `Pending: ... { future: Future }` should resolve to the
     /// `Future` declared in the SAME enclosing scope as `Pending`
     /// rather than an unrelated like-named type elsewhere in the
     /// file.
+    ///
+    /// There is no file-level fallback: a name that no lexical scope of
+    /// `start_ti` reaches resolves to null.  A type declared outside
+    /// those scopes is addressed by its qualified name, so guessing
+    /// here would answer with a declaration the writer never named.
     pub fn findTypeInScope(self: *const FileModel, name: []const u8, start_ti: *const TypeInfo) ?*const TypeInfo {
         // Compute `start_ti`'s INDEX in the types array — used to
         // search its own NESTED types (children) before walking
@@ -259,9 +310,7 @@ pub const FileModel = struct {
             if (parent_idx >= self.types.len) break;
             scope_parent = self.types[parent_idx].parent;
         }
-        // Fallback: any like-named type in the file (existing
-        // findType behavior).
-        return self.findType(name);
+        return null;
     }
 
     /// Resolve a qualified type path like `["Result", "Pending", "State"]`
@@ -275,7 +324,7 @@ pub const FileModel = struct {
     /// verify the chain's names match the path's earlier segments
     /// (right-to-left).  Returns the first candidate whose chain
     /// matches.
-    fn findQualifiedType(
+    pub fn findQualifiedType(
         self: *const FileModel,
         path: []const []const u8,
     ) ?*const TypeInfo {
@@ -304,18 +353,13 @@ pub const FileModel = struct {
         while (i > 0) {
             i -= 1;
             const parent_idx = cur orelse return false;
-            // Defensive bounds check: in pathological cases (e.g. an
-            // arena reused across builds or a model snapshot taken
-            // mid-construction) a parent index might exceed the
-            // final slice length.  ReleaseSafe would panic; we
-            // prefer a graceful "no match" so the call site falls
-            // back to the first-identifier heuristic.
-            if (parent_idx >= self.types.len) return false;
+            // Each qualified segment must match this declaration's parent
+            // chain. There is no file-level or first-identifier fallback.
             const parent_ti = &self.types[parent_idx];
             if (!std.mem.eql(u8, parent_ti.name, path[i])) return false;
             cur = parent_ti.parent;
         }
-        return true;
+        return cur == null;
     }
 
     /// Resolve a field's full type-path (`Result.Pending.State`) to
@@ -342,27 +386,29 @@ pub const FileModel = struct {
         ti: *const TypeInfo,
         field_name: []const u8,
     ) ?*const TypeInfo {
-        const f = ti.findField(field_name) orelse return null;
-        const tags = self.tree.tokens.items(.tag);
-        // Collect identifier chain inside the field's type-tokens.
-        var path_buf: [8][]const u8 = undefined;
-        var n: u32 = 0;
-        var t: TokenIndex = f.type_first;
-        while (t <= f.type_last) : (t += 1) {
-            switch (tags[t]) {
-                .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-                .identifier => {
-                    if (n < path_buf.len) {
-                        path_buf[n] = self.tree.tokenSlice(t);
-                        n += 1;
-                    }
-                },
-                .period => {},
-                else => break,
-            }
+        const field = ti.findField(field_name) orelse return null;
+        const name = tokens.typeNameFromTokens(self.tree, field.type_first, field.type_last) orelse return null;
+        return self.resolveTypeNameInScope(name, ti);
+    }
+
+    pub fn resolveTypeNameInScope(self: *const FileModel, name: []const u8, owner: *const TypeInfo) ?*const TypeInfo {
+        var segments = std.mem.splitScalar(u8, name, '.');
+        const first = std.mem.trim(u8, segments.next() orelse return null, &std.ascii.whitespace);
+        var current = self.findTypeInScope(first, owner) orelse return null;
+        var depth: u8 = 0;
+        while (segments.next()) |part| : (depth += 1) {
+            if (depth == 32) return null;
+            const segment = std.mem.trim(u8, part, &std.ascii.whitespace);
+            current = child: {
+                for (self.types) |*candidate| {
+                    const parent = candidate.parent orelse continue;
+                    if (&self.types[parent] != current) continue;
+                    if (std.mem.eql(u8, candidate.name, segment)) break :child candidate;
+                }
+                return null;
+            };
         }
-        if (n == 0) return null;
-        return self.findQualifiedType(path_buf[0..n]);
+        return current;
     }
 
     /// Convenience: type exists AND has the named method.
@@ -390,7 +436,10 @@ pub const FileModel = struct {
     /// not the outer — methods on nested types should associate
     /// with their declaring type, not its container.
     pub fn containingTypeOf(self: *const FileModel, fn_decl: Ast.Node.Index) ?*const TypeInfo {
-        const fn_tok = self.tree.firstToken(fn_decl);
+        return self.containingTypeAtToken(self.tree.firstToken(fn_decl));
+    }
+
+    pub fn containingTypeAtToken(self: *const FileModel, fn_tok: TokenIndex) ?*const TypeInfo {
         var best: ?*const TypeInfo = null;
         var best_span: u32 = std.math.maxInt(u32);
         for (self.types) |*ti| {
@@ -405,45 +454,12 @@ pub const FileModel = struct {
         return best;
     }
 
-    /// (struct_name, field_name) -> the field's declared base type
-    /// name with `*` / `?` / `const` / `[]` wrappers stripped.
-    /// Returns null when the struct or field isn't known, or when the
-    /// type has no resolvable base name (slice/array/fn-pointer
-    /// shapes).  Matches the old `Db.fieldType` query shape.
+    /// Complete declared name after pointer/optional qualifiers.
+    /// Arrays, slices, function types, and unresolved shapes return null.
     pub fn fieldType(self: *const FileModel, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
         const ti = self.findType(struct_name) orelse return null;
         const f = ti.findField(field_name) orelse return null;
-        return baseTypeName(self.tree, f.type_first, f.type_last);
-    }
-
-    pub const FieldTypePath = struct { ns: ?[]const u8, type_name: []const u8 };
-
-    /// Like `fieldType` but returns the `<ns>.<Type>` split when the
-    /// field's type references an imported namespace.  Used by R10
-    /// Case B cross-file filtering: `inner: *lib.Item` needs to look
-    /// up `Item` in `lib`'s FileCache, not in this file.
-    pub fn fieldTypePath(
-        self: *const FileModel,
-        struct_name: []const u8,
-        field_name: []const u8,
-    ) ?FieldTypePath {
-        const ti = self.findType(struct_name) orelse return null;
-        const f = ti.findField(field_name) orelse return null;
-        const tags = self.tree.tokens.items(.tag);
-        var t: TokenIndex = f.type_first;
-        while (t <= f.type_last) : (t += 1) {
-            switch (tags[t]) {
-                .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-                .identifier => break,
-                else => return null,
-            }
-        }
-        if (t > f.type_last or tags[t] != .identifier) return null;
-        const first_id = self.tree.tokenSlice(t);
-        if (t + 2 <= f.type_last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
-            return .{ .ns = first_id, .type_name = self.tree.tokenSlice(t + 2) };
-        }
-        return .{ .ns = null, .type_name = first_id };
+        return tokens.typeNameFromTokens(self.tree, f.type_first, f.type_last);
     }
 
     /// True iff the field's declared type starts with `*` (after
@@ -633,7 +649,8 @@ pub const FileModel = struct {
             // Variant starts at an identifier at depth 0 of the
             // union body (skip past method decls / nested types).
             if (tags[t] == .keyword_fn or tags[t] == .keyword_pub or
-                tags[t] == .keyword_const or tags[t] == .keyword_var) {
+                tags[t] == .keyword_const or tags[t] == .keyword_var)
+            {
                 // Skip the entire decl (method/const/etc.) — walk
                 // to its terminating `;` or end-of-block `}` at
                 // depth 0.
@@ -764,17 +781,16 @@ pub const FileModel = struct {
 /// and would otherwise look top-level by syntactic walk.
 fn isInsideFnBody(tree: *const Ast, name_tok: TokenIndex) bool {
     const tags = tree.tokens.items(.tag);
-    if (name_tok == 0) return false;
-    var t: i64 = @as(i64, @intCast(name_tok)) - 1;
+    var t: TokenIndex = name_tok;
     var depth: i32 = 0;
-    while (t >= 0) : (t -= 1) {
-        const tok: TokenIndex = @intCast(t);
-        switch (tags[tok]) {
+    while (t > 0) {
+        t -= 1;
+        switch (tags[t]) {
             .r_brace => depth += 1,
             .l_brace => {
                 if (depth == 0) {
                     // Unmatched `{`.  Identify what opened it.
-                    switch (braceOpenerKind(tags, tok)) {
+                    switch (braceOpenerKind(tags, t)) {
                         .fn_body => return true,
                         .type_body => {
                             // Struct/union/enum body — continue
@@ -800,16 +816,12 @@ const BraceOpener = enum { fn_body, type_body, unknown };
 /// keyword.  Conservative: returns `.unknown` rather than guessing
 /// when the lookback hits a terminator or runs out of budget.
 fn braceOpenerKind(tags: []const std.zig.Token.Tag, brace_tok: TokenIndex) BraceOpener {
-    if (brace_tok == 0) return .unknown;
-    var u: i64 = @as(i64, @intCast(brace_tok)) - 1;
+    var u: TokenIndex = brace_tok;
     var paren: i32 = 0;
     var hops: u32 = 0;
-    while (u >= 0 and hops < 128) : ({
+    while (u > 0 and hops < 128) : (hops += 1) {
         u -= 1;
-        hops += 1;
-    }) {
-        const ut: TokenIndex = @intCast(u);
-        switch (tags[ut]) {
+        switch (tags[u]) {
             .r_paren => paren += 1,
             .l_paren => paren -= 1,
             .keyword_fn => if (paren == 0) return .fn_body,
@@ -822,25 +834,6 @@ fn braceOpenerKind(tags: []const std.zig.Token.Tag, brace_tok: TokenIndex) Brace
         }
     }
     return .unknown;
-}
-
-/// Strip pointer / optional / const / slice wrappers from a type
-/// expression token range and return the base identifier.  Returns
-/// null when the base isn't a single identifier (fn-pointer, anon
-/// struct, etc.).
-fn baseTypeName(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    var t: TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            // Strip leading wrappers and keep scanning.
-            .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-            .identifier => return tree.tokenSlice(t),
-            // Anything else (paren, dot, etc.) — give up.
-            else => return null,
-        }
-    }
-    return null;
 }
 
 /// Build a FileModel for the given Ast.  `tree` must outlive the model.
@@ -856,6 +849,7 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
 /// used) so cross-file lookups can resolve types named after their
 /// containing file.
 pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]const u8) !FileModel {
+    if (tree.errors.len != 0) return error.InvalidSyntax;
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -864,7 +858,13 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
     var fns: std.ArrayListUnmanaged(FnInfo) = .empty;
 
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
+    // `last` is a `TokenIndex`, so the token count has to be
+    // addressable as one.  Tokens tile the source — each starts at a
+    // distinct byte, which `std.zig.Ast` already stores as a `u32`
+    // offset — so a token table this long needs a source longer still,
+    // and the count is checked rather than truncated: a file whose
+    // tokens do not fit a `u32` index is not modelled at all.
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
     if (tok_count == 0) {
         return .{
             .arena = arena,
@@ -884,18 +884,51 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
     // index.
     try collectTypesInRange(a, tree, &types, 0, last, null);
 
-    // ── Pass 2: top-level fn decls ─────────────────────────
-    // Walk Ast.fn_decl nodes; classify as top-level by checking that
-    // their containing token is NOT inside any type body we just
-    // collected.
+    // ── Pass 2: top-level fn declarations ───────────────────
+    // A bodied `fn name(...) T { ... }` is an `Ast.fn_decl` wrapping its
+    // proto.  A BODYLESS declaration — `extern "c" fn fill(..) void;`,
+    // `export fn f() void;` — ends in a SEMICOLON, and the parser
+    // allocates NO `fn_decl` for it at all: the root decl IS the bare
+    // `fn_proto*` node.  Walking only `.fn_decl` therefore drops every
+    // bodyless declaration on the floor, and `findFn` cannot name one.
+    // Both shapes are declarations, so both are collected here, with
+    // `body`/`body_first`/`body_last` null for the bodyless one.
+    //
+    // Classify as top-level by checking that the name token is NOT
+    // inside any type body we just collected.
+    //
+    // The proto of a bodied `fn_decl` carries a `fn_proto*` tag too, and
+    // the parser reserves that proto BEFORE its `fn_decl`, so an
+    // ascending walk meets the proto first.  Collect the owned proto
+    // indices up front and skip them, or every bodied function would be
+    // filed twice.
+    var owned_protos: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
+    defer owned_protos.deinit(a);
+    var scan: u32 = 1;
+    while (scan < tree.nodes.len) : (scan += 1) {
+        const candidate: Ast.Node.Index = @enumFromInt(scan);
+        if (tree.nodeTag(candidate) != .fn_decl) continue;
+        try owned_protos.put(a, tree.nodeData(candidate).node_and_node[0], {});
+    }
+
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
         var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = tokens.fnProto(tree, &proto_buf, node) orelse continue;
+        const proto: Ast.full.FnProto = switch (tree.nodeTag(node)) {
+            .fn_decl => tokens.fnProto(tree, &proto_buf, node) orelse continue,
+            .fn_proto,
+            .fn_proto_simple,
+            .fn_proto_multi,
+            .fn_proto_one,
+            => blk: {
+                if (owned_protos.contains(node)) continue;
+                break :blk tree.fullFnProto(&proto_buf, node) orelse continue;
+            },
+            else => continue,
+        };
         const name_tok = proto.name_token orelse continue;
-        const body = tokens.bodyOf(tree, node) orelse continue;
+        const body = tokens.bodyOf(tree, node);
 
         // Skip if inside a type body.
         var inside_type = false;
@@ -919,9 +952,14 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
             .name = tree.tokenSlice(name_tok),
             .name_token = name_tok,
             .fn_decl = node,
-            .body = body,
-            .body_first = tree.firstToken(body),
-            .body_last = tree.lastToken(body),
+            // A bodyless declaration names no body, so it gets the
+            // INVERTED range `(name_tok + 1, name_tok)`: every
+            // `token <= body_last` walk rejects it, and no token of the
+            // declaration is ever mistaken for body text.
+            .body = body orelse node,
+            .body_first = if (body) |b| tree.firstToken(b) else name_tok + 1,
+            .body_last = if (body) |b| tree.lastToken(b) else name_tok,
+            .has_body = body != null,
             .is_pub = isPrecededByPub(tags, name_tok),
             .returns_error_union = protoReturnsErrorUnion(tree, proto),
         });
@@ -958,7 +996,12 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
             const fs_fields = try collectFields(a, tree, 0, last);
             // Convert file-level fns into method-shape entries.
             var fs_methods: std.ArrayListUnmanaged(MethodInfo) = .empty;
+            // A bodyless `extern`/`export` declaration carries no body
+            // for a method entry to name, and `MethodInfo`'s range is
+            // not optional — so it stays out of the method list.  It
+            // remains in `model.fns`, which is what `findFn` reads.
             for (fns.items) |f| {
+                if (!f.has_body) continue;
                 var proto_buf: [1]Ast.Node.Index = undefined;
                 const proto = tokens.fnProto(tree, &proto_buf, f.fn_decl) orelse continue;
                 try fs_methods.append(a, .{
@@ -974,10 +1017,17 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
             }
             // Find the name token of the `@This()` decl as a stable
             // pos anchor (mirrors how collectTypesInRange records
-            // name_token).
+            // name_token).  Both zeros below are the documented
+            // sentinels: this entry names no token of its own and
+            // opens no brace, because there is nothing in the source
+            // for either to point at.  They are written HERE and
+            // nowhere else, which is what makes `body_first == 0`
+            // mean "the file struct" rather than "a type whose body
+            // happens to start at the first token".
             const fs_name_tok = findFileStructNameToken(tree, fs_name) orelse 0;
             try types.append(a, .{
                 .name = fs_name,
+                .qualified_name = fs_name,
                 .name_token = fs_name_tok,
                 .kind = .struct_,
                 .body_first = 0,
@@ -989,12 +1039,65 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
         }
     }
 
+    // Every slice is taken BEFORE the arena is handed over.  Evaluating
+    // `.arena = arena` first would snapshot the allocator, and each
+    // allocation after that snapshot can prepend a new buffer the returned
+    // copy never learns about — so `deinit` would release the old head and
+    // lose the rest.
+    const owned_types = try types.toOwnedSlice(a);
+    const owned_fns = try fns.toOwnedSlice(a);
+    const owned_imports = try collectRelativeImports(a, tree);
     return .{
         .arena = arena,
         .tree = tree,
-        .types = try types.toOwnedSlice(a),
-        .fns = try fns.toOwnedSlice(a),
+        .types = owned_types,
+        .fns = owned_fns,
+        .relative_imports = owned_imports,
     };
+}
+
+/// Every `@import("…")` in `tree` that names a file rather than a module.
+/// One pass over the node table, with the spelling read by the one
+/// reader every caller uses: an escaped spelling names no path this
+/// tool can resolve, a bare alias names no file, and a call carrying a
+/// SECOND argument names no single path at all.
+fn collectRelativeImports(a: std.mem.Allocator, tree: *const Ast) ![]const []const u8 {
+    var found: std.ArrayListUnmanaged([]const u8) = .empty;
+    // The growth buffer is released here whatever happens, so an
+    // out-of-memory unwind and a successful collection both leave the
+    // caller's arena holding only the returned slice.
+    defer found.deinit(a);
+    for (tree.nodes.items(.tag), 0..) |tag, raw_node| {
+        switch (tag) {
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(raw_node);
+        // Read by the shared reader, over the node's own span, so
+        // Zig's optional trailing comma form is read like the plain
+        // one while a second argument — which is not the path, and
+        // spans more tokens than an import is spelled in — is not.
+        const spelling = tokens.importLiteralFromTokens(tree, tree.nodeMainToken(node), tree.lastToken(node)) orelse continue;
+        if (!isRelativeImport(spelling)) continue;
+        try found.append(a, spelling);
+    }
+    // A file that imports no file by path needs no slice at all.
+    if (found.items.len == 0) return &.{};
+    return found.toOwnedSlice(a);
+}
+
+/// True iff an import spelling names a FILE rather than a module: it ends
+/// in `.zig` or `.zon`.  A bare name is a module, never a file, and a
+/// nested or parent-relative path is still a file — `@import("sub/x.zig")`
+/// and `@import("../x.zig")` are exactly the edges a membership walk
+/// follows.
+///
+/// This is the tool's one classification of the question.  The caches and
+/// the model all read it rather than each deciding on their own.
+pub fn isRelativeImport(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    return std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon");
 }
 
 /// True iff the file's top-level syntax looks like a struct
@@ -1006,14 +1109,15 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
 /// source doesn't have a `const X = @This();` alias.
 fn fileLooksLikeStruct(tree: *const Ast) bool {
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
     // Scan for `<ident>(@This())` patterns or `*@This()` in fn
     // signatures.  Bound the scan to the first ~512 tokens for
     // performance — the convention places these markers near the
-    // file head.
+    // file head.  The bound stays `usize`: only `t` indexes `tags`,
+    // so the token count never needs a `u32` copy of itself, and
+    // comparing in `usize` is what keeps `t + 2` from wrapping.
     var t: TokenIndex = 0;
-    const scan_end: TokenIndex = if (tok_count < 1024) tok_count else 1024;
-    while (t + 2 < scan_end) : (t += 1) {
+    const scan_end: usize = @min(tags.len, 1024);
+    while (@as(usize, t) + 2 < scan_end) : (t += 1) {
         if (tags[t] != .builtin) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), "@This")) continue;
         // `@This()` — confirmed.  This appears in any of the bun
@@ -1026,10 +1130,9 @@ fn fileLooksLikeStruct(tree: *const Ast) bool {
 
 fn detectFileStructName(tree: *const Ast) ?[]const u8 {
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
     var t: TokenIndex = 0;
     var scanned: u32 = 0;
-    while (t + 4 < tok_count and scanned < 64) : (t += 1) {
+    while (@as(usize, t) + 4 < tags.len and scanned < 64) : (t += 1) {
         if (tags[t] != .keyword_const) continue;
         scanned += 1;
         if (tags[t + 1] != .identifier) continue;
@@ -1043,10 +1146,9 @@ fn detectFileStructName(tree: *const Ast) ?[]const u8 {
 
 fn findFileStructNameToken(tree: *const Ast, name: []const u8) ?TokenIndex {
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
     var t: TokenIndex = 0;
     var scanned: u32 = 0;
-    while (t + 4 < tok_count and scanned < 64) : (t += 1) {
+    while (@as(usize, t) + 4 < tags.len and scanned < 64) : (t += 1) {
         if (tags[t] != .keyword_const) continue;
         scanned += 1;
         if (tags[t + 1] != .identifier) continue;
@@ -1074,7 +1176,7 @@ fn collectTypesInRange(
     start: TokenIndex,
     end: TokenIndex,
     parent: ?u32,
-) std.mem.Allocator.Error!void {
+) error{ OutOfMemory, TooManyTypes }!void {
     const tags = tree.tokens.items(.tag);
     if (end < 4 or start + 4 >= end) return;
 
@@ -1123,9 +1225,19 @@ fn collectTypesInRange(
             &[_]FieldInfo{};
         const methods_slice = try collectMethods(a, tree, b + 1, body_last - 1, tree.tokenSlice(t + 1));
 
-        const this_index: u32 = @intCast(types.items.len);
+        // The flat `types` list is addressed by `u32` — `TypeInfo.parent`
+        // and this function's `parent` argument are both `?u32` — so
+        // the index this entry is about to take has to fit.  Checked
+        // once, here, before the append that takes the index; every
+        // later read of a parent index is a position this check has
+        // already proved, so no lookup needs to re-test it.
+        const this_index = std.math.cast(u32, types.items.len) orelse return error.TooManyTypes;
         try types.append(a, .{
             .name = tree.tokenSlice(t + 1),
+            .qualified_name = if (parent) |index|
+                try std.fmt.allocPrint(a, "{s}.{s}", .{ types.items[index].qualified_name, tree.tokenSlice(t + 1) })
+            else
+                tree.tokenSlice(t + 1),
             .name_token = t + 1,
             .kind = kind,
             .body_first = b,
@@ -1709,7 +1821,7 @@ test "build: empty source" {
     try testing.expectEqual(@as(usize, 0), model.fns.len);
 }
 
-test "build: nested type decls collected with parent link" {
+test "nested declarations require their qualified lookup path" {
     const src: [:0]const u8 =
         \\const Outer = struct {
         \\    x: u32,
@@ -1725,14 +1837,10 @@ test "build: nested type decls collected with parent link" {
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
 
-    try testing.expectEqual(@as(usize, 2), model.types.len);
     const outer = model.findType("Outer").?;
-    const inner = model.findType("Inner").?;
-    try testing.expect(outer.parent == null);
-    try testing.expect(inner.parent != null);
-    // Inner's parent index points to Outer.
-    try testing.expectEqual(outer, &model.types[inner.parent.?]);
-    // Both pick up their methods so hasCleanupMethod works.
+    const inner = model.findType("Outer.Inner").?;
+    try testing.expect(model.findType("Inner") == null);
+    try testing.expect(model.findTypeInScope("Inner", outer) == inner);
     try testing.expect(outer.hasMethod("deinit"));
     try testing.expect(inner.hasMethod("close"));
     try testing.expect(inner.hasCleanupMethod());
@@ -1795,7 +1903,7 @@ test "containingTypeOf: method's fn_decl resolves to its struct" {
     try testing.expect(model.containingTypeOf(top_node.?) == null);
 }
 
-test "fieldType: strips pointer/optional/const/slice wrappers" {
+test "named field types distinguish wrappers from slices" {
     const src: [:0]const u8 =
         \\const Bar = struct {
         \\    a: Inner,
@@ -1814,7 +1922,7 @@ test "fieldType: strips pointer/optional/const/slice wrappers" {
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "a").?);
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "b").?);
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "c").?);
-    try testing.expectEqualStrings("u8", model.fieldType("Bar", "d").?);
+    try testing.expect(model.fieldType("Bar", "d") == null);
     try testing.expectEqualStrings("Inner", model.fieldType("Bar", "e").?);
 }
 
@@ -1859,7 +1967,7 @@ test "flagOwnedFields: returns the field-name set" {
     try testing.expectEqualStrings("two", flagged[1]);
 }
 
-test "build: doubly-nested type chains parent links" {
+test "qualified paths traverse multiple container scopes" {
     const src: [:0]const u8 =
         \\const A = struct {
         \\    const B = struct {
@@ -1872,11 +1980,11 @@ test "build: doubly-nested type chains parent links" {
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
 
-    try testing.expectEqual(@as(usize, 3), model.types.len);
     const a = model.findType("A").?;
-    const b = model.findType("B").?;
-    const c = model.findType("C").?;
-    try testing.expect(a.parent == null);
-    try testing.expectEqual(a, &model.types[b.parent.?]);
-    try testing.expectEqual(b, &model.types[c.parent.?]);
+    const b = model.findType("A.B").?;
+    const c = model.findType("A.B.C").?;
+    try testing.expect(model.resolveTypeNameInScope("B.C", a) == c);
+    try testing.expect(model.findTypeInScope("C", b) == c);
+    try testing.expect(model.findType("B") == null);
+    try testing.expect(model.findType("C") == null);
 }

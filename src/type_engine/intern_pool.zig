@@ -34,7 +34,7 @@ pub const Key = union(enum) {
     simple_type: SimpleType,
     simple_value: SimpleValue,
 
-    int_type: std.lang.Type.Int,
+    int_type: std.builtin.Type.Int,
     pointer_type: Pointer,
     array_type: Array,
     struct_type: Struct.Index,
@@ -75,11 +75,11 @@ pub const Key = union(enum) {
         packed_offset: PackedOffset = .{ .bit_offset = 0, .host_size = 0 },
 
         pub const Flags = packed struct(u32) {
-            size: std.lang.Type.Pointer.Size,
+            size: std.builtin.Type.Pointer.Size,
             is_const: bool = false,
             is_volatile: bool = false,
             is_allowzero: bool = false,
-            address_space: std.lang.AddressSpace = .generic,
+            address_space: std.builtin.AddressSpace = .generic,
             _: u6 = 0,
             alignment: u16 = 0,
         };
@@ -115,16 +115,16 @@ pub const Key = union(enum) {
     pub const Function = struct {
         args: Index.Slice,
         /// zig only lets the first 32 arguments be `comptime`
-        args_is_comptime: std.bit_set.Static(32) = .empty,
+        args_is_comptime: std.StaticBitSet(32) = .empty,
         /// zig only lets the first 32 arguments be generic
-        args_is_generic: std.bit_set.Static(32) = .empty,
+        args_is_generic: std.StaticBitSet(32) = .empty,
         /// zig only lets the first 32 arguments be `noalias`
-        args_is_noalias: std.bit_set.Static(32) = .empty,
+        args_is_noalias: std.StaticBitSet(32) = .empty,
         return_type: Index,
         flags: Flags = .{},
 
         pub const Flags = packed struct(u32) {
-            calling_convention: std.lang.CallingConvention.Tag = .auto,
+            calling_convention: std.builtin.CallingConvention.Tag = .auto,
             is_generic: bool = false,
             is_var_args: bool = false,
             _: u6 = 0,
@@ -952,7 +952,7 @@ pub const Decl = struct {
     /// this stores both the type and the value
     index: InternPool.Index,
     alignment: u16,
-    address_space: std.lang.AddressSpace,
+    address_space: std.builtin.AddressSpace,
     src_namespace: InternPool.NamespaceIndex,
     is_pub: bool,
     is_exported: bool,
@@ -993,7 +993,7 @@ pub const Struct = struct {
     fields: std.array_hash_map.Auto(String, Field),
     owner_decl: Decl.OptionalIndex,
     namespace: NamespaceIndex,
-    layout: std.lang.Type.ContainerLayout = .auto,
+    layout: std.builtin.Type.ContainerLayout = .auto,
     backing_int_ty: InternPool.Index,
     status: FieldStatus,
 
@@ -1021,7 +1021,7 @@ pub const Union = struct {
     tag_type: InternPool.Index,
     fields: std.array_hash_map.Auto(String, Field),
     namespace: NamespaceIndex,
-    layout: std.lang.Type.ContainerLayout = .auto,
+    layout: std.builtin.Type.ContainerLayout = .auto,
     status: FieldStatus,
 
     pub const Field = struct {
@@ -1111,7 +1111,7 @@ pub fn init(io: std.Io, gpa: Allocator) Allocator.Error!InternPool {
         .{ .index = .fn_noreturn_no_args_type, .key = .{ .function_type = .{ .args = Index.Slice.empty, .return_type = .noreturn_type } } },
         .{ .index = .fn_void_no_args_type, .key = .{ .function_type = .{ .args = Index.Slice.empty, .return_type = .void_type } } },
         .{ .index = .fn_naked_noreturn_no_args_type, .key = .{ .function_type = .{ .args = Index.Slice.empty, .return_type = .void_type, .flags = .{ .calling_convention = .naked } } } },
-        .{ .index = .fn_ccc_void_no_args_type, .key = .{ .function_type = .{ .args = Index.Slice.empty, .return_type = .void_type, .flags = .{ .calling_convention = std.lang.CallingConvention.c } } } },
+        .{ .index = .fn_ccc_void_no_args_type, .key = .{ .function_type = .{ .args = Index.Slice.empty, .return_type = .void_type, .flags = .{ .calling_convention = std.builtin.CallingConvention.c } } } },
         .{ .index = .single_const_pointer_to_comptime_int_type, .key = .{ .pointer_type = .{ .elem_type = .comptime_int_type, .flags = .{ .size = .one, .is_const = true } } } },
         .{ .index = .slice_const_u8_type, .key = .{ .pointer_type = .{ .elem_type = .u8_type, .flags = .{ .size = .slice, .is_const = true } } } },
         .{ .index = .slice_const_u8_sentinel_0_type, .key = .{ .pointer_type = .{ .elem_type = .u8_type, .sentinel = .zero_u8, .flags = .{ .size = .slice, .is_const = true } } } },
@@ -1428,18 +1428,42 @@ pub fn contains(ip: *InternPool, key: Key) ?Index {
     return @enumFromInt(index);
 }
 
+/// A `start`/`len` pair addressing words in one of the pool's word lists.
+const WordRange = struct {
+    start: u32,
+    len: u32,
+};
+
+/// Checks that `len` more words still fit in the `u32` window that `list` can
+/// be addressed through, and reserves capacity for them.
+///
+/// Every range the pool hands out stores a `u32` `start` and is read back as
+/// `list[start + i]` with that addition done in `u32`, so `start + len` has to
+/// stay representable. That is a limit of the representation rather than of the
+/// allocator, so it is reported as `error.OutOfMemory` - the error these entry
+/// points already return - and callers keep their current error set. The check
+/// runs before any capacity is reserved or word written, so a rejected append
+/// leaves `list` untouched and never publishes a partial range.
+fn reserveRange(comptime List: type, list: *List, gpa: Allocator, len: usize) error{OutOfMemory}!WordRange {
+    const start = std.math.cast(u32, list.items.len) orelse return error.OutOfMemory;
+    const count = std.math.cast(u32, len) orelse return error.OutOfMemory;
+    _ = std.math.add(u32, start, count) catch return error.OutOfMemory;
+    try list.ensureUnusedCapacity(gpa, len);
+    return .{ .start = start, .len = count };
+}
+
 pub fn getIndexSlice(ip: *InternPool, data: []const Index) error{OutOfMemory}!Index.Slice {
     if (data.len == 0) return Index.Slice.empty;
 
     ip.lock.lockUncancelable(ip.io);
     defer ip.lock.unlock(ip.io);
 
-    const start: u32 = @intCast(ip.extra.items.len);
-    try ip.extra.appendSlice(ip.gpa, @ptrCast(data));
+    const range = try reserveRange(std.ArrayList(u32), &ip.extra, ip.gpa, data.len);
+    ip.extra.appendSliceAssumeCapacity(@ptrCast(data));
 
     return .{
-        .start = start,
-        .len = @intCast(data.len),
+        .start = range.start,
+        .len = range.len,
     };
 }
 
@@ -1449,24 +1473,24 @@ pub fn getStringSlice(ip: *InternPool, data: []const String) error{OutOfMemory}!
     ip.lock.lockUncancelable(ip.io);
     defer ip.lock.unlock(ip.io);
 
-    const start: u32 = @intCast(ip.extra.items.len);
-    try ip.extra.appendSlice(ip.gpa, @ptrCast(data));
+    const range = try reserveRange(std.ArrayList(u32), &ip.extra, ip.gpa, data.len);
+    ip.extra.appendSliceAssumeCapacity(@ptrCast(data));
 
     return .{
-        .start = start,
-        .len = @intCast(data.len),
+        .start = range.start,
+        .len = range.len,
     };
 }
 
 fn getLimbSlice(ip: *InternPool, data: []const std.math.big.Limb) error{OutOfMemory}!LimbSlice {
     if (data.len == 0) return LimbSlice.empty;
 
-    const start: u32 = @intCast(ip.limbs.items.len);
-    try ip.limbs.appendSlice(ip.gpa, data);
+    const range = try reserveRange(std.ArrayList(usize), &ip.limbs, ip.gpa, data.len);
+    ip.limbs.appendSliceAssumeCapacity(data);
 
     return .{
-        .start = start,
-        .len = @intCast(data.len),
+        .start = range.start,
+        .len = range.len,
     };
 }
 
@@ -1541,12 +1565,10 @@ fn addExtra(ip: *InternPool, comptime T: type, extra: T) Allocator.Error!u32 {
         @compileError(@typeName(T) ++ " fits into a u32! Consider directly storing this extra in Item's data field");
     };
 
-    const result: u32 = @intCast(ip.extra.items.len);
-
     const size = @divExact(@sizeOf(T), 4);
 
-    try ip.extra.ensureUnusedCapacity(ip.gpa, size);
-    inline for (std.meta.fields(T)) |field| {
+    const range = try reserveRange(std.ArrayList(u32), &ip.extra, ip.gpa, size);
+    inline for (@typeInfo(T).@"struct".fields) |field| {
         const item = @field(extra, field.name);
         switch (field.type) {
             Index,
@@ -1554,12 +1576,12 @@ fn addExtra(ip: *InternPool, comptime T: type, extra: T) Allocator.Error!u32 {
             Decl.OptionalIndex,
             StringPool.String,
             StringPool.OptionalString,
-            std.lang.Type.Pointer.Size,
+            std.builtin.Type.Pointer.Size,
             => ip.extra.appendAssumeCapacity(@intFromEnum(item)),
 
             u32,
             i32,
-            std.bit_set.Static(32),
+            std.StaticBitSet(32),
             Key.Pointer.Flags,
             Key.Pointer.PackedOffset,
             Key.Function.Flags,
@@ -1577,13 +1599,13 @@ fn addExtra(ip: *InternPool, comptime T: type, extra: T) Allocator.Error!u32 {
             else => @compileError("unexpected: " ++ @typeName(field.type)),
         }
     }
-    return result;
+    return range.start;
 }
 
 fn extraData(ip: *const InternPool, comptime T: type, index: u32) T {
     var result: T = undefined;
     var i: u32 = 0;
-    inline for (std.meta.fields(T)) |field| {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
         const item = ip.extra.items[index + i];
         i += 1;
         @field(result, field.name) = switch (field.type) {
@@ -1592,14 +1614,14 @@ fn extraData(ip: *const InternPool, comptime T: type, index: u32) T {
             StringPool.OptionalString,
             Decl.Index,
             Decl.OptionalIndex,
-            std.lang.Type.Pointer.Size,
-            // std.lang.AddressSpace,
-            // std.lang.CallingConvention,
+            std.builtin.Type.Pointer.Size,
+            // std.builtin.AddressSpace,
+            // std.builtin.CallingConvention,
             => @enumFromInt(item),
 
             u32,
             i32,
-            std.bit_set.Static(32),
+            std.StaticBitSet(32),
             Key.Pointer.Flags,
             Key.Pointer.PackedOffset,
             Key.Function.Flags,
@@ -1739,11 +1761,13 @@ pub fn coerce(
 
                 const elem_res = try ip.coerceInMemoryAllowed(arena, dest_info.elem_type, array_elem_type, dest_info.flags.is_const, target);
                 if (elem_res != .ok) {
-                    in_memory_result = .{ .ptr_child = .{
-                        .child = try elem_res.dupe(arena), // zbc-disable-line: tagged-union-payload-early-exit — arena-allocated; arena owns cleanup on error
-                        .actual = array_elem_type,
-                        .wanted = dest_info.elem_type,
-                    } };
+                    in_memory_result = .{
+                        .ptr_child = .{
+                            .child = try elem_res.dupe(arena), // zbc-disable-line: tagged-union-payload-early-exit — arena-allocated; arena owns cleanup on error
+                            .actual = array_elem_type,
+                            .wanted = dest_info.elem_type,
+                        },
+                    };
                     break :src_array_ptr;
                 }
 
@@ -2454,8 +2478,8 @@ const InMemoryCoercionResult = union(enum) {
     };
 
     const IntMismatch = struct {
-        actual_signedness: std.lang.Signedness,
-        wanted_signedness: std.lang.Signedness,
+        actual_signedness: std.builtin.Signedness,
+        wanted_signedness: std.builtin.Signedness,
         actual_bits: u16,
         wanted_bits: u16,
     };
@@ -2466,8 +2490,8 @@ const InMemoryCoercionResult = union(enum) {
     };
 
     const Size = struct {
-        actual: std.lang.Type.Pointer.Size,
-        wanted: std.lang.Type.Pointer.Size,
+        actual: std.builtin.Type.Pointer.Size,
+        wanted: std.builtin.Type.Pointer.Size,
     };
 
     const Qualifiers = struct {
@@ -2478,13 +2502,13 @@ const InMemoryCoercionResult = union(enum) {
     };
 
     const AddressSpace = struct {
-        actual: std.lang.AddressSpace,
-        wanted: std.lang.AddressSpace,
+        actual: std.builtin.AddressSpace,
+        wanted: std.builtin.AddressSpace,
     };
 
     const CC = struct {
-        actual: std.lang.CallingConvention.Tag,
-        wanted: std.lang.CallingConvention.Tag,
+        actual: std.builtin.CallingConvention.Tag,
+        wanted: std.builtin.CallingConvention.Tag,
     };
 
     const BitRange = struct {
@@ -2959,7 +2983,7 @@ fn panicOrElse(comptime T: type, message: []const u8, value: T) T {
 //               HELPER FUNCTIONS
 // ---------------------------------------------
 
-pub fn zigTypeTag(ip: *InternPool, index: Index) ?std.lang.TypeId {
+pub fn zigTypeTag(ip: *InternPool, index: Index) ?std.builtin.TypeId {
     ip.lock.lockSharedUncancelable(ip.io);
     defer ip.lock.unlockShared(ip.io);
     return switch (ip.items.items(.tag)[@intFromEnum(index)]) {
@@ -3306,7 +3330,7 @@ pub fn isUnsignedInt(ip: *InternPool, ty: Index, target: std.Target) bool {
 }
 
 /// Asserts the type is an integer, enum, error set, packed struct, or vector of one of them.
-pub fn intInfo(ip: *InternPool, ty: Index, target: std.Target) std.lang.Type.Int {
+pub fn intInfo(ip: *InternPool, ty: Index, target: std.Target) std.builtin.Type.Int {
     var index = ty;
     while (true) switch (index) {
         .u1_type => return .{ .signedness = .unsigned, .bits = 1 },
@@ -3944,17 +3968,17 @@ fn printInternal(ip: *InternPool, ty: Index, writer: *std.Io.Writer, options: Fo
             .empty_struct_type => try writer.writeAll("@TypeOf(.{})"),
             .enum_literal_type => try writer.writeAll("@EnumLiteral()"),
 
-            .atomic_order => try writer.writeAll("std.lang.AtomicOrder"),
-            .atomic_rmw_op => try writer.writeAll("std.lang.AtomicRmwOp"),
-            .calling_convention => try writer.writeAll("std.lang.CallingConvention"),
-            .address_space => try writer.writeAll("std.lang.AddressSpace"),
-            .float_mode => try writer.writeAll("std.lang.FloatMode"),
-            .reduce_op => try writer.writeAll("std.lang.ReduceOp"),
-            .modifier => try writer.writeAll("std.lang.CallModifier"),
-            .prefetch_options => try writer.writeAll("std.lang.PrefetchOptions"),
-            .export_options => try writer.writeAll("std.lang.ExportOptions"),
-            .extern_options => try writer.writeAll("std.lang.ExternOptions"),
-            .type_info => try writer.writeAll("std.lang.Type"),
+            .atomic_order => try writer.writeAll("std.builtin.AtomicOrder"),
+            .atomic_rmw_op => try writer.writeAll("std.builtin.AtomicRmwOp"),
+            .calling_convention => try writer.writeAll("std.builtin.CallingConvention"),
+            .address_space => try writer.writeAll("std.builtin.AddressSpace"),
+            .float_mode => try writer.writeAll("std.builtin.FloatMode"),
+            .reduce_op => try writer.writeAll("std.builtin.ReduceOp"),
+            .modifier => try writer.writeAll("std.builtin.CallModifier"),
+            .prefetch_options => try writer.writeAll("std.builtin.PrefetchOptions"),
+            .export_options => try writer.writeAll("std.builtin.ExportOptions"),
+            .extern_options => try writer.writeAll("std.builtin.ExternOptions"),
+            .type_info => try writer.writeAll("std.builtin.Type"),
             .unknown => try writer.writeAll("(unknown type)"),
             .generic_poison => try writer.writeAll("(generic poison)"),
         },
@@ -4712,7 +4736,7 @@ test "function type" {
         .args = .empty,
         .return_type = .type_type,
         .flags = .{
-            .calling_convention = std.lang.CallingConvention.c,
+            .calling_convention = std.builtin.CallingConvention.c,
             .alignment = 4,
         },
     } });
@@ -4885,12 +4909,16 @@ test "test thread safety of InternPool" {
 
     const index_start = ip.map.count();
 
-    const size: usize = 100;
+    // The stress helper below interns `float_32_value`s built from `0..count`,
+    // so `count` is typed as the exact integer domain `f32` represents: every
+    // `u16` converts to `f32` without rounding, and the helper is only ever
+    // called with a value this test picks.
+    const size: u16 = 100;
 
     const funcs = struct {
         fn do(
             intern_pool: *InternPool,
-            count: usize,
+            count: u16,
         ) void {
             // insert float_32_value from 0 to count + random work
             for (0..count) |i| {
@@ -4911,9 +4939,9 @@ test "test thread safety of InternPool" {
     }
     try wait_group.await(io);
 
-    try std.testing.expectEqual(index_start + size, ip.map.count());
+    try std.testing.expectEqual(index_start + @as(usize, size), ip.map.count());
 
-    var found: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, size);
+    var found: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, @as(usize, size));
     defer found.deinit(gpa);
 
     // test that every value is in the InternPool
@@ -4923,10 +4951,10 @@ test "test thread safety of InternPool" {
 
     // test that every Index stores a unique float_32_value
     for (0..size) |i| {
-        const index: Index = @enumFromInt(index_start + i);
+        const index: Index = @enumFromInt(index_start + @as(usize, i));
         const key = ip.indexToKey(index);
         const value: usize = @intFromFloat(key.float_32_value);
-        try std.testing.expect(value < size);
+        try std.testing.expect(value < @as(usize, size));
         try std.testing.expect(!found.isSet(value));
         found.set(value);
     }

@@ -98,8 +98,8 @@ pub const Declaration = union(enum) {
     error_token: Ast.TokenIndex,
 
     comptime {
-        for (std.meta.fields(Declaration)) |field| {
-            std.debug.assert(@sizeOf(field.type) <= 8); // a Declaration without the union tag must be less than 8 bytes
+        for (@typeInfo(Declaration).@"union".fields) |field| {
+            std.debug.assert(@sizeOf(field.type) <= 8);
         }
     }
 
@@ -424,6 +424,11 @@ const ScopeContext = struct {
     };
 
     fn startScope(context: *ScopeContext, tag: Scope.Tag, data: Scope.Data, loc: Scope.SmallLoc) error{OutOfMemory}!PushedScope {
+        // Registering this scope with its parent may append to the shared
+        // child-scope scratch list. Its own offset starts after that append.
+        // Both recorded offsets must remain addressable as u32.
+        const declarations_start = std.math.cast(u32, context.child_declarations_scratch.items.len) orelse return error.OutOfMemory;
+
         try context.doc_scope.scopes.append(context.allocator, .{
             .data = .{
                 .tag = tag,
@@ -444,13 +449,14 @@ const ScopeContext = struct {
         if (context.current_scope.unwrap()) |parent_scope| {
             try context.pushChildScope(parent_scope, new_scope_index);
         }
+        const scopes_start = std.math.cast(u32, context.child_scopes_scratch.items.len) orelse return error.OutOfMemory;
 
         context.current_scope = new_scope_index.toOptional();
         return .{
             .context = context,
             .scope = context.current_scope.unwrap().?,
-            .scopes_start = @intCast(context.child_scopes_scratch.items.len),
-            .declarations_start = @intCast(context.child_declarations_scratch.items.len),
+            .scopes_start = scopes_start,
+            .declarations_start = declarations_start,
         };
     }
 
@@ -507,10 +513,18 @@ pub fn init(allocator: std.mem.Allocator, tree: *const Ast) error{OutOfMemory}!D
         .zig => try walkContainerDecl(&context, tree, .root),
         .zon => {
             const root_node = tree.nodeData(.root).node;
+            // `Scope.SmallLoc` ends are `u32`, so the root scope that spans
+            // the whole source can only be started while that source is
+            // addressable as one - the same bound `startScope` applies to the
+            // scratch offsets it records, and the same bound
+            // `Handle.requireAddressableSource` applies before a document is
+            // stored.  A source that does not fit is refused here rather
+            // than truncated into a scope that would report wrong positions.
+            const source_end = std.math.cast(u32, tree.source.len) orelse return error.OutOfMemory;
             const new_scope = try context.startScope(
                 .container,
                 .{ .ast_node = root_node },
-                .{ .start = 0, .end = @intCast(tree.source.len) },
+                .{ .start = 0, .end = source_end },
             );
             try walkNode(&context, tree, root_node);
             try new_scope.finalize();
@@ -613,7 +627,7 @@ fn walkNode(
         .switch_comma,
         => walkSwitchNode(context, tree, node_idx),
 
-        .@"errdefer",
+        .@"errdefer" => walkErrdeferNode(context, tree, node_idx),
         .@"defer",
         .bool_not,
         .negation,
@@ -662,6 +676,7 @@ fn walkNode(
         .add,
         .sub,
         .array_cat,
+        .array_mult,
         .add_wrap,
         .sub_wrap,
         .add_sat,
@@ -1019,6 +1034,32 @@ noinline fn walkCatchNode(
     }
 }
 
+/// errdefer |payload_token|? body
+noinline fn walkErrdeferNode(
+    context: *ScopeContext,
+    tree: *const Ast,
+    node_idx: Ast.Node.Index,
+) error{OutOfMemory}!void {
+    const payload_token, const body = tree.nodeData(node_idx).opt_token_and_node;
+
+    if (payload_token.unwrap()) |payload| {
+        const name_token = payload + @intFromBool(tree.tokenTag(payload) == .asterisk);
+
+        // The capture takes precedence over every outer binding of that name,
+        // but only for the deferred body.  It is an error value without an
+        // error union expression behind it, hence the `.none` condition.
+        const body_scope = try walkNodeEnsureScope(context, tree, body, name_token);
+        try body_scope.pushDeclaration(
+            name_token,
+            .{ .error_union_error = .{ .identifier = name_token, .condition = .none } },
+            .other,
+        );
+        try body_scope.finalize();
+    } else {
+        try walkNode(context, tree, body);
+    }
+}
+
 /// label_token: inline_token while (cond_expr) |payload_token| : (cont_expr) then_expr else |error_token| else_expr
 noinline fn walkWhileNode(
     context: *ScopeContext,
@@ -1321,4 +1362,144 @@ pub fn getScopeChildScopesConst(
         const other = slice.items(.child_scopes)[@intFromEnum(scope)].other;
         return @ptrCast(doc_scope.extra.items[other.start..other.end]);
     }
+}
+
+test "an errdefer payload is declared in the deferred body only" {
+    const gpa = std.testing.allocator;
+
+    // A consumer Zig itself accepts: the capture shadows nothing (Zig forbids
+    // that), `incoming` is a real parameter of `foo`, and `foo` really returns
+    // an error, so there is something for the errdefer to defer for.  `handle`
+    // takes a parameter named `err` as well, so a lookup of `err` that escaped
+    // `foo` would find that parameter instead of finding nothing at all.
+    const source =
+        \\fn handle(err: anyerror) void {
+        \\    _ = err;
+        \\}
+        \\
+        \\fn use(value: anyerror) void {
+        \\    _ = value;
+        \\}
+        \\
+        \\fn foo(incoming: anyerror) !void {
+        \\    errdefer |err| {
+        \\        handle(err);
+        \\        _ = err;
+        \\    }
+        \\    _ = incoming;
+        \\    use(incoming);
+        \\    return error.Boom;
+        \\}
+        \\
+    ;
+
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+
+    var document_scope = try init(gpa, &tree);
+    defer document_scope.deinit(gpa);
+
+    // Name lookup the way `analysis.lookupSymbolGlobal` performs it: start at
+    // the innermost scope covering a source index, then ask every enclosing
+    // scope for an `.other` declaration of that name.
+    const Lookup = struct {
+        fn innermost(doc_scope: *const DocumentScope, source_index: usize) Scope.Index {
+            var current: Scope.Index = .root;
+            descend: while (true) {
+                for (doc_scope.getScopeChildScopesConst(current)) |child| {
+                    const loc = doc_scope.scopes.items(.loc)[@intFromEnum(child)];
+                    const start: usize = loc.start;
+                    const end: usize = loc.end;
+                    if (source_index < start or end < source_index) continue;
+                    current = child;
+                    continue :descend;
+                }
+                return current;
+            }
+        }
+
+        fn other(
+            doc_scope: *const DocumentScope,
+            source_index: usize,
+            name: []const u8,
+        ) ?Declaration.Index {
+            var scope = innermost(doc_scope, source_index);
+            while (true) {
+                if (doc_scope.getScopeDeclaration(.{
+                    .scope = scope,
+                    .name = name,
+                    .kind = .other,
+                }).unwrap()) |decl_index| return decl_index;
+                scope = doc_scope.getScopeParent(scope).unwrap() orelse return null;
+            }
+        }
+    };
+
+    // `foo` is the function holding the errdefer; it is looked up by name so
+    // the parameter check below can name the function it belongs to.
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    var foo_fn: ?Ast.Node.Index = null;
+    for (0..tree.nodes.items(.tag).len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const proto = tree.fullFnProto(&proto_buffer, node).?;
+        const name = tree.tokenSlice(proto.name_token orelse continue);
+        if (!std.mem.eql(u8, name, "foo")) continue;
+        foo_fn = node;
+        break;
+    }
+    const foo_node = foo_fn orelse return error.TestUnexpectedResult;
+
+    var statement_buffer: [2]Ast.Node.Index = undefined;
+    const foo_body = tree.nodeData(foo_node).node_and_node[1];
+    const foo_statements = tree.blockStatements(&statement_buffer, foo_body).?;
+
+    // The statement behind the errdefer is `_ = incoming;`, a real use of the
+    // parameter that lies outside the deferred body.
+    const errdefer_at = for (foo_statements, 0..) |stmt, i| {
+        if (tree.nodeTag(stmt) != .@"errdefer") continue;
+        break i;
+    } else return error.TestUnexpectedResult;
+    if (errdefer_at + 1 >= foo_statements.len) return error.TestUnexpectedResult;
+    const errdefer_stmt = foo_statements[errdefer_at];
+    const stmt_after_errdefer = foo_statements[errdefer_at + 1];
+
+    const deferred_body = tree.nodeData(errdefer_stmt).opt_token_and_node[1];
+    var body_statement_buffer: [2]Ast.Node.Index = undefined;
+    const body_statements = tree.blockStatements(&body_statement_buffer, deferred_body).?;
+    // `_ = err;`, the use of the capture that has to resolve.
+    const capture_use = for (body_statements) |stmt| {
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.firstToken(stmt)), "_")) continue;
+        break stmt;
+    } else return error.TestUnexpectedResult;
+
+    // Inside the deferred body `err` resolves, and the scope covering that use
+    // is the deferred body itself and owns the payload directly, so no outer
+    // binding can be reached through it.
+    const inside_body = tree.tokenStart(tree.firstToken(capture_use));
+    const payload_index = Lookup.other(&document_scope, inside_body, "err") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(document_scope.declarations.get(@intFromEnum(payload_index)) == .error_union_error);
+
+    const owning_scope = Lookup.innermost(&document_scope, inside_body);
+    try std.testing.expectEqual(deferred_body, getScopeAstNode(document_scope, owning_scope) orelse
+        return error.TestUnexpectedResult);
+    try std.testing.expectEqual(
+        payload_index,
+        getScopeDeclaration(document_scope, .{ .scope = owning_scope, .name = "err", .kind = .other }).unwrap() orelse
+            return error.TestUnexpectedResult,
+    );
+
+    // Behind the errdefer `incoming` is still the parameter of `foo`...
+    const after_body = tree.tokenStart(tree.firstToken(stmt_after_errdefer));
+    const incoming_index = Lookup.other(&document_scope, after_body, "incoming") orelse
+        return error.TestUnexpectedResult;
+    const incoming = document_scope.declarations.get(@intFromEnum(incoming_index));
+    try std.testing.expect(incoming == .function_parameter);
+    try std.testing.expectEqual(foo_node, incoming.function_parameter.func);
+
+    // ...and the payload is gone: nothing named `err` is in scope there, even
+    // though `handle` has a parameter of that name.
+    try std.testing.expect(Lookup.other(&document_scope, after_body, "err") == null);
 }

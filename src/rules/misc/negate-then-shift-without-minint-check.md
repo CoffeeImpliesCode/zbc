@@ -9,11 +9,10 @@
 A signed integer is negated (`-value`) and then left-shifted (`<< N`) without
 a guard that handles the case where `value == std.math.minInt(@TypeOf(value))`.
 
-In two's complement arithmetic, `std.math.minInt(i32)` (−2,147,483,648) has
-no positive representation: `-minInt(i32)` overflows back to `minInt(i32)`.
-Left-shifting the already-wrong result produces garbage output.  In Zig's
-Debug and ReleaseSafe builds this traps at runtime; in **ReleaseFast** it
-silently wraps.
+The signed minimum has no positive representation in the same integer type.
+Negating it traps in Debug and ReleaseSafe.
+In ReleaseFast and ReleaseSmall, the operation has undefined behavior.
+It is not defined wrapping arithmetic.
 
 ## Example (fires)
 

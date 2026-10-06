@@ -1,4 +1,7 @@
-// oven-sh/bun#29422 — partial-union-write across all 4 site shapes.
+// oven-sh/bun#29422 — partial-union-write across all 4 site shapes, plus
+// the tagged-union-payload-early-exit pair: the same partial retag reports
+// when the union is the caller's, and stays quiet when the failing path
+// only releases the storage raw.
 
 const std = @import("std");
 
@@ -116,7 +119,6 @@ const Resolve = struct {
 fn localVar() !void {
     var x: Decompressor = .none;
     x = .{ .zlib = try ZlibInit() };
-    _ = x;
 }
 
 // ─── Control 2: payload is plain, no try/catch-return.  Not dangerous.
@@ -134,4 +136,42 @@ fn defaultReader() *Reader {
 
 fn catchValue(this: *Decompressor) void {
     this.* = .{ .zlib = ZlibInit() catch defaultReader() };
+}
+
+// ─── Site 5: caller-visible union field with a `try` payload.
+//             `resolve` is a parameter, so the union lives in storage
+//             the caller owns and can read on the error path.  The
+//             `.err` tag is written before `Msg.fromJS` resolves, so a
+//             failed call leaves `.err` active over `.pending`'s
+//             payload bytes.
+
+fn onTry(resolve: *Resolve, exception: usize) !void {
+    resolve.value = .{ .err = try Msg.fromJS(exception) };
+}
+
+// ─── Control 4: private union storage whose only cleanup is a raw
+//                `free` of the whole slice.  Every failing path
+//                releases the allocation without reading the union
+//                element, so the partial retag is unobservable.
+
+fn privateBuild(gpa: std.mem.Allocator) !void {
+    const fields = try gpa.alloc(Decompressor, 1);
+    defer gpa.free(fields);
+    fields[0] = .{ .zlib = try ZlibInit() };
+}
+
+// ─── Control 5: the same retag as site 5, into frame-private storage.
+//                `pending` never leaves this frame, and the `defer`
+//                releases the whole slice without reading the union
+//                element, so nothing can observe the half-retagged
+//                `.err` over `.pending`'s payload bytes.  Only storage
+//                ownership differs from site 5 — same union, same field,
+//                same `Msg.fromJS` call, same `try`.
+
+fn privateRetag(gpa: std.mem.Allocator, exception: usize) !void {
+    const fields = try gpa.alloc(Resolve, 1);
+    defer gpa.free(fields);
+    var pending: Resolve = .{ .value = .pending };
+    pending.value = .{ .err = try Msg.fromJS(exception) };
+    fields[0] = pending;
 }

@@ -53,7 +53,7 @@ pub fn check(
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 8) return;
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok = tree.lastToken(.root);
 
     var t: Ast.TokenIndex = 0;
     while (t + 5 <= last_tok) : (t += 1) {
@@ -69,7 +69,10 @@ pub fn check(
             var k: Ast.TokenIndex = 1;
             while (k <= 5 and k <= t) : (k += 1) {
                 const prev = tags[t - k];
-                if (prev == .keyword_or) { or_before = true; break; }
+                if (prev == .keyword_or) {
+                    or_before = true;
+                    break;
+                }
                 if (prev == .l_paren or prev == .semicolon or
                     prev == .l_brace or prev == .r_brace) break;
             }

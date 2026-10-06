@@ -102,7 +102,7 @@ fn checkBody(
             var start = t - 1;
             while (start >= 2 and tags[start - 1] == .period and tags[start - 2] == .identifier) start -= 2;
             const recv = tree.source[tree.tokenStart(start)..(tree.tokenStart(t - 1) + tree.tokenSlice(t - 1).len)];
-            if (value_range.provesMinLen(gpa, tree, body, recv, n, t + 2, null)) continue;
+            if (try value_range.provesMinLen(gpa, tree, body, recv, n, t + 2, null)) continue;
         }
 
         try report(gpa, problems, tree, t + 2, n);

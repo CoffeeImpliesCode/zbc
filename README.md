@@ -52,44 +52,27 @@ Exit 0 if clean, 1 if problems found.
 
 ## Rules
 
-45 rules in two families:
+113 rules in two families, distinguished by the analysis each needs:
 
-**Flow analysis** — must-not-escape / must-not-free-twice guarantees via
-per-fn CFG and abstract interpretation:
+**Flow analysis** — must-not-escape / must-not-free-twice guarantees
+via a per-fn CFG and abstract interpretation.  Ten invariants:
+`allocator-mismatch`, `arena-escape`, `arena-use-after-kill`,
+`heap-double-free`, `heap-leak`, `heap-use-after-free`,
+`interior-pointer-destroy`, `partial-union-write`, `stack-escape`,
+`use-undefined`.
 
-`heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
-`arena-escape`, `stack-escape`, `use-undefined`, `allocator-mismatch`,
-`interior-pointer-destroy`
+**Pattern detectors** — per-fn or per-file token / AST walks over
+canonical bug shapes mined from open-source Zig PRs.  The other 103.
+Cheaper than flow analysis; each targets a recurring "look for this
+exact shape" class — heap lifetime, error-path cleanup, pointer and
+slice stability, tagged-union semantics, lifecycle consistency,
+concurrency, and numeric / bounds bugs.
 
-**Pattern detectors** — catches recurring bug shapes from real Zig PRs:
-
-- Heap leak / aliasing: `heap-leak`, `partial-union-write`,
-  `aliased-heap-dupe`, `clobbered-by-struct-reset`, `realloc-byte-count`,
-  `asymmetric-field-free`, `free-without-null-then-check`,
-  `overwrite-without-deinit`
-- Error-path cleanup: `missing-errdefer-between-tries`,
-  `free-then-try-realloc`, `destroy-after-deinit-in-loop`,
-  `dead-errdefer-in-result-fn`, `duplicate-errdefer`,
-  `missing-errdefer-on-out-param`, `unreleased-refs-on-error`,
-  `unreleased-factory-handle`
-- Pointer / slice stability: `hashmap-getptr-rehash`,
-  `arraylist-items-slice`, `fd-write-after-close`,
-  `stack-fallback-escape`, `slice-of-arena-into-heap`,
-  `borrowed-slice-into-out-param`,
-  `borrowed-slice-into-stack-buffer-returned`,
-  `memset-undef-after-len-truncation`,
-  `sentinel-strip-free-size-mismatch`
-- Tagged-union semantics: `tagged-union-retag-with-old-payload-read`,
-  `union-deinit-without-inert-reset`, `self-undefined-after-destroy`,
-  `return-borrowed-payload`
-- Lifecycle / sibling consistency: `reset-skips-pooled-resource-release`,
-  `missing-deinit-on-composed-owner`, `owned-field-no-outer-cleanup`,
-  `deinit-order-violates-construction-dep`,
-  `defer-and-errdefer-free-overlap`, `move-out-without-restore`
-- Concurrency / hardening: `publish-then-touch-self`,
-  `assert-on-untrusted-input`
-
-`zbc --explain <rule-id>` prints the rationale, canonical bug, and fix.
+That split is not maintained here.  The authoritative lists are the
+`all` catalog and the `escape_detectors` dispatch table in
+`src/rule_catalog.zig`; `zbc --list-rules` prints the catalog and
+`zbc --explain <rule-id>` prints one rule's rationale, canonical bug,
+and fix.  ARCHITECTURE.md traces both declarations.
 
 ## False positives and missed bugs
 

@@ -157,9 +157,9 @@ fn checkLoopBody(
             tags[t + 2] == .identifier and
             tags[t + 3] == .l_paren)
         {
-            const method = tree.tokenSlice(t + 2);
-            if (method_names.isArrayListGrowMethodName(method)) {
-                try report(gpa, problems, tree, t + 2, recv, method);
+            const callee = tree.tokenSlice(t + 2);
+            if (method_names.isArrayListGrowMethodName(callee)) {
+                try report(gpa, problems, tree, t + 2, callee, recv);
                 t += 3;
                 continue;
             }
@@ -207,19 +207,15 @@ fn identAppearsIn(
     return false;
 }
 
-fn report(
+/// Append one finding for `call_tok`.  Takes ownership of `msg` on
+/// success; frees it if the append fails.
+fn appendProblem(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
     call_tok: Ast.TokenIndex,
-    recv: []const u8,
-    method: []const u8,
+    msg: []u8,
 ) !void {
-    const msg = try std.fmt.allocPrint(
-        gpa,
-        "`{s}.{s}` inside `for ({s}.items)` may reallocate the backing buffer — the loop's implicit slice pointer is invalidated; move the call outside the loop or capture needed data before growing",
-        .{ recv, method, recv },
-    );
     errdefer gpa.free(msg);
     try problems.append(gpa, .{
         .rule_id = R,
@@ -230,6 +226,21 @@ fn report(
     });
 }
 
+fn report(
+    gpa: std.mem.Allocator,
+    problems: *std.ArrayListUnmanaged(Problem),
+    tree: *const Ast,
+    call_tok: Ast.TokenIndex,
+    callee: []const u8,
+    recv: []const u8,
+) !void {
+    try appendProblem(gpa, problems, tree, call_tok, try std.fmt.allocPrint(
+        gpa,
+        "`{s}.{s}` inside `for ({s}.items)` may reallocate the backing buffer — the loop's implicit slice pointer is invalidated; move the call outside the loop or capture needed data before growing",
+        .{ recv, callee, recv },
+    ));
+}
+
 fn reportCallee(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -238,19 +249,11 @@ fn reportCallee(
     callee: []const u8,
     recv: []const u8,
 ) !void {
-    const msg = try std.fmt.allocPrint(
+    try appendProblem(gpa, problems, tree, call_tok, try std.fmt.allocPrint(
         gpa,
         "`{s}(...)` inside `for ({s}.items)` may grow a collection — if it reallocates the iterated slice, the loop's implicit pointer is invalidated; ensure `{s}` cannot grow `{s}` during iteration",
         .{ callee, recv, callee, recv },
-    );
-    errdefer gpa.free(msg);
-    try problems.append(gpa, .{
-        .rule_id = R,
-        .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, call_tok),
-        .end = Pos.fromTokenEnd(tree, call_tok),
-        .message = msg,
-    });
+    ));
 }
 
 // ── Tests ──────────────────────────────────────────────────

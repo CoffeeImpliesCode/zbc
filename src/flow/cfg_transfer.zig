@@ -11,6 +11,7 @@ const problem_mod = @import("../problem.zig");
 const cfg = @import("cfg.zig");
 const state_mod = @import("abstract_state.zig");
 const config_mod = @import("../config.zig");
+const type_query = @import("../model/type_query.zig");
 
 const Problem = problem_mod.Problem;
 const Severity = problem_mod.Severity;
@@ -24,6 +25,108 @@ const AbstractState = state_mod.AbstractState;
 const Origin = state_mod.Origin;
 const LocalId = state_mod.LocalId;
 
+/// The identities of the diagnostics one analysis run has already
+/// emitted.  The solver owns one and hands it to every [Ctx] it builds,
+/// because it replays each block once per path state that block holds:
+/// without a memo of what has already been said, every report at an
+/// already-reported site re-derives its message and re-reads the whole
+/// finding list to discover it is a duplicate.
+///
+/// Identity is the pair the old scan compared — the rule and the byte
+/// its primary span starts at — so two reports agree exactly when they
+/// name one source operation, and a second rule or a second site at
+/// the same byte is still its own finding.  [Context] carries that
+/// comparison on the rule's bytes, never on a `Problem`'s raw bytes.
+///
+/// The rule id in a key is BORROWED, never copied.  A report's rule id
+/// is a `comptime` parameter, so it is a string literal with static
+/// lifetime; an adopted one is `Problem.rule_id`, which the module
+/// already requires to outlive the findings carrying it, because
+/// `Problem.deinit` never frees it.  Both outlive this memo, whose
+/// lifetime ends inside the `check` call that owns the list.
+pub const Seen = struct {
+    const Key = struct { rule_id: []const u8, byte: u32 };
+
+    keys: std.ArrayHashMapUnmanaged(Key, void, Context, true) = .empty,
+    /// Findings the caller already held, and whether they have been
+    /// folded in yet.  Both are set by [adopt] and consumed by the
+    /// first [record].
+    unadopted: ?[]const Problem = null,
+    adopted: bool = false,
+
+    /// Identity is BYTES, not addresses.  `std.hash_map.AutoContext`
+    /// cannot be used here: it routes to `std.hash.autoHash`, which
+    /// rejects any key containing a slice outright, and its equality
+    /// is `std.meta.eql`, which compares a slice by `ptr` + `len`.  A
+    /// rule id adopted from `ctx.problems` and the same rule id passed
+    /// to `report` are equal strings at different addresses, so an
+    /// address comparison would report a source operation twice — the
+    /// exact answer the scan over `ctx.problems` never gave.  Hashing
+    /// the bytes keeps distinct rule ids apart and identical ones
+    /// together, which is what the scan's `std.mem.eql` did.
+    const Context = struct {
+        pub fn hash(_: Context, key: Key) u32 {
+            return @truncate(std.hash.Wyhash.hash(
+                std.hash_map.hashString(key.rule_id),
+                std.mem.asBytes(&key.byte),
+            ));
+        }
+
+        pub fn eql(_: Context, a: Key, b: Key, _: usize) bool {
+            return a.byte == b.byte and std.mem.eql(u8, a.rule_id, b.rule_id);
+        }
+    };
+
+    pub fn init() Seen {
+        return .{};
+    }
+
+    pub fn deinit(self: *Seen, gpa: std.mem.Allocator) void {
+        self.keys.deinit(gpa);
+    }
+
+    /// Record `rule_id` at `byte`.  Returns false when that diagnostic
+    /// has already been recorded — the caller's cue to skip building a
+    /// message and a note for a finding nobody will read twice.
+    ///
+    /// Failing to remember a diagnostic is an analysis failure, not a
+    /// silent one: reporting without the memo would hand back the same
+    /// finding once per path state.
+    pub fn record(self: *Seen, gpa: std.mem.Allocator, rule_id: []const u8, byte: u32) !bool {
+        // The findings [adopt] was given are folded in HERE, on the
+        // first diagnostic this run actually emits.  A function that
+        // reports nothing never consults the memo, so it never pays to
+        // walk a list it was never going to read — the scan this
+        // replaced likewise ran only on a real report.
+        if (!self.adopted) {
+            self.adopted = true;
+            if (self.unadopted) |existing| {
+                // Nothing has been appended since [adopt] captured this
+                // slice: a run records a diagnostic before it appends
+                // it, so the list cannot have moved under the seed.
+                for (existing) |problem| _ = try self.put(gpa, problem.rule_id, problem.start.byte);
+            }
+        }
+        return self.put(gpa, rule_id, byte);
+    }
+
+    fn put(self: *Seen, gpa: std.mem.Allocator, rule_id: []const u8, byte: u32) !bool {
+        const slot = try self.keys.getOrPut(gpa, .{ .rule_id = rule_id, .byte = byte });
+        if (slot.found_existing) return false;
+        slot.value_ptr.* = {};
+        return true;
+    }
+
+    /// Remember the findings the caller already holds, so a run that
+    /// writes into a non-empty list keeps the same "first one wins"
+    /// answer the scan over that list gave it.  Recording what to adopt
+    /// costs nothing; the pass itself belongs to [record], and runs
+    /// only if this run emits anything at all.
+    pub fn adopt(self: *Seen, problems: []const Problem) void {
+        self.unadopted = problems;
+    }
+};
+
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
     locals: []const LocalInfo,
@@ -31,43 +134,52 @@ pub const Ctx = struct {
     problems: *std.ArrayListUnmanaged(Problem),
     /// Source file path for diagnostics.
     path: []const u8,
+    /// The run's record of what has already been reported, owned by
+    /// whoever outlives the [Ctx] — the solver, which builds one [Ctx]
+    /// per block visit and replays every block once per path state.
+    seen: *Seen,
     /// Invariant gating.  Some checks run inside transfer (arena_escape
     /// fires from transferRet, not from a dedicated Stmt) — those
     /// consult the config to honor Config.enabled.
     config: *const config_mod.Config = &config_mod.Default,
+    report_enabled: bool = true,
 };
 
 /// Mutate `state` to reflect the effect of `stmt`.  Emit any problems
 /// to `ctx.problems`.
 pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
+    if (!state.feasible) return;
     switch (stmt.kind) {
         .decl => |d| try transferDecl(ctx, state, d, stmt.pos),
         .assign => |a| try transferAssign(ctx, state, a, stmt.pos),
+        .assume => |condition| state.feasible = switch (condition) {
+            .constant => |value| value,
+            .local => |local| try state.facts.assumeBoolean(ctx.gpa, local, true, !ctx.locals[@intFromEnum(local)].address_taken),
+            .not_local => |local| try state.facts.assumeBoolean(ctx.gpa, local, false, !ctx.locals[@intFromEnum(local)].address_taken),
+        },
+        .guard_fact => |g| state.feasible = try state.facts.assumeGuard(ctx.gpa, g.guard, g.holds),
         .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos, stmt.end_pos),
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .pointer_write => |p| {
+            state.facts.forgetLocal(p.target);
             if (state.locals.get(p.target)) |origin| {
+                if (origin == .stack) {
+                    state.facts.forgetLocal(origin.stack);
+                }
                 if (origin == .undef) try state.locals.put(ctx.gpa, p.target, .plain);
             }
         },
         .reset_capture => |r| {
+            state.facts.forgetLocal(r.local);
             try state.locals.put(ctx.gpa, r.local, .plain);
             // Also clear any tracked FIELD origins for this local —
             // `for (bins) |bin| ctx.allocator.free(bin.path);` frees
             // `bin.path` once per iteration; without clearing the
             // field, iter N+1 sees iter N's freed state and reports
             // a spurious double-free of `bin.path`.
-            var i: usize = 0;
-            while (i < state.fields.count()) {
-                const key = state.fields.keys()[i];
-                if (key.parent == r.local) {
-                    state.fields.swapRemoveAt(i);
-                } else {
-                    i += 1;
-                }
-            }
+            state.forgetFields(r.local);
         },
         .composite_escape => |c| try transferCompositeEscape(ctx, state, c, stmt.pos, stmt.end_pos),
         .field_assign => |a| try transferFieldAssign(ctx, state, a, stmt.pos),
@@ -77,8 +189,25 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
         .leak_warning => |l| try transferLeakWarning(ctx, l, stmt.pos, stmt.end_pos),
         .partial_union_write => |p| try transferPartialUnionWrite(ctx, p, stmt.pos, stmt.end_pos),
-        .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+        .lowering_gap => |g| transferGap(state, g),
     }
+}
+
+fn booleanValue(state: *const AbstractState, value: cfg.BooleanValue) ?bool {
+    return switch (value) {
+        .constant => |v| v,
+        .local => |local| state.facts.boolean(local),
+        .not_local => |local| if (state.facts.boolean(local)) |v| !v else null,
+    };
+}
+
+fn bindBoolean(ctx: Ctx, state: *AbstractState, local: LocalId, kind: ExprKind) !void {
+    const value = if (ctx.locals[@intFromEnum(local)].address_taken) null else switch (kind) {
+        .boolean => |v| booleanValue(state, v),
+        .copy_of => |source| state.facts.boolean(source),
+        else => null,
+    };
+    try state.facts.bindBoolean(ctx.gpa, local, value);
 }
 
 fn transferLeakWarning(
@@ -88,9 +217,7 @@ fn transferLeakWarning(
     end_pos: cfg.SrcPos,
 ) !void {
     if (!config_mod.isEnabled(ctx.config, .heap_leak)) return;
-    try report(ctx, "heap-leak", pos, end_pos, .@"error",
-        "destructor for `{s}` does not free `self` — instances allocated by the type's heap-creator leak (no `allocator.destroy(self)` reachable from this destructor)",
-        .{l.type_name});
+    try report(ctx, "heap-leak", pos, end_pos, .@"error", "destructor for `{s}` does not free `self` — instances allocated by the type's heap-creator leak (no `allocator.destroy(self)` reachable from this destructor)", .{l.type_name});
 }
 
 fn transferPartialUnionWrite(
@@ -100,9 +227,7 @@ fn transferPartialUnionWrite(
     end_pos: cfg.SrcPos,
 ) !void {
     if (!config_mod.isEnabled(ctx.config, .partial_union_write)) return;
-    try report(ctx, "partial-union-write", pos, end_pos, .@"error",
-        "tagged-union literal writes the `.{s}` tag before evaluating its payload; an early-exit (`try` / `catch return`) in the payload leaves the LHS with the new tag and stale/garbage payload bytes — hoist the fallible expression into a local first",
-        .{p.tag_name});
+    try report(ctx, "partial-union-write", pos, end_pos, .@"error", "tagged-union literal writes the `.{s}` tag before evaluating its payload; an early-exit (`try` / `catch return`) in the payload leaves the LHS with the new tag and stale/garbage payload bytes — hoist the fallible expression into a local first", .{p.tag_name});
 }
 
 fn transferInteriorPointerDestroy(
@@ -116,9 +241,7 @@ fn transferInteriorPointerDestroy(
     if (!config_mod.isEnabled(ctx.config, .interior_pointer_destroy)) return;
     const receiver_name = ctx.locals[@intFromEnum(i.receiver)].name;
     const container_name = ctx.locals[@intFromEnum(i.container)].name;
-    try report(ctx, "interior-pointer-destroy", pos, end_pos, .@"error",
-        "destroying `{s}` — an interior pointer into `{s}` — is undefined behavior under typical allocators (the pointer wasn't returned by allocator.create)",
-        .{ receiver_name, container_name });
+    try report(ctx, "interior-pointer-destroy", pos, end_pos, .@"error", "destroying `{s}` — an interior pointer into `{s}` — is undefined behavior under typical allocators (the pointer wasn't returned by allocator.create)", .{ receiver_name, container_name });
 }
 
 fn transferDecl(
@@ -127,22 +250,45 @@ fn transferDecl(
     d: @TypeOf(@as(StmtKind, undefined).decl),
     pos: cfg.SrcPos,
 ) !void {
+    try bindBoolean(ctx, state, d.local, d.init_kind);
     const origin = try originOfInit(ctx, state, d.init_kind, pos);
-    try state.locals.put(ctx.gpa, d.local, origin);
+    try state.locals.put(ctx.gpa, d.local, scalarBindingOrigin(ctx, d.local, origin));
     // Clear any stale field state for this local — a fresh decl
     // (e.g. `const source = ...` inside a loop body) creates a new
     // instance; prior-iteration field tracking for the same LocalId
     // is a back-edge artifact that would spuriously fire double-free
     // / UAF on the new instance.
-    var i: usize = 0;
-    while (i < state.fields.count()) {
-        const key = state.fields.keys()[i];
-        if (key.parent == d.local) {
-            state.fields.swapRemoveAt(i);
-        } else {
-            i += 1;
-        }
+    state.forgetFields(d.local);
+}
+
+/// A binding DECLARED with a primitive scalar type cannot hold an
+/// address, so a resource origin flowing into one is a mis-attribution
+/// rather than a claim about its lifetime.
+///
+/// `var out: u8 = 0; … defer out = observe(p); defer gpa.free(p);`
+/// assigns a callee result whose own origin is `copy_of(p)` into that
+/// `u8`.  The `u8` holds a byte copied OUT of `p`, not `p` itself;
+/// binding it to the allocation makes the later `return out` read a
+/// freed heap — a use-after-free of a value that was never an
+/// address.  The origin it arrived with comes from the callee's own
+/// `@returns borrowed_from(0)` reading, which is right for a
+/// pointer-typed result and wrong for one the declared type cannot
+/// carry; the DECLARED TYPE is what settles it here.
+///
+/// Every other answer keeps the origin.  A binding with no declared
+/// type, a pointer, a slice, an array, a struct, a generic or an
+/// opaque one can hold any of them, and downgrading there would lose
+/// a real use-after-free.  Only a positively-proven address-free type
+/// downgrades, which is exactly what [type_query.
+/// isReservedScalarTypeName] claims and no more.
+fn scalarBindingOrigin(ctx: Ctx, local: LocalId, origin: Origin) Origin {
+    switch (origin) {
+        .heap, .arena, .arena_borrow => {},
+        else => return origin,
     }
+    const type_name = ctx.locals[@intFromEnum(local)].type_name orelse return origin;
+    if (!type_query.isReservedScalarTypeName(type_name)) return origin;
+    return .plain;
 }
 
 fn transferAssign(
@@ -151,8 +297,9 @@ fn transferAssign(
     a: @TypeOf(@as(StmtKind, undefined).assign),
     pos: cfg.SrcPos,
 ) !void {
+    try bindBoolean(ctx, state, a.target, a.rhs_kind);
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
-    try state.locals.put(ctx.gpa, a.target, origin);
+    try state.locals.put(ctx.gpa, a.target, scalarBindingOrigin(ctx, a.target, origin));
     // Whole-local reassignment invalidates any tracked field
     // origins for this local — the new value is independent of the
     // old.  Common cases: `&local` passed to a fn (cfg emits an
@@ -160,15 +307,7 @@ fn transferAssign(
     // also have initialised any field), and `x = foo()` rebinding
     // x.  Stale field state would surface as use-undefined / leak
     // FPs on the new value's fields.
-    var i: usize = 0;
-    while (i < state.fields.count()) {
-        const key = state.fields.keys()[i];
-        if (key.parent == a.target) {
-            state.fields.swapRemoveAt(i);
-        } else {
-            i += 1;
-        }
-    }
+    state.forgetFields(a.target);
 }
 
 fn transferArenaKill(
@@ -225,13 +364,10 @@ fn transferHeapFree(
                 if (st.state == .dead) {
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const name = ctx.locals[@intFromEnum(f.freed_local)].name;
-                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error",
-                            "double-free of `{s}`",
-                            .{name},
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "first freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error", "double-free of `{s}`", .{name}, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "first freed here" }
+                        else
+                            null);
                     }
                     return;
                 }
@@ -249,9 +385,7 @@ fn transferHeapFree(
                         const freed_name = ctx.locals[@intFromEnum(f.freed_local)].name;
                         const alloc_alloc = ctx.locals[@intFromEnum(st.allocator_local.?)].name;
                         const free_alloc = ctx.locals[@intFromEnum(f.allocator_local.?)].name;
-                        try report(ctx, "allocator-mismatch", pos, end_pos, .@"error",
-                            "`{s}` was allocated by `{s}` but freed by `{s}` — allocators must match",
-                            .{ freed_name, alloc_alloc, free_alloc });
+                        try report(ctx, "allocator-mismatch", pos, end_pos, .@"error", "`{s}` was allocated by `{s}` but freed by `{s}` — allocators must match", .{ freed_name, alloc_alloc, free_alloc });
                     }
                     return;
                 }
@@ -314,13 +448,10 @@ fn transferRetOutParamDanglingHeaps(
         const st = state.heaps.get(hid) orelse continue;
         if (st.state != .dead) continue;
         const out_name = ctx.locals[@intFromEnum(out_local)].name;
-        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-            "value written through `{s}` was freed before return — caller's pointee dangles",
-            .{out_name},
-            if (st.killed_at) |ks|
-                .{ .site = ks, .label = "value freed here" }
-            else
-                null);
+        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "value written through `{s}` was freed before return — caller's pointee dangles", .{out_name}, if (st.killed_at) |ks|
+            .{ .site = ks, .label = "value freed here" }
+        else
+            null);
     }
 }
 
@@ -349,8 +480,7 @@ fn transferRetValueChecks(
     if (origin == .undef and !r.is_literal_undef and
         config_mod.isEnabled(ctx.config, .use_undefined))
     {
-        try report(ctx, "use-undefined", pos, end_pos, .@"error",
-            "returning a value that is still `undefined`", .{});
+        try report(ctx, "use-undefined", pos, end_pos, .@"error", "returning a value that is still `undefined`", .{});
         return;
     }
 
@@ -362,11 +492,9 @@ fn transferRetValueChecks(
     if (origin == .stack and config_mod.isEnabled(ctx.config, .stack_escape)) {
         const name = ctx.locals[@intFromEnum(origin.stack)].name;
         if (r.is_borrowed_return_type) {
-            try report(ctx, "stack-escape", pos, end_pos, .@"error",
-                "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
+            try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
         } else {
-            try report(ctx, "stack-escape", pos, end_pos, .@"error",
-                "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+            try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
         }
         return;
     }
@@ -389,23 +517,19 @@ fn transferRetValueChecks(
             // to the heap — the struct manages its own cleanup.
             if (ast.is_heap_allocated) return;
             if (is_composite) {
-                try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                    "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
+                try report(ctx, "arena-escape", pos, end_pos, .@"error", "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
             } else {
-                try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                    "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
+                try report(ctx, "arena-escape", pos, end_pos, .@"error", "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "returning a heap pointer after free", .{},
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "value freed here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "returning a heap pointer after free", .{}, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "value freed here" }
+                else
+                    null);
             }
         },
         else => {},
@@ -478,13 +602,10 @@ fn transferFieldHeapFree(
                 if (st.state == .dead) {
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
-                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error",
-                            "double-free of `{s}{s}{s}`",
-                            .{ parent_name, pathSep(f.name), f.name },
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "first freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error", "double-free of `{s}{s}{s}`", .{ parent_name, pathSep(f.name), f.name }, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "first freed here" }
+                        else
+                            null);
                     }
                     return;
                 }
@@ -516,27 +637,59 @@ fn transferFieldUse(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    // Parent-liveness check, gated on inter-procedural origin:
-    // `h.x` after `h` was freed via a @takes-ownership call IS a
-    // UAF regardless of whether `h.x` itself was tracked.  Only
-    // fire when the parent's freed state came from the
-    // inter-procedural fallback — regular alloc+free pairs already
-    // track their own field state, and would otherwise cascade
-    // back-edge FPs across loop iterations.
+    // Reading a field dereferences its owner, whatever origin the
+    // FIELD itself carries.  A dead heap owner invalidates the read,
+    // and an owner that is still `undefined` has no bytes to read at
+    // all — `var x: T = undefined; use(x.field)` reads uninitialized
+    // memory whatever the field's own record says, and the field has
+    // no record of its own until something assigns it.
+    //
+    // This check is on the owner's own state, never on how that state
+    // was reached: a regular alloc-and-free in this function and an
+    // inter-procedural `@takes` both leave the owner dead, and both
+    // invalidate the read.  `ArenaState.is_inter_procedural` is part of
+    // the partition identity (see `sameLiveness`), not a filter here.
+    //
+    // OWNER WINS OVER FIELD.  The two prongs below and the field
+    // arms after them describe one read, and `Seen` keys on
+    // (rule_id, byte) — a second rule at the same byte is a second
+    // finding, not a duplicate.  So an owner that reports takes the
+    // statement: it names the whole access and needs no field context
+    // to justify itself.  `transferRetValueChecks` settles the same
+    // precedence for the same reason, by folding the gate into the
+    // branch condition rather than guarding the whole function.
+    //
+    // "TOOK THE STATEMENT" MEANS REPORTED — never "the owner prong ran".
+    // An owner whose own rule is off has said nothing about this byte,
+    // and returning on its behalf would hand one `--disable=<unrelated
+    // rule>` the field-origin analysis too: a `.heap` payload whose
+    // allocation is already dead, or a `.stack`/`.arena` borrow whose
+    // owner is, stay use-after-frees whichever way the OUTER local was
+    // never initialised.  Those findings carry their own rule ids and
+    // answer to their own gates, so a gate that is off here must not
+    // silence them.  (`.undef` parent + `field_heap_free` fallback +
+    // `field_use` reaches exactly this: the fallback records a dead
+    // field origin WITHOUT touching `state.locals[parent]`, so the two
+    // coexist.)
     if (state.locals.get(u.parent)) |parent_origin| switch (parent_origin) {
+        .undef => {
+            if (config_mod.isEnabled(ctx.config, .use_undefined)) {
+                const owner_name = ctx.locals[@intFromEnum(u.parent)].name;
+                try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while `{s}` is still `undefined`", .{ owner_name, pathSep(u.name), u.name, owner_name });
+                return;
+            }
+        },
         .heap => |hid| {
             const st = state.heaps.get(hid);
-            if (st) |s| if (s.state == .dead and s.is_inter_procedural) {
+            if (st) |s| if (s.state == .dead) {
                 if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
                     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
-                    try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                        "use of `{s}` after free", .{parent_name},
-                        if (s.killed_at) |ks|
-                            .{ .site = ks, .label = "value freed here" }
-                        else
-                            null);
+                    try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}` after free", .{parent_name}, if (s.killed_at) |ks|
+                        .{ .site = ks, .label = "value freed here" }
+                    else
+                        null);
+                    return;
                 }
-                return;
             };
         },
         else => {},
@@ -549,33 +702,25 @@ fn transferFieldUse(
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error",
-                    "`{s}{s}{s}` borrows from an arena that was deinit'd",
-                    .{ parent_name, pathSep(u.name), u.name },
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "arena deinit'd here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}{s}{s}` borrows from an arena that was deinit'd", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "arena deinit'd here" }
+                else
+                    null);
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "use of `{s}{s}{s}` after free",
-                    .{ parent_name, pathSep(u.name), u.name },
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "value freed here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` after free", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "value freed here" }
+                else
+                    null);
             }
         },
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
-            try report(ctx, "use-undefined", pos, end_pos, .@"error",
-                "use of `{s}{s}{s}` while still `undefined`",
-                .{ parent_name, pathSep(u.name), u.name });
+            try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while still `undefined`", .{ parent_name, pathSep(u.name), u.name });
         },
         .stack => |owner_id| {
             // Field borrows from a stack owner — mirrors the .stack
@@ -590,13 +735,10 @@ fn transferFieldUse(
                 .heap => |hid| {
                     const st = state.heaps.get(hid) orelse return;
                     if (st.state == .dead) {
-                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                            "use of `{s}{s}{s}` (borrow from `{s}`) after free",
-                            .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name },
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "value freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` (borrow from `{s}`) after free", .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name }, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "value freed here" }
+                        else
+                            null);
                     }
                 },
                 else => {},
@@ -606,11 +748,7 @@ fn transferFieldUse(
     }
 }
 
-/// Composite-escape check: fires the same escape diagnostics as
-/// transferRet would for a value-shape composite return embedding
-/// this local.  Used for the SECOND, third, ... borrow in a
-/// multi-borrow composite — the first is handled by the surrounding
-/// .ret's value_kind.
+/// Check direct stack addresses and the current origins of aggregate aliases.
 fn transferCompositeEscape(
     ctx: Ctx,
     state: *AbstractState,
@@ -618,15 +756,28 @@ fn transferCompositeEscape(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    _ = state;
-    // Walker only emits this stmt for `&local` / `array[..]`
-    // patterns — those are stack borrows by construction.  Don't
-    // consult state.locals: the address-of-write rule already
-    // collapsed the local's origin to .plain before we get here.
+    // The producer is another module, so its `ExprKind` set is not this
+    // function's to rely on: a variant added there has to degrade to a
+    // documented no-op here, never to a build-mode-dependent panic in
+    // the middle of analyzing someone's file.
+    //
+    // The two borrow shapes are the ones this check models, and the
+    // narrowing is not a no-op by construction: `.borrowed_from` and
+    // `.composite_borrow` resolve to their SOURCE local, so a `.stack`
+    // source would reach the report below and the loop would widen,
+    // not hold.  What the switch guarantees is narrower than "silence"
+    // and stronger: a shape nobody here has argued about reports
+    // nothing, and widening it again needs that shape's own
+    // reachability argument rather than origin resolution alone.
+    switch (c) {
+        .stack_ref, .copy_of => {},
+        else => return,
+    }
     if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
-    const name = ctx.locals[@intFromEnum(c.local)].name;
-    try report(ctx, "stack-escape", pos, end_pos, .@"error",
-        "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+    const origin = try originOfInit(ctx, state, c, pos);
+    if (origin != .stack) return;
+    const name = ctx.locals[@intFromEnum(origin.stack)].name;
+    try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
 }
 
 /// Write-through-pointer escape check.  `out.* = X` (or
@@ -680,9 +831,7 @@ fn transferOutParamWrite(
                 if (out_origin == .stack) return;
             }
             const src_name = ctx.locals[@intFromEnum(src_local)].name;
-            try report(ctx, "stack-escape", pos, end_pos, .@"error",
-                "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)",
-                .{ src_name, out_name });
+            try report(ctx, "stack-escape", pos, end_pos, .@"error", "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)", .{ src_name, out_name });
         },
         .heap => |hid| {
             // Record the write for the deferred check at fn exit
@@ -723,9 +872,7 @@ fn transferOutParamWrite(
             // FROM the arena leaving the frame — which arrives here
             // with value_kind != .arena_init.
             if (w.value_kind == .arena_init) return;
-            try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                "writing a value borrowed from a function-local arena through `{s}` (escapes its lifetime)",
-                .{out_name});
+            try report(ctx, "arena-escape", pos, end_pos, .@"error", "writing a value borrowed from a function-local arena through `{s}` (escapes its lifetime)", .{out_name});
         },
         else => {},
     }
@@ -753,14 +900,18 @@ fn transferUse(
 }
 
 fn transferGap(
-    ctx: Ctx,
     state: *AbstractState,
     g: @TypeOf(@as(StmtKind, undefined).lowering_gap),
-    pos: cfg.SrcPos,
-) !void {
-    _ = g;
-    _ = pos;
-    _ = ctx;
+) void {
+    // A gap the builder marked `may_assign_locals = false` is a
+    // statement that provably CANNOT write a local: `call-untracked`
+    // carries no pointer argument, and `assign-target`'s `arr[i] = X`
+    // writes one ELEMENT, not the array.  Collapsing origins for it
+    // erases facts the statement never touched, and the flag is the
+    // only thing that distinguishes the two claims — reading past it
+    // made every gap a claim about locals no gap can support.
+    if (!g.may_assign_locals) return;
+    state.facts.forgetAllLocals();
     // Conservative: collapse .undef → .plain since an unknown stmt
     // may have written through a passed pointer to initialize the
     // local.  But PRESERVE resource origins (.heap, .arena,
@@ -788,7 +939,7 @@ fn originOfInit(
 ) !Origin {
     _ = pos;
     return switch (kind) {
-        .plain => .plain,
+        .plain, .boolean => .plain,
         .owned => .plain,
         .arena_init => |info| blk: {
             // OVERWRITE to .live on every visit — the decl represents
@@ -847,32 +998,25 @@ fn checkOriginAlive(
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error",
-                    "`{s}` borrows from an arena that was deinit'd",
-                    .{local_name},
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "arena deinit'd here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}` borrows from an arena that was deinit'd", .{local_name}, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "arena deinit'd here" }
+                else
+                    null);
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "use of `{s}` after free",
-                    .{local_name},
-                    if (st.killed_at) |ks|
-                        .{ .site = ks, .label = "value freed here" }
-                    else
-                        null);
+                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}` after free", .{local_name}, if (st.killed_at) |ks|
+                    .{ .site = ks, .label = "value freed here" }
+                else
+                    null);
             }
         },
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
-            try report(ctx, "use-undefined", pos, end_pos, .@"error",
-                "use of `{s}` while still `undefined`", .{local_name});
+            try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}` while still `undefined`", .{local_name});
         },
         .stack => |owner_id| {
             // Stack-borrow liveness — the borrow inherits the owner
@@ -889,13 +1033,10 @@ fn checkOriginAlive(
                 .heap => |hid| {
                     const st = state.heaps.get(hid) orelse return;
                     if (st.state == .dead) {
-                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                            "use of `{s}` (borrow from `{s}`) after free",
-                            .{ local_name, ctx.locals[@intFromEnum(owner_id)].name },
-                            if (st.killed_at) |ks|
-                                .{ .site = ks, .label = "value freed here" }
-                            else
-                                null);
+                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}` (borrow from `{s}`) after free", .{ local_name, ctx.locals[@intFromEnum(owner_id)].name }, if (st.killed_at) |ks|
+                            .{ .site = ks, .label = "value freed here" }
+                        else
+                            null);
                     }
                 },
                 else => {},
@@ -907,7 +1048,7 @@ fn checkOriginAlive(
 
 fn report(
     ctx: Ctx,
-    rule_id: []const u8,
+    comptime rule_id: []const u8,
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
     severity: Severity,
@@ -919,7 +1060,7 @@ fn report(
 
 fn reportWithNote(
     ctx: Ctx,
-    rule_id: []const u8,
+    comptime rule_id: []const u8,
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
     severity: Severity,
@@ -927,35 +1068,35 @@ fn reportWithNote(
     args: anytype,
     kill_site: ?struct { site: state_mod.KillSite, label: []const u8 },
 ) !void {
+    if (!ctx.report_enabled) return;
+    // One source operation can be reached through several cleanup paths,
+    // and the solver replays the block holding it once per path state.
+    // The memo answers "has this already been said" without touching
+    // the finding list or the strings below; a new identity costs one
+    // insert, an old one one lookup.  The FIRST report still wins, so
+    // the finding that lands — and the note it carries — is the one the
+    // scan over `ctx.problems` used to keep.
+    if (!try ctx.seen.record(ctx.gpa, rule_id, pos.byte)) return;
     const msg = try std.fmt.allocPrint(ctx.gpa, fmt, args);
+    errdefer ctx.gpa.free(msg);
     const real_end: cfg.SrcPos = if (end_pos.byte > pos.byte)
         end_pos
     else
         .{ .line = pos.line, .column = pos.column + 1, .byte = pos.byte + 1 };
     var notes: []problem_mod.Note = &.{};
     if (kill_site) |ks| {
-        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
         const label = try ctx.gpa.dupe(u8, ks.label);
+        errdefer ctx.gpa.free(label);
+        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
         notes[0] = .{
             .start = .{ .line = ks.site.line, .column = ks.site.column, .byte = ks.site.byte },
             .end = .{ .line = ks.site.end_line, .column = ks.site.end_column, .byte = ks.site.end_byte },
             .label = label,
         };
     }
-    // Dedupe by (rule_id, start.byte).  The cfg builder inlines
-    // defer/errdefer bodies at every exit point, so a diagnostic
-    // emitted from inside a defer body fires once per exit — one
-    // logical bug, N reports.  Linear scan is fine here: per-fn
-    // problem counts are small (rarely >50).
-    for (ctx.problems.items) |p| {
-        if (p.start.byte == pos.byte and std.mem.eql(u8, p.rule_id, rule_id)) {
-            ctx.gpa.free(msg);
-            if (notes.len > 0) {
-                for (notes) |*n| ctx.gpa.free(n.label);
-                ctx.gpa.free(notes);
-            }
-            return;
-        }
+    errdefer {
+        for (notes) |note| ctx.gpa.free(note.label);
+        ctx.gpa.free(notes);
     }
     try ctx.problems.append(ctx.gpa, .{
         .rule_id = rule_id,
@@ -969,10 +1110,8 @@ fn reportWithNote(
 
 // ── Tests ──────────────────────────────────────────────────
 //
-// Unit tests for the per-stmt transfer functions.  These exercise the
-// state-mutation contracts in isolation — analyzer.zig's 78 end-to-end
-// tests cover the CFG-builder + worklist + transfer composition; these
-// localize regressions to a single transfer.
+// These unit tests exercise each statement transfer's state-mutation contract
+// in isolation. They localize failures to a single transfer.
 
 const testing = std.testing;
 const LocalInfoSlice = []const LocalInfo;
@@ -1002,6 +1141,111 @@ fn freeProblems(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(Problem)) 
     list.deinit(gpa);
 }
 
+/// Every default invariant EXCEPT `use_undefined` — the CLI's
+/// `--disable=use_undefined`, spelled out.  Derived from
+/// `all_invariants` instead of hand-listed on purpose: a fixture that
+/// enabled only the handful of rules it cared about would pass even if
+/// the gate under test were ignored, because the gate being open and
+/// the rule being listed are the same fact from there.
+const enabled_without_use_undefined: [config_mod.all_invariants.len - 1]config_mod.Invariant = blk: {
+    var buf: [config_mod.all_invariants.len - 1]config_mod.Invariant = undefined;
+    var n: usize = 0;
+    for (config_mod.all_invariants) |inv| {
+        if (inv == .use_undefined) continue;
+        buf[n] = inv;
+        n += 1;
+    }
+    break :blk buf;
+};
+
+test "transfer: a cloned guard still prunes a contradictory use" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"saved"}), .problems = &problems, .seen = &seen, .path = "test" };
+    const saved: LId = @enumFromInt(0);
+    const guard: state_mod.GuardId = @enumFromInt(0);
+    try transfer(ctx, &state, .{ .kind = .{ .decl = .{ .local = saved, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } } } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .heap_free = .{ .freed_local = saved, .fallback_hid = @enumFromInt(0) } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .guard_fact = .{ .guard = guard, .holds = true } }, .pos = pos0(), .end_pos = pos1() });
+
+    var contradicted = try state.clone(gpa);
+    defer contradicted.deinit(gpa);
+    try transfer(ctx, &contradicted, .{ .kind = .{ .guard_fact = .{ .guard = guard, .holds = false } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &contradicted, .{ .kind = .{ .use = .{ .local = saved } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(!contradicted.feasible);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+
+    var reachable = try state.clone(gpa);
+    defer reachable.deinit(gpa);
+    try transfer(ctx, &reachable, .{ .kind = .{ .guard_fact = .{ .guard = guard, .holds = true } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &reachable, .{ .kind = .{ .use = .{ .local = saved } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(reachable.feasible);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "transfer: joining boolean alternatives does not prune a reachable use" {
+    const gpa = testing.allocator;
+    var lhs: AbstractState = .{};
+    defer lhs.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "flag", "saved" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const flag: LId = @enumFromInt(0);
+    const saved: LId = @enumFromInt(1);
+    try transfer(ctx, &lhs, .{ .kind = .{ .decl = .{ .local = flag, .init_kind = .{ .boolean = .{ .constant = true } } } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &lhs, .{ .kind = .{ .decl = .{ .local = saved, .init_kind = .undef } }, .pos = pos0(), .end_pos = pos1() });
+    var rhs = try lhs.clone(gpa);
+    defer rhs.deinit(gpa);
+    try transfer(ctx, &rhs, .{ .kind = .{ .assign = .{ .target = flag, .rhs_kind = .{ .boolean = .{ .constant = false } } } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(lhs.canMerge(&rhs));
+    _ = try state_mod.join(&lhs, &rhs, gpa);
+
+    try transfer(ctx, &lhs, .{ .kind = .{ .assume = .{ .not_local = flag } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &lhs, .{ .kind = .{ .use = .{ .local = saved } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(lhs.feasible);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+}
+
+test "transfer: local writes invalidate predicates before a later use" {
+    const gpa = testing.allocator;
+    const flag: LId = @enumFromInt(0);
+    const saved: LId = @enumFromInt(1);
+    const writes = [_]StmtKind{
+        .{ .decl = .{ .local = flag, .init_kind = .unknown } },
+        .{ .assign = .{ .target = flag, .rhs_kind = .unknown } },
+        .{ .pointer_write = .{ .target = flag } },
+        .{ .reset_capture = .{ .local = flag } },
+        .{ .lowering_gap = .{ .note = "unclassified write", .may_assign_locals = true } },
+    };
+    for (writes) |write| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "flag", "saved" }), .problems = &problems, .seen = &seen, .path = "test" };
+        try transfer(ctx, &state, .{ .kind = .{ .decl = .{ .local = flag, .init_kind = .{ .boolean = .{ .constant = true } } } }, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = .{ .decl = .{ .local = saved, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } } } }, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = .{ .heap_free = .{ .freed_local = saved, .fallback_hid = @enumFromInt(0) } }, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = write, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .not_local = flag } }, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = .{ .use = .{ .local = saved } }, .pos = pos0(), .end_pos = pos1() });
+        try testing.expect(state.feasible);
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+    }
+}
+
 test "transferDecl: heap_alloc binds local to .heap and marks heap live" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
@@ -1009,7 +1253,9 @@ test "transferDecl: heap_alloc binds local to .heap and marks heap live" {
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
     const locals = mkLocals(&.{"x"});
-    const ctx: Ctx = .{ .gpa = gpa, .locals = locals, .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = locals, .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     const hid: HId = @enumFromInt(7);
@@ -1030,7 +1276,9 @@ test "transferDecl: undef init produces .undef origin" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     try transferDecl(ctx, &state, .{ .local = x, .init_kind = .undef }, pos0());
@@ -1043,7 +1291,9 @@ test "transferDecl: stack_ref produces .stack" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "x", "y" }), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "x", "y" }), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     const y: LId = @enumFromInt(1);
@@ -1059,7 +1309,9 @@ test "transferAssign: overwrites prior origin" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     try state.locals.put(gpa, x, .undef);
@@ -1073,7 +1325,9 @@ test "transferArenaKill: marks arena dead with kill site" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"a"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"a"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const a: LId = @enumFromInt(0);
     const aid: AId = @enumFromInt(3);
@@ -1093,7 +1347,9 @@ test "transferHeapFree: live heap marked dead, no problem" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "p", "gpa_l" }), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "p", "gpa_l" }), .problems = &problems, .seen = &seen, .path = "test" };
 
     const p: LId = @enumFromInt(0);
     const hid: HId = @enumFromInt(1);
@@ -1115,7 +1371,9 @@ test "transferHeapFree: second free fires heap-double-free" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"p"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"p"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const p: LId = @enumFromInt(0);
     const hid: HId = @enumFromInt(2);
@@ -1137,7 +1395,9 @@ test "transferHeapFree: allocator mismatch fires" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "p", "gpa_a", "gpa_b" }), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "p", "gpa_a", "gpa_b" }), .problems = &problems, .seen = &seen, .path = "test" };
 
     const p: LId = @enumFromInt(0);
     const ga: LId = @enumFromInt(1);
@@ -1162,7 +1422,9 @@ test "transferHeapFree: inter-procedural fallback records dead heap" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"p"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"p"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const p: LId = @enumFromInt(0);
     const fb: HId = @enumFromInt(42);
@@ -1185,7 +1447,9 @@ test "transferUse: live heap origin produces no problem" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     const hid: HId = @enumFromInt(1);
@@ -1202,7 +1466,9 @@ test "transferUse: dead heap origin fires heap-use-after-free" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     const hid: HId = @enumFromInt(1);
@@ -1220,7 +1486,9 @@ test "transferUse: method-call on .undef clears to .plain (no fire)" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     try state.locals.put(gpa, x, .undef);
@@ -1237,7 +1505,9 @@ test "transferUse: bare read of .undef fires use-undefined" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     try state.locals.put(gpa, x, .undef);
@@ -1252,9 +1522,6 @@ test "transferGap: collapses .undef → .plain, preserves resource origins" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
     defer state.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "u", "h", "a" }), .problems = &problems, .path = "test" };
 
     const u: LId = @enumFromInt(0);
     const h: LId = @enumFromInt(1);
@@ -1263,7 +1530,7 @@ test "transferGap: collapses .undef → .plain, preserves resource origins" {
     try state.locals.put(gpa, h, .{ .heap = @enumFromInt(1) });
     try state.locals.put(gpa, a, .{ .arena = @enumFromInt(1) });
 
-    try transferGap(ctx, &state, .{ .note = "test" }, pos0());
+    transferGap(&state, .{ .note = "test" });
 
     try testing.expect(state.locals.get(u).? == .plain);
     try testing.expect(state.locals.get(h).? == .heap);
@@ -1276,7 +1543,9 @@ test "transferRet: returning .arena from borrowed-return-type fires arena-escape
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     const aid: AId = @enumFromInt(1);
@@ -1302,7 +1571,9 @@ test "transferRet: returning .stack fires stack-escape" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "y", "buf" }), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "y", "buf" }), .problems = &problems, .seen = &seen, .path = "test" };
 
     const y: LId = @enumFromInt(0);
     const buf: LId = @enumFromInt(1);
@@ -1323,7 +1594,9 @@ test "transferFieldHeapFree: tracks field origin as dead" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"obj"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"obj"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const obj: LId = @enumFromInt(0);
     const hid: HId = @enumFromInt(5);
@@ -1339,13 +1612,257 @@ test "transferFieldHeapFree: tracks field origin as dead" {
     try testing.expect(state.heaps.get(hid).?.state == .dead);
 }
 
+test "transferDecl: re-declaring a killed allocation makes it live again" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"item"}), .problems = &problems, .seen = &seen, .path = "test" };
+
+    const item: LId = @enumFromInt(0);
+    // One call site mints ONE HeapId, so every iteration of a loop that
+    // allocates here rebinds the same id.  The kill is the previous
+    // iteration's destroy arriving over the back-edge.
+    const hid: HId = @enumFromInt(0);
+    try transferDecl(ctx, &state, .{
+        .local = item,
+        .init_kind = .{ .heap_alloc = .{ .id = hid } },
+    }, pos0());
+    try transferHeapFree(ctx, &state, .{
+        .freed_local = item,
+        .fallback_hid = @enumFromInt(1),
+    }, pos0(), pos1());
+    try testing.expect(state.heaps.get(hid).?.state == .dead);
+
+    try transferDecl(ctx, &state, .{
+        .local = item,
+        .init_kind = .{ .heap_alloc = .{ .id = hid } },
+    }, pos0());
+
+    // This reset is what keeps a back-edge's dead entry from cascading
+    // into the next iteration's reads.  Without it every field read in a
+    // loop that re-allocates would see a dead owner.
+    try testing.expect(state.heaps.get(hid).?.state == .live);
+    try testing.expect(state.locals.get(item).? == .heap);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "transferCompositeEscape: an out-of-domain ExprKind is a silent no-op, not a widening" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "inner", "src" }), .problems = &problems, .seen = &seen, .path = "test" };
+
+    const inner: LId = @enumFromInt(0);
+    const src: LId = @enumFromInt(1);
+    try state.locals.put(gpa, inner, .undef);
+    try state.locals.put(gpa, src, .{ .stack = inner });
+    // `.composite_borrow` and `.borrowed_from` resolve through to their
+    // SOURCE local, so `src`'s `.stack` origin would satisfy the report
+    // below.  The narrowing is what keeps a shape this function has no
+    // argument for from reporting an escape nobody proved: the two
+    // variants the producer actually emits still fire, and these two
+    // reach the same origin by a different route and stay silent.
+    try transferCompositeEscape(ctx, &state, .{ .composite_borrow = src }, pos0(), pos1());
+    try transferCompositeEscape(ctx, &state, .{ .borrowed_from = src }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+
+    // The same source reached through the shapes the producer DOES emit
+    // still reports, so the control above is about the narrowing and not
+    // about `src` failing to carry a stack origin.
+    try transferCompositeEscape(ctx, &state, .{ .stack_ref = src }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+}
+
+test "transferFieldUse: a locally killed parent guards a field with no origin of its own" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"item"}), .problems = &problems, .seen = &seen, .path = "test" };
+
+    const item: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(0);
+    try state.heaps.put(gpa, hid, .{
+        .state = .dead,
+        .killed_at = .{ .line = 1, .column = 1, .byte = 10, .end_line = 1, .end_column = 2, .end_byte = 11 },
+    });
+    try state.locals.put(gpa, item, .{ .heap = hid });
+    // `count` is a `u32`: an assignment of it never records a field
+    // origin, so `state.fields` stays empty and the parent's own
+    // liveness is the ONLY thing that can report the read.  This is the
+    // state an in-function `create` + `destroy` pair leaves behind —
+    // `is_inter_procedural` is false — so gating this report on that
+    // flag would silence a real use-after-free of a locally-owned value.
+    try testing.expectEqual(@as(usize, 0), state.fields.count());
+    try transferFieldUse(ctx, &state, .{ .parent = item, .name = "count" }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "transferFieldUse: a live field origin does not excuse a dead owner" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"item"}), .problems = &problems, .seen = &seen, .path = "test" };
+
+    const item: LId = @enumFromInt(0);
+    const owner: HId = @enumFromInt(0);
+    const buf: HId = @enumFromInt(1);
+    try state.heaps.put(gpa, owner, .{
+        .state = .dead,
+        .killed_at = .{ .line = 1, .column = 1, .byte = 10, .end_line = 1, .end_column = 2, .end_byte = 11 },
+    });
+    try state.heaps.put(gpa, buf, .{ .state = .live });
+    try state.locals.put(gpa, item, .{ .heap = owner });
+    try state.fields.putContext(gpa, .{ .parent = item, .name = "buf" }, .{ .heap = buf }, .{});
+    // The field's payload is separately owned and still live, which is
+    // exactly the case that makes skipping the parent check unsound:
+    // `item.buf` is reached THROUGH `item`, so the read itself runs on a
+    // pointer whose storage has already been handed back.  A live
+    // payload makes the copy wrong, not the access safe.  This is the
+    // control any narrowing of the parent-liveness guard has to survive.
+    try transferFieldUse(ctx, &state, .{ .parent = item, .name = "buf" }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "transferFieldUse: an inter-procedural dead parent guards the same read" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"item"}), .problems = &problems, .seen = &seen, .path = "test" };
+
+    const item: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(0);
+    try state.heaps.put(gpa, hid, .{
+        .state = .dead,
+        .killed_at = .{ .line = 1, .column = 1, .byte = 10, .end_line = 1, .end_column = 2, .end_byte = 11 },
+        .is_inter_procedural = true,
+    });
+    try state.locals.put(gpa, item, .{ .heap = hid });
+    // The callee freed a pointer this function never saw allocated, so
+    // no field-level tracking exists to fall back on: the parent report
+    // is the whole signal.  Whatever is done about the locally-killed
+    // case above, this one has to keep firing.
+    try transferFieldUse(ctx, &state, .{ .parent = item, .name = "count" }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "transferFieldUse: a live parent reports nothing on its own" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"item"}), .problems = &problems, .seen = &seen, .path = "test" };
+
+    const item: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(0);
+    try state.heaps.put(gpa, hid, .{ .state = .live });
+    try state.locals.put(gpa, item, .{ .heap = hid });
+    // Control for the tests above: the parent's liveness alone must
+    // never produce a finding while the allocation is alive.
+    try transferFieldUse(ctx, &state, .{ .parent = item, .name = "count" }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "transferFieldUse: the owner prong yields the statement only to a rule it reported" {
+    const gpa = testing.allocator;
+    const without_undef: config_mod.Config = .{ .enabled = &enabled_without_use_undefined };
+    // Both arms run the IDENTICAL statement sequence — only `config`
+    // differs — so the pair answers "does this gate decide this
+    // finding?" and not "did these two fixtures happen to differ?".
+    // `heap-use-after-free` stays ON in both: the subject arm turns
+    // off `use_undefined`, an unrelated rule, and must still find it.
+    const arms = [_]struct { config: *const config_mod.Config, rule: []const u8 }{
+        .{ .config = &config_mod.Default, .rule = "use-undefined" },
+        .{ .config = &without_undef, .rule = "heap-use-after-free" },
+    };
+    for (arms) |arm| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{
+            .gpa = gpa,
+            .locals = mkLocals(&.{"item"}),
+            .problems = &problems,
+            .seen = &seen,
+            .path = "test",
+            .config = arm.config,
+        };
+        const item: LId = @enumFromInt(0);
+        const freed: HId = @enumFromInt(0);
+
+        // `var item: Item = undefined;`
+        try transferDecl(ctx, &state, .{ .local = item, .init_kind = .undef }, pos0());
+        // `gpa.free(item.buf);` — nothing has tracked this field, so
+        // the free takes `transferFieldHeapFree`'s inter-procedural
+        // FALLBACK and records it as a dead heap.  Both halves of the
+        // fixture therefore come out of the real transfers: "this
+        // field's allocation is dead" is a fact the analysis reached,
+        // not one the test wrote into the state.  The fallback touches
+        // only `state.fields`, which is what leaves the parent `.undef`
+        // and a dead field origin coexisting.
+        try transferFieldHeapFree(ctx, &state, .{
+            .parent = item,
+            .name = "buf",
+            .fallback_hid = freed,
+        }, pos0(), pos1());
+        try testing.expect(state.locals.get(item).? == .undef);
+        try testing.expect(state.heaps.get(freed).?.state == .dead);
+
+        // `sink(item.buf);`
+        try transferFieldUse(ctx, &state, .{ .parent = item, .name = "buf" }, pos0(), pos1());
+
+        // Exactly one finding either way.  Under the defaults the owner
+        // still wins the byte (`use-undefined` names the read); with
+        // `use_undefined` off the owner prong has reported nothing, so
+        // the field's own dead origin has to get its say instead of
+        // being dropped on the owner's behalf.
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings(arm.rule, problems.items[0].rule_id);
+    }
+}
+
 test "originOfInit: copy_of arena yields .arena_borrow" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "a", "b" }), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "a", "b" }), .problems = &problems, .seen = &seen, .path = "test" };
 
     const a: LId = @enumFromInt(0);
     const aid: AId = @enumFromInt(7);
@@ -1362,7 +1879,9 @@ test "originOfInit: arena_init mints + registers live arena" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"a"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"a"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const aid: AId = @enumFromInt(11);
     const o = try originOfInit(ctx, &state, .{ .arena_init = .{ .id = aid } }, pos0());
@@ -1377,7 +1896,9 @@ test "transfer: reset_capture clears local to .plain + drops field tracking" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"bin"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"bin"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const bin: LId = @enumFromInt(0);
     try state.locals.put(gpa, bin, .{ .heap = @enumFromInt(1) });
@@ -1400,7 +1921,9 @@ test "transfer: dispatches each StmtKind without panic" {
     defer state.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer freeProblems(gpa, &problems);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
 
     const x: LId = @enumFromInt(0);
     try state.locals.put(gpa, x, .plain);
@@ -1415,4 +1938,29 @@ test "transfer: dispatches each StmtKind without panic" {
         .{ .kind = .{ .lowering_gap = .{ .note = "smoke" } }, .pos = pos0(), .end_pos = pos1() },
     };
     for (kinds) |s| try transfer(ctx, &state, s);
+}
+
+test "transfer: aliasable boolean reads do not retain assumptions" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "flag", .decl_pos = pos0(), .address_taken = true },
+        .{ .name = "saved", .decl_pos = pos0() },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const flag: LId = @enumFromInt(0);
+    const saved: LId = @enumFromInt(1);
+    try transfer(ctx, &state, .{ .kind = .{ .decl = .{ .local = saved, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } } } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .heap_free = .{ .freed_local = saved, .fallback_hid = @enumFromInt(0) } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .local = flag } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .not_local = flag } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .use = .{ .local = saved } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(state.feasible);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
 }

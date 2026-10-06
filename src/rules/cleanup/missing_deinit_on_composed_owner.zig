@@ -85,7 +85,7 @@ pub fn check(
             // for trait-uniform value types that conform to the
             // `deinit(self, allocator)` signature for API
             // uniformity but do no real cleanup.
-            if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
+            if (!mq.anyNonTrivialCleanup(tree, inner_ti)) continue;
 
             // Refcounted-inner skip: when the inner type uses
             // `bun.ptr.RefCount(@This(), ...)` machinery, its
@@ -177,13 +177,6 @@ pub fn check(
         }
     }
 }
-
-/// True iff `ti` has at least one cleanup-named method whose
-/// body is non-trivial — i.e. contains something other than
-/// `_ = <expr>;` discards.  An empty `{}` or all-discards body
-/// means the method does nothing on drop, so a missing outer
-/// cleanup of the field is harmless.
-const anyNonTrivialCleanup = mq.anyNonTrivialCleanup;
 
 /// True iff some method of `outer` OTHER than `deinit_method`
 /// contains a call `<X>.<field_name>.<cleanup>(...)` — evidence
