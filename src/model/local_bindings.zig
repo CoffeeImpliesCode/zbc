@@ -18,9 +18,11 @@
 //!
 //! What's tracked (v1):
 //!   - All `const NAME = ...` / `var NAME = ...` declarations
-//!     inside the body (at any nesting depth — we record them all
-//!     and the rule scopes its lookups itself).
+//!     inside the body, including nested initializer expressions.
+//!     Container members belong to their own container, not this body.
 //!   - All fn parameters (added as `.param` origin).
+//!   - Loop, success/error branch, catch, and switch-prong captures
+//!     with their exact branch horizons.
 //!
 //! What's NOT tracked (v1):
 //!   - Reassignments via `NAME = ...;` (after the initial binding).
@@ -45,8 +47,11 @@ pub const OriginKind = enum {
     /// Fn parameter binding (declared in the proto).
     param,
     /// Loop / control-flow capture: `for (xs) |x|`, `for (xs) |x, i|`,
-    /// `if (opt) |x|`, `while (it.next()) |x|`, `catch |err|`.
-    /// `rhs_first` / `rhs_last` span the iterable / scrutinee expr.
+    /// `if (opt) |x|`, `while (it.next()) |x|`, `catch |err|`,
+    /// error-branch and switch-prong payloads.
+    /// `rhs_first` / `rhs_last` span this capture's corresponding
+    /// iterable / range input, or the success scrutinee expression.
+    /// Other payloads use their clause keyword.
     loop_capture,
     /// Literal value: `42`, `\"x\"`, `null`, `undefined`, `true`,
     /// `.{...}`, `.tag`, `[N]u8{...}`, etc.
@@ -148,11 +153,11 @@ pub const Binding = struct {
     /// Last token of the RHS expression (inclusive, before `;`).
     /// For params, the type's last token.
     rhs_last: TokenIndex,
-    /// The block this binding is written in — the `{` that opens it
-    /// and the `}` that closes it, or the whole body for a
-    /// parameter.  A binding names a value only from its own
-    /// `name_token` to `scope_close`, and that range is what tells a
-    /// shadowing local and the declaration it shadows apart.
+    /// The declaring block's braces, or the whole body for a parameter.
+    /// A capture instead starts at its declaration token and ends at
+    /// its actual AST branch's last token (including a while continue
+    /// expression before the success body). A binding names a value
+    /// only from `name_token` through `scope_close` inside this range.
     scope_open: TokenIndex,
     scope_close: TokenIndex,
     origin: Origin,
@@ -196,6 +201,10 @@ pub const LocalBindings = struct {
     arena: std.heap.ArenaAllocator,
     tree: *const Ast,
     items: []const Binding,
+
+    // `items` owns no separate allocation: the arena owns its backing
+    // storage. No allocator pointing at this arena is retained, so moving
+    // this value into a cache entry does not leave a self-pointer.
 
     pub fn deinit(self: *LocalBindings) void {
         self.arena.deinit();
@@ -282,6 +291,13 @@ pub fn build(
     // ── Pass 2: local decls + capture clauses in body ──────
     var t: TokenIndex = first;
     while (t < last) : (t += 1) {
+        // Container members and their function bodies are not locals of
+        // this body. Keep scanning expressions in the container header,
+        // but skip its member braces, not aggregate initializer braces.
+        if (tags[t] == .l_brace and isContainerBody(tags, first, t)) {
+            t = tokens.matchBrace(tags, t, last) orelse continue;
+            continue;
+        }
         // Capture clauses on for/while/if/catch.  Pattern:
         //   - for (it) |x|       — pipe pair after the iterable
         //   - for (it) |x, i|    — multi-capture
@@ -299,11 +315,10 @@ pub fn build(
             }
             try captureItemsBetween(a, &items, tree, t + 2, close - 1, close + 1, last);
             // Don't advance t past the capture — body still needs walking.
-        } else if (tags[t] == .keyword_catch) {
+        } else if (tags[t] == .keyword_catch or tags[t] == .keyword_else or tags[t] == .equal_angle_bracket_right) {
             if (t + 1 > last or tags[t + 1] != .pipe) continue;
-            // `catch` has no enclosing parens for the scrutinee — the
-            // expression before `catch` is the scrutinee but we don't
-            // track its range as the capture's rhs (rare to need).
+            // These clauses do not bind their scrutinee's value.
+            // Their actual AST payload/target supplies the scope below.
             try captureItemsBetween(a, &items, tree, t, t, t + 1, last);
         }
         if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
@@ -352,15 +367,54 @@ pub fn build(
             .scope_close = unset_scope,
             .origin = origin,
         });
-        t = sc;
+        // Register this declaration once, then visit its initializer.
+        // Skip the header: `*const T = ...` is not a declaration of T.
+        t = eq;
     }
 
-    try assignScopes(a, tags, first, last, &items);
+    // A capture is collected at its control-flow keyword, before any
+    // declarations inside the condition. Restore source order for the
+    // scope cursor without changing either declaration's token identity.
+    std.mem.sort(Binding, items.items, {}, struct {
+        fn lessThan(_: void, lhs: Binding, rhs: Binding) bool {
+            return lhs.name_token < rhs.name_token;
+        }
+    }.lessThan);
+
+    try assignScopes(a, tree, proto, body, first, last, &items);
 
     return .{
         .arena = arena,
         .tree = tree,
-        .items = try items.toOwnedSlice(a),
+        .items = items.items,
+    };
+}
+
+/// Recognize `struct {`, `union(enum) {`, `enum(T) {`, and `opaque {`.
+/// Looking back only over an immediately preceding parenthesized header
+/// leaves any lexical blocks in that header in the normal forward scan.
+fn isContainerBody(tags: []const TokenTag, first: TokenIndex, brace: TokenIndex) bool {
+    if (brace <= first) return false;
+    var preceding = brace - 1;
+    if (tags[preceding] == .r_paren) {
+        var depth: u32 = 1;
+        while (preceding > first) {
+            preceding -= 1;
+            switch (tags[preceding]) {
+                .r_paren => depth += 1,
+                .l_paren => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                else => {},
+            }
+        }
+        if (depth != 0 or preceding == first) return false;
+        preceding -= 1;
+    }
+    return switch (tags[preceding]) {
+        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => true,
+        else => false,
     };
 }
 
@@ -373,12 +427,15 @@ pub fn build(
 /// that `{` was pushed, so each frame carries where those began.
 fn assignScopes(
     a: std.mem.Allocator,
-    tags: []const TokenTag,
+    tree: *const Ast,
+    proto: ?Ast.full.FnProto,
+    body: Ast.Node.Index,
     first: TokenIndex,
     last: TokenIndex,
     items: *std.ArrayListUnmanaged(Binding),
 ) !void {
     if (items.items.len == 0) return;
+    const tags = tree.tokens.items(.tag);
     const Frame = struct { open: TokenIndex, first_inside: usize };
     var open: std.ArrayListUnmanaged(Frame) = .empty;
     var next: usize = 0;
@@ -407,8 +464,144 @@ fn assignScopes(
     }
     // A parameter was written above the body and a `{` the walk never
     // closed leaves its bindings open; both run to the body's end.
+    var has_capture = false;
     for (items.items) |*binding| {
-        if (binding.scope_close == unset_scope) binding.scope_close = last;
+        if (binding.origin == .loop_capture) {
+            // A clause sits before its body's brace, so the brace walk
+            // cannot give it a branch horizon. Only its actual AST node
+            // may extend this declaration-token-only initial range.
+            binding.scope_open = binding.name_token;
+            binding.scope_close = binding.name_token;
+            has_capture = true;
+        } else if (binding.scope_close == unset_scope) {
+            binding.scope_close = last;
+        }
+    }
+    if (has_capture) assignCaptureScopes(tree, proto, body, first, last, items.items);
+}
+
+/// Join already collected capture tokens to their control nodes once.
+/// This phase assigns scopes only; it never discovers another binding.
+fn assignCaptureScopes(
+    tree: *const Ast,
+    proto: ?Ast.full.FnProto,
+    body: Ast.Node.Index,
+    first: TokenIndex,
+    last: TokenIndex,
+    items: []Binding,
+) void {
+    const tags = tree.tokens.items(.tag);
+    var index: u32 = if (proto) |function| @intFromEnum(function.ast.proto_node) + 1 else 1;
+    while (index <= @intFromEnum(body)) : (index += 1) {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const main = tree.nodeMainToken(node);
+        if (main < first or main > last) continue;
+        switch (tree.nodeTag(node)) {
+            .if_simple, .@"if" => {
+                const branch = tree.fullIf(node).?;
+                scopeCapture(tree, items, branch.payload_token, branch.ast.then_expr, last);
+                if (branch.ast.else_expr.unwrap()) |failure| {
+                    scopeCapture(tree, items, branch.error_token, failure, last);
+                }
+            },
+            .while_simple, .while_cont, .@"while" => {
+                const branch = tree.fullWhile(node).?;
+                // The capture precedes both the continue expression and
+                // the success body; its final token is the body's end.
+                scopeCapture(tree, items, branch.payload_token, branch.ast.then_expr, last);
+                if (branch.ast.else_expr.unwrap()) |failure| {
+                    scopeCapture(tree, items, branch.error_token, failure, last);
+                }
+            },
+            .for_simple, .@"for" => {
+                const branch = tree.fullFor(node).?;
+                scopeCapture(tree, items, branch.payload_token, branch.ast.then_expr, last);
+                assignForCaptureInputs(tree, items, branch, last);
+            },
+            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
+                const branch = tree.fullSwitchCase(node).?;
+                scopeCapture(tree, items, branch.payload_token, branch.ast.target_expr, last);
+            },
+            .@"catch" => {
+                if (main + 1 <= last and tags[main + 1] == .pipe) {
+                    scopeCapture(tree, items, main + 2, tree.nodeData(node).node_and_node[1], last);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Assign only exact declaration tokens in the AST's payload clause.
+/// Rows are already source sorted; no name lookup or new index is needed.
+fn scopeCapture(
+    tree: *const Ast,
+    items: []Binding,
+    payload: ?TokenIndex,
+    target: Ast.Node.Index,
+    last: TokenIndex,
+) void {
+    const start = payload orelse return;
+    if (start > last) return;
+    const tags = tree.tokens.items(.tag);
+    var end = start;
+    while (end <= last and tags[end] != .pipe) : (end += 1) {}
+    if (end > last) return;
+
+    var lower: usize = 0;
+    var upper = items.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        if (items[middle].name_token < start) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    const close = tree.lastToken(target);
+    while (lower < items.len and items[lower].name_token < end) : (lower += 1) {
+        const binding = &items[lower];
+        if (binding.origin != .loop_capture) continue;
+        binding.scope_open = binding.name_token;
+        binding.scope_close = close;
+    }
+}
+
+/// Multi-input captures are positional, including discarded entries.
+/// Join each existing capture token to its own input AST span rather
+/// than the token scanner's whole comma-separated input list.
+fn assignForCaptureInputs(
+    tree: *const Ast,
+    items: []Binding,
+    branch: Ast.full.For,
+    last: TokenIndex,
+) void {
+    const start = branch.payload_token;
+    if (start > last) return;
+    const tags = tree.tokens.items(.tag);
+    var lower: usize = 0;
+    var upper = items.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        if (items[middle].name_token < start) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    var input: usize = 0;
+    var token = start;
+    while (token <= last and tags[token] != .pipe) : (token += 1) {
+        if (tags[token] != .identifier) continue;
+        if (input >= branch.ast.inputs.len) return;
+        const source = branch.ast.inputs[input];
+        input += 1;
+        while (lower < items.len and items[lower].name_token < token) : (lower += 1) {}
+        if (lower == items.len or items[lower].name_token != token) continue;
+        const binding = &items[lower];
+        if (binding.origin != .loop_capture) continue;
+        binding.rhs_first = tree.firstToken(source);
+        binding.rhs_last = tree.lastToken(source);
     }
 }
 
@@ -928,4 +1121,369 @@ test "build: underscore capture is skipped" {
     defer bindings.deinit();
     try testing.expect(bindings.find("_") == null);
     try testing.expect(bindings.find("i") != null);
+}
+
+/// The first token of a unique source marker, not a name-only lookup.
+fn testSourceToken(tree: *const Ast, marker: []const u8) !TokenIndex {
+    const offset = std.mem.indexOf(u8, tree.source, marker) orelse return error.MarkerNotFound;
+    for (tree.tokens.items(.start), 0..) |start, index| {
+        if (start == offset) return @intCast(index);
+    }
+    return error.MarkerNotToken;
+}
+
+test "build: initializer block local resolves at its exact use and stays inside its block" {
+    var r = try parseFn(
+        \\fn f() *u8 {
+        \\    const result = blk: { var cell: u8 = 1; break :blk &cell; };
+        \\    return result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const use = try testSourceToken(&r.tree, "cell;");
+    const cell = bindings.findAt("cell", use).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "cell: u8"), cell.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "{ var cell"), cell.scope_open);
+    try testing.expectEqual(try testSourceToken(&r.tree, "};"), cell.scope_close);
+    try testing.expect(!cell.is_const);
+    try testing.expectEqual(OriginKind.literal, std.meta.activeTag(cell.origin));
+    const result_use = try testSourceToken(&r.tree, "result;");
+    try testing.expect(bindings.findAt("cell", result_use) == null);
+    const result = bindings.findAt("result", result_use).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "blk:"), result.rhs_first);
+    try testing.expectEqual(cell.scope_close, result.rhs_last);
+}
+
+test "build: initializer field values and call arguments retain nested declaration identities" {
+    const fixtures = [_][:0]const u8{
+        "fn f() void { const result = .{ .ptr = blk: { var cell: u8 = 1; break :blk &cell; } }; _ = result; }",
+        "fn f() void { const result = wrap(blk: { var cell: u8 = 1; break :blk &cell; }); _ = result; }",
+        "fn f() void { const result = outer: { break :outer inner: { var cell: u8 = 1; break :inner &cell; }; }; _ = result; }",
+    };
+    for (fixtures) |source| {
+        var r = try parseFn(source);
+        defer r.tree.deinit(testing.allocator);
+        var bindings = r.bindings;
+        defer bindings.deinit();
+
+        const cell = bindings.findAt("cell", try testSourceToken(&r.tree, "cell;")).?;
+        try testing.expectEqual(try testSourceToken(&r.tree, "cell: u8"), cell.name_token);
+        try testing.expectEqual(try testSourceToken(&r.tree, "{ var cell"), cell.scope_open);
+        try testing.expect(bindings.findAt("cell", try testSourceToken(&r.tree, "result;")) == null);
+    }
+}
+
+test "build: initializer shadowing restores the outer source binding after the block" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    var cell: u8 = 1;
+        \\    const result = blk: { var cell: u8 = 2; break :blk &cell; };
+        \\    _ = &cell; _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const inner = bindings.findAt("cell", try testSourceToken(&r.tree, "cell; };")).?;
+    const outer = bindings.findAt("cell", try testSourceToken(&r.tree, "cell; _ =")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "cell: u8 = 2"), inner.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "cell: u8 = 1"), outer.name_token);
+    try testing.expect(inner.name_token != outer.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "{ var cell"), inner.scope_open);
+}
+
+test "build: type-valued initializer blocks keep lexical locals but exclude container-owned bindings" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    const T = blk: {
+        \\        const N = 2;
+        \\        break :blk struct {
+        \\            const member = 1;
+        \\            data: [N]u8,
+        \\            fn nested(arg: u8) void { const private = arg; _ = private; }
+        \\        };
+        \\    };
+        \\    _ = T;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const n = bindings.findAt("N", try testSourceToken(&r.tree, "N]u8")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "N ="), n.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "{\n        const N"), n.scope_open);
+    try testing.expect(bindings.findAt("N", try testSourceToken(&r.tree, "T;")) == null);
+    try testing.expect(bindings.findAt("member", try testSourceToken(&r.tree, "member =")) == null);
+    try testing.expect(bindings.findAt("arg", try testSourceToken(&r.tree, "arg;")) == null);
+    try testing.expect(bindings.findAt("private", try testSourceToken(&r.tree, "private;")) == null);
+}
+
+test "build: nested condition declarations do not reorder or duplicate initializer capture bindings" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    const result = if (cond: { const flag: ?u8 = 1; break :cond flag; }) |value|
+        \\        yes: { const cell = value; break :yes cell; }
+        \\    else no: { const cell = 0; break :no cell; };
+        \\    _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const flag = bindings.findAt("flag", try testSourceToken(&r.tree, "flag;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "flag: ?u8"), flag.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "{ const flag"), flag.scope_open);
+    try testing.expectEqual(try testSourceToken(&r.tree, "})"), flag.scope_close);
+    const value_use = try testSourceToken(&r.tree, "value;");
+    try testing.expect(bindings.findAt("flag", value_use) == null);
+    const value = bindings.findAt("value", value_use).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "value|"), value.name_token);
+    try testing.expectEqual(OriginKind.loop_capture, std.meta.activeTag(value.origin));
+    const yes_cell = bindings.findAt("cell", try testSourceToken(&r.tree, "cell; }")).?;
+    const no_cell = bindings.findAt("cell", try testSourceToken(&r.tree, "cell; };")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "cell = value"), yes_cell.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "cell = 0"), no_cell.name_token);
+    try testing.expect(bindings.findAt("cell", try testSourceToken(&r.tree, "result;")) == null);
+    for (bindings.items) |*binding| {
+        if (binding == value or binding == yes_cell or binding == no_cell) continue;
+        try testing.expect(binding.name_token != value.name_token);
+        try testing.expect(binding.name_token != yes_cell.name_token);
+        try testing.expect(binding.name_token != no_cell.name_token);
+    }
+}
+
+test "build: visiting initializer does not turn a const-qualified type header into a binding" {
+    var r = try parseFn(
+        \\fn f(comptime T: type) *const T {
+        \\    const result: *const T = blk: { var cell: T = undefined; break :blk &cell; };
+        \\    return result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const type_binding = bindings.findAt("T", try testSourceToken(&r.tree, "T = blk")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "T: type"), type_binding.name_token);
+    try testing.expectEqual(OriginKind.param, std.meta.activeTag(type_binding.origin));
+    const result_use = try testSourceToken(&r.tree, "result;");
+    try testing.expectEqual(type_binding.name_token, bindings.findAt("T", result_use).?.name_token);
+    const cell = bindings.findAt("cell", try testSourceToken(&r.tree, "cell;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "cell: T"), cell.name_token);
+    try testing.expect(bindings.findAt("cell", result_use) == null);
+}
+
+test "build: initializer loop and catch bodies use the same lexical declaration scan" {
+    const fixtures = [_][:0]const u8{
+        "fn f(xs: []u8) void { const result = for (xs) |value| { const cell = value; _ = cell; } else 0; _ = result; }",
+        "fn f(next: anytype) void { const result = while (next()) |value| { const cell = value; _ = cell; } else 0; _ = result; }",
+        "fn f() void { const result = next() catch |value| blk: { const cell = value; _ = cell; break :blk 0; }; _ = result; }",
+    };
+    for (fixtures) |source| {
+        var r = try parseFn(source);
+        defer r.tree.deinit(testing.allocator);
+        var bindings = r.bindings;
+        defer bindings.deinit();
+
+        const cell = bindings.findAt("cell", try testSourceToken(&r.tree, "cell;")).?;
+        try testing.expectEqual(try testSourceToken(&r.tree, "cell = value"), cell.name_token);
+        try testing.expectEqual(try testSourceToken(&r.tree, "{ const cell"), cell.scope_open);
+        const value = bindings.findAt("value", try testSourceToken(&r.tree, "value;")).?;
+        try testing.expectEqual(try testSourceToken(&r.tree, "value|"), value.name_token);
+        try testing.expectEqual(OriginKind.loop_capture, std.meta.activeTag(value.origin));
+        try testing.expect(bindings.findAt("cell", try testSourceToken(&r.tree, "result;")) == null);
+        for (bindings.items) |*binding| {
+            if (binding == value or binding == cell) continue;
+            try testing.expect(binding.name_token != value.name_token);
+            try testing.expect(binding.name_token != cell.name_token);
+        }
+    }
+}
+
+test "build: type-valued container header expressions retain their lexical locals" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    const T = enum(blk: { const Width = u8; break :blk Width; }) { value };
+        \\    _ = T;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const width = bindings.findAt("Width", try testSourceToken(&r.tree, "Width;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "Width ="), width.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "{ const Width"), width.scope_open);
+    try testing.expectEqual(try testSourceToken(&r.tree, "})"), width.scope_close);
+    try testing.expect(bindings.findAt("Width", try testSourceToken(&r.tree, "T;")) == null);
+}
+
+test "build: initializer captures end at their actual branch rather than the enclosing block" {
+    const fixtures = [_][:0]const u8{
+        "fn f(maybe: ?u8) void { const result = if (maybe) |value| value else 0; _ = result; }",
+        "fn f(maybe: ?u8) void { const result = if (maybe) |value| blk: { break :blk value; } else 0; _ = result; }",
+        "fn f(xs: []u8) void { const result = for (xs) |value| { _ = value; } else 0; _ = result; }",
+        "fn f(next: anytype) void { const result = while (next()) |value| { _ = value; } else 0; _ = result; }",
+    };
+    for (fixtures) |source| {
+        var r = try parseFn(source);
+        defer r.tree.deinit(testing.allocator);
+        var bindings = r.bindings;
+        defer bindings.deinit();
+
+        const capture = bindings.findAt("value", try testSourceToken(&r.tree, "value|")).?;
+        try testing.expectEqual(try testSourceToken(&r.tree, "value|"), capture.name_token);
+        try testing.expect(bindings.findAt("value", try testSourceToken(&r.tree, "0;")) == null);
+        try testing.expect(bindings.findAt("value", try testSourceToken(&r.tree, "result;")) == null);
+    }
+}
+
+test "build: initializer capture shadow ends before the next binding use" {
+    var r = try parseFn(
+        \\fn f(value: u8, maybe: ?u8) void {
+        \\    const result = if (maybe) |value| value else value;
+        \\    _ = value; _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const parameter = try testSourceToken(&r.tree, "value: u8");
+    const payload_use = try testSourceToken(&r.tree, "value else");
+    try testing.expectEqual(try testSourceToken(&r.tree, "value|"), bindings.findAt("value", payload_use).?.name_token);
+    try testing.expectEqual(parameter, bindings.findAt("value", try testSourceToken(&r.tree, "value;\n")).?.name_token);
+    try testing.expectEqual(parameter, bindings.findAt("value", try testSourceToken(&r.tree, "value; _ =")).?.name_token);
+}
+
+test "build: initializer error capture belongs only to the else branch" {
+    var r = try parseFn(
+        \\fn f(maybe: anytype) void {
+        \\    const result = if (maybe) |value| value else |err| err;
+        \\    _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const success = try testSourceToken(&r.tree, "value else");
+    const failure = try testSourceToken(&r.tree, "err;");
+    try testing.expect(bindings.findAt("err", success) == null);
+    try testing.expect(bindings.findAt("value", failure) == null);
+    try testing.expectEqual(try testSourceToken(&r.tree, "err|"), bindings.findAt("err", failure).?.name_token);
+    const outside = try testSourceToken(&r.tree, "result;");
+    try testing.expect(bindings.findAt("value", outside) == null);
+    try testing.expect(bindings.findAt("err", outside) == null);
+}
+
+test "build: while initializer capture includes continue expression but not else" {
+    var r = try parseFn(
+        \\fn f(next: anytype) void {
+        \\    const result = while (next()) |value| : (_ = value) { _ = value; } else 0;
+        \\    _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const capture_token = try testSourceToken(&r.tree, "value|");
+    try testing.expectEqual(capture_token, bindings.findAt("value", try testSourceToken(&r.tree, "value)")).?.name_token);
+    try testing.expectEqual(capture_token, bindings.findAt("value", try testSourceToken(&r.tree, "value;")).?.name_token);
+    try testing.expect(bindings.findAt("value", try testSourceToken(&r.tree, "0;")) == null);
+    try testing.expect(bindings.findAt("value", try testSourceToken(&r.tree, "result;")) == null);
+}
+
+test "build: catch initializer capture ends at its exact RHS" {
+    var r = try parseFn(
+        \\fn f(value: u8) void {
+        \\    const result = next() catch |value| wrap(value);
+        \\    _ = value; _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const capture = bindings.findAt("value", try testSourceToken(&r.tree, "value);")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "value|"), capture.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, ");"), capture.scope_close);
+    try testing.expectEqual(try testSourceToken(&r.tree, "value: u8"), bindings.findAt("value", try testSourceToken(&r.tree, "value; _ =")).?.name_token);
+}
+
+test "build: sibling switch initializer captures keep separate exact scopes" {
+    var r = try parseFn(
+        \\fn f(value: u8, choice: anytype) void {
+        \\    const result = switch (choice) {
+        \\        .left => |value| value,
+        \\        .right => |value| blk: { break :blk value; },
+        \\    };
+        \\    _ = value; _ = result;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const left = bindings.findAt("value", try testSourceToken(&r.tree, "value,")).?;
+    const right = bindings.findAt("value", try testSourceToken(&r.tree, "value; }")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "value| value"), left.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "value| blk"), right.name_token);
+    try testing.expect(left.name_token != right.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "value: u8"), bindings.findAt("value", try testSourceToken(&r.tree, "value; _ =")).?.name_token);
+}
+
+test "build: multi-input for captures record their corresponding exact input spans" {
+    var r = try parseFn(
+        \\fn f() *u8 {
+        \\    var local: u8 = 1;
+        \\    const values = [_]*u8{&local};
+        \\    for (values, 0..) |item, index| { _ = index; return item; }
+        \\    return &local;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const item = bindings.findAt("item", try testSourceToken(&r.tree, "item;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "item, index"), item.name_token);
+    const values_token = try testSourceToken(&r.tree, "values, 0");
+    try testing.expectEqual(values_token, item.rhs_first);
+    try testing.expectEqual(values_token, item.rhs_last);
+    const index = bindings.findAt("index", try testSourceToken(&r.tree, "index;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "index|"), index.name_token);
+    try testing.expectEqual(try testSourceToken(&r.tree, "0..)"), index.rhs_first);
+    try testing.expectEqual(try testSourceToken(&r.tree, "..) |"), index.rhs_last);
+    const outside = try testSourceToken(&r.tree, "local;\n");
+    try testing.expect(bindings.findAt("item", outside) == null);
+    try testing.expect(bindings.findAt("index", outside) == null);
+}
+
+test "build: discarded and pointer captures retain multi-input ordinal identity" {
+    var r = try parseFn(
+        \\fn f(values: anytype, other: anytype) void {
+        \\    for (values, other, 0..) |_, *item, index| { _ = item; _ = index; }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const item = bindings.findAt("item", try testSourceToken(&r.tree, "item;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "item, index"), item.name_token);
+    const other_token = try testSourceToken(&r.tree, "other, 0");
+    try testing.expectEqual(other_token, item.rhs_first);
+    try testing.expectEqual(other_token, item.rhs_last);
+    const index = bindings.findAt("index", try testSourceToken(&r.tree, "index;")).?;
+    try testing.expectEqual(try testSourceToken(&r.tree, "0..)"), index.rhs_first);
+    try testing.expectEqual(try testSourceToken(&r.tree, "..) |"), index.rhs_last);
+    try testing.expect(bindings.findAt("_", try testSourceToken(&r.tree, "item;")) == null);
 }

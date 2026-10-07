@@ -12,11 +12,72 @@ const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../cache/file_cache.zig");
 const zls_resolver_mod = @import("../type_resolver.zig");
 const budget_mod = @import("../budget.zig");
+const tokens = @import("../ast/tokens.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
 const AbstractState = state_mod.AbstractState;
 const Problem = problem_mod.Problem;
+
+pub const UndefinedParameterStore = struct {
+    parameter: u32,
+    path: []const u8,
+    on_boolean: ?bool = null,
+};
+
+pub const ParameterStoreReplay = struct {
+    locals: []const ?cfg_mod.LocalId,
+    stores: *std.ArrayListUnmanaged(UndefinedParameterStore),
+};
+
+/// Settled diagnostic byte masks. They never constitute value certificates.
+pub const UndefinedReturnBytes = struct {
+    whole: bool = false,
+    holes: std.ArrayListUnmanaged([]const u8) = .empty,
+    written: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *UndefinedReturnBytes, gpa: std.mem.Allocator) void {
+        for (self.holes.items) |path| gpa.free(path);
+        self.holes.deinit(gpa);
+        for (self.written.items) |path| gpa.free(path);
+        self.written.deinit(gpa);
+    }
+
+    fn prefix(base: []const u8, path: []const u8) bool {
+        return base.len == 0 or std.mem.eql(u8, base, path) or
+            (path.len > base.len and std.mem.startsWith(u8, path, base) and
+                (path[base.len] == '.' or path[base.len] == '['));
+    }
+
+    pub fn mayBeUndefined(self: *const UndefinedReturnBytes, path: []const u8) bool {
+        var repair: ?usize = null;
+        for (self.written.items) |written| {
+            if (prefix(written, path) and (repair == null or repair.? < written.len)) repair = written.len;
+        }
+        for (self.holes.items) |hole| {
+            if (prefix(hole, path)) {
+                if (repair == null or repair.? < hole.len) return true;
+            } else if (prefix(path, hole)) {
+                var hole_repaired = false;
+                for (self.written.items) |written| {
+                    if (prefix(written, hole) and written.len >= hole.len) { hole_repaired = true; break; }
+                }
+                if (!hole_repaired) return true;
+            }
+        }
+        return self.whole and repair == null;
+    }
+
+    fn appendPath(self: *UndefinedReturnBytes, gpa: std.mem.Allocator, source: []const u8, path: []const u8, undefined_bytes: bool) !void {
+        const selected = if (prefix(path, source)) "" else if (prefix(source, path))
+            path[source.len + @intFromBool(source.len != 0 and path[source.len] == '.') ..]
+        else return;
+        const target = if (undefined_bytes) &self.holes else &self.written;
+        const owned = try gpa.dupe(u8, selected);
+        errdefer gpa.free(owned);
+        try target.append(gpa, owned);
+    }
+};
 
 pub const Options = struct {
     path: []const u8,
@@ -29,11 +90,19 @@ pub const Options = struct {
     /// no name to give (an anonymous fn, or a fixture built without
     /// one); the byte offset still identifies the site.
     fn_name: []const u8 = "",
+    /// Optional source-backed callee query. Filled only during settled replay;
+    /// no reachable value return, or any uncertain return, supplies no proof.
+    return_defined: ?*bool = null,
+    /// Union of reached returns that carry proved-undefined bytes.
+    return_undefined: ?*bool = null,
+    return_bytes: ?*std.ArrayListUnmanaged(UndefinedReturnBytes) = null,
+    parameter_stores: ?ParameterStoreReplay = null,
+    summary_cache: ?*file_cache_mod.FileCache = null,
 };
 
 /// Returns true when the CFG contains any statement that can affect the
 /// abstract state — arena/heap allocation, deallocation, out-param write,
-/// stack escape, undef, or composite borrow.
+/// stack escape, undef, composite borrow, or indexed initialization.
 /// Functions where every ExprKind is `.plain`, `.unknown`, `.field_copy_of`
 /// or `.boolean` converge immediately to empty states and can never
 /// produce a finding.
@@ -41,10 +110,11 @@ fn hasTrackableStatements(cfg: *const Cfg) bool {
     for (cfg.blocks) |block| {
         for (block.stmts) |stmt| {
             switch (stmt.kind) {
-                .arena_kill, .heap_free, .field_heap_free, .composite_escape, .interior_pointer_destroy, .leak_warning, .partial_union_write => return true,
+                .arena_kill, .heap_free, .field_heap_free, .composite_escape, .interior_pointer_destroy, .leak_warning, .partial_union_write, .indexed_read, .indexed_write, .counter_step, .compare_assume, .array_complete, .array_prefix => return true,
+                .array_memset_prefix, .array_range_complete => return true,
                 .decl => |d| if (exprKindIsTracked(d.init_kind)) return true,
                 .assign => |a| if (exprKindIsTracked(a.rhs_kind)) return true,
-                .ret => |r| if (exprKindIsTracked(r.value_kind)) return true,
+                .ret => |r| if (exprKindIsTracked(r.value_kind) or r.stack_loans.locals.len != 0) return true,
                 .out_param_write => |w| if (exprKindIsTracked(w.value_kind)) return true,
                 .field_assign => |a| if (exprKindIsTracked(a.rhs_kind)) return true,
                 else => {},
@@ -126,7 +196,10 @@ fn computeLiveness(gpa: std.mem.Allocator, cfg: *const Cfg) !Liveness {
     @memset(returns, false);
 
     for (cfg.blocks) |block| {
-        for (block.stmts) |stmt| {
+        var statement_index = block.stmts.len;
+        while (statement_index != 0) {
+            statement_index -= 1;
+            const stmt = block.stmts[statement_index];
             markStatement(uses, defs, out_defs, &returns[@intFromEnum(block.id)], words, block.id, stmt);
         }
     }
@@ -206,10 +279,25 @@ fn computeLiveness(gpa: std.mem.Allocator, cfg: *const Cfg) !Liveness {
     return .{ .words = words, .origins = origins, .out_params = out_params };
 }
 
-/// Record which locals this statement reads and overwrites.  A local
-/// that is only written needs no incoming origin — the write replaces
-/// it — so it drops out of the backward fixpoint; one that is read as
-/// well as written stays live, because the read happens first.
+fn markValueInputs(uses: []u8, words: usize, block: BlockId, inputs: []const ?cfg_mod.ValueInput) void {
+    for (inputs) |entry| {
+        const input = entry orelse continue;
+        switch (input) {
+            .local => |local| markLocal(uses, words, block, local),
+            .field => |field| markLocal(uses, words, block, field.parent),
+            .indexed => |indexed| {
+                markLocal(uses, words, block, indexed.array);
+                markIndexTermUse(uses, words, block, indexed.index);
+                if (indexed.modulo) |modulo| markLocal(uses, words, block, modulo.input);
+            },
+        }
+    }
+}
+
+/// Walk statements backwards to derive upward-exposed reads. A write
+/// removes later reads of the old value before its own inputs are added.
+/// Thus `const t = alloc(); use(t)` does not keep a previous iteration's
+/// allocation live at `t`'s declaration, while `x = read(x)` still reads x.
 fn markStatement(
     uses: []u8,
     defs: []u8,
@@ -220,30 +308,104 @@ fn markStatement(
     stmt: cfg_mod.Stmt,
 ) void {
     switch (stmt.kind) {
+        .decl => |d| clearLocal(uses, words, block, d.local),
+        .assign => |a| clearLocal(uses, words, block, a.target),
+        .counter_step => |step| clearLocal(uses, words, block, step.local),
+        .reset_capture => |r| clearLocal(uses, words, block, r.local),
+        else => {},
+    }
+    switch (stmt.kind) {
         .decl => |d| {
             markLocal(defs, words, block, d.local);
             markExprUses(uses, words, block, d.init_kind);
+            markValueInputs(uses, words, block, &d.value_inputs);
         },
         .assign => |a| {
             markLocal(defs, words, block, a.target);
             markExprUses(uses, words, block, a.rhs_kind);
+            markValueInputs(uses, words, block, &a.value_inputs);
         },
         .assume => {},
+        .indexed_read => |read| {
+            markLocal(uses, words, block, read.array);
+            markIndexTermUse(uses, words, block, read.index);
+            if (read.modulo) |modulo| markLocal(uses, words, block, modulo.input);
+            if (read.scaled) |element| markLocal(uses, words, block, element.index);
+        },
+        .indexed_write => |write| {
+            markLocal(uses, words, block, write.array);
+            markIndexTermUse(uses, words, block, write.index);
+            markExprUses(uses, words, block, write.rhs_kind);
+            for (write.inputs) |input| {
+                if (input) |local| markLocal(uses, words, block, local);
+            }
+            markValueInputs(uses, words, block, &write.selected_inputs);
+        },
+        .counter_step => |step| {
+            markLocal(uses, words, block, step.local);
+            markLocal(defs, words, block, step.local);
+        },
+        .compare_assume => |comparison| {
+            markIndexTermUse(uses, words, block, comparison.lhs);
+            markIndexTermUse(uses, words, block, comparison.rhs);
+        },
+        .scaled_index => |certificate| {
+            for ([_]state_mod.LocalId{ certificate.index, certificate.count, certificate.cursor, certificate.upper, certificate.start }) |local| {
+                markLocal(uses, words, block, local);
+            }
+        },
+        // Completion adds array coverage but preserves its resource origin.
+        .array_complete => |complete| {
+            markLocal(uses, words, block, complete.array);
+            for (complete.inputs) |input| if (input) |local| markLocal(uses, words, block, local);
+            markValueInputs(uses, words, block, &complete.selected_inputs);
+        },
+        .array_range_complete => |range| {
+            markLocal(uses, words, block, range.array);
+            for (range.inputs) |input| if (input) |local| markLocal(uses, words, block, local);
+            markValueInputs(uses, words, block, &range.selected_inputs);
+        },
+        .array_value => |value| {
+            markLocal(uses, words, block, value.target);
+            markExprUses(uses, words, block, value.source);
+            for (value.inputs) |input| if (input) |local| markLocal(uses, words, block, local);
+            markValueInputs(uses, words, block, &value.selected_inputs);
+        },
+        .array_prefix => |prefix| {
+            markLocal(uses, words, block, prefix.array);
+            markLocal(uses, words, block, prefix.count);
+            for (prefix.inputs) |input| {
+                if (input) |local| markLocal(uses, words, block, local);
+            }
+        },
+        .array_memset_prefix => |prefix| {
+            markLocal(uses, words, block, prefix.array);
+            markIndexTermUse(uses, words, block, prefix.count);
+            markExprUses(uses, words, block, prefix.rhs_kind);
+            markValueInputs(uses, words, block, &prefix.selected_inputs);
+        },
         .arena_kill => |k| markLocal(uses, words, block, k.arena_local),
         .heap_free => |f| markLocal(uses, words, block, f.freed_local),
         .ret => |r| {
             markExprUses(uses, words, block, r.value_kind);
             returns.* = true;
+            markValueInputs(uses, words, block, &r.value_inputs);
+            if (r.diagnostic_source) |source| markLocal(uses, words, block, source);
         },
         .use => |u| markLocal(uses, words, block, u.local),
         // A write THROUGH a pointer leaves the local's own resource
         // identity alone, so its origin is read, not replaced.
-        .pointer_write => |p| markLocal(uses, words, block, p.target),
+        .pointer_write => |p| {
+            markLocal(uses, words, block, p.target);
+            markValueInputs(uses, words, block, &p.preserve_inputs);
+            markValueInputs(uses, words, block, &p.diagnostic_inputs);
+        },
         .reset_capture => |r| {
             markLocal(uses, words, block, r.local);
+            if (r.value_source) |source| markLocal(uses, words, block, source);
             markLocal(defs, words, block, r.local);
         },
-        .composite_escape => |c| markExprUses(uses, words, block, c),
+        .composite_escape => |c| markExprUses(uses, words, block, c.value_kind),
         .field_assign => |a| {
             markLocal(uses, words, block, a.parent);
             markExprUses(uses, words, block, a.rhs_kind);
@@ -267,13 +429,29 @@ fn markStatement(
     }
 }
 
+fn markIndexTermUse(uses: []u8, words: usize, block: BlockId, term: cfg_mod.IndexTerm) void {
+    switch (term) {
+        .unknown, .constant => {},
+        .local => |value| markLocal(uses, words, block, value.local),
+        .field => |value| markLocal(uses, words, block, value.parent),
+    }
+}
+
 /// The locals an expression classification reads when it is turned
 /// into an origin: the borrowed/copied source, or a field's parent.
 fn markExprUses(uses: []u8, words: usize, block: BlockId, kind: cfg_mod.ExprKind) void {
     switch (kind) {
         .borrowed_from, .composite_borrow, .stack_ref, .copy_of => |local| markLocal(uses, words, block, local),
         .field_copy_of => |f| markLocal(uses, words, block, f.parent),
-        .plain, .boolean, .owned, .arena_init, .heap_alloc, .undef, .unknown => {},
+        .heap_alloc => |allocation| if (allocation.allocator_source) |source| switch (source) {
+            .local => |local| markLocal(uses, words, block, local),
+            .field => |field| markLocal(uses, words, block, field.parent),
+            .indexed => |element| {
+                markLocal(uses, words, block, element.array);
+                markIndexTermUse(uses, words, block, element.index);
+            },
+        },
+        .plain, .boolean, .owned, .arena_init, .undef, .unknown => {},
     }
 }
 
@@ -287,13 +465,23 @@ fn markLocal(table: []u8, words: usize, block: BlockId, local: state_mod.LocalId
     table[offset] |= @as(u8, 1) << bit;
 }
 
+fn clearLocal(table: []u8, words: usize, block: BlockId, local: state_mod.LocalId) void {
+    if (words == 0) return;
+    const index: usize = @intFromEnum(local);
+    if (index / 8 >= words) return;
+    const offset = @intFromEnum(block) * words + index / 8;
+    if (offset >= table.len) return;
+    const bit: u3 = @intCast(index % 8);
+    table[offset] &= ~(@as(u8, 1) << bit);
+}
+
 pub fn check(
     gpa: std.mem.Allocator,
     cfg: *const Cfg,
     opts: Options,
     out: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    if (!hasTrackableStatements(cfg)) return;
+    if (opts.return_defined == null and opts.return_undefined == null and !hasTrackableStatements(cfg)) return;
     var solver = try Solver.init(gpa, cfg, opts, out);
     defer solver.deinit();
     try solver.run();
@@ -340,6 +528,7 @@ const Solver = struct {
     /// replay's duplicate check costs one lookup per report instead of
     /// a walk over every finding the run has produced so far.
     seen: transfer.Seen,
+    saw_value_return: bool = false,
 
     fn init(
         gpa: std.mem.Allocator,
@@ -347,6 +536,7 @@ const Solver = struct {
         opts: Options,
         out: *std.ArrayListUnmanaged(Problem),
     ) !Solver {
+        std.debug.assert(cfg.integer_domains.len == 0 or cfg.integer_domains.len == cfg.locals.len);
         const states = try gpa.alloc(States, cfg.blocks.len);
         errdefer gpa.free(states);
         for (states) |*block| block.* = .empty;
@@ -393,7 +583,8 @@ const Solver = struct {
     }
 
     fn run(self: *Solver) !void {
-        try self.propagate(self.cfg.entry, &.{});
+        const entry: AbstractState = .{ .integer_domains = self.cfg.integer_domains };
+        try self.propagate(self.cfg.entry, &entry);
         var visits: u32 = 0;
         while (self.queue.pop()) |item| {
             if (visits == self.opts.max_block_visits) {
@@ -415,6 +606,9 @@ const Solver = struct {
                 try self.apply(block, true);
             }
         }
+        if (self.opts.return_defined) |defined| {
+            defined.* = defined.* and self.saw_value_return;
+        }
     }
 
     fn apply(self: *Solver, block: cfg_mod.BasicBlock, report_enabled: bool) !void {
@@ -425,9 +619,77 @@ const Solver = struct {
             .path = self.opts.path,
             .config = self.opts.config,
             .seen = &self.seen,
-            .report_enabled = report_enabled,
+            .report_enabled = report_enabled and self.opts.return_defined == null and self.opts.return_undefined == null,
         };
         for (block.stmts) |statement| {
+            if (self.opts.summary_cache) |cache| try cache.chargeNormalCleanup(@enumFromInt(0));
+            if (report_enabled and self.scratch.feasible and statement.kind == .ret) {
+                if (self.opts.return_defined) |defined| {
+                    self.saw_value_return = true;
+                    defined.* = defined.* and transfer.returnValueIsDefined(ctx, &self.scratch, statement.kind);
+                }
+                if (self.opts.return_undefined) |undefined_value| {
+                    const returned_undefined = transfer.returnValueMayBeUndefined(ctx, &self.scratch, statement.kind);
+                    undefined_value.* = undefined_value.* or returned_undefined;
+                    if (returned_undefined and self.opts.return_bytes != null)
+                    {
+                        var bytes: UndefinedReturnBytes = .{};
+                        errdefer bytes.deinit(self.gpa);
+                        const kind = statement.kind.ret.value_kind;
+                        const source: ?cfg_mod.LocalId = statement.kind.ret.diagnostic_source orelse switch (kind) {
+                            .copy_of => |local| local,
+                            .field_copy_of => |field| field.parent,
+                            else => null,
+                        };
+                        const selected = if (statement.kind.ret.diagnostic_source == null and kind == .field_copy_of) kind.field_copy_of.name else "";
+                        if (source) |local| {
+                            if (selected.len != 0 or !self.cfg.locals[@intFromEnum(local)].is_pointer) {
+                                bytes.whole = self.scratch.may_undefined_values.contains(local) or
+                                    (self.scratch.locals.get(local) orelse .plain) == .undef;
+                                for (self.scratch.undefined_field_values.keys()) |field| {
+                                    if (field.parent == local and self.scratch.fieldValueMayBeUndefined(local, field.name))
+                                        try bytes.appendPath(self.gpa, selected, field.name, true);
+                                }
+                                for (self.scratch.written_fields.keys()) |field| {
+                                    if (field.parent == local)
+                                        try bytes.appendPath(self.gpa, selected, field.name, false);
+                                }
+                            } else bytes.whole = true;
+                        } else bytes.whole = true;
+                        try self.opts.return_bytes.?.append(self.gpa, bytes);
+                    }
+                }
+                if (self.opts.parameter_stores) |replay| {
+                    const returned = statement.kind.ret.value_kind;
+                    const on_boolean: ?bool = switch (returned) {
+                        .boolean => |value| switch (value) {
+                            .constant => |constant| constant,
+                            .local => |local| self.scratch.facts.boolean(local),
+                            .not_local => |local| if (self.scratch.facts.boolean(local)) |known| !known else null,
+                        },
+                        .copy_of => |local| self.scratch.facts.boolean(local),
+                        else => null,
+                    };
+                    for (replay.locals, 0..) |selected, parameter| {
+                        const local = selected orelse continue;
+                        for (self.scratch.undefined_field_values.keys()) |field| {
+                            if (field.parent != local or !self.scratch.fieldValueMayBeUndefined(local, field.name)) continue;
+                            var duplicate = false;
+                            for (replay.stores.items) |prior| {
+                                if (prior.parameter == parameter and prior.on_boolean == on_boolean and
+                                    std.mem.eql(u8, prior.path, field.name)) {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (duplicate) continue;
+                            const path = try self.gpa.dupe(u8, field.name);
+                            errdefer self.gpa.free(path);
+                            try replay.stores.append(self.gpa, .{ .parameter = @intCast(parameter), .path = path, .on_boolean = on_boolean });
+                        }
+                    }
+                }
+            }
             try transfer.transfer(ctx, &self.scratch, statement);
             if (!self.scratch.feasible) break;
         }
@@ -481,6 +743,13 @@ const Solver = struct {
         const live = self.liveness.originRow(block_id);
         const live_out_params = self.liveness.outParamRow(block_id);
         @memcpy(self.retained, live);
+        if (self.opts.parameter_stores) |replay| {
+            for (replay.locals) |selected| {
+                const local = selected orelse continue;
+                const index = @intFromEnum(local);
+                self.retained[index / 8] |= @as(u8, 1) << @intCast(index % 8);
+            }
+        }
         // The usual case is a state the block still needs in full; the
         // check is a linear walk, while a projection costs a clone.
         var projected = incoming;
@@ -522,37 +791,74 @@ const Solver = struct {
 const Ast = std.zig.Ast;
 
 fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return analyzeImpl(gpa, src, false);
+    return analyzeImpl(gpa, src, false, null);
 }
 
 fn analyzeWithZls(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return analyzeImpl(gpa, src, true);
+    return analyzeImpl(gpa, src, true, null);
+}
+
+const ReturnObservation = struct {
+    name: []const u8,
+    defined: bool = true,
+    seen: bool = false,
+};
+
+fn analyzeWithReturnCertificate(gpa: std.mem.Allocator, src: []const u8, name: []const u8, expected: bool) !std.ArrayListUnmanaged(Problem) {
+    var observation: ReturnObservation = .{ .name = name };
+    var problems = try analyzeImpl(gpa, src, true, &observation);
+    errdefer freeProblems(gpa, &problems);
+    try std.testing.expect(observation.seen);
+    try std.testing.expectEqual(expected, observation.defined);
+    return problems;
 }
 
 fn analyzeImpl(
     gpa: std.mem.Allocator,
     src: []const u8,
     use_zls: bool,
+    observation: ?*ReturnObservation,
 ) !std.ArrayListUnmanaged(Problem) {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    if (tree.errors.len != 0) return error.InvalidSyntax;
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(cwd);
+    const path = try std.fs.path.join(gpa, &.{ cwd, "zbc-worklist-test.zig" });
+    defer gpa.free(path);
 
     const tio = std.testing.io;
     var own_ctx: zls_resolver_mod.ManagedContext = .{};
-    own_ctx.tryInit(gpa, tio);
+    if (use_zls) {
+        try own_ctx.inner.init(gpa, tio);
+        own_ctx.initialized = true;
+    } else {
+        own_ctx.tryInit(gpa, tio);
+    }
     defer own_ctx.deinit();
 
     var own_resolver: zls_resolver_mod.ManagedResolver = .{};
-    if (own_ctx.get()) |c| own_resolver.tryInit(c, gpa, "<test>", src_z);
+    if (own_ctx.get()) |c| {
+        if (use_zls) {
+            try own_resolver.inner.init(c, gpa, path, src_z);
+            own_resolver.initialized = true;
+        } else {
+            own_resolver.tryInit(c, gpa, path, src_z);
+        }
+    }
     defer own_resolver.deinit();
     const zls_ptr = own_resolver.get();
+    var fallback_tree: ?Ast = null;
+    defer if (fallback_tree) |*tree| tree.deinit(gpa);
+    const tree = if (zls_ptr) |zls| &zls.handle.document.tree else blk: {
+        fallback_tree = try Ast.parse(gpa, src_z, .zig);
+        break :blk &fallback_tree.?;
+    };
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
-    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
+    var rule_cache = file_cache_mod.FileCache.init(gpa, tree);
     defer rule_cache.deinit();
     rule_cache.setZls(zls_ptr);
+    if (zls_ptr) |zls| rule_cache.module_id = zls.handle.module;
     try rule_cache.resolveTransitiveTakes();
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
@@ -562,10 +868,19 @@ fn analyzeImpl(
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
+        const observe = if (observation) |target| observe: {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tokens.fnProto(tree, &buffer, node) orelse break :observe false;
+            const name = proto.name_token orelse break :observe false;
+            break :observe std.mem.eql(u8, tree.tokenSlice(name), target.name);
+        } else false;
+        const saved_mode = rule_cache.return_defined_mode;
+        rule_cache.return_defined_mode = observe;
+        defer rule_cache.return_defined_mode = saved_mode;
         const maybe_cfg = if (use_zls)
             try cfg_builder.lowerFunctionFullWithZls(
                 gpa,
-                &tree,
+                tree,
                 node,
                 &config_mod.Default,
                 &rule_cache,
@@ -574,7 +889,7 @@ fn analyzeImpl(
         else
             try cfg_builder.lowerFunctionFull(
                 gpa,
-                &tree,
+                tree,
                 node,
                 &config_mod.Default,
                 &rule_cache,
@@ -582,6 +897,14 @@ fn analyzeImpl(
         var cfg = maybe_cfg orelse continue;
         defer cfg.deinit(gpa);
         try check(gpa, &cfg, .{ .path = "<test>" }, &problems);
+        if (observe) {
+            const target = observation.?;
+            try std.testing.expect(!target.seen);
+            target.seen = true;
+            var replay_problems: std.ArrayListUnmanaged(Problem) = .empty;
+            defer freeProblems(gpa, &replay_problems);
+            try check(gpa, &cfg, .{ .path = "<certificate>", .return_defined = &target.defined }, &replay_problems);
+        }
     }
     return problems;
 }
@@ -1582,7 +1905,7 @@ test "stack_escape: a by-value field named like a pointer is still frame storage
     // own copy, and that copy dies with the frame.  The second function
     // is the control — there the field really IS `*Leaf`, so the same
     // name sits over a genuine traversal out of the frame.
-    var problems = try analyze(gpa,
+    const source =
         \\const Leaf = struct { count: u32 };
         \\const Boxed = struct { value_ptr: Leaf };
         \\const Held = struct { value_ptr: *Leaf };
@@ -1593,15 +1916,17 @@ test "stack_escape: a by-value field named like a pointer is still frame storage
         \\    return &held.value_ptr.count;
         \\}
         \\
-    );
+    ;
+    var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
     var escapes: usize = 0;
     for (problems.items) |p| {
         if (!std.mem.eql(u8, p.rule_id, "stack-escape")) continue;
         escapes += 1;
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "stack variable `boxed`") != null);
     }
     try std.testing.expectEqual(@as(usize, 1), escapes);
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &boxed.value_ptr.count", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return &held.value_ptr.count", 0));
 }
 
 test "stack_escape: the outermost access of a chain names a slot in the frame" {
@@ -1639,14 +1964,14 @@ test "stack_escape: the outermost access of a chain names a slot in the frame" {
     try std.testing.expect(saw_linked);
 }
 
-test "stack_escape: a chain too deep to describe keeps its frame origin" {
+test "stack_escape: a chain too deep to describe does not prove a frame escape" {
     const gpa = std.testing.allocator;
     // Nine accesses past the root is more of a chain than the builder
     // records, so it can prove nothing about where the address lands.
-    // Not knowing is not knowing it left: the root local is still the
-    // storage this address names, and the walk must charge it there
-    // rather than drop the origin and report nothing.
-    var problems = try analyze(gpa,
+    // Without a complete chain, a hidden pointer hop is unresolved.
+    // The proved-only policy is silent; a shorter by-value chain below
+    // remains a positive control.
+    const source =
         \\const N9 = struct { deep: u32 };
         \\const N8 = struct { n9: N9 };
         \\const N7 = struct { n8: N8 };
@@ -1659,16 +1984,15 @@ test "stack_escape: a chain too deep to describe keeps its frame origin" {
         \\fn deepChain(record: N1) *const u32 {
         \\    return &record.n2.n3.n4.n5.n6.n7.n8.n9.deep;
         \\}
+        \\fn knownChain(record: N7) *const u32 {
+        \\    return &record.n8.n9.deep;
+        \\}
         \\
-    );
+    ;
+    var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
-    var found = false;
-    for (problems.items) |p| {
-        if (!std.mem.eql(u8, p.rule_id, "stack-escape")) continue;
-        found = true;
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "stack variable `record`") != null);
-    }
-    try std.testing.expect(found);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return &record.n2.n3", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &record.n8.n9", 0));
 }
 
 test "an import-qualified optional pointer capture retains its pointee storage" {
@@ -1873,7 +2197,7 @@ test "a diverging catch fallback still binds the callee's declared pointer" {
     // that BINDS (`&local`), which makes the fallback a second origin
     // for the same local and the frame borrow of that prong must
     // survive.
-    var problems = try analyze(gpa,
+    const source =
         \\const Tree = struct { leaves: u32 };
         \\const Doc = struct { tree: Tree };
         \\const Bag = struct { tree: Tree };
@@ -1913,20 +2237,18 @@ test "a diverging catch fallback still binds the callee's declared pointer" {
         \\    return &handle.tree;
         \\}
         \\
-    );
+    ;
+    var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
     var escapes: usize = 0;
-    var saw_bag = false;
-    var saw_partial = false;
     for (problems.items) |p| {
         if (!std.mem.eql(u8, p.rule_id, "stack-escape")) continue;
         escapes += 1;
-        if (std.mem.indexOf(u8, p.message, "stack variable `bag`") != null) saw_bag = true;
-        if (std.mem.indexOf(u8, p.message, "stack variable `handle`") != null) saw_partial = true;
     }
     try std.testing.expectEqual(@as(usize, 2), escapes);
-    try std.testing.expect(saw_bag);
-    try std.testing.expect(saw_partial);
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &bag.tree", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return &handle.tree", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &handle.tree", 1));
 }
 
 test "a free function's declared pointer return proves the binding through a catch" {
@@ -3018,10 +3340,11 @@ test "type-aware lookup: `loader.finalize()` doesn't inherit `rewriter.finalize(
 test "type-aware lookup: cross-fn self-freeing fires when callee on same type DOES destroy" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
         \\const T = struct {
         \\    x: u32,
-        \\    pub fn finalize(this: *T) void { bun.destroy(this); }
+        \\    pub fn finalize(this: *T) void { allocator.destroy(this); }
         \\    pub fn onFinish(this: *T) void { this.finalize(); }
         \\    pub fn caller(this: *T) void {
         \\        this.onFinish();
@@ -3072,9 +3395,10 @@ test "field-type lookup: `wrapper.field.method()` resolves via field's type" {
 test "R10 field-chain: wrapper method `this.inner.dispose()` propagates as ownership_field" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
         \\const Item = struct {
-        \\    pub fn dispose(this: *Item) void { bun.destroy(this); }
+        \\    pub fn dispose(this: *Item) void { allocator.destroy(this); }
         \\};
         \\const Wrapper = struct {
         \\    inner: *Item,
@@ -3100,9 +3424,10 @@ test "R10 field-chain: wrapper method `this.inner.dispose()` propagates as owner
 test "R10 multi-field: wrapper frees TWO different fields → both UAFs fire" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
-        \\const A = struct { pub fn dispose(this: *A) void { bun.destroy(this); } };
-        \\const B = struct { pub fn dispose(this: *B) void { bun.destroy(this); } };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
+        \\const A = struct { pub fn dispose(this: *A) void { allocator.destroy(this); } };
+        \\const B = struct { pub fn dispose(this: *B) void { allocator.destroy(this); } };
         \\const Wrapper = struct {
         \\    a: *A,
         \\    b: *B,
@@ -3141,7 +3466,7 @@ test "deep-path field_assign clears freed state — `o.inner.handle = fresh()` r
         \\    inner: *Inner,
         \\    pub fn cleanup(this: *Outer) void { this.inner.handle.dispose(); }
         \\};
-        \\fn fresh() *Handle { return undefined; }
+        \\fn fresh() *Handle { return @ptrFromInt(8); }
         \\pub fn ok(o: *Outer) void {
         \\    o.cleanup();
         \\    o.inner.handle = fresh();
@@ -3243,8 +3568,9 @@ test "deep-path free via `g.free(obj.f.g)` is recognised" {
 test "R10 deeper chain: `this.inner.handle.dispose()` propagates as field path \"inner.handle\"" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
-        \\const Handle = struct { pub fn dispose(this: *Handle) void { bun.destroy(this); } };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
+        \\const Handle = struct { pub fn dispose(this: *Handle) void { allocator.destroy(this); } };
         \\const Inner = struct { handle: *Handle };
         \\const Outer = struct {
         \\    inner: *Inner,
@@ -3299,8 +3625,9 @@ test "field_use prefix emission: depth-1 free + depth-2 use still fires UAF" {
 test "R10 non-receiver field: `cleanup(self, other)` frees other.f" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
-        \\const Item = struct { pub fn dispose(this: *Item) void { bun.destroy(this); } };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
+        \\const Item = struct { pub fn dispose(this: *Item) void { allocator.destroy(this); } };
         \\const X = struct { dummy: u32 = 0 };
         \\const Y = struct { f: *Item };
         \\pub fn cleanup(self: *X, other: *Y) void {
@@ -3327,8 +3654,9 @@ test "R10 non-receiver field: method call where 2nd param's field is freed" {
     // recv.method(arg) — callee's param 0 = recv, param 1 = arg.
     // If method frees arg.f, the call site should free recv-arg's f.
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
-        \\const Item = struct { pub fn dispose(this: *Item) void { bun.destroy(this); } };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
+        \\const Item = struct { pub fn dispose(this: *Item) void { allocator.destroy(this); } };
         \\const Holder = struct { f: *Item };
         \\const Cleaner = struct {
         \\    dummy: u32 = 0,
@@ -3355,8 +3683,9 @@ test "R10 non-receiver field: method call where 2nd param's field is freed" {
 test "R10 multi-field: dedupes — same field destroyed twice doesn't double-emit" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
-        \\const A = struct { pub fn dispose(this: *A) void { bun.destroy(this); } };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
+        \\const A = struct { pub fn dispose(this: *A) void { allocator.destroy(this); } };
         \\const Wrapper = struct {
         \\    a: *A,
         \\    pub fn cleanup(this: *Wrapper) void {
@@ -3407,9 +3736,10 @@ test "R10 field-chain: wrapper with NON-destroying inner method doesn't FP" {
 test "field-type lookup: still catches `w.field.method()` when method DOES destroy that field's type" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const std = @import("std");
+        \\const allocator: std.mem.Allocator = std.heap.page_allocator;
         \\const Item = struct {
-        \\    pub fn dispose(this: *Item) void { bun.destroy(this); }
+        \\    pub fn dispose(this: *Item) void { allocator.destroy(this); }
         \\};
         \\const Wrapper = struct { item: *Item };
         \\pub fn buggy(w: *Wrapper) void {
@@ -3561,15 +3891,16 @@ test "heap-leak: *const T receiver — two-step cleanup pattern — does NOT fir
     // release fields, then `alloc.destroy(instance)` to release the struct.
     // The rule must NOT fire on such destructors.
     const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
         \\pub const Data = struct {
         \\    buf: []const u8,
-        \\    pub fn init(alloc: anytype, text: []const u8) !*Data {
+        \\    pub fn init(alloc: std.mem.Allocator, text: []const u8) !*Data {
         \\        const d = try alloc.create(Data);
         \\        d.buf = try alloc.dupe(u8, text);
         \\        return d;
         \\    }
-        \\    pub fn deinit(self: *const Data, alloc: anytype) void {
+        \\    pub fn deinit(self: *const Data, alloc: std.mem.Allocator) void {
         \\        alloc.free(self.buf);
         \\    }
         \\};
@@ -3584,15 +3915,16 @@ test "heap-leak: *const T receiver — two-step cleanup pattern — does NOT fir
 test "heap-leak: *T receiver without destroy — fires" {
     // Non-const receiver, has a heap-creator, no destroy call → fires.
     const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
         \\pub const Data = struct {
         \\    buf: []const u8,
-        \\    pub fn init(alloc: anytype, text: []const u8) !*Data {
+        \\    pub fn init(alloc: std.mem.Allocator, text: []const u8) !*Data {
         \\        const d = try alloc.create(Data);
         \\        d.buf = try alloc.dupe(u8, text);
         \\        return d;
         \\    }
-        \\    pub fn deinit(self: *Data, alloc: anytype) void {
+        \\    pub fn deinit(self: *Data, alloc: std.mem.Allocator) void {
         \\        alloc.free(self.buf);
         \\    }
         \\};
@@ -4317,6 +4649,143 @@ test "address AST: a bitwise operand remains a value read" {
     try std.testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
 }
 
+test "callee output loops: successful switch wrappers initialize the full supplied slice" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const Status = enum { done, yielded, suspended };
+        \\const Workspace = struct {
+        \\    fn run(_: *Workspace, status: Status, outputs: []u64) error{Blocked}!void {
+        \\        while (true) switch (status) {
+        \\            .done => {
+        \\                for (outputs, 0..) |*output, index| output.* = index + 10;
+        \\                return;
+        \\            },
+        \\            .yielded => continue,
+        \\            .suspended => return error.Blocked,
+        \\        };
+        \\    }
+        \\    fn apply(self: *Workspace, status: Status, outputs: []u64) error{Blocked}!void {
+        \\        self.run(status, outputs) catch |err| return err;
+        \\    }
+        \\};
+        \\pub fn good(status: Status, n: usize) !u64 {
+        \\    if (n == 0 or n > 4) return error.Invalid;
+        \\    var workspace: Workspace = .{};
+        \\    var output: [4]u64 = undefined;
+        \\    try workspace.apply(status, output[0..n]);
+        \\    return output[n - 1];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "callee output loops: a skipped capture write and an unwritten suffix remain undefined" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn partial(output: []u64) void {
+        \\    for (output, 0..) |*value, index| {
+        \\        if (index == 1) continue;
+        \\        value.* = index;
+        \\    }
+        \\}
+        \\fn fill(output: []u64) void {
+        \\    for (output, 0..) |*value, index| value.* = index;
+        \\}
+        \\pub fn bad() u64 {
+        \\    var output: [4]u64 = undefined;
+        \\    partial(&output);
+        \\    return output[1];
+        \\}
+        \\pub fn suffix(n: usize) u64 {
+        \\    if (n > 3) return 0;
+        \\    var output: [4]u64 = undefined;
+        \\    fill(output[0..n]);
+        \\    return output[3];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 2);
+}
+
+test "callee output loops: resolved strided integer stores cover every byte" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\fn finish(output: *[8]u8, values: [2]u32) void {
+        \\    for (values, 0..) |value, index| {
+        \\        std.mem.writeInt(u32, output[4 * index..][0..4], value, .big);
+        \\    }
+        \\}
+        \\pub fn good(values: [2]u32) [8]u8 {
+        \\    var output: [8]u8 = undefined;
+        \\    finish(&output, values);
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "callee output loops: strided holes and undefined chunk values remain undefined" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn chunk(out: *[2]u8, value: [2]u8) void { out.* = value; }
+        \\fn holes(out: *[8]u8) void {
+        \\    const values = [_][2]u8{ .{1, 2}, .{3, 4} };
+        \\    for (values, 0..) |value, index| chunk(out[4 * index..][0..2], value);
+        \\}
+        \\fn poison(out: *[4]u8) void {
+        \\    const values: [2][2]u8 = .{ .{1, 2}, undefined };
+        \\    for (values, 0..) |value, index| chunk(out[2 * index..][0..2], value);
+        \\}
+        \\pub fn bad() u8 {
+        \\    var output: [8]u8 = undefined;
+        \\    holes(&output);
+        \\    return output[3];
+        \\}
+        \\pub fn undefinedValue() u8 {
+        \\    var output: [4]u8 = undefined;
+        \\    poison(&output);
+        \\    return output[3];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 2);
+}
+
+test "callee output loops: scaled successful prefix covers each lane but not its suffix" {
+    const gpa = std.testing.allocator;
+    var good = try analyzeWithZls(gpa,
+        \\fn fill(output: []u64) void {
+        \\    for (output, 0..) |*value, index| value.* = index;
+        \\}
+        \\pub fn good(lanes: usize) u64 {
+        \\    if (lanes > 4) return 0;
+        \\    var output: [8]u64 = undefined;
+        \\    fill(output[0..lanes * 2]);
+        \\    var result: u64 = 0;
+        \\    for (0..lanes) |lane| result += output[lane * 2] + output[lane * 2 + 1];
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &good);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(good.items, "use-undefined"));
+    var bad = try analyzeWithZls(gpa,
+        \\fn fill(output: []u64) void {
+        \\    for (output, 0..) |*value, index| value.* = index;
+        \\}
+        \\pub fn bad(lanes: usize) u64 {
+        \\    if (lanes > 3) return 0;
+        \\    var output: [8]u64 = undefined;
+        \\    fill(output[0..lanes * 2]);
+        \\    return output[7];
+        \\}
+    );
+    defer freeProblems(gpa, &bad);
+    try std.testing.expect(countRuleLines(bad.items, "use-undefined") != 0);
+}
+
 fn expectFlowRules(source: []const u8, expected: []const []const u8) !void {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa, source);
@@ -4348,6 +4817,454 @@ test "cleanup flow: an armed defer still detects double free" {
         \\    gpa.free(p);
         \\}
     , &.{"heap-double-free"});
+}
+
+test "callee frees a field and republishes a new allocation: repeated calls are not a double free" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    segments: []u32 = &.{},
+        \\    fn grow(self: *List, allocator: std.mem.Allocator) !void {
+        \\        const bigger = try allocator.alloc(u32, self.segments.len + 1);
+        \\        allocator.free(self.segments);
+        \\        self.segments = bigger;
+        \\    }
+        \\    pub fn twice(self: *List, allocator: std.mem.Allocator) !void {
+        \\        try self.grow(allocator);
+        \\        try self.grow(allocator);
+        \\    }
+        \\};
+    , &.{});
+}
+
+test "callee frees a field without republishing it: repeated calls are a double free" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    segments: []u32 = &.{},
+        \\    fn drop(self: *List, allocator: std.mem.Allocator) void {
+        \\        allocator.free(self.segments);
+        \\    }
+        \\    pub fn twice(self: *List, allocator: std.mem.Allocator) void {
+        \\        self.drop(allocator);
+        \\        self.drop(allocator);
+        \\    }
+        \\};
+    , &.{"heap-double-free"});
+}
+
+test "callee frees a field and poisons it with undefined: repeated calls are a double free" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    segments: []u32 = &.{},
+        \\    fn drop(self: *List, allocator: std.mem.Allocator) void {
+        \\        allocator.free(self.segments);
+        \\        self.segments = undefined;
+        \\    }
+        \\    pub fn twice(self: *List, allocator: std.mem.Allocator) void {
+        \\        self.drop(allocator);
+        \\        self.drop(allocator);
+        \\    }
+        \\};
+    , &.{"heap-double-free"});
+}
+
+test "saved old payload replacement: a callee publishes live storage before freeing the old slice" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        errdefer gpa.free(fresh);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        gpa.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace(gpa);
+        \\    defer gpa.free(buffer.bytes);
+        \\    buffer.bytes[0] = 1;
+        \\    return buffer.bytes[0];
+        \\}
+    , &.{});
+}
+
+test "saved old payload replacement: conditional reserve and nested wrappers retain live current fields" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    indexes: []u32 = &.{},
+        \\    capacity: usize = 0,
+        \\    fn reserve(self: *Buffer, capacity: usize) !void {
+        \\        if (capacity <= self.capacity and self.indexes.len != 0) return;
+        \\        const fresh = try self.allocator.alloc(u32, capacity + 3);
+        \\        errdefer self.allocator.free(fresh);
+        \\        const old = self.indexes;
+        \\        self.indexes = fresh;
+        \\        self.capacity = capacity;
+        \\        if (old.len != 0) self.allocator.free(old);
+        \\    }
+        \\    fn finish(self: *Buffer) !void {
+        \\        if (self.indexes.len == 0) try self.reserve(0);
+        \\        self.indexes[0..3].* = .{ 1, 1, 0 };
+        \\    }
+        \\    fn deinit(self: *Buffer) void {
+        \\        if (self.indexes.len != 0) self.allocator.free(self.indexes);
+        \\        self.* = undefined;
+        \\    }
+        \\};
+        \\const Parser = struct {
+        \\    storage: Buffer,
+        \\    indexes: []u32 = &.{},
+        \\    fn init(allocator: std.mem.Allocator, capacity: usize) !Parser {
+        \\        var parser: Parser = .{ .storage = .{ .allocator = allocator } };
+        \\        errdefer parser.storage.deinit();
+        \\        if (capacity != 0) {
+        \\            try parser.storage.reserve(capacity);
+        \\            parser.indexes = parser.storage.indexes;
+        \\        }
+        \\        return parser;
+        \\    }
+        \\    fn prepare(self: *Parser) ![]const u32 {
+        \\        try self.storage.reserve(8);
+        \\        self.indexes = self.storage.indexes;
+        \\        try self.storage.finish();
+        \\        return self.storage.indexes[0..3];
+        \\    }
+        \\    fn deinit(self: *Parser) void {
+        \\        self.storage.deinit();
+        \\        self.* = undefined;
+        \\    }
+        \\};
+        \\pub fn cleanup(allocator: std.mem.Allocator) !void {
+        \\    var parser = try Parser.init(allocator, 0);
+        \\    defer parser.deinit();
+        \\    _ = try parser.prepare();
+        \\}
+    , &.{});
+}
+
+test "saved old payload replacement: caller aliases still refer to the released allocation" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        gpa.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    const saved = buffer.bytes;
+        \\    try buffer.replace(gpa);
+        \\    defer gpa.free(buffer.bytes);
+        \\    return saved[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "heap-use-after-free"));
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "heap-double-free"));
+}
+
+test "saved old payload replacement: freeing the new field remains a use-after-free" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        gpa.free(old);
+        \\        gpa.free(self.bytes);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace(gpa);
+        \\    return buffer.bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "heap-use-after-free"));
+}
+
+test "saved old payload replacement: freeing the new field twice remains a double free" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        gpa.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !void {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace(gpa);
+        \\    gpa.free(buffer.bytes);
+        \\    gpa.free(buffer.bytes);
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "heap-double-free"));
+}
+
+test "saved old payload replacement: an alias captured after publication releases the new field" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        const current = self.bytes;
+        \\        gpa.free(old);
+        \\        gpa.free(current);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace(gpa);
+        \\    return buffer.bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "heap-use-after-free"));
+}
+
+test "saved old payload replacement: republishing the old slice does not revive it" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) void {
+        \\        const old = self.bytes;
+        \\        gpa.free(old);
+        \\        self.bytes = old;
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    buffer.replace(gpa);
+        \\    return buffer.bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 1);
+}
+
+test "saved old payload replacement: error cleanup of an unpublished fresh slice leaves the old field live" {
+    try expectFlowRules(
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator, fail: bool) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        errdefer gpa.free(fresh);
+        \\        if (fail) return error.Stop;
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        gpa.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator, fail: bool) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    defer gpa.free(buffer.bytes);
+        \\    buffer.replace(gpa, fail) catch {};
+        \\    buffer.bytes[0] = 1;
+        \\    return buffer.bytes[0];
+        \\}
+    , &.{});
+}
+
+test "saved old payload replacement: publishing an already freed allocation does not revive it" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const fresh = try gpa.alloc(u8, 8);
+        \\        gpa.free(fresh);
+        \\        self.bytes = fresh;
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace(gpa);
+        \\    return buffer.bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 1);
+}
+
+test "saved old payload replacement: aggregate value snapshots preserve old-alias hazards" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const old = self.*;
+        \\        self.bytes = try gpa.alloc(u8, 8);
+        \\        gpa.free(old.bytes);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    const saved = buffer.bytes;
+        \\    try buffer.replace(gpa);
+        \\    return saved[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 1);
+}
+
+test "saved old payload replacement: nested cleanup of an entry snapshot retains old-alias hazards" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\fn drop(gpa: std.mem.Allocator, bytes: []u8) void { gpa.free(bytes); }
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const old = self.bytes;
+        \\        self.bytes = try gpa.alloc(u8, 8);
+        \\        drop(gpa, old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    const saved = buffer.bytes;
+        \\    try buffer.replace(gpa);
+        \\    return saved[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 1);
+}
+
+test "saved old payload replacement: conditional snapshot releases remain possible on each field" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    a: []u8,
+        \\    b: []u8,
+        \\    fn release(self: *Buffer, gpa: std.mem.Allocator, flag: bool) void {
+        \\        var old: []u8 = undefined;
+        \\        if (flag) { old = self.a; } else { old = self.b; }
+        \\        gpa.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator, flag: bool) !u8 {
+        \\    var buffer = Buffer{ .a = try gpa.alloc(u8, 4), .b = try gpa.alloc(u8, 4) };
+        \\    buffer.release(gpa, flag);
+        \\    const a = buffer.a[0];
+        \\    return a + buffer.b[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 2);
+}
+
+test "saved old payload replacement: the new allocator's arena lifetime survives callee replay" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, old_a: std.mem.Allocator, new_a: std.mem.Allocator) !void {
+        \\        const fresh = try new_a.alloc(u8, 8);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        old_a.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const a = arena.allocator();
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace(gpa, a);
+        \\    arena.deinit();
+        \\    return buffer.bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "arena-use-after-kill") >= 1);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "allocator-mismatch"));
+}
+
+test "saved old payload replacement: receiver allocator fields preserve arena lifetime" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    old_a: std.mem.Allocator,
+        \\    new_a: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer) !void {
+        \\        const fresh = try self.new_a.alloc(u8, 8);
+        \\        const old = self.bytes;
+        \\        self.bytes = fresh;
+        \\        self.old_a.free(old);
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const a = arena.allocator();
+        \\    var buffer = Buffer{ .old_a = gpa, .new_a = a, .bytes = try gpa.alloc(u8, 4) };
+        \\    try buffer.replace();
+        \\    arena.deinit();
+        \\    return buffer.bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "arena-use-after-kill") >= 1);
+}
+
+test "saved old payload replacement: opaque tails cannot erase observed entry-release hazards" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\extern fn opaqueValue() void;
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn replace(self: *Buffer, gpa: std.mem.Allocator) !void {
+        \\        const old = self.bytes;
+        \\        self.bytes = try gpa.alloc(u8, 8);
+        \\        gpa.free(old);
+        \\        opaqueValue();
+        \\    }
+        \\};
+        \\pub fn use(gpa: std.mem.Allocator) !u8 {
+        \\    var buffer = Buffer{ .bytes = try gpa.alloc(u8, 4) };
+        \\    const saved = buffer.bytes;
+        \\    try buffer.replace(gpa);
+        \\    return saved[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 1);
 }
 
 test "cleanup flow: branch cleanup stays correlated with ownership" {
@@ -4700,6 +5617,1464 @@ fn countRuleLines(problems: []const Problem, rule_id: []const u8) usize {
     return n;
 }
 
+test "aggregate lifetime: complete clearing removes copied parser stack origin" {
+    const source =
+        \\const Version = struct {
+        \\    major: u32 = 0,
+        \\    pre: ?[]const u8 = null,
+        \\    build: ?[]const u8 = null,
+        \\    fn parse(input: []const u8) Version { return .{ .pre = input }; }
+        \\};
+        \\fn fixed() Version {
+        \\    var buf: [64]u8 = [_]u8{0} ** 64;
+        \\    const ver = Version.parse(&buf);
+        \\    var stripped = ver;
+        \\    stripped.pre = null;
+        \\    stripped.build = null;
+        \\    return stripped;
+        \\}
+        \\const View = struct { pre: ?[]const u8, build: ?[]const u8 };
+        \\fn parse(input: []const u8) View { return .{ .pre = input, .build = input }; }
+        \\fn cleared() View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    const original = parse(&buf);
+        \\    var copy = original;
+        \\    copy.pre = null;
+        \\    copy.build = null;
+        \\    return copy;
+        \\}
+        \\fn literalCleared() View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var view: View = .{ .pre = &buf, .build = &buf };
+        \\    view.pre = null;
+        \\    view.build = null;
+        \\    return view;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "stack-escape"));
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "aggregate lifetime: incomplete clearing and snapshots retain stack origin" {
+    for ([_][]const u8{
+        \\const View = struct { pre: ?[]const u8, build: ?[]const u8 };
+        \\fn parse(input: []const u8) View { return .{ .pre = input, .build = input }; }
+        \\fn partial() View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var view = parse(&buf);
+        \\    view.pre = null;
+        \\    return view;
+        \\}
+        ,
+        \\const View = struct { pre: ?[]const u8 };
+        \\fn conditional(clear: bool) View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var view: View = .{ .pre = &buf };
+        \\    if (clear) view.pre = null;
+        \\    return view;
+        \\}
+        ,
+        \\const View = struct { pre: ?[]const u8, build: ?[]const u8, pointer: *const [2]u8 };
+        \\fn residual() View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var view: View = .{ .pre = &buf, .build = &buf, .pointer = &buf };
+        \\    view.pre = null;
+        \\    view.build = null;
+        \\    return view;
+        \\}
+        ,
+        \\const View = struct { pre: ?[]const u8 };
+        \\fn snapshot() View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var original: View = .{ .pre = &buf };
+        \\    const copy = original;
+        \\    original.pre = null;
+        \\    return copy;
+        \\}
+        ,
+        \\const View = struct { pre: ?[]const u8 };
+        \\fn rebound(rebind: bool) View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var view: View = .{ .pre = &buf };
+        \\    view.pre = null;
+        \\    if (rebind) view = .{ .pre = &buf };
+        \\    return view;
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "stack-escape"));
+    }
+}
+
+test "aggregate lifetime: unknown mutation after clearing revokes the loan proof" {
+    const source =
+        \\const View = struct { pre: ?[]const u8 };
+        \\fn mutated(mutate: *const fn (*View) void) View {
+        \\    const buf = [_]u8{0} ** 2;
+        \\    var view: View = .{ .pre = &buf };
+        \\    view.pre = null;
+        \\    mutate(&view);
+        \\    return view;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "stack-escape"));
+}
+
+test "aggregate lifetime: known reader returns external pointee not local array cell" {
+    const source =
+        \\fn read(values: []*u8) *u8 { return values[0]; }
+        \\fn externalReader(external: *u8) *u8 {
+        \\    var pointers: [1]*u8 = .{external};
+        \\    return read(&pointers);
+        \\}
+        \\fn castReader(external: *u8) *u8 {
+        \\    var pointers: [1]*u8 = .{external};
+        \\    return read(@as([]*u8, &pointers));
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "stack-escape"));
+}
+
+test "aggregate lifetime: known reader retains local pointee and late element stores" {
+    for ([_][]const u8{
+        \\fn read(values: []*u8) *u8 { return values[0]; }
+        \\fn localReader() *u8 {
+        \\    var local: u8 = 1;
+        \\    var pointers: [1]*u8 = .{&local};
+        \\    return read(&pointers);
+        \\}
+        ,
+        \\fn read(values: []*u8) *u8 { return values[0]; }
+        \\fn lateReader(external: *u8) *u8 {
+        \\    var local: u8 = 1;
+        \\    var pointers: [1]*u8 = .{external};
+        \\    pointers[0] = &local;
+        \\    return read(&pointers);
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "stack-escape"));
+        for (problems.items) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "stack-escape"))
+                try std.testing.expect(std.mem.indexOf(u8, problem.message, "`local`") != null);
+        }
+    }
+}
+
+test "aggregate lifetime: returned outer array cell retains frame origin" {
+    for ([_][]const u8{
+        \\fn identity(values: *[1]*u8) *[1]*u8 { return values; }
+        \\fn cell(external: *u8) *[1]*u8 {
+        \\    var pointers: [1]*u8 = .{external};
+        \\    return identity(&pointers);
+        \\}
+        ,
+        \\fn reinterpret(values: []*u8) *u8 { return @ptrCast(values.ptr); }
+        \\fn cell(external: *u8) *u8 {
+        \\    var pointers: [1]*u8 = .{external};
+        \\    return reinterpret(&pointers);
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "stack-escape"));
+    }
+}
+
+test "aggregate lifetime: expression-local cell loans survive lowering" {
+    const source =
+        \\fn blockLocal() *const u8 {
+        \\    return blk: {
+        \\        const cell: u8 = 1;
+        \\        break :blk &cell;
+        \\    };
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "stack-escape"));
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "stack-escape")) {
+            try std.testing.expect(std.mem.indexOf(u8, problem.message, "`cell`") != null);
+        }
+    }
+}
+
+test "aggregate lifetime: wrapped expression-local cell loans remain physical" {
+    for ([_][]const u8{
+        \\fn wrapped() *const u8 {
+        \\    return @as(*const u8, blk: {
+        \\        const cell: u8 = 1;
+        \\        break :blk &cell;
+        \\    });
+        \\}
+        ,
+        \\fn wrapped() struct { pointer: *const u8 } {
+        \\    return .{ .pointer = blk: {
+        \\        const cell: u8 = 1;
+        \\        break :blk &cell;
+        \\    } };
+        \\}
+        ,
+        \\fn identity(value: *const u8) *const u8 { return value; }
+        \\fn wrapped() *const u8 {
+        \\    return identity(blk: {
+        \\        const cell: u8 = 1;
+        \\        break :blk &cell;
+        \\    });
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "stack-escape"));
+        for (problems.items) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "stack-escape")) {
+                try std.testing.expect(std.mem.indexOf(u8, problem.message, "`cell`") != null);
+            }
+        }
+    }
+}
+
+// Lowering destroys its query scratch before check consumes the CFG. The
+// failure sweep covers unpublished proofs, shared fallback loans, and finalization.
+fn stackLoanOwnership(gpa: std.mem.Allocator) !void {
+    const source =
+        \\fn borrow(flag: bool) *const u8 {
+        \\    if (flag) return first_block: {
+        \\        const first: u8 = 1;
+        \\        break :first_block &first;
+        \\    };
+        \\    return second_block: {
+        \\        const second: u8 = 2;
+        \\        break :second_block &second;
+        \\    };
+        \\}
+        \\fn carrier(unknown: *const fn () *const u8) struct {
+        \\    first: *const u8, second: *const u8, unknown_pointer: ?*const u8,
+        \\} {
+        \\    const cell: u8 = 1;
+        \\    const other: u8 = 2;
+        \\    return .{ .first = &cell, .second = &other, .unknown_pointer = unknown() };
+        \\}
+    ;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var index: u32 = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var graph = lower: {
+            var cache = file_cache_mod.FileCache.init(gpa, &tree);
+            defer cache.deinit();
+            break :lower (try cfg_builder.lowerFunctionFull(
+                gpa,
+                &tree,
+                node,
+                &config_mod.Default,
+                &cache,
+            )) orelse continue;
+        };
+        defer graph.deinit(gpa);
+        try check(gpa, &graph, .{ .path = "<test>" }, &problems);
+    }
+    var found_first = false;
+    var found_second = false;
+    var found_carrier = false;
+    for (problems.items) |problem| {
+        if (!std.mem.eql(u8, problem.rule_id, "stack-escape")) continue;
+        if (problem.start.line == 2 and std.mem.indexOf(u8, problem.message, "`first`") != null) {
+            found_first = true;
+        }
+        if (problem.start.line == 6 and std.mem.indexOf(u8, problem.message, "`second`") != null) {
+            found_second = true;
+        }
+        if (problem.start.line == 16 and
+            (std.mem.indexOf(u8, problem.message, "`cell`") != null or
+                std.mem.indexOf(u8, problem.message, "`other`") != null))
+        {
+            found_carrier = true;
+        }
+    }
+    try std.testing.expect(found_first);
+    try std.testing.expect(found_second);
+    try std.testing.expect(found_carrier);
+}
+
+test "stack loan ownership survives scratch teardown and allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, stackLoanOwnership, .{});
+}
+
+test "borrow headers: parser results and aggregate copies do not read pointed bytes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const Version = struct {
+        \\    major: u32 = 0,
+        \\    pre: ?[]const u8 = null,
+        \\    build: ?[]const u8 = null,
+        \\    fn parse(input: []const u8) Version { return .{ .pre = input }; }
+        \\};
+        \\pub fn initialized() Version {
+        \\    var buf: [64]u8 = [_]u8{0} ** 64;
+        \\    const ver = Version.parse(&buf);
+        \\    return ver;
+        \\}
+        \\pub fn copied() Version {
+        \\    var buf: [64]u8 = [_]u8{0} ** 64;
+        \\    const ver = Version.parse(&buf);
+        \\    var stripped = ver;
+        \\    stripped.pre = null;
+        \\    stripped.build = null;
+        \\    return stripped;
+        \\}
+        \\pub fn undefinedBytes() Version {
+        \\    var buf: [64]u8 = undefined;
+        \\    const ver = Version.parse(&buf);
+        \\    return ver;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "callee output dependencies: nested scalar writes reach the caller" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn sum(a: f64, b: f64, tail: *f64) f64 {
+        \\    const high = a + b;
+        \\    tail.* = b - (high - a);
+        \\    return high;
+        \\}
+        \\fn rounded(a: f64) f64 { return @mulAdd(f64, a, a, -a); }
+        \\fn compound(a: f64, out: *f64) f64 {
+        \\    var tail: f64 = undefined;
+        \\    const high = sum(a, rounded(a), &tail);
+        \\    out.* = high + tail;
+        \\    return high;
+        \\}
+        \\pub fn use(value: f64) f64 {
+        \\    var low: f64 = undefined;
+        \\    const high = compound(value, &low);
+        \\    low -= rounded(value);
+        \\    var correction: f64 = undefined;
+        \\    const result = sum(high, low, &correction);
+        \\    return result + correction;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "callee output dependencies: unresolved and undefined inputs retain reports" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\extern fn opaqueValue(value: f64) f64;
+        \\fn scalar(value: f64, out: *f64) void { out.* = value + 1; }
+        \\fn unknown(value: f64, out: *f64) void { out.* = opaqueValue(value); }
+        \\pub fn unsafeInput() f64 {
+        \\    var input: f64 = undefined;
+        \\    var output: f64 = undefined;
+        \\    scalar(input, &output);
+        \\    return output;
+        \\}
+        \\pub fn unsafeEffect(value: f64) f64 {
+        \\    var output: f64 = undefined;
+        \\    unknown(value, &output);
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "callee output dependencies: translated C pointer copies write both outputs" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn pair(arg_hi: [*c]f64, arg_lo: [*c]f64, arg_a: f64, arg_b: f64) void {
+        \\    @setFloatMode(.strict);
+        \\    var hi = arg_hi; _ = &hi;
+        \\    var lo = arg_lo; _ = &lo;
+        \\    var a = arg_a; _ = &a;
+        \\    var b = arg_b; _ = &b;
+        \\    hi.* = a + b;
+        \\    lo.* = b - (hi.* - a);
+        \\}
+        \\pub fn use(value: f64) f64 {
+        \\    var high: f64 = undefined;
+        \\    var low: f64 = undefined;
+        \\    pair(&high, &low, value, 2);
+        \\    return high + low;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "callee output dependencies: a rebound C pointer copy cannot initialize its old output" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn fill(out: [*c]f64, other: [*c]f64) void {
+        \\    var copied = out;
+        \\    copied = other;
+        \\    copied.* = 1;
+        \\}
+        \\pub fn bad() f64 {
+        \\    var output: f64 = undefined;
+        \\    var other: f64 = 0;
+        \\    fill(&output, &other);
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "borrow headers: undefined pointer header remains a read" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn identity(input: *const u8) *const u8 { return input; }
+        \\pub fn bad() *const u8 {
+        \\    var pointer: *const u8 = undefined;
+        \\    return identity(pointer);
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "borrow headers: undefined scalar copy remains a read" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn bad() u8 {
+        \\    var byte: u8 = undefined;
+        \\    const copied = byte;
+        \\    return copied;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "borrow headers: byvalue array call copies undefined payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn copy(input: *const [2]u8) [2]u8 { return input.*; }
+        \\pub fn bad() [2]u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    const copied = copy(&bytes);
+        \\    return copied;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array copies: readonly pointer returns preserve initialized actual payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn copy(input: *const [2]u8) [2]u8 { return input.*; }
+        \\pub fn good() u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    bytes[1] = 2;
+        \\    const copied = copy(&bytes);
+        \\    return copied[1];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array copies: readonly pointer returns retain actual source holes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn copy(input: *const [2]u8) [2]u8 { return input.*; }
+        \\pub fn bad() u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    const copied = copy(&bytes);
+        \\    return copied[1];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array extent credit: local literal supports runtime indexed reads" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn good(index: usize) u8 {
+        \\    const bytes = [_]u8{ 1, 2, 3 };
+        \\    if (index >= bytes.len) return 0;
+        \\    return bytes[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array extent credit: local literal retains undefined runtime selection" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn bad(index: usize) u8 {
+        \\    const bytes = [_]u8{ 1, undefined, 3 };
+        \\    if (index >= bytes.len) return 0;
+        \\    return bytes[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array loop payloads: literal runtime scalar enum and aggregate elements stay defined" {
+    const gpa = std.testing.allocator;
+    const sources = [_][]const u8{
+        \\pub fn read(count: usize) u8 {
+        \\    const values = [_]u8{ 1, 2 };
+        \\    if (count > values.len) return 0;
+        \\    var sum: u8 = 0;
+        \\    for (0..count) |index| sum += values[index];
+        \\    return sum;
+        \\}
+        ,
+        \\pub fn read(value: i32, count: usize) i32 {
+        \\    const values = [_]i32{ value, value };
+        \\    if (count > values.len) return 0;
+        \\    var sum: i32 = 0;
+        \\    for (0..count) |index| sum += values[index];
+        \\    return sum;
+        \\}
+        ,
+        \\const Id = enum(u32) { _ };
+        \\const Info = struct { type_id: Id };
+        \\pub fn read(self: Info, pointer: Id, external: []const Info) bool {
+        \\    const integer = self.type_id;
+        \\    const values = [_]Id{ integer, integer, pointer, pointer };
+        \\    if (external.len != values.len) return false;
+        \\    for (external, values) |actual, wanted| {
+        \\        if (actual.type_id != wanted) return false;
+        \\    }
+        \\    return true;
+        \\}
+        ,
+        \\const Operand = union(enum) { reg: u32, memory: struct { base: u32, displacement: i32 } };
+        \\const Binary = struct { dst: Operand, src: Operand };
+        \\pub fn read(base: u32, displacement: i32) u32 {
+        \\    const source: Operand = .{ .memory = .{ .base = base, .displacement = displacement } };
+        \\    const destination: Operand = .{ .memory = .{ .base = base + 1, .displacement = displacement } };
+        \\    const values = [_]Binary{
+        \\        .{ .dst = .{ .reg = 1 }, .src = source },
+        \\        .{ .dst = destination, .src = .{ .reg = 1 } },
+        \\    };
+        \\    var sum: u32 = 0;
+        \\    for (values) |value| {
+        \\        switch (value.src) { .reg => |r| sum += r, .memory => |m| sum += m.base }
+        \\    }
+        \\    return sum;
+        \\}
+        ,
+    };
+    var complete = true;
+    for (sources) |source| {
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        const defined = countRuleLines(problems.items, "use-undefined") == 0;
+        complete = complete and defined;
+    }
+    try std.testing.expect(complete);
+}
+
+test "array loop payloads: literal and aggregate holes remain undefined" {
+    const gpa = std.testing.allocator;
+    const sources = [_][]const u8{
+        \\pub fn read(value: u8, count: usize) u8 {
+        \\    const values = [_]u8{ value, undefined };
+        \\    if (count > values.len) return 0;
+        \\    var sum: u8 = 0;
+        \\    for (0..count) |index| sum += values[index];
+        \\    return sum;
+        \\}
+        ,
+        \\const Item = struct { value: u32 };
+        \\pub fn read(value: u32) u32 {
+        \\    const values = [_]Item{ .{ .value = value }, .{ .value = undefined } };
+        \\    var sum: u32 = 0;
+        \\    for (values) |item| sum += item.value;
+        \\    return sum;
+        \\}
+        ,
+    };
+    for (sources) |source| {
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "array loop payloads: only the active union field supplies initialized bytes" {
+    const gpa = std.testing.allocator;
+    const operands = [_][]const u8{ "seed", "undefined", "unknown()" };
+    for (operands, 0..) |operand, ordinal| {
+        const source = try std.fmt.allocPrint(gpa,
+            \\const Value = union(enum) {{ scalar: u32, group: struct {{ value: u32, witness: u32 }} }};
+            \\extern fn unknown() u32;
+            \\pub fn read(seed: u32) u32 {{
+            \\    const value: Value = .{{ .group = .{{ .value = {s}, .witness = seed }} }};
+            \\    const values = [_]Value{{value}};
+            \\    var sum: u32 = 0;
+            \\    for (values) |entry| {{
+            \\        switch (entry) {{ .scalar => |scalar| sum += scalar, .group => |group| sum += group.value }}
+            \\    }}
+            \\    return sum;
+            \\}}
+        , .{operand});
+        defer gpa.free(source);
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expectEqual(ordinal == 1,
+            diagnosedAt(problems.items, "use-undefined", source, "for (values)", 0));
+    }
+}
+
+test "slice loop bindings: optional external descriptors are fresh each iteration" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn scan(indices: []const usize, write_offsets: ?[]usize, copies: ?[]u8) !void {
+        \\    for (indices) |index| {
+        \\        if (copies) |storage| {
+        \\            const offsets = write_offsets orelse return error.Invalid;
+        \\            if (index >= offsets.len) return error.Invalid;
+        \\            const copy_index = offsets[index];
+        \\            if (copy_index >= storage.len) return error.Invalid;
+        \\            storage[copy_index] = 1;
+        \\            offsets[index] = copy_index + 1;
+        \\        }
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "slice loop bindings: fresh optional aliases preserve complete local backing" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn scan(indices: []const usize) !usize {
+        \\    var backing = [_]usize{ 0, 1 };
+        \\    const write_offsets: ?[]usize = backing[0..];
+        \\    var sum: usize = 0;
+        \\    for (indices) |index| {
+        \\        const offsets = write_offsets orelse return error.Invalid;
+        \\        if (index >= offsets.len) return error.Invalid;
+        \\        sum += offsets[index];
+        \\        offsets[index] = 1;
+        \\    }
+        \\    return sum;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "slice loop bindings: fresh optional aliases retain undefined local backing" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn scan(indices: []const usize) !usize {
+        \\    var backing: [2]usize = undefined;
+        \\    backing[0] = 0;
+        \\    const write_offsets: ?[]usize = backing[0..];
+        \\    var sum: usize = 0;
+        \\    for (indices) |index| {
+        \\        const offsets = write_offsets orelse return error.Invalid;
+        \\        if (index >= offsets.len) return error.Invalid;
+        \\        sum += offsets[index];
+        \\    }
+        \\    return sum;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "offsets[index]", 0));
+}
+
+test "slice stores: only defined values preserve existing complete backing" {
+    const gpa = std.testing.allocator;
+    const operands = [_][]const u8{ "1", "undefined", "unknown()" };
+    for (operands, 0..) |operand, ordinal| {
+        const source = try std.fmt.allocPrint(gpa,
+            \\extern fn unknown() usize;
+            \\pub fn read(index: usize) usize {{
+            \\    var backing = [_]usize{{ 0, 1 }};
+            \\    const view: []usize = backing[0..];
+            \\    if (index >= view.len) return 0;
+            \\    view[index] = {s};
+            \\    return backing[0];
+            \\}}
+        , .{operand});
+        defer gpa.free(source);
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expectEqual(ordinal == 1,
+            diagnosedAt(problems.items, "use-undefined", source, "return backing[0]", 0));
+    }
+}
+
+test "loop bindings: a zero-trip loop does not initialize an outer scalar return" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn eat(count: usize) u8 {
+        \\    var value: u8 = undefined;
+        \\    var counter: usize = 0;
+        \\    while (counter < count) : (counter += 1) value = 1;
+        \\    return value;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+}
+
+test "array extent credit: local alias copy supports runtime indexed reads" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn good(index: usize) u8 {
+        \\    const bytes = [_]u8{ 1, 2, 3 };
+        \\    const alias = bytes;
+        \\    const copied = alias;
+        \\    if (index >= copied.len) return 0;
+        \\    return copied[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array extent credit: local alias copies preserve undefined holes" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn bad(index: usize) u8 {
+        \\    const bytes = [_]u8{ 1, undefined, 3 };
+        \\    const alias = bytes;
+        \\    const copied = alias;
+        \\    if (index >= copied.len) return 0;
+        \\    return copied[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return copied[index]", 0));
+}
+
+test "array extent credit: full exact writes support runtime indexed reads" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn good(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[2] = 3;
+        \\    bytes[0] = 1;
+        \\    bytes[1] = 2;
+        \\    if (index >= bytes.len) return 0;
+        \\    return bytes[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array extent credit: sparse exact writes do not cover a runtime hole" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn bad(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[2] = 3;
+        \\    bytes[0] = 1;
+        \\    if (index >= bytes.len) return 0;
+        \\    return bytes[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array extent credit: full indexed input defines its stored scalar" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn good(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    bytes[1] = 2;
+        \\    bytes[2] = 3;
+        \\    if (index >= bytes.len) return 0;
+        \\    const selected = bytes[index];
+        \\    var output: [1]u8 = undefined;
+        \\    output[0] = selected;
+        \\    return output[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array extent credit: indexed input with a hole does not define its stored scalar" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn bad(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    bytes[2] = 3;
+        \\    if (index >= bytes.len) return 0;
+        \\    const selected = bytes[index];
+        \\    var output: [1]u8 = undefined;
+        \\    output[0] = selected;
+        \\    return output[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array values: returned aggregate fields preserve defined payload" {
+    const gpa = std.testing.allocator;
+    var good = try analyzeWithZls(gpa,
+        \\const Result = struct { origin: [2]f32, node: ?usize };
+        \\fn resolve(value: f32) Result { return .{ .origin = .{ value, 0 }, .node = null }; }
+        \\pub fn good(value: f32) f32 {
+        \\    const result = resolve(value);
+        \\    const origin = result.origin;
+        \\    return origin[0] + origin[1];
+        \\}
+    );
+    defer freeProblems(gpa, &good);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(good.items, "use-undefined"));
+    var bad = try analyzeWithZls(gpa,
+        \\const Result = struct { origin: [2]f32 };
+        \\fn resolve(value: f32) Result { return .{ .origin = .{ value, undefined } }; }
+        \\pub fn bad(value: f32) f32 {
+        \\    const result = resolve(value);
+        \\    const origin = result.origin;
+        \\    return origin[1];
+        \\}
+    );
+    defer freeProblems(gpa, &bad);
+    try std.testing.expect(countRuleLines(bad.items, "use-undefined") != 0);
+}
+
+test "array values: uninstantiated comptime callbacks remain conservative" {
+    const gpa = std.testing.allocator;
+    var uninstantiated = try analyzeWithZls(gpa,
+        \\fn mapped(comptime convert: fn ([4]f32) [4]f32, input: [4]f32) f32 {
+        \\    const converted = convert(input);
+        \\    return converted[0] + converted[1] + converted[2] + converted[3];
+        \\}
+        \\fn identity(input: [4]f32) [4]f32 { return input; }
+        \\pub fn selected(input: [4]f32) f32 { return mapped(identity, input); }
+    );
+    defer freeProblems(gpa, &uninstantiated);
+    // An unresolved generic callback result is unknown, not undefined.
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(uninstantiated.items, "use-undefined"));
+    var bad = try analyzeWithZls(gpa,
+        \\fn mapped(comptime convert: fn ([4]f32) [4]f32, input: [4]f32) f32 {
+        \\    const converted = convert(input);
+        \\    return converted[3];
+        \\}
+        \\fn partial(input: [4]f32) [4]f32 { return .{ input[0], input[1], input[2], undefined }; }
+        \\pub fn bad(input: [4]f32) f32 { return mapped(partial, input); }
+    );
+    defer freeProblems(gpa, &bad);
+    try std.testing.expect(countRuleLines(bad.items, "use-undefined") != 0);
+}
+
+test "array values: integer pointer factory does not certify undefined backing" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Ref = struct {
+        \\    address: usize,
+        \\    fn deref(self: Ref, comptime T: type) *T { return @ptrFromInt(self.address); }
+        \\};
+        \\pub fn unknownBacking() u64 {
+        \\    var original: [2]u64 = undefined;
+        \\    original[0] = 11;
+        \\    const reference: Ref = .{ .address = @intFromPtr(&original) };
+        \\    const copied = reference.deref([2]u64).*;
+        \\    return copied[1];
+        \\}
+        \\pub fn bad() u64 {
+        \\    var original: [2]u64 = undefined;
+        \\    original[0] = 11;
+        \\    return original[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return copied[1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return original[1]", 0));
+}
+
+test "array values: opaque extern pointer result does not certify slice payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithReturnCertificate(gpa,
+        \\const Step = extern struct { kind: u32, value: u32 };
+        \\extern fn steps(count: *u32) [*c]const Step;
+        \\pub fn bad() u32 {
+        \\    var count: u32 = 0;
+        \\    const pointer = steps(&count);
+        \\    if (count == 0) return 0;
+        \\    const slice = pointer[0..count];
+        \\    return slice[0].value;
+        \\}
+    , "bad", false);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array values: bounded modulo selection transports nested call payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn color(input: [4]f32) [4]f32 { return input; }
+        \\pub fn stripe(index: usize) f32 {
+        \\    const stripes = [_][4]f32{
+        \\        color(.{ 1, 0, 0, 1 }),
+        \\        color(.{ 0, 1, 0, 1 }),
+        \\    };
+        \\    const result = stripes[index % 2];
+        \\    return result[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array values: arithmetic after remainder retains the actually selected hole" {
+    const gpa = std.testing.allocator;
+    var diagnosed = true;
+    for ([_][]const u8{
+        \\pub fn read(selector: usize) u8 {
+        \\    const data: [2]u8 = .{ 7, undefined };
+        \\    return data[selector % 2 * 0 + 1];
+        \\}
+        ,
+        \\pub fn lookup(position: u16) u64 {
+        \\    const cells: [2]u64 = .{ 19, undefined };
+        \\    return cells[position % 2 * 0 + 1];
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        // Multiplication and addition follow the remainder: both select
+        // the undefined slot one, not the initialized slot zero.
+        diagnosed = diagnosed and countRuleLines(problems.items, "use-undefined") != 0;
+    }
+    try std.testing.expect(diagnosed);
+}
+
+test "array values: modulo selection retains undefined selector and nested holes" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        \\fn color(input: [4]f32) [4]f32 { return input; }
+        \\pub fn stripe() f32 {
+        \\    const stripes = [_][4]f32{
+        \\        color(.{ 1, 0, 0, 1 }),
+        \\        color(.{ 0, 1, 0, 1 }),
+        \\    };
+        \\    const index: usize = undefined;
+        \\    const result = stripes[index % 2];
+        \\    return result[0];
+        \\}
+        ,
+        \\fn color(input: [4]f32) [4]f32 { return input; }
+        \\pub fn stripe(index: usize) f32 {
+        \\    const stripes = [_][4]f32{
+        \\        color(.{ 1, 0, 0, 1 }),
+        \\        color(.{ undefined, 1, 0, 1 }),
+        \\    };
+        \\    const result = stripes[index % 2];
+        \\    return result[0];
+        \\}
+        ,
+        \\fn color(input: [4]f32) [4]f32 { return input; }
+        \\pub fn stripe(index: usize) f32 {
+        \\    const stripes = [_][4]f32{
+        \\        color(.{ 1, 0, 0, 1 }),
+        \\        color(.{ undefined, 1, 0, 1 }),
+        \\    };
+        \\    const result = stripes[index % 3];
+        \\    return result[0];
+        \\}
+        ,
+        \\fn color(input: [4]f32) [4]f32 { return input; }
+        \\pub fn stripe(index: usize) f32 {
+        \\    const stripes = [_][4]f32{
+        \\        color(.{ 1, 0, 0, 1 }),
+        \\        color(.{ undefined, 1, 0, 1 }),
+        \\    };
+        \\    const result = stripes[index / 2];
+        \\    return result[0];
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        const selection = if (std.mem.indexOf(u8, source, "stripes[index / 2]") != null)
+            "stripes[index / 2]"
+        else if (std.mem.indexOf(u8, source, "stripes[index % 3]") != null)
+            "stripes[index % 3]"
+        else
+            "stripes[index % 2]";
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, selection, 0));
+    }
+}
+
+test "array values: namespace literal aliases preserve nested payload" {
+    const gpa = std.testing.allocator;
+    var good = try analyzeWithZls(gpa,
+        \\const data = struct { const table = [2][3]u64{ .{ 1, 2, 3 }, .{ 4, 5, 6 } }; };
+        \\pub fn good(index: usize) u64 {
+        \\    const table = data.table;
+        \\    return table[index % 2][1];
+        \\}
+    );
+    defer freeProblems(gpa, &good);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(good.items, "use-undefined"));
+    var bad = try analyzeWithZls(gpa,
+        \\const data = struct { const table = [2]u64{ 1, undefined }; };
+        \\pub fn bad() u64 {
+        \\    const table = data.table;
+        \\    return table[1];
+        \\}
+    );
+    defer freeProblems(gpa, &bad);
+    try std.testing.expect(countRuleLines(bad.items, "use-undefined") != 0);
+}
+
+test "array values: namespace runtime table load defines exact destination slot" {
+    const gpa = std.testing.allocator;
+    var good = try analyzeWithZls(gpa,
+        \\const data = struct { const table = [5]u64{ 1, 2, 3, 4, 5 }; };
+        \\pub fn good(index: usize) u64 {
+        \\    var values: [2]u64 = undefined;
+        \\    values[0] = data.table[index % 5];
+        \\    return values[0];
+        \\}
+    );
+    defer freeProblems(gpa, &good);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(good.items, "use-undefined"));
+    for ([_][]const u8{
+        \\const data = struct { const table = [5]u64{ 1, 2, 3, 4, undefined }; };
+        \\pub fn bad(index: usize) u64 {
+        \\    var values: [2]u64 = undefined;
+        \\    values[0] = data.table[index % 5];
+        \\    return values[0];
+        \\}
+        ,
+        \\const data = struct { const table = [5]u64{ 1, 2, 3, 4, 5 }; };
+        \\pub fn bad() u64 {
+        \\    const index: usize = undefined;
+        \\    var values: [2]u64 = undefined;
+        \\    values[0] = data.table[index];
+        \\    return values[0];
+        \\}
+        ,
+    }) |source| {
+        var bad = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &bad);
+        try std.testing.expect(countRuleLines(bad.items, "use-undefined") != 0);
+    }
+}
+
+test "immutable table payload: selected undefined elements and selectors retain their origins" {
+    const gpa = std.testing.allocator;
+    var good = try analyzeWithZls(gpa,
+        \\const data = struct { const table = [2][2]u8{ .{1, 2}, .{3, 4} }; };
+        \\pub fn good(index: usize) u8 {
+        \\    var out: [1]u8 = undefined;
+        \\    out[0] = data.table[index % 2][index % 2];
+        \\    return out[0];
+        \\}
+    );
+    defer freeProblems(gpa, &good);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(good.items, "use-undefined"));
+    for ([_][]const u8{
+        \\const data = struct { const table = [2][2]u8{ .{1, 2}, .{undefined, 4} }; };
+        \\pub fn bad(index: usize) u8 {
+        \\    var out: [1]u8 = undefined;
+        \\    out[0] = data.table[index % 3][0];
+        \\    return out[0];
+        \\}
+        ,
+        \\const data = struct { const table = [2][2]u8{ .{1, 2}, .{3, undefined} }; };
+        \\pub fn bad(index: usize) u8 {
+        \\    var out: [1]u8 = undefined;
+        \\    out[0] = data.table[index % 2][index % 3];
+        \\    return out[0];
+        \\}
+        ,
+        \\const data = struct { const table = [2][2]u8{ .{1, 2}, .{undefined, 4} }; };
+        \\pub fn bad(index: usize) u8 {
+        \\    var out: [1]u8 = undefined;
+        \\    out[0] = data.table[index][0];
+        \\    return out[0];
+        \\}
+        ,
+        \\const data = struct { const table = [2][2]u8{ .{1, 2}, .{3, 4} }; };
+        \\pub fn bad() u8 {
+        \\    const index: usize = undefined;
+        \\    var out: [1]u8 = undefined;
+        \\    out[0] = data.table[index % 2][0];
+        \\    return out[0];
+        \\}
+        ,
+    }) |source| {
+        var bad = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &bad);
+        try std.testing.expect(diagnosedAt(bad.items, "use-undefined", source, "return out[0]", 0));
+    }
+}
+
+test "array payload casts: undefined sentinel storage cannot initialize bitcast bytes" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn bad() u8 {
+        \\    var input: [2:0]u8 = .{1, 2};
+        \\    input[2] = undefined;
+        \\    const bytes: [3]u8 = @bitCast(input);
+        \\    return bytes[2];
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[2]", 0));
+}
+
+test "array payload casts: layout-changing copies require a complete source certificate" {
+    const gpa = std.testing.allocator;
+    var good = try analyzeWithZls(gpa,
+        \\pub fn good() u8 {
+        \\    const input = [2]u32{1, 2};
+        \\    const bytes: [8]u8 = @bitCast(input);
+        \\    return bytes[7];
+        \\}
+        \\pub fn assigned() u8 {
+        \\    const input = [2]u32{1, 2};
+        \\    var bytes: [8]u8 = undefined;
+        \\    bytes = @bitCast(input);
+        \\    return bytes[7];
+        \\}
+    );
+    defer freeProblems(gpa, &good);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(good.items, "use-undefined"));
+    for ([_][]const u8{
+        \\pub fn bad() u8 {
+        \\    var input: [2]u32 = undefined;
+        \\    input[0] = 1;
+        \\    const bytes: [8]u8 = @bitCast(input);
+        \\    return bytes[0];
+        \\}
+        ,
+        \\pub fn bad() u8 {
+        \\    var input: [2]u32 = undefined;
+        \\    input[0] = 1;
+        \\    var bytes: [8]u8 = .{0} ** 8;
+        \\    bytes = @bitCast(input);
+        \\    return bytes[0];
+        \\}
+        ,
+        \\const Item = extern struct { a: u8, b: u16 };
+        \\pub fn bad() u32 {
+        \\    const input = [2]Item{ .{ .a = 1, .b = 2 }, .{ .a = 3, .b = 4 } };
+        \\    const bytes: [2]u32 = @bitCast(input);
+        \\    return bytes[0];
+        \\}
+        ,
+    }, 0..) |source, ordinal| {
+        var bad = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &bad);
+        try std.testing.expectEqual(ordinal < 2, diagnosedAt(bad.items, "use-undefined", source, "return bytes[0]", 0));
+    }
+}
+
+test "external slice headers: a view of caller-owned storage is defined, local undefined storage is not" {
+    const gpa = std.testing.allocator;
+    var external = try analyze(gpa,
+        \\const Buffer = struct {
+        \\    items: []u8,
+        \\    fn view(self: *const Buffer) []u8 { return self.items; }
+        \\};
+        \\pub fn field(buffer: *const Buffer) u8 {
+        \\    const bytes = buffer.items;
+        \\    return bytes[0];
+        \\}
+        \\pub fn call(buffer: *const Buffer) u8 {
+        \\    const bytes = buffer.view();
+        \\    return bytes[0];
+        \\}
+        \\pub fn offset(buffer: *const Buffer) u8 {
+        \\    const bytes = buffer.items[1..];
+        \\    return bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &external);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(external.items, "use-undefined"));
+
+    var local = try analyze(gpa,
+        \\pub fn bad() u8 {
+        \\    var buf: [4]u8 = undefined;
+        \\    return buf[1];
+        \\}
+        \\pub fn header() u8 {
+        \\    var bytes: []u8 = undefined;
+        \\    return bytes[0];
+        \\}
+    );
+    defer freeProblems(gpa, &local);
+    try std.testing.expectEqual(@as(usize, 2), countRuleLines(local.items, "use-undefined"));
+}
+
+test "external slice headers: an unmodelled index offset does not make caller-owned bytes undefined" {
+    const gpa = std.testing.allocator;
+    var external = try analyze(gpa,
+        \\const Buffer = struct {
+        \\    items: []u8,
+        \\    fn view(self: *const Buffer) []u8 { return self.items; }
+        \\};
+        \\pub fn offsets(buffer: *const Buffer, t: usize) bool {
+        \\    const bytes = buffer.view();
+        \\    if (bytes[t] != 1) return false;
+        \\    if (bytes[t + 1] != 1) return false;
+        \\    if (bytes[t + 2] != 1) return false;
+        \\    return bytes[t + 3] == 1 and bytes[t + 4] == 1;
+        \\}
+        \\pub fn sum(buffer: *const Buffer, t: usize, u: usize) u8 {
+        \\    const bytes = buffer.items;
+        \\    return bytes[t + u];
+        \\}
+    );
+    defer freeProblems(gpa, &external);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(external.items, "use-undefined"));
+
+    var local = try analyze(gpa,
+        \\pub fn bad(n: usize) u8 {
+        \\    var buf: [4]u8 = undefined;
+        \\    const bytes: []const u8 = buf[0..n];
+        \\    return bytes[n + 2];
+        \\}
+        \\pub fn header() u8 {
+        \\    var bytes: []const u8 = undefined;
+        \\    return bytes[2];
+        \\}
+    );
+    defer freeProblems(gpa, &local);
+    try std.testing.expectEqual(@as(usize, 2), countRuleLines(local.items, "use-undefined"));
+}
+
+test "array copies: byvalue parameters supply initialized payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn declared(source: [2]u8) u8 {
+        \\    const copy = source;
+        \\    return copy[1];
+        \\}
+        \\pub fn assigned(source: [2]u8) u8 {
+        \\    var copy: [2]u8 = undefined;
+        \\    copy = source;
+        \\    return copy[1];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array copies: tracked source holes survive declaration and assignment" {
+    const gpa = std.testing.allocator;
+    const sources = [_][]const u8{
+        \\pub fn declared() u8 {
+        \\    var source: [2]u8 = undefined;
+        \\    source[0] = 1;
+        \\    const copy = source;
+        \\    return copy[1];
+        \\}
+        ,
+        \\pub fn assigned() u8 {
+        \\    var source: [2]u8 = undefined;
+        \\    source[0] = 1;
+        \\    var copy: [2]u8 = undefined;
+        \\    copy = source;
+        \\    return copy[1];
+        \\}
+        ,
+    };
+    for (sources) |source| {
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "array copies: opaque alias writes remain silent without proved-undefined bytes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithReturnCertificate(gpa,
+        \\const S = struct { bytes: [2]u8 };
+        \\extern fn mutate(value: *S) void;
+        \\pub fn bad() u8 {
+        \\    var owner = S{ .bytes = .{ 1, 2 } };
+        \\    const alias = &owner;
+        \\    mutate(alias);
+        \\    const copy = owner.bytes;
+        \\    return copy[1];
+        \\}
+    , "bad", false);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array coverage: std mem optimization barrier preserves initialized elements" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\pub fn afterOpaque(a: u32, b: u32, c: u32) u32 {
+        \\    var inputs = [_]u32{ a, b, c };
+        \\    std.mem.doNotOptimizeAway(&inputs);
+        \\    return inputs[0] ^ inputs[1] ^ inputs[2];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array coverage: aliased std mem optimization barrier remains read only" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const barrier = std.mem.doNotOptimizeAway;
+        \\pub fn afterAlias(a: u32, b: u32) u32 {
+        \\    var inputs = [_]u32{ a, b };
+        \\    const pointer = &inputs;
+        \\    barrier(pointer);
+        \\    return inputs[0] ^ inputs[1];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array coverage: std mem optimization barrier does not initialize holes" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\pub fn holes(value: u32) u32 {
+        \\    var inputs: [2]u32 = .{ value, undefined };
+        \\    std.mem.doNotOptimizeAway(&inputs);
+        \\    const initialized = inputs[0];
+        \\    const missing = inputs[1];
+        \\    return initialized ^ missing;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "inputs[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "inputs[1]", 0));
+}
+
+test "array coverage: a local optimization barrier lookalike can mutate payload" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = struct {
+        \\    const mem = struct {
+        \\        fn doNotOptimizeAway(pointer: anytype) void {
+        \\            pointer.* = undefined;
+        \\        }
+        \\    };
+        \\};
+        \\pub fn shadow(value: u32) u32 {
+        \\    var inputs = [_]u32{value};
+        \\    std.mem.doNotOptimizeAway(&inputs);
+        \\    return inputs[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array coverage: unresolved mutable pointer calls do not prove undefined bytes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithReturnCertificate(gpa,
+        \\pub fn opaqueValue(value: u32, mutate: *const fn (*[1]u32) void) u32 {
+        \\    var inputs = [_]u32{value};
+        \\    mutate(&inputs);
+        \\    return inputs[0];
+        \\}
+    , "opaqueValue", false);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array coverage: unresolved mutable alias calls do not prove undefined bytes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithReturnCertificate(gpa,
+        \\pub fn opaqueValue(value: u32, mutate: *const fn (*[1]u32) void) u32 {
+        \\    var inputs = [_]u32{value};
+        \\    const pointer = &inputs;
+        \\    mutate(pointer);
+        \\    return inputs[0];
+        \\}
+    , "opaqueValue", false);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "borrow headers: opaque writes do not undefine the alias pointer" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const S = struct { bytes: [2]u8 };
+        \\extern fn mutate(value: *S) void;
+        \\pub fn headers() bool {
+        \\    var owner = S{ .bytes = .{ 1, 2 } };
+        \\    const alias = &owner;
+        \\    mutate(alias);
+        \\    return alias == &owner;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "borrow headers: canonical call retains local arena death" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const std = @import("std");
+        \\const Ctx = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
+        \\    fn text(self: *const Ctx) []const u8 { return self.bytes; }
+        \\};
+        \\fn wrap(context: *const Ctx) []const u8 { return context.text(); }
+        \\pub fn bad() u8 {
+        \\    var owner = Ctx{ .inner = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        \\    owner.bytes = owner.inner.allocator().dupe(u8, "borrowed") catch unreachable;
+        \\    const header = wrap(&owner);
+        \\    owner.inner.deinit();
+        \\    return header[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "arena-use-after-kill") != 0);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
 test "indexed fill: an array-literal source fills the declared array" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
@@ -5005,7 +7380,7 @@ test "indexed fill: a second mention of the target in the body does not prove it
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
-test "indexed fill: a runtime for over the same source does not prove the target" {
+test "indexed fill: a runtime for over an independently fixed source proves the target" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const specs = [_]u8{ 7, 8, 9 };
@@ -5018,7 +7393,7 @@ test "indexed fill: a runtime for over the same source does not prove the target
         \\}
     );
     defer freeProblems(gpa, &problems);
-    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
 }
 
 test "indexed fill: a mutable source carries no immutable length binding" {
@@ -5637,10 +8012,8 @@ test "counter fill: one loop with a manual counter is not the nested proof" {
         \\}
     );
     defer freeProblems(gpa, &problems);
-    // There is no PRODUCT here — the count is the one loop's, and a
-    // single element per iteration is the indexed proof's business,
-    // which declines a runtime loop.  Widening that is not this
-    // proof's to do.
+    // The indexed proof needs the loop's own index capture. A separate
+    // mutable counter is not an enumeration certificate.
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
@@ -6004,6 +8377,739 @@ test "pointer capture fill: a write behind a conditional does not prove the targ
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
+// Successful natural exhaustion proves only the slots each iteration stores.
+test "natural loop fill: fallible fixed array stores complete only on success" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn create(n: usize) !usize { return n; }
+        \\pub fn build() ![3]usize {
+        \\    var values: [3]usize = undefined;
+        \\    var done: usize = 0;
+        \\    errdefer { for (values[0..done]) |value| { _ = value; } }
+        \\    while (done < values.len) : (done += 1) {
+        \\        values[done] = try create(done);
+        \\    }
+        \\    return values;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "natural loop fill: error cleanup cannot read the complete array" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn create(n: usize) !usize { return n; }
+        \\pub fn build() ![3]usize {
+        \\    var values: [3]usize = undefined;
+        \\    var done: usize = 0;
+        \\    errdefer { _ = values; }
+        \\    while (done < 3) : (done += 1) values[done] = try create(done);
+        \\    return values;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+
+test "natural loop fill: conditional undefined skipped and unknown-bound stores stay unsafe" {
+    const gpa = std.testing.allocator;
+    const bodies = [_][]const u8{
+        "while (i < 3) : (i += 1) { if (flag) values[i] = try create(i); }",
+        "while (i < 3) : (i += 2) values[i] = try create(i);",
+        "while (i < 3) : (i += 1) values[i] = undefined;",
+        "while (i < bound) : (i += 1) values[i] = try create(i);",
+        "while (i < 3) : (i += 1) { values[i] = try create(i); if (flag) break; }",
+    };
+    for (bodies) |body| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "fn create(n: usize) !usize {{ return n; }} " ++
+                "pub fn build(flag: bool, bound: usize) ![3]usize {{ " ++
+                "var values: [3]usize = undefined; var i: usize = 0; {s} return values; }}",
+            .{body},
+        );
+        defer gpa.free(source);
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "enum value fill: implicit and explicit zero tags cover every array slot" {
+    const gpa = std.testing.allocator;
+    const declarations = [_][]const u8{
+        "enum { entry, add, exit }",
+        "enum(u8) { entry = 0, add, exit }",
+        "enum(u8) { entry = 0, add = 1, exit = 2 }",
+    };
+    var complete = true;
+    for (declarations) |declaration| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Op = {s}; " ++
+                "pub fn build() [std.meta.fields(Op).len]u8 {{ " ++
+                "var result: [std.meta.fields(Op).len]u8 = undefined; " ++
+                "inline for (std.meta.fields(Op)) |field| {{ result[field.value] = 1; }} " ++
+                "return result; }}",
+            .{declaration},
+        );
+        defer gpa.free(source);
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        complete = complete and countRuleLines(problems.items, "use-undefined") == 0;
+    }
+    try std.testing.expect(complete);
+}
+
+test "enum value fill: gaps nonzero starts and duplicate tags cannot prove coverage" {
+    const gpa = std.testing.allocator;
+    const declarations = [_][]const u8{
+        "enum(u8) { entry = 0, add = 2, exit = 3 }",
+        "enum(u8) { entry = 1, add, exit }",
+        "enum(u8) { entry = 0, add = 0, exit = 2 }",
+    };
+    for (declarations) |declaration| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Op = {s}; " ++
+                "pub fn build() [3]u8 {{ var result: [3]u8 = undefined; " ++
+                "inline for (std.meta.fields(Op)) |field| {{ result[field.value] = 1; }} " ++
+                "return result; }}",
+            .{declaration},
+        );
+        defer gpa.free(source);
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "enum value fill: undefined conditional break and repeated indices stay unsafe" {
+    const gpa = std.testing.allocator;
+    const bodies = [_][]const u8{
+        "result[field.value] = undefined;",
+        "if (flag) result[field.value] = 1;",
+        "result[field.value] = 1; if (flag) break;",
+        "result[field.value] = 1; if (flag) continue;",
+        "result[0] = 1;",
+        "result[field.value] = 1; result[field.value] = 2;",
+    };
+    for (bodies) |body| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Op = enum {{ entry = 0, add, exit }}; " ++
+                "pub fn build(flag: bool) [3]u8 {{ var result: [3]u8 = undefined; " ++
+                "inline for (std.meta.fields(Op)) |field| {{ {s} }} return result; }}",
+            .{body},
+        );
+        defer gpa.free(source);
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "enum value fill: runtime sources erased before the loop remain undefined" {
+    const gpa = std.testing.allocator;
+    const sources = [_][]const u8{
+        "var source: u8 = 1; source = undefined;",
+        "var source: u8 = 1; if (flag) source = undefined;",
+    };
+    for (sources) |source| {
+        const text = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Op = enum {{ entry = 0, add, exit }}; " ++
+                "pub fn build(flag: bool) [3]u8 {{ {s} var result: [3]u8 = undefined; " ++
+                "inline for (std.meta.fields(Op)) |field| {{ result[field.value] = source; }} " ++
+                "return result; }}",
+            .{source},
+        );
+        defer gpa.free(text);
+        var problems = try analyze(gpa, text);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "enum value fill: mutable per-iteration sources do not inherit enum proof" {
+    const gpa = std.testing.allocator;
+    const bodies = [_][]const u8{
+        "var op: Op = @enumFromInt(field.value); op = undefined; " ++
+            "result[field.value] = @intFromEnum(op);",
+        "var op: Op = @enumFromInt(field.value); if (flag) op = undefined; " ++
+            "result[field.value] = @intFromEnum(op);",
+    };
+    for (bodies) |body| {
+        const text = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Op = enum(u8) {{ entry = 0, add, exit }}; " ++
+                "pub fn build(flag: bool) [3]u8 {{ var result: [3]u8 = undefined; " ++
+                "inline for (std.meta.fields(Op)) |field| {{ {s} }} return result; }}",
+            .{body},
+        );
+        defer gpa.free(text);
+        var problems = try analyze(gpa, text);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "enum value fill: immutable per-iteration enum conversion is defined" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Op = enum(u8) { entry = 0, add, exit };
+        \\pub fn build() [3]u8 {
+        \\    var result: [3]u8 = undefined;
+        \\    inline for (std.meta.fields(Op)) |field| {
+        \\        const op: Op = @enumFromInt(field.value);
+        \\        result[field.value] = @intFromEnum(op);
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "enum value fill: a smaller enum cannot define a larger array" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Op = enum { entry = 0, exit };
+        \\pub fn build() [3]u8 {
+        \\    var result: [3]u8 = undefined;
+        \\    inline for (std.meta.fields(Op)) |field| result[field.value] = 1;
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+
+test "enum value fill: a shadowed std namespace cannot certify an enumeration" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Op = enum { entry, add, exit };
+        \\const std = struct {
+        \\    const meta = struct {
+        \\        fn fields(comptime T: type) [1]struct { value: usize } {
+        \\            _ = T;
+        \\            return .{.{ .value = 0 }};
+        \\        }
+        \\    };
+        \\};
+        \\pub fn build() [3]u8 {
+        \\    var result: [3]u8 = undefined;
+        \\    inline for (std.meta.fields(Op)) |field| result[field.value] = 1;
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+
+test "natural loop fill: runtime source coverage cannot be replaced by its first slot" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\extern fn mutate(values: *[3]u8) void;
+        \\pub fn hole() [3]u8 {
+        \\    var source = [_]u8{ 1, 2, 3 };
+        \\    source[1] = undefined;
+        \\    var output: [3]u8 = undefined;
+        \\    for (source, 0..) |value, i| output[i] = value;
+        \\    return output;
+        \\}
+        \\pub fn opaqueValue() [3]u8 {
+        \\    var source = [_]u8{ 1, 2, 3 };
+        \\    mutate(&source);
+        \\    var output: [3]u8 = undefined;
+        \\    for (source, 0..) |value, i| output[i] = value;
+        \\    return output;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return output", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return output", 1));
+}
+
+test "natural loop fill: enum reflection counts actual fields for runtime enumeration" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Icon = enum(u8) { a = 2, b = 9, c = 17 };
+        \\const count = @typeInfo(Icon).@"enum".fields.len;
+        \\const documents = [_][]const u8{ "a", "b", "c" };
+        \\pub fn build() [count]usize {
+        \\    var values: [count]usize = undefined;
+        \\    for (documents, 0..) |document, index| values[index] = document.len;
+        \\    return values;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "natural loop fill: enum reflection never guesses a missing field" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Icon = enum { a, b, c, d };
+        \\const count = @typeInfo(Icon).@"enum".fields.len;
+        \\const documents = [_]u8{ 1, 2, 3 };
+        \\pub fn build() [count]u8 {
+        \\    var values: [count]u8 = undefined;
+        \\    for (documents, 0..) |document, index| values[index] = document;
+        \\    return values;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+
+test "natural loop fill: an asserted fixed array length does not read undefined elements" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn check(input: []const u8) usize {
+        \\    const sections: [4]u8 = undefined;
+        \\    std.debug.assert(input.len == sections.len);
+        \\    return sections.len;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "natural loop fill: canonical immediate assertion certifies a runtime member extent" {
+    const gpa = std.testing.allocator;
+    const conditions = [_][]const u8{
+        "image.sections.len == sections.len",
+        "sections.len == image.sections.len",
+    };
+    for (conditions) |condition| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Counts = struct {{ relocation_count: usize }}; " ++
+                "const Image = struct {{ sections: []const usize }}; " ++
+                "pub fn build(image: *const Image) [4]Counts {{ " ++
+                "var sections: [4]Counts = undefined; std.debug.assert({s}); " ++
+                "for (image.sections, 0..) |section, index| sections[index] = .{{ .relocation_count = section }}; " ++
+                "sections[1].relocation_count += 1; return sections; }}",
+            .{condition},
+        );
+        defer gpa.free(source);
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+    }
+}
+
+test "natural loop fill: absent unrelated and stale assertions cannot certify runtime extent" {
+    const gpa = std.testing.allocator;
+    const assertions = [_][]const u8{
+        "",
+        "std.debug.assert(image.other.len == sections.len);",
+        "std.debug.assert(image.sections.len == other.len);",
+        "std.debug.assert(image.sections.len != sections.len);",
+        "std.debug.assert(image.sections.len == sections.len); _ = image;",
+        "if (flag) std.debug.assert(image.sections.len == sections.len);",
+        "std.debug.assert(image.sections.len == 3);",
+    };
+    for (assertions) |assertion| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\"); const Image = struct {{ sections: []const usize, other: []const usize }}; " ++
+                "pub fn build(image: *const Image, flag: bool) [4]usize {{ " ++
+                "var sections: [4]usize = undefined; const other: [4]usize = .{{ 0, 0, 0, 0 }}; {s} " ++
+                "for (image.sections, 0..) |section, index| sections[index] = section; " ++
+                "return sections; }}",
+            .{assertion},
+        );
+        defer gpa.free(source);
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "natural loop fill: spoofed std assertion and std parameter cannot certify runtime extent" {
+    const gpa = std.testing.allocator;
+    const declarations = [_][]const u8{
+        "const std = struct { const debug = struct { fn assert(_: bool) void {} }; }; pub fn build(input: []const usize)",
+        "const std = @import(\"std\"); const Fake = struct { const debug = struct { fn assert(_: bool) void {} }; }; pub fn build(std: Fake, input: []const usize)",
+        "const std = @import(\"not-std\"); pub fn build(input: []const usize)",
+    };
+    for (declarations) |declaration| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "{s} [4]usize {{ var sections: [4]usize = undefined; " ++
+                "std.debug.assert(input.len == sections.len); " ++
+                "for (input, 0..) |value, index| sections[index] = value; return sections; }}",
+            .{declaration},
+        );
+        defer gpa.free(source);
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "natural loop fill: countdown preserves an immutable initialized prefix" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn sum(shape: []const u32) !usize {
+        \\    const rank = shape.len;
+        \\    if (rank > 8) return error.TooLarge;
+        \\    var values: [8]usize = undefined;
+        \\    var stride: usize = 1;
+        \\    var axis = rank;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        values[axis] = stride;
+        \\        stride *= shape[axis];
+        \\    }
+        \\    var result: usize = 0;
+        \\    for (0..rank) |i| result += values[i];
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "natural loop fill: countdown does not define its uncovered suffix" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn build(rank: usize) ![8]usize {
+        \\    if (rank > 8) return error.TooLarge;
+        \\    var values: [8]usize = undefined;
+        \\    var axis = rank;
+        \\    while (axis > 0) { axis -= 1; values[axis] = 1; }
+        \\    return values;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+
+test "natural loop fill: successful countdown helper preserves prefix and suffix" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\fn strides(shape: []const u32, out: *[8]usize) !void {
+        \\    if (shape.len > 8) return error.TooLarge;
+        \\    var stride: usize = 1;
+        \\    var axis = shape.len;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        out[axis] = stride;
+        \\        stride *= shape[axis];
+        \\    }
+        \\}
+        \\pub fn sum(shape: []const u32) !usize {
+        \\    var values: [8]usize = undefined;
+        \\    try strides(shape, &values);
+        \\    var result: usize = 0;
+        \\    for (shape, 0..) |_, i| result += values[i];
+        \\    _ = values[7];
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "values[i]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[7]", 0));
+}
+
+test "natural loop fill: ordinary countdown helper credits only its prefix" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\fn strides(shape: []const u32, out: *[8]usize) void {
+        \\    var stride: usize = 1;
+        \\    var axis = shape.len;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        out[axis] = stride;
+        \\        stride *= shape[axis];
+        \\    }
+        \\}
+        \\pub fn sum(shape: []const u32) usize {
+        \\    var values: [8]usize = undefined;
+        \\    strides(shape, &values);
+        \\    var result: usize = 0;
+        \\    for (shape, 0..) |_, i| result += values[i];
+        \\    _ = values[7];
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "values[i]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[7]", 0));
+}
+
+test "natural loop fill: countdown helper error path receives no prefix" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\fn strides(shape: []const u32, out: *[8]usize) !void {
+        \\    if (shape.len > 8) return error.TooLarge;
+        \\    var stride: usize = 1;
+        \\    var axis = shape.len;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        out[axis] = stride;
+        \\        stride *= shape[axis];
+        \\    }
+        \\}
+        \\pub fn inspect(shape: []const u32) usize {
+        \\    var values: [8]usize = undefined;
+        \\    strides(shape, &values) catch return values[0];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[0]", 0));
+}
+
+test "natural loop fill: countdown helper early success cannot certify stores" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\fn strides(shape: []const u32, out: *[8]usize) void {
+        \\    if (shape.len == 2) return;
+        \\    var stride: usize = 1;
+        \\    var axis = shape.len;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        out[axis] = stride;
+        \\        stride *= shape[axis];
+        \\    }
+        \\}
+        \\pub fn sum(shape: []const u32) usize {
+        \\    var values: [8]usize = undefined;
+        \\    strides(shape, &values);
+        \\    var result: usize = 0;
+        \\    for (shape, 0..) |_, i| result += values[i];
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[i]", 0));
+}
+
+test "natural loop fill: interrupted countdown cannot certify a prefix" {
+    const gpa = std.testing.allocator;
+    const bodies = [_][]const u8{
+        "axis -= 2; values[axis] = 1;",
+        "axis -= 1; if (flag) values[axis] = 1;",
+        "axis -= 1; values[axis] = undefined;",
+        "axis -= 1; if (flag) continue; values[axis] = 1;",
+        "axis -= 1; values[axis] = 1; if (flag) break;",
+    };
+    for (bodies) |body| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "pub fn sum(rank: usize, flag: bool) !usize {{ " ++
+                "if (rank > 8) return error.TooLarge; var values: [8]usize = undefined; " ++
+                "var axis = rank; while (axis > 0) {{ {s} }} " ++
+                "var result: usize = 0; for (0..rank) |i| result += values[i]; return result; }}",
+            .{body},
+        );
+        defer gpa.free(source);
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "constant for fill: fallible decode fills every fixed array element" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\fn decode(byte: u8) !u8 { return byte; }
+        \\pub fn digest(bytes: *const [32]u8) ![32]u8 {
+        \\    var output: [32]u8 = undefined;
+        \\    for (0..32) |index| output[index] = try decode(bytes[index]);
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant for fill: successful decode accepts a runtime slice argument" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn decode(pair: *const [2]u8) !u8 { return pair[0] + pair[1]; }
+        \\pub fn digest(text: []const u8) ![32]u8 {
+        \\    if (text.len != 64) return error.BadLength;
+        \\    var output: [32]u8 = undefined;
+        \\    for (0..32) |index| output[index] = try decode(text[index * 2 ..][0..2]);
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant for fill: successful ranged calls retain earlier explicit coverage" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\fn decode(pair: *const [2]u8) !u8 { return pair[0] + pair[1]; }
+        \\pub fn digest(text: []const u8) ![34]u8 {
+        \\    if (text.len != 64) return error.BadLength;
+        \\    var output: [34]u8 = undefined;
+        \\    output[0] = 0;
+        \\    for (0..32) |index| output[index + 1] = try decode(text[index * 2 ..][0..2]);
+        \\    output[33] = 0;
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant for fill: a break inside the RHS leaves the array incomplete" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn fragment(flag: bool) [4]usize {
+        \\    var output: [4]usize = undefined;
+        \\    for (0..4) |index| output[index] = value: {
+        \\        if (flag) break;
+        \\        break :value index;
+        \\    };
+        \\    return output;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return output", 0));
+}
+
+test "constant for fill: explicit edges cannot hide an interior coverage gap" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn fragment() [9]usize {
+        \\    var output: [9]usize = undefined;
+        \\    output[0] = 0;
+        \\    for (1..4) |index| output[index] = index;
+        \\    for (5..8) |index| output[index] = index;
+        \\    output[8] = 8;
+        \\    return output;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return output", 0));
+}
+
+test "constant for fill: explicit edges and offset fixed enumeration form one coverage union" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const kinds = [_]u8{ 1, 2, 3, 4, 5, 6 };
+        \\pub fn fixture() [9]u8 {
+        \\    var instructions: [9]u8 = undefined;
+        \\    instructions[0] = 0;
+        \\    instructions[1] = 1;
+        \\    for (kinds, 0..) |kind, index| instructions[index + 2] = kind;
+        \\    instructions[8] = 8;
+        \\    return instructions;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant for fill: disjoint ranges join explicit middle and suffix writes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn fixture() [27]usize {
+        \\    var instructions: [27]usize = undefined;
+        \\    instructions[0] = 0;
+        \\    for (1..13) |index| instructions[index] = index;
+        \\    instructions[13] = 13;
+        \\    instructions[14] = 14;
+        \\    for (0..10) |index| instructions[15 + index] = index;
+        \\    instructions[25] = 25;
+        \\    instructions[26] = 26;
+        \\    return instructions;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant for fill: compact coverage has no synthetic slot count cap" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn fill() [513]usize {
+        \\    var output: [513]usize = undefined;
+        \\    output[0] = 0;
+        \\    for (1..513) |index| output[index] = index;
+        \\    return output;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant for fill: partial coverage permits only the written slots" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn fragment() usize {
+        \\    var output: [5]usize = undefined;
+        \\    output[0] = 0;
+        \\    for (1..4) |index| output[index] = index;
+        \\    _ = output[2];
+        \\    return output[4];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "output[2]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "output[4]", 0));
+}
+
+test "constant for fill: holes breaks undefined conditional and unknown bounds stay unsafe" {
+    const gpa = std.testing.allocator;
+    const bodies = [_][]const u8{
+        "for (1..4) |index| output[index] = index;",
+        "for (0..3) |index| output[index] = index;",
+        "for (0..4) |index| { output[index] = index; if (flag) break; }",
+        "for (0..4) |index| output[index] = undefined;",
+        "for (0..4) |index| { if (flag) output[index] = index; }",
+        "for (0..bound) |index| output[index] = index;",
+        "for (0..4) |index| { if (flag) continue; output[index] = index; }",
+        "for (0..4) |index| output[index] = seed;",
+    };
+    for (bodies) |body| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "pub fn fragment(flag: bool, bound: usize) [4]usize {{ " ++
+                "var output: [4]usize = undefined; var seed: usize = 1; seed = undefined; " ++
+                "{s} return output; }}",
+            .{body},
+        );
+        defer gpa.free(source);
+        var problems = try analyze(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return output", 0));
+    }
+}
+
+test "constant for fill: a zero trip scalar assignment cannot define a return" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn empty() usize {
+        \\    var result: usize = undefined;
+        \\    for (0..0) |index| result = index;
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+
 // ── Counter-guarded fill: `while` + counting equality check ─────
 //
 // The loop's trip count is a runtime value, so no per-iteration proof
@@ -6061,27 +9167,26 @@ test "counter-guarded fill: a counter that can run past the length without the g
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
-test "counter-guarded fill: a second advance in the body does not fill" {
+test "counter-guarded fill: advancing the array counter twice leaves a hole" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\pub fn collect(source: []const u8) bool {
+        \\pub fn collect(source: [3]u8) [3]u8 {
         \\    var fields: [3]u8 = undefined;
         \\    var count: usize = 0;
-        \\    var at: usize = 0;
-        \\    while (at < source.len) {
-        \\        if (count == 3) return false;
-        \\        fields[count] = source[at];
-        \\        count += 1;
-        \\        at += 1;
+        \\    while (count < 3) {
+        \\        if (count == 0) {
+        \\            fields[count] = source[count];
+        \\            count += 1;
+        \\            count += 1;
+        \\        } else {
+        \\            fields[count] = source[count];
+        \\            count += 1;
+        \\        }
         \\    }
-        \\    if (count != 3) return false;
-        \\    _ = fields;
-        \\    return true;
+        \\    return fields;
         \\}
     );
     defer freeProblems(gpa, &problems);
-    // The counter is no longer the only thing advancing, so its value
-    // stops being a count of the elements written.
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
@@ -6107,30 +9212,24 @@ test "counter-guarded fill: no check after the loop does not fill" {
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
-test "counter-guarded fill: a check that is not the next statement does not dominate the read" {
+test "counter-guarded fill: changing count after the completion check exposes a gap" {
     const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn collect(source: []const u8) bool {
-        \\    var fields: [3]u8 = undefined;
+    const source =
+        \\pub fn collect() u8 {
+        \\    var fields: [4]u8 = undefined;
         \\    var count: usize = 0;
-        \\    var at: usize = 0;
-        \\    while (at < source.len) : (at += 1) {
-        \\        if (count == 3) return false;
-        \\        fields[count] = source[at];
+        \\    while (count < 3) {
+        \\        fields[count] = 1;
         \\        count += 1;
         \\    }
-        \\    const doubled = count * 2;
-        \\    if (count != 3) return false;
-        \\    _ = doubled;
-        \\    _ = fields;
-        \\    return true;
+        \\    if (count != 3) return 0;
+        \\    count += 1;
+        \\    return fields[count - 1];
         \\}
-    );
+    ;
+    var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
-    // A statement between the loop and the check reads the counter
-    // again; the pair has to be adjacent for the check to be the
-    // thing standing between the loop and the use.
-    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "fields[count - 1]", 0));
 }
 
 test "counter-guarded fill: a read before the check is still undefined" {
@@ -6224,6 +9323,818 @@ test "counter-guarded fill: a counter seeded at one does not fill" {
     // Starting at one, `count == 3` is reached after two writes, so
     // slot zero is never written.
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+}
+test "indexed initialization: a computed block reads the element after its store" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn read(value: u8) u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    const result = blk: {
+        \\        bytes[0] = value;
+        \\        break :blk bytes[0];
+        \\    };
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a computed if does not read its indexed assignment target" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn choose(flag: bool, value: u8) u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    const result = if (flag) blk: {
+        \\        bytes[0] = value;
+        \\        break :blk bytes[0];
+        \\    } else value;
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a computed switch arm does not read its indexed assignment target" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn choose(flag: bool, value: u8) void {
+        \\    var single_buf: [1]u8 = undefined;
+        \\    const other = [_]u8{value};
+        \\    const view = switch (flag) {
+        \\        true => blk: {
+        \\            single_buf[0] = value;
+        \\            break :blk single_buf[0..];
+        \\        },
+        \\        false => other[0..],
+        \\    };
+        \\    _ = view;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: guarded push and decrement-before-read pop preserve the prefix" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn stack() void {
+        \\    var stack: [2]u8 = undefined;
+        \\    var depth: usize = 0;
+        \\    while (depth < 2) {
+        \\        stack[depth] = 1;
+        \\        depth += 1;
+        \\    }
+        \\    while (depth > 0) {
+        \\        depth -= 1;
+        \\        _ = stack[depth];
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: negated upper and reversed positive guards preserve push-pop proofs" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn stack() void {
+        \\    var array: [2]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (true) {
+        \\        if (!(count < array.len)) break;
+        \\        array[count] = 1;
+        \\        count += 1;
+        \\    }
+        \\    if (0 < count) {
+        \\        count -= 1;
+        \\        _ = array[count];
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a later bounded consumer reads the filled wanted prefix" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn consume(source: []const u8) void {
+        \\    var wanted: [4]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    var source_index: usize = 0;
+        \\    while (source_index < source.len and count < 4) {
+        \\        wanted[count] = source[source_index];
+        \\        count += 1;
+        \\        source_index += 1;
+        \\    }
+        \\    var index: usize = 0;
+        \\    while (index < count) {
+        \\        _ = wanted[index];
+        \\        index += 1;
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a nonzero tag count proves only tag_names zero" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn first(tags: []const []const u8) usize {
+        \\    var tag_names: [16][]const u8 = undefined;
+        \\    var n_tags: usize = 0;
+        \\    for (tags) |tag| {
+        \\        if (n_tags == 16) break;
+        \\        tag_names[n_tags] = tag;
+        \\        n_tags += 1;
+        \\    }
+        \\    if (n_tags > 0) return tag_names[0].len;
+        \\    return 0;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: array literals credit only their defined elements" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn literal() u8 {
+        \\    const bytes: [2]u8 = .{ 1, undefined };
+        \\    const defined = bytes[0];
+        \\    const hole = bytes[1];
+        \\    return defined + hole;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 0));
+}
+
+test "indexed initialization: a sparse exact store does not initialize a gap" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn sparse() u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[2] = 1;
+        \\    const written = bytes[2];
+        \\    const gap = bytes[1];
+        \\    return written + gap;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "bytes[2]", 0));
+}
+
+test "indexed initialization: returning a partially written aggregate reports the tail" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn partial() [4]u8 {
+        \\    var bytes: [4]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    return bytes;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes", 2));
+}
+
+test "indexed initialization: a zero-iteration loop does not initialize an element" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn empty() u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count != 0) {
+        \\        bytes[count] = 1;
+        \\        count += 1;
+        \\    }
+        \\    return bytes[0];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+}
+
+test "indexed initialization: an undefined index and RHS do not credit a store" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn write() u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    var index: usize = undefined;
+        \\    var rhs: u8 = undefined;
+        \\    bytes[index] = rhs;
+        \\    return bytes[0];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "index", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "rhs", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+}
+
+test "indexed initialization: advancing after a conditionally skipped store keeps the gap undefined" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn maybeStore(write: bool) u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    if (write) bytes[count] = 1;
+        \\    count += 1;
+        \\    if (count == 1) return bytes[0];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+}
+
+test "indexed initialization: an aliased counter mutation invalidates the prefix" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\fn advance(count: *usize) void {
+        \\    count.* += 1;
+        \\}
+        \\pub fn collect() u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count < 3) {
+        \\        bytes[count] = 1;
+        \\        count += 1;
+        \\    }
+        \\    advance(&count);
+        \\    return bytes[count - 1];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[count - 1]", 0));
+}
+
+test "indexed initialization: a guard on an undefined index cannot credit its store" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn write() u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    var index: usize = undefined;
+        \\    if (index == 0) {
+        \\        bytes[index] = 1;
+        \\        return bytes[0];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+}
+
+test "indexed initialization: grouped computed arms keep selected stores before reads" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn choose(flag: bool, value: u8) u8 {
+        \\    var bytes: [1]u8 = undefined;
+        \\    const result = (if (flag) blk: {
+        \\        bytes[0] = value;
+        \\        break :blk bytes[0];
+        \\    } else value);
+        \\    return result;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: advancing an unrelated counter preserves filled coverage" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn read() u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    var unrelated: usize = 0;
+        \\    while (count < 2) {
+        \\        bytes[count] = 1;
+        \\        count += 1;
+        \\        unrelated += 1;
+        \\    }
+        \\    _ = unrelated;
+        \\    if (count > 0) return bytes[count - 1];
+        \\    return 0;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a compound step over defined operands keeps a stored value defined" {
+    const source =
+        \\pub fn chain(id: u32, last: u32) u32 {
+        \\    var buf: [4]u32 = undefined;
+        \\    var len: usize = 1;
+        \\    buf[0] = id;
+        \\    var u: u32 = id + 1;
+        \\    while (u <= last) {
+        \\        if (len >= buf.len) break;
+        \\        buf[len] = u;
+        \\        len += 1;
+        \\        u += 2;
+        \\    }
+        \\    if (len >= 2) return buf[len - 1];
+        \\    return buf[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a compound step over an undefined operand leaves the stored value undefined" {
+    const source =
+        \\pub fn chain(id: u32, last: u32) u32 {
+        \\    var buf: [4]u32 = undefined;
+        \\    var len: usize = 1;
+        \\    buf[0] = id;
+        \\    var step: u32 = undefined;
+        \\    var u: u32 = id + 1;
+        \\    while (u <= last) {
+        \\        if (len >= buf.len) break;
+        \\        buf[len] = u;
+        \\        len += 1;
+        \\        u += step;
+        \\    }
+        \\    if (len >= 2) return buf[len - 1];
+        \\    return buf[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "buf[len - 1]", 0));
+}
+
+test "indexed initialization: a conjunction keeps its left guard after a subscripted right operand" {
+    const source =
+        \\pub fn pick(src: []const u32, last: u32) u32 {
+        \\    var buf: [4]u32 = undefined;
+        \\    var len: usize = 0;
+        \\    for (src) |b| {
+        \\        if (len == buf.len) break;
+        \\        buf[len] = b;
+        \\        len += 1;
+        \\    }
+        \\    if (len == 2 and buf[1] == last) return buf[1];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a weaker left guard does not prove the slot the right operand reads" {
+    const source =
+        \\pub fn pick(src: []const u32, last: u32) u32 {
+        \\    var buf: [4]u32 = undefined;
+        \\    var len: usize = 0;
+        \\    for (src) |b| {
+        \\        if (len == buf.len) break;
+        \\        buf[len] = b;
+        \\        len += 1;
+        \\    }
+        \\    if (len >= 1 and buf[1] == last) return buf[1];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "buf[1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "buf[1]", 1));
+}
+
+test "bounded prefix fill: a capped push certifies the returned count only after an overflow guard" {
+    const head =
+        \\const max_depth: usize = 8;
+        \\
+        \\fn openStack(tags: []const u8, token: u32, regions: *[max_depth]u32) ?usize {
+        \\    var depth: usize = 0;
+        \\    var t: u32 = 0;
+        \\    while (t < token) : (t += 1) {
+        \\
+    ;
+    const tail =
+        \\        switch (tags[t]) {
+        \\            '{' => {
+        \\                if (depth < max_depth) regions[depth] = t;
+        \\                depth += 1;
+        \\            },
+        \\            '}' => {
+        \\                if (depth > 0) depth -= 1;
+        \\            },
+        \\            else => {},
+        \\        }
+        \\    }
+        \\
+    ;
+    const caller =
+        \\}
+        \\
+        \\pub fn enclosing(tags: []const u8, token: u32) ?u32 {
+        \\    var regions: [max_depth]u32 = undefined;
+        \\    const region_len = openStack(tags, token, &regions) orelse return null;
+        \\    var i = region_len;
+        \\    while (i > 0) {
+        \\        i -= 1;
+        \\        const brace = regions[INDEX];
+        \\        if (brace == 0) continue;
+        \\        if (tags[brace - 1] == 'c') return brace;
+        \\    }
+        \\    return null;
+        \\}
+    ;
+    const cases = [_]struct { guard: []const u8, early: []const u8, index: []const u8, warns: bool }{
+        .{ .guard = "    if (depth > max_depth) return null;\n    return depth;\n", .early = "", .index = "i", .warns = false },
+        // No overflow guard: the count can exceed the capacity.
+        .{ .guard = "    return depth;\n", .early = "", .index = "i", .warns = true },
+        // A return inside the loop precedes any bound.
+        .{ .guard = "    if (depth > max_depth) return null;\n    return depth;\n", .early = "        if (t == 99) return depth;\n", .index = "i", .warns = true },
+        // A read past the returned count is not in the written prefix.
+        .{ .guard = "    if (depth > max_depth) return null;\n    return depth;\n", .early = "", .index = "i + 1", .warns = true },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, case.early, tail, case.guard, caller });
+        defer std.testing.allocator.free(source);
+        const patched = try std.mem.replaceOwned(u8, std.testing.allocator, source, "INDEX", case.index);
+        defer std.testing.allocator.free(patched);
+        var problems = try analyzeWithZls(std.testing.allocator, patched);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "complete arrays: a defined store at an unplaced index keeps the splat complete" {
+    const source =
+        \\pub fn total(name: u8, k: usize) u8 {
+        \\    var buf: [4]u8 = @splat(0);
+        \\    buf[k % 4] = name;
+        \\    return buf[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "complete arrays: an undefined store at an unplaced index still leaves the splat undefined" {
+    const source =
+        \\pub fn total(k: usize) u8 {
+        \\    var buf: [4]u8 = @splat(0);
+        \\    var hole: u8 = undefined;
+        \\    buf[k % 4] = hole;
+        \\    return buf[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "buf[0]", 0));
+}
+
+test "complete arrays: a splat sized by an inline-struct array literal is complete, an undefined one is not" {
+    const preamble =
+        \\const primitives = [_]struct { name: []const u8 }{
+        \\    .{ .name = "a" },
+        \\    .{ .name = "b" },
+        \\};
+        \\
+    ;
+    const cases = [_]struct { body: []const u8, warns: bool }{
+        .{ .body = "pub fn check(index: usize) bool {\n    var found: [primitives.len]bool = @splat(false);\n    return found[index];\n}\n", .warns = false },
+        .{ .body = "pub fn check(index: usize) bool {\n    var found: [primitives.len]bool = undefined;\n    return found[index];\n}\n", .warns = true },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ preamble, case.body });
+        defer std.testing.allocator.free(source);
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "indexed initialization: an RHS counter mutation cannot credit the changed index" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn write() u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    var index: usize = 0;
+        \\    bytes[index] = blk: {
+        \\        index = 1;
+        \\        break :blk 7;
+        \\    };
+        \\    return bytes[1];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 0));
+}
+
+test "indexed initialization: unsupported arithmetic does not establish an indexed proof" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn sparse() u8 {
+        \\    var bytes: [4]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count < 2) {
+        \\        bytes[count * 2] = 1;
+        \\        count += 1;
+        \\    }
+        \\    return bytes[1];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 0));
+}
+
+test "error-only constructor cleanup does not become a normal-return field free" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Session = struct {
+        \\    project: []u8,
+        \\    fn init(self: *Session, gpa: std.mem.Allocator, fail: bool) error{Init}!void {
+        \\        errdefer gpa.free(self.project);
+        \\        if (fail) return error.Init;
+        \\    }
+        \\    fn deinit(self: *Session, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.project);
+        \\    }
+        \\};
+        \\pub fn run(gpa: std.mem.Allocator, project: []u8, fail: bool) !void {
+        \\    var session = Session{ .project = project };
+        \\    try session.init(gpa, fail);
+        \\    session.deinit(gpa);
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |problem| {
+        try std.testing.expect(!std.mem.eql(u8, problem.rule_id, "heap-double-free"));
+    }
+}
+
+test "normal-return constructor field free remains visible to the caller" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Session = struct {
+        \\    project: []u8,
+        \\    fn init(self: *Session, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.project);
+        \\    }
+        \\    fn deinit(self: *Session, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.project);
+        \\    }
+        \\};
+        \\pub fn run(gpa: std.mem.Allocator, project: []u8) void {
+        \\    var session = Session{ .project = project };
+        \\    session.init(gpa);
+        \\    session.deinit(gpa);
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    var double_free = false;
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "heap-double-free")) double_free = true;
+    }
+    try std.testing.expect(double_free);
+}
+
+test "conditional normal field release keeps the possible use-after-free hazard" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Session = struct {
+        \\    project: []u8,
+        \\    fn maybeRelease(self: *Session, gpa: std.mem.Allocator, release: bool) void {
+        \\        if (release) gpa.free(self.project);
+        \\    }
+        \\};
+        \\pub fn read(gpa: std.mem.Allocator, project: []u8, release: bool) u8 {
+        \\    var session = Session{ .project = project };
+        \\    session.maybeRelease(gpa, release);
+        \\    return session.project[0];
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-use-after-free") >= 1);
+}
+
+test "conditional normal field release is cleared by a fresh precise-field replacement" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Session = struct {
+        \\    project: []u8,
+        \\    fn maybeRelease(self: *Session, gpa: std.mem.Allocator, release: bool) void {
+        \\        if (release) gpa.free(self.project);
+        \\    }
+        \\    fn deinit(self: *Session, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.project);
+        \\    }
+        \\};
+        \\pub fn replace(gpa: std.mem.Allocator, project: []u8, release: bool) !void {
+        \\    var session = Session{ .project = project };
+        \\    session.maybeRelease(gpa, release);
+        \\    session.project = try gpa.alloc(u8, 1);
+        \\    session.deinit(gpa);
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "heap-use-after-free"));
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "heap-double-free"));
+}
+
+test "caller error cleanup runs after the constructor's error-only field cleanup" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Item = struct {
+        \\    field: []u8,
+        \\    fn start(self: *Item, gpa: std.mem.Allocator, fail: bool) error{Start}!void {
+        \\        errdefer gpa.free(self.field);
+        \\        if (fail) return error.Start;
+        \\    }
+        \\    fn deinit(self: *Item, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.field);
+        \\    }
+        \\};
+        \\pub fn run(gpa: std.mem.Allocator, field: []u8, fail: bool) !void {
+        \\    var item = Item{ .field = field };
+        \\    errdefer gpa.free(item.field);
+        \\    try item.start(gpa, fail);
+        \\    item.deinit(gpa);
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "heap-double-free", source, "item.field", 0));
+}
+
+test "fallible computed if and switch calls keep error-only cleanup off success" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Mode = enum { first, second };
+        \\const Item = struct {
+        \\    field: []u8,
+        \\    fn start(self: *Item, gpa: std.mem.Allocator, fail: bool) error{Start}!u32 {
+        \\        errdefer gpa.free(self.field);
+        \\        if (fail) return error.Start;
+        \\        return 1;
+        \\    }
+        \\    fn deinit(self: *Item, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.field);
+        \\    }
+        \\};
+        \\pub fn normalIf(gpa: std.mem.Allocator, field: []u8, flag: bool, fail: bool) error{Start}!void {
+        \\    var item = Item{ .field = field };
+        \\    const value = try if (flag) item.start(gpa, fail) else item.start(gpa, fail);
+        \\    _ = value;
+        \\    item.deinit(gpa);
+        \\}
+        \\pub fn normalSwitch(gpa: std.mem.Allocator, field: []u8, mode: Mode, fail: bool) error{Start}!void {
+        \\    var item = Item{ .field = field };
+        \\    const value = try switch (mode) {
+        \\        .first => item.start(gpa, fail),
+        \\        .second => item.start(gpa, fail),
+        \\    };
+        \\    _ = value;
+        \\    item.deinit(gpa);
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "heap-double-free"));
+}
+
+test "fallible computed if and switch calls replay caller error cleanup after callee cleanup" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Mode = enum { first, second };
+        \\const Item = struct {
+        \\    field: []u8,
+        \\    fn start(self: *Item, gpa: std.mem.Allocator, fail: bool) error{Start}!u32 {
+        \\        errdefer gpa.free(self.field);
+        \\        if (fail) return error.Start;
+        \\        return 1;
+        \\    }
+        \\    fn deinit(self: *Item, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.field);
+        \\    }
+        \\};
+        \\pub fn errorIf(gpa: std.mem.Allocator, field: []u8, flag: bool, fail: bool) error{Start}!void {
+        \\    var item = Item{ .field = field };
+        \\    errdefer gpa.free(item.field);
+        \\    const value = try if (flag) item.start(gpa, fail) else item.start(gpa, fail);
+        \\    _ = value;
+        \\    item.deinit(gpa);
+        \\}
+        \\pub fn errorSwitch(gpa: std.mem.Allocator, field: []u8, mode: Mode, fail: bool) error{Start}!void {
+        \\    var item = Item{ .field = field };
+        \\    errdefer gpa.free(item.field);
+        \\    const value = try switch (mode) {
+        \\        .first => item.start(gpa, fail),
+        \\        .second => item.start(gpa, fail),
+        \\    };
+        \\    _ = value;
+        \\    item.deinit(gpa);
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-double-free") >= 2);
+}
+
+test "fallible computed block break does not run its errdefer for an error union value" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Item = struct {
+        \\    field: []u8,
+        \\    fn start(self: *Item, gpa: std.mem.Allocator, fail: bool) error{Start}!u32 {
+        \\        errdefer gpa.free(self.field);
+        \\        if (fail) return error.Start;
+        \\        return 1;
+        \\    }
+        \\    fn deinit(self: *Item, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.field);
+        \\    }
+        \\};
+        \\pub fn run(gpa: std.mem.Allocator, field: []u8, fail: bool) error{Start}!void {
+        \\    var item = Item{ .field = field };
+        \\    const value = try blk: {
+        \\        errdefer gpa.free(item.field);
+        \\        break :blk item.start(gpa, fail);
+        \\    };
+        \\    _ = value;
+        \\    item.deinit(gpa);
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "heap-double-free"));
+}
+
+test "fallible computed block defer runs after its callee error cleanup" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const std = @import("std");
+        \\const Item = struct {
+        \\    field: []u8,
+        \\    fn start(self: *Item, gpa: std.mem.Allocator, fail: bool) error{Start}!u32 {
+        \\        errdefer gpa.free(self.field);
+        \\        if (fail) return error.Start;
+        \\        return 1;
+        \\    }
+        \\};
+        \\pub fn run(gpa: std.mem.Allocator, field: []u8, fail: bool) error{Start}!void {
+        \\    var item = Item{ .field = field };
+        \\    const value = try blk: {
+        \\        defer gpa.free(item.field);
+        \\        break :blk item.start(gpa, fail);
+        \\    };
+        \\    _ = value;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "heap-double-free") >= 1);
+}
+
+test "computed opaque outcomes do not initialize unrelated undefined storage" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\pub fn read(flag: bool) error{Oops}!u8 {
+        \\    var untouched: u8 = undefined;
+        \\    var operand: error{Oops}!void = undefined;
+        \\    _ = try if (flag) operand else operand;
+        \\    return untouched;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "untouched", 1));
 }
 
 // ── Defined under a guard, read under the same guard re-tested ──
@@ -6481,37 +10392,6 @@ test "defined under a guard: a call whose body calls anything is never read as w
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
-test "defined under a guard: a call inside the establishing arm is an event between the two tests" {
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const Frame = struct { id: u32 };
-        \\const Cache = struct {
-        \\    count: usize = 0,
-        \\    frame: Frame = .{ .id = 0 },
-        \\    fn clear(self: *Cache) void {
-        \\        self.count = 0;
-        \\    }
-        \\};
-        \\pub fn peek(cache: *Cache, top: usize) u32 {
-        \\    var saved: Frame = undefined;
-        \\    if (top < cache.count) {
-        \\        saved = cache.frame;
-        \\        cache.clear();
-        \\    }
-        \\    if (top < cache.count) {
-        \\        return saved.id;
-        \\    }
-        \\    return 0;
-        \\}
-    );
-    defer freeProblems(gpa, &problems);
-    // #55.  The release runs inside the very branch the second test
-    // claims to contradict, so scanning only the statements BETWEEN the
-    // two `if`s left it invisible and read the pair as stable on the one
-    // path where it is least true.
-    try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
-}
-
 test "defined under a guard: a call handed the operand as an argument is an event on it" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
@@ -6552,9 +10432,9 @@ test "defined under a guard: a call handed the operand as an argument is an even
 // pairing at all — both `if`s would record the same truth value, and the
 // second would contradict itself instead of the first.
 
-test "defined under a guard: a negated re-test cuts the arm that cannot run" {
+test "defined under a guard: a negated re-test reads the uninitialised arm" {
     const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
+    const source =
         \\const Frame = struct { id: u32 };
         \\const Guard = struct { recorded: bool };
         \\const Cache = struct {
@@ -6575,14 +10455,11 @@ test "defined under a guard: a negated re-test cuts the arm that cannot run" {
         \\    }
         \\    return 0;
         \\}
-    );
+    ;
+    var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
-    // `wipe` writes `cache.frame` and calls nothing, and `guard` is a
-    // by-value parameter no callee in that body is handed — so the guard
-    // is intact and the arm that would read an unwritten `saved` is
-    // unreachable.  The second `if` holding is exactly the first one not
-    // holding, which is where `saved` WAS written.
-    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+    // The guard is intact, but the opposite arm did not initialise saved.
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return saved.id", 0));
 }
 
 test "defined under a guard: a negated re-test after a write to the tested field does not pair" {
@@ -6615,9 +10492,9 @@ test "defined under a guard: a negated re-test after a write to the tested field
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
-test "defined under a guard: the complementary equality is the other sense of one value" {
+test "defined under a guard: a complementary equality reads the uninitialised arm" {
     const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
+    const source =
         \\const Frame = struct { id: u32 };
         \\const Cache = struct {
         \\    slot: ?*Frame = null,
@@ -6637,13 +10514,11 @@ test "defined under a guard: the complementary equality is the other sense of on
         \\    }
         \\    return 0;
         \\}
-    );
+    ;
+    var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
-    // `!=` is `==`'s negation, so these two conditions are one value read
-    // two ways.  `note` writes `frame`, which is not what either
-    // condition reads, so the guard survives and the surviving arm is
-    // the one where `saved` was written.
-    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+    // The != arm runs precisely when the == arm did not initialise saved.
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return saved.id", 0));
 }
 
 test "defined under a guard: an order comparison is not paired with its own negation" {
@@ -6871,7 +10746,7 @@ test "guard over proven storage: a handed-in callee that writes the tested field
     try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
 }
 
-test "guard over proven storage: the same wiring with an unrelated store stays quiet" {
+test "guard over proven storage: an unrelated store does not initialise the opposite arm" {
     const gpa = std.testing.allocator;
     const source =
         \\const Image = struct { id: u32 };
@@ -6896,10 +10771,54 @@ test "guard over proven storage: the same wiring with an unrelated store stays q
     ;
     var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
-    // The CONTROL, and the pair the #55 story is made of: identical in
-    // every respect but the field the callee stores.  `recorded` is
-    // untouched, the two conditions still agree, and the `!` arm is
-    // exactly where `saved` was written.
+    // The unrelated store preserves the guard and leaves saved undefined
+    // in the opposite arm.
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return saved;", 0));
+}
+
+test "defined under a guard: complementary reads follow initialisation in the else arm" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Frame = struct { id: u32 };
+        \\const Guard = struct { recorded: bool };
+        \\const Cache = struct {
+        \\    slot: ?*Frame = null,
+        \\    recorded: bool = false,
+        \\    frame: Frame = .{ .id = 0 },
+        \\    fn note(self: *Cache) void {
+        \\        self.frame = .{ .id = 0 };
+        \\    }
+        \\};
+        \\pub fn negated(cache: *Cache, guard: Guard) u32 {
+        \\    var saved: Frame = undefined;
+        \\    if (!guard.recorded) {} else {
+        \\        saved = cache.frame;
+        \\    }
+        \\    cache.note();
+        \\    if (guard.recorded) return saved.id;
+        \\    return 0;
+        \\}
+        \\pub fn equality(cache: *Cache) u32 {
+        \\    var saved: Frame = undefined;
+        \\    if (cache.slot == null) {} else {
+        \\        saved = cache.frame;
+        \\    }
+        \\    cache.note();
+        \\    if (cache.slot != null) return saved.id;
+        \\    return 0;
+        \\}
+        \\pub fn unrelatedStore(cache: *Cache) u32 {
+        \\    var saved: Frame = undefined;
+        \\    if (cache.recorded) {} else {
+        \\        saved = cache.frame;
+        \\    }
+        \\    cache.note();
+        \\    if (!cache.recorded) return saved.id;
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
 }
 
@@ -7225,7 +11144,7 @@ test "receiver free: a direct release and a child deinit are BOTH marked in a no
         \\pub fn run(owner: *Owner) void {
         \\    const done = owner.release();
         \\    const a = owner.held;
-        \\    const b = owner.child;
+        \\    const b = owner.child.buf;
         \\    _ = done;
         \\    _ = a;
         \\    _ = b;
@@ -7233,12 +11152,9 @@ test "receiver free: a direct release and a child deinit are BOTH marked in a no
     ;
     var problems = try analyze(gpa, source);
     defer freeProblems(gpa, &problems);
-    // The call sits in a declaration initialiser, so it reaches the
-    // non-statement route.  `release` frees `held` from its OWN list and
-    // hands `child` back through the deinit it calls; returning as soon
-    // as the first route produced a free skipped the second, and
-    // `owner.child` went on reading storage the call had released.
-    try std.testing.expect(diagnosedAt(problems.items, "heap-use-after-free", source, "owner.child", 0));
+    // The initializer call releases both held and child.buf. The child
+    // descriptor itself remains live; only its released buffer is a UAF.
+    try std.testing.expect(diagnosedAt(problems.items, "heap-use-after-free", source, "owner.child.buf", 0));
     try std.testing.expect(diagnosedAt(problems.items, "heap-use-after-free", source, "owner.held", 0));
 }
 
@@ -7553,4 +11469,5836 @@ test "cleanup flow: an errdefer does not run on a normal continue" {
     // The loud twin of this polarity is the `return error.X` row: the
     // same registration DOES fire there.
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "indexed initialization: short-circuit field offsets use guarded prefix only" {
+    const safe =
+        \\const Entry = struct { length: usize };
+        \\fn f(entry: Entry) bool {
+        \\    var array: [8]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count < 3) { array[count] = 1; count += 1; }
+        \\    return entry.length <= count and (entry.length == 0 or array[entry.length - 1] == 1);
+        \\}
+    ;
+    var safe_problems = try analyze(std.testing.allocator, safe);
+    defer freeProblems(std.testing.allocator, &safe_problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(safe_problems.items, "use-undefined"));
+    const negative =
+        \\const Entry = struct { length: isize };
+        \\fn f(entry: Entry) bool {
+        \\    var array: [8]u8 = undefined;
+        \\    array[0] = 1;
+        \\    return entry.length != 0 and array[entry.length - 1] == 1;
+        \\}
+    ;
+    var negative_problems = try analyze(std.testing.allocator, negative);
+    defer freeProblems(std.testing.allocator, &negative_problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(negative_problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a local signed field type cannot borrow global unsigned metadata" {
+    const source =
+        \\const Entry = struct { length: usize };
+        \\fn f() bool {
+        \\    const Entry = struct { length: isize };
+        \\    var entry: Entry = undefined;
+        \\    entry.length = -1;
+        \\    var array: [8]u8 = undefined;
+        \\    array[0] = 1;
+        \\    return entry.length != 0 and array[entry.length - 1] == 1;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[entry.length - 1]", 0));
+}
+
+test "indexed initialization: successful guarded helper certifies only returned prefix" {
+    const source =
+        \\fn fill(out: []u8) ?usize {
+        \\    var count: usize = 0;
+        \\    const value: u8 = 1;
+        \\    while (count < 2) {
+        \\        if (count == out.len) return null;
+        \\        out[count] = value;
+        \\        count += 1;
+        \\    }
+        \\    return count;
+        \\}
+        \\fn f() void {
+        \\    var array: [4]u8 = undefined;
+        \\    const count = fill(&array) orelse return;
+        \\    if (count > 0) _ = array[count - 1];
+        \\    _ = array[3];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "use-undefined"));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[3]", 0));
+}
+
+test "indexed initialization: helper partial writes and undefined payloads remain hazards" {
+    for ([_][]const u8{
+        \\fn fill(out: []u8) ?usize {
+        \\    out[0] = 1;
+        \\    return 2;
+        \\}
+        \\fn f() void {
+        \\    var array: [4]u8 = undefined;
+        \\    const count = fill(&array) orelse return;
+        \\    if (count > 0) _ = array[count - 1];
+        \\}
+        ,
+        \\fn fill(out: []u8) ?usize {
+        \\    var count: usize = 0;
+        \\    while (count < 2) {
+        \\        if (count == out.len) return null;
+        \\        out[count] = undefined;
+        \\        count += 1;
+        \\    }
+        \\    return count;
+        \\}
+        \\fn f() void {
+        \\    var array: [4]u8 = undefined;
+        \\    const count = fill(&array) orelse return;
+        \\    if (count > 0) _ = array[count - 1];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "use-undefined"));
+    }
+}
+
+test "indexed initialization: selected scalar array values keep each arm's element mask" {
+    const source =
+        \\fn f(flag: bool) void {
+        \\    const array: [2]u8 = switch (flag) {
+        \\        true => .{ 1, undefined },
+        \\        false => .{ 2, 3 },
+        \\    };
+        \\    _ = array[0];
+        \\    _ = array[1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "use-undefined"));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[1]", 0));
+}
+
+test "indexed initialization: selected labeled-block arrays retain completed local storage" {
+    const source =
+        \\fn f(flag: bool) u8 {
+        \\    const picked: [2]u8 = if (flag) blk: {
+        \\        var temporary: [2]u8 = undefined;
+        \\        temporary[0] = 1;
+        \\        temporary[1] = 2;
+        \\        break :blk temporary;
+        \\    } else .{ 7, 8 };
+        \\    return picked[1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: selected labeled-block arrays retain local holes at the consumer" {
+    const source =
+        \\fn f(flag: bool) u8 {
+        \\    const picked: [2]u8 = if (flag) blk: {
+        \\        var temporary: [2]u8 = undefined;
+        \\        temporary[0] = 1;
+        \\        break :blk temporary;
+        \\    } else .{ 7, 8 };
+        \\    return picked[1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return picked[1]", 0));
+}
+
+test "indexed initialization: selector mutation cannot substitute another value branch's coverage" {
+    const source =
+        \\fn f(flag: bool) u8 {
+        \\    var choose = flag;
+        \\    var partial: [2]u8 = undefined;
+        \\    partial[0] = 1;
+        \\    const picked: [2]u8 = if (choose) blk: {
+        \\        choose = false;
+        \\        break :blk partial;
+        \\    } else .{ 7, 8 };
+        \\    return picked[1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return picked[1]", 0));
+}
+
+test "indexed initialization: readonly array projections require defined actual storage" {
+    const safe =
+        \\const Source = struct {
+        \\    values: [2]u8,
+        \\    fn pair(self: *const Source) [2]u8 { return self.values; }
+        \\};
+        \\fn f(source: Source, flag: bool) void {
+        \\    const array: [2]u8 = switch (flag) {
+        \\        true => source.pair(),
+        \\        false => .{ 2, 3 },
+        \\    };
+        \\    _ = array[0];
+        \\    _ = array[1];
+        \\}
+    ;
+    var safe_problems = try analyze(std.testing.allocator, safe);
+    defer freeProblems(std.testing.allocator, &safe_problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(safe_problems.items, "use-undefined"));
+    const unsafe =
+        \\fn pair(input: [2]u8) [2]u8 { return input; }
+        \\fn f(flag: bool) void {
+        \\    var source: [2]u8 = undefined;
+        \\    source[0] = 1;
+        \\    const array: [2]u8 = switch (flag) {
+        \\        true => pair(source),
+        \\        false => .{ 2, 3 },
+        \\    };
+        \\    _ = array[1];
+        \\}
+    ;
+    var unsafe_problems = try analyze(std.testing.allocator, unsafe);
+    defer freeProblems(std.testing.allocator, &unsafe_problems);
+    try std.testing.expect(diagnosedAt(unsafe_problems.items, "use-undefined", unsafe, "array[1]", 0));
+}
+
+test "indexed initialization: opaque array results do not borrow another arm's coverage" {
+    const source =
+        \\extern fn fetchArray() [2]u8;
+        \\fn f(flag: bool) void {
+        \\    const array: [2]u8 = if (flag) fetchArray() else .{ 2, 3 };
+        \\    _ = array[0];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[0]", 0));
+}
+
+test "array field getters: typed byvalue struct results preserve defined source fields" {
+    const source =
+        \\const Payload = struct { pair: [2]u8 };
+        \\const Source = struct {
+        \\    payload: Payload,
+        \\    fn get(self: Source) Payload { return self.payload; }
+        \\};
+        \\fn f(input: Source) u8 {
+        \\    const pair = input.get().pair;
+        \\    return pair[0] + pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array field getters: typed byvalue union results preserve defined source fields" {
+    const source =
+        \\const Payload = union { pair: [2]u8 };
+        \\const Source = struct {
+        \\    payload: Payload,
+        \\    fn get(self: Source) Payload { return self.payload; }
+        \\};
+        \\fn f(input: Source) u8 {
+        \\    const pair = input.get().pair;
+        \\    return pair[0] + pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array field getters: typed result does not define source holes" {
+    const source =
+        \\const Payload = struct { pair: [2]u8 };
+        \\fn get(input: Payload) Payload { return input; }
+        \\fn f() u8 {
+        \\    const input: Payload = .{ .pair = .{ 7, undefined } };
+        \\    const pair = get(input).pair;
+        \\    return pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return pair[1]", 0));
+}
+
+test "array field getters: typed result does not define pointer pointee storage" {
+    const source =
+        \\const Payload = struct { pair: [2]u8 };
+        \\fn get(input: *const Payload) Payload { return input.*; }
+        \\fn f() u8 {
+        \\    var storage: Payload = undefined;
+        \\    const pair = get(&storage).pair;
+        \\    return pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return pair[1]", 0));
+}
+
+test "array field getters: an initialized caller value proves the projected pointee" {
+    const source =
+        \\const Payload = struct { pair: [2]u8 };
+        \\fn get(input: *const Payload) Payload { return input.*; }
+        \\fn f() u8 {
+        \\    const input = Payload{ .pair = .{ 1, 2 } };
+        \\    const pair = get(&input).pair;
+        \\    return pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return pair[1]", 0));
+}
+
+test "array field getters: an incoming pointer pointee stays unknown and silent" {
+    const source =
+        \\const Payload = struct { pair: [2]u8 };
+        \\fn get(input: *const Payload) Payload { return input.*; }
+        \\fn f(input: *const Payload) u8 {
+        \\    const pair = get(input).pair;
+        \\    return pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "f", false);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array field getters: opaque typed result retains unknown payload" {
+    const source =
+        \\const Payload = extern struct { pair: [2]u8 };
+        \\extern fn get() Payload;
+        \\fn f() u8 {
+        \\    const pair = get().pair;
+        \\    return pair[1];
+        \\}
+    ;
+    var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "f", false);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "bounded array projection: a selected append proves the first element" {
+    const source =
+        \\fn f(tags: []const u8) ?u8 {
+        \\    var names: [4]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    var index = tags.len;
+        \\    while (index > 0) {
+        \\        index -= 1;
+        \\        switch (tags[index]) {
+        \\            0 => break,
+        \\            1 => {
+        \\                if (count < names.len) {
+        \\                    names[count] = tags[index];
+        \\                    count += 1;
+        \\                }
+        \\            },
+        \\            else => {},
+        \\        }
+        \\    }
+        \\    if (count == 0) return null;
+        \\    return names[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "bounded array projection: source defined method results extend only the written prefix" {
+    const source =
+        \\const Token = struct {
+        \\    text: []const u8,
+        \\    fn value(self: Token) []const u8 { return self.text; }
+        \\};
+        \\fn f(token: Token, selected: bool) ?[]const u8 {
+        \\    var names: [4][]const u8 = undefined;
+        \\    var count: usize = 0;
+        \\    if (selected and count < names.len) {
+        \\        names[count] = token.value();
+        \\        count += 1;
+        \\    }
+        \\    if (count == 0) return null;
+        \\    _ = names[3];
+        \\    return names[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "use-undefined"));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "names[3]", 0));
+}
+
+test "bounded array projection: undefined method results remain holes" {
+    for ([_][]const u8{
+        \\const Token = struct {
+        \\    text: []const u8,
+        \\    fn value(self: Token) []const u8 { return self.text; }
+        \\};
+        \\fn f(selected: bool) ?[]const u8 {
+        \\    const token: Token = .{ .text = undefined };
+        \\    var names: [4][]const u8 = undefined;
+        \\    var count: usize = 0;
+        \\    if (selected and count < names.len) {
+        \\        names[count] = token.value();
+        \\        count += 1;
+        \\    }
+        \\    if (count == 0) return null;
+        \\    return names[0];
+        \\}
+        ,
+        \\const Token = struct {
+        \\    fetch: *const fn () []const u8,
+        \\    fn value(self: Token) []const u8 { _ = self; return undefined; }
+        \\};
+        \\fn f(token: Token, selected: bool) ?[]const u8 {
+        \\    var names: [4][]const u8 = undefined;
+        \\    var count: usize = 0;
+        \\    if (selected and count < names.len) {
+        \\        names[count] = token.value();
+        \\        count += 1;
+        \\    }
+        \\    if (count == 0) return null;
+        \\    return names[0];
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return names[0]", 0));
+    }
+}
+
+test "call result definedness: source helpers initialize literals and indexed stores" {
+    const source =
+        \\fn bits(x: u32) f32 { return @bitCast(x); }
+        \\fn choose(x: u8, flag: bool) u8 {
+        \\    var y: u8 = undefined;
+        \\    if (flag) y = x + 1 else y = x;
+        \\    return y;
+        \\}
+        \\fn f(x: u8, flag: bool) void {
+        \\    const floats = [_]f32{ bits(0), bits(0x3f800000) };
+        \\    _ = floats[0]; _ = floats[1];
+        \\    var array: [2]u8 = undefined;
+        \\    array[0] = choose(x, flag);
+        \\    _ = array[0];
+        \\    _ = array[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "floats[0]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "floats[1]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[0]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[1]", 0));
+}
+
+test "call result definedness: all returns and actual inputs must be defined" {
+    for ([_][]const u8{
+        \\fn helper(x: u8, flag: bool) u8 { if (flag) return undefined; return x; }
+        \\fn f(flag: bool) u8 { const a = [_]u8{helper(1, flag)}; return a[0]; }
+        ,
+        \\fn helper(x: u8) u8 { var y = x; y = undefined; return y; }
+        \\fn f() u8 { const a = [_]u8{helper(1)}; return a[0]; }
+        ,
+        \\fn helper(x: u8) u8 { return x + 1; }
+        \\fn f() u8 { var x: u8 = undefined; const a = [_]u8{helper(x)}; return a[0]; }
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "a[0]", 0));
+    }
+}
+
+test "call result definedness: nested array values retain unsafe controls" {
+    const source =
+        \\fn channels(x: f32) [2]f32 { return .{ x, x + 1 }; }
+        \\fn bad(x: f32) [2]f32 { return .{ x, undefined }; }
+        \\fn f(x: f32) void {
+        \\    const good = [_][2]f32{ channels(x), channels(1) };
+        \\    _ = good[0]; _ = good[1];
+        \\    const holes = [_][2]f32{bad(x)};
+        \\    _ = holes[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "good[0]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "good[1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+}
+
+test "call result definedness: counter prefix stores preserve an unwritten tail" {
+    const source =
+        \\fn step(x: u8) u8 { return x +% 1; }
+        \\fn f(count: u8) void {
+        \\    var buf: [256]u8 = undefined;
+        \\    for (0..count) |i| buf[i] = step(1);
+        \\    if (count > 0) _ = buf[0];
+        \\    _ = buf[255];
+        \\}
+        \\extern fn unknown() u8;
+        \\fn g(count: u8) void {
+        \\    var holes: [256]u8 = undefined;
+        \\    const source: u8 = undefined;
+        \\    for (0..count) |i| holes[i] = step(source);
+        \\    if (count > 0) _ = holes[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "buf[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "buf[255]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+}
+
+test "call result definedness: exhaustive completion retains runtime actual inputs" {
+    const source =
+        \\extern fn unknown() u8;
+        \\fn step(x: u8) u8 { return x +% 1; }
+        \\fn safe(x: u8) void {
+        \\    var values: [4]u8 = undefined;
+        \\    for (0..values.len) |i| values[i] = step(x);
+        \\    _ = values[0];
+        \\}
+        \\fn opaqueInput() void {
+        \\    const x = unknown();
+        \\    var holes: [4]u8 = undefined;
+        \\    for (0..holes.len) |i| holes[i] = step(x);
+        \\    _ = holes[0];
+        \\}
+        \\fn undefinedInput() void {
+        \\    var x: u8 = undefined;
+        \\    var missing: [4]u8 = undefined;
+        \\    for (0..missing.len) |i| missing[i] = step(x);
+        \\    _ = missing[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "values[0]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "missing[0]", 0));
+}
+
+test "call result definedness: whole aggregates retain descendant taint" {
+    const source =
+        \\const S = struct { value: u8 };
+        \\extern fn unknown() u8;
+        \\fn good() S {
+        \\    var s = S{ .value = 1 };
+        \\    const snapshot = s.value;
+        \\    _ = snapshot;
+        \\    s.value = 2;
+        \\    return s;
+        \\}
+        \\fn bad() S {
+        \\    var s = S{ .value = 1 };
+        \\    const snapshot = s.value;
+        \\    _ = snapshot;
+        \\    s.value = undefined;
+        \\    return s;
+        \\}
+        \\fn uncertain() S {
+        \\    var s = S{ .value = 1 };
+        \\    const snapshot = s.value;
+        \\    _ = snapshot;
+        \\    s.value = undefined;
+        \\    return s;
+        \\}
+        \\fn relay(s: S) S { _ = s.value; return s; }
+        \\fn f() void {
+        \\    const okay = [_]S{good()};
+        \\    const holes = [_]S{bad()};
+        \\    const opaque_values = [_]S{uncertain()};
+        \\    _ = okay[0];
+        \\    _ = holes[0];
+        \\    _ = opaque_values[0];
+        \\    const good_input = S{ .value = 1 };
+        \\    _ = good_input.value;
+        \\    const good_actual = [_]S{relay(good_input)};
+        \\    _ = good_actual[0];
+        \\    var input = S{ .value = 1 };
+        \\    const snapshot = input.value;
+        \\    _ = snapshot;
+        \\    input.value = undefined;
+        \\    const bad_actual = [_]S{relay(input)};
+        \\    _ = bad_actual[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "okay[0]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "good_actual[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "opaque_values[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bad_actual[0]", 0));
+}
+
+test "call result definedness: whole value actuals and snapshots retain descendant holes" {
+    const source =
+        \\const S = struct { value: u8 };
+        \\extern fn unknown() u8;
+        \\fn relay(input: S) S { return input; }
+        \\fn f() void {
+        \\    const initialized = S{ .value = 1 };
+        \\    const good = [_]S{relay(initialized)};
+        \\    _ = good[0];
+        \\    var storage = S{ .value = 1 };
+        \\    storage.value = undefined;
+        \\    const hole_snapshot = storage;
+        \\    const holes = [_]S{relay(hole_snapshot)};
+        \\    _ = holes[0];
+        \\    storage.value = undefined;
+        \\    const uncertain_snapshot = storage;
+        \\    const uncertain = [_]S{relay(uncertain_snapshot)};
+        \\    _ = uncertain[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "good[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "uncertain[0]", 0));
+}
+
+test "call result definedness: auto-addressed value receivers revoke field proofs" {
+    const source =
+        \\const S = struct {
+        \\    value: u8,
+        \\    fn inspect(self: *const @This()) void { _ = self.value; }
+        \\    fn copy(self: @This()) u8 { return self.value; }
+        \\    fn poison(self: *@This()) void { self.value = undefined; }
+        \\};
+        \\fn good() u8 {
+        \\    var s = S{ .value = 1 };
+        \\    s.inspect();
+        \\    _ = s.copy();
+        \\    return s.value;
+        \\}
+        \\fn bad() u8 {
+        \\    var s = S{ .value = 1 };
+        \\    s.poison();
+        \\    return s.value;
+        \\}
+        \\fn f() void {
+        \\    const okay = [_]u8{good()};
+        \\    const holes = [_]u8{bad()};
+        \\    _ = okay[0];
+        \\    _ = holes[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "okay[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+}
+
+test "call result definedness: constructors retain undefined calls and defaults" {
+    for ([_][]const u8{
+        \\fn unknown() u8 { return undefined; }
+        \\fn helper() [1]u8 { return .{unknown()}; }
+        \\fn f() void { const a = [_][1]u8{helper()}; _ = a[0]; }
+        ,
+        \\const Item = struct { value: u8, other: u8 = undefined };
+        \\fn helper(x: u8) Item { return .{ .value = x }; }
+        \\fn f() void { const a = [_]Item{helper(1)}; _ = a[0]; }
+        ,
+        \\var global: u8 = undefined;
+        \\fn helper() [1]u8 { return .{global}; }
+        \\fn f() void { const a = [_][1]u8{helper()}; _ = a[0]; }
+        ,
+        \\fn helper() u8 { var x: u8 = undefined; defer x = 1; return x; }
+        \\fn f() void { const a = [_]u8{helper()}; _ = a[0]; }
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "a[0]", 0));
+    }
+}
+
+test "call result definedness: instantiated scalar types retain actual input taint" {
+    const source =
+        \\fn add(comptime T: type, x: T) T { return x + 1; }
+        \\fn f() void {
+        \\    const integers = [_]u8{add(u8, 1)};
+        \\    _ = integers[0];
+        \\    const floats = [_]f32{add(f32, 1)};
+        \\    _ = floats[0];
+        \\    var value: u8 = undefined;
+        \\    const holes = [_]u8{add(u8, value)};
+        \\    _ = holes[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "integers[0]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "floats[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "holes[0]", 0));
+}
+
+test "bounded array projection: a count does not license holes or whole array copies" {
+    for ([_][]const u8{
+        \\fn f(tags: []const u8) ?u8 {
+        \\    var names: [4]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    for (tags) |tag| {
+        \\        if (count < names.len) {
+        \\            names[count] = undefined;
+        \\            count += 1;
+        \\        }
+        \\        _ = tag;
+        \\    }
+        \\    if (count == 0) return null;
+        \\    return names[0];
+        \\}
+        ,
+        \\const Batch = struct { names: [4]u8, count: usize };
+        \\fn f(tag: u8) Batch {
+        \\    var names: [4]u8 = undefined;
+        \\    names[0] = tag;
+        \\    return .{ .names = names, .count = 1 };
+        \\}
+        ,
+        \\fn f(tags: []const u8) ?u8 {
+        \\    var names: [4]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    for (tags) |tag| {
+        \\        if (count < names.len - 1) {
+        \\            names[count + 1] = tag;
+        \\            count += 1;
+        \\        }
+        \\    }
+        \\    if (count == 0) return null;
+        \\    return names[0];
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "indexed initialization: a helper cannot mutate its certified count through another operator" {
+    const source =
+        \\fn fill(out: []u8) ?usize {
+        \\    var count: usize = 0;
+        \\    if (count == out.len) return null;
+        \\    out[count] = 1;
+        \\    count += 1;
+        \\    count |= 3;
+        \\    return count;
+        \\}
+        \\fn f() void {
+        \\    var array: [4]u8 = undefined;
+        \\    const count = fill(&array) orelse return;
+        \\    if (count > 0) _ = array[count - 1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "explicit aggregate initialization: member arithmetic and indexed values remain defined" {
+    const source =
+        \\const Vec = [3]u32;
+        \\const Input = struct { x: u32, bytes: []const u8 };
+        \\fn f(input: Input) u32 {
+        \\    var result: Vec = .{ 0, 0, 0 };
+        \\    inline for (0..3) |index| {
+        \\        result = .{ result[0] + input.x, result[1] + index, result[2] };
+        \\    }
+        \\    const selected: [2]u32 = .{ result[0], input.bytes[0] };
+        \\    const ordered: [2]u32 = if (input.x == 0) selected else .{ selected[1], selected[0] };
+        \\    return ordered[0];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "explicit aggregate initialization: copying an undefined member or array hole retains the hole" {
+    const source =
+        \\fn f() void {
+        \\    const input = .{ .x = @as(u32, undefined) };
+        \\    const partial: [2]u32 = .{ 1, undefined };
+        \\    const result: [2]u32 = .{ input.x + 1, partial[1] };
+        \\    _ = result[0];
+        \\    _ = result[1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "result[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "result[1]", 0));
+}
+
+test "bounded range fill: every slot is defined on normal exit" {
+    const source =
+        \\fn f(value: u32) [3]u32 {
+        \\    var result: [3]u32 = undefined;
+        \\    for (0..result.len) |index| result[index] = value + index;
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "bounded range fill: partial conditional and interrupted fills remain undefined" {
+    for ([_][]const u8{
+        \\fn f() [3]u32 { var result: [3]u32 = undefined; for (0..2) |index| result[index] = 1; return result; }
+        ,
+        \\fn f(flag: bool) [3]u32 { var result: [3]u32 = undefined; for (0..3) |index| { if (flag) result[index] = 1; } return result; }
+        ,
+        \\fn f(flag: bool) [3]u32 { var result: [3]u32 = undefined; for (0..3) |index| { if (flag) break; result[index] = 1; } return result; }
+        ,
+        \\fn f() [3]u32 { var result: [3]u32 = undefined; for (1..3) |index| result[index] = 1; return result; }
+        ,
+        \\fn f() [3]u32 { var result: [3]u32 = undefined; for (0..3) |index| result[index] = undefined; return result; }
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "explicit initialization: splats and sentinel slices are not undefined fixed arrays" {
+    const source =
+        \\fn f(bytes: []const u8, end: usize) u8 {
+        \\    var counts: [3]u32 = @splat(0);
+        \\    counts[1] += 1;
+        \\    const reported: [:0]const u8 = bytes[0..end :0];
+        \\    _ = counts;
+        \\    return reported[0];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed compound writes: undefined old elements and operands cannot initialize a slot" {
+    for ([_][]const u8{
+        \\fn f() u8 {
+        \\    var array: [2]u8 = undefined;
+        \\    array[0] += 1;
+        \\    return array[0];
+        \\}
+        ,
+        \\fn f() u8 {
+        \\    var array: [2]u8 = @splat(0);
+        \\    const value: u8 = undefined;
+        \\    array[0] += value;
+        \\    return array[0];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return array[0]", 0));
+    }
+}
+
+test "bounded prefix fill: scaled level indices select acquired nodes only" {
+    const source =
+        \\fn f(upper: usize, start: usize) !void {
+        \\    if (upper < start or upper - start > 4) return;
+        \\    var acquired: [8]u32 = undefined;
+        \\    const required = (upper - start) * 2;
+        \\    for (0..required) |index| acquired[index] = 1;
+        \\    var level = start;
+        \\    while (level < upper) : (level += 1) {
+        \\        const child = (level - start) * 2;
+        \\        _ = acquired[child];
+        \\        _ = acquired[child + 1];
+        \\    }
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "bounded prefix fill: a skipped store cannot certify acquired nodes" {
+    const source =
+        \\fn f(upper: usize, start: usize, skip: bool) void {
+        \\    if (upper < start or upper - start > 4) return;
+        \\    var acquired: [8]u32 = undefined;
+        \\    const required = (upper - start) * 2;
+        \\    for (0..required) |index| { if (!skip) acquired[index] = 1; }
+        \\    var level = start;
+        \\    while (level < upper) : (level += 1) {
+        \\        const child = (level - start) * 2;
+        \\        _ = acquired[child + 1];
+        \\    }
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "acquired[child + 1]", 0));
+}
+
+test {
+    _ = @import("bounded_prefix_test.zig");
+}
+
+test "undefined initialization: a mutator name is not a write certificate" {
+    const source =
+        \\const State = struct {
+        \\    value: u32,
+        \\    fn initialize(self: *State) void { _ = self; }
+        \\};
+        \\fn f() u32 {
+        \\    var state: State = undefined;
+        \\    state.initialize();
+        \\    return state.value;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return state.value", 0));
+}
+
+test "undefined initialization: a proven whole-array outparameter defines all slots" {
+    const source =
+        \\fn fill(out: *[2]u32) void { out.* = .{ 4, 5 }; }
+        \\fn f() u32 {
+        \\    var array: [2]u32 = undefined;
+        \\    fill(&array);
+        \\    return array[1];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "bounded prefix fill: suffix and mismatched scaled indices remain undefined" {
+    for ([_][]const u8{
+        \\fn f(count: usize) void {
+        \\    if (count > 4) return;
+        \\    var array: [8]u32 = undefined;
+        \\    for (0..count) |index| array[index] = 1;
+        \\    _ = array[count];
+        \\}
+        ,
+        \\fn f(upper: usize, start: usize) void {
+        \\    if (upper < start or upper - start > 2) return;
+        \\    var array: [8]u32 = undefined;
+        \\    const count = (upper - start) * 2;
+        \\    for (0..count) |index| array[index] = 1;
+        \\    var level = start;
+        \\    while (level < upper) : (level += 1) {
+        \\        const child = (level - start) * 3;
+        \\        _ = array[child + 1];
+        \\    }
+        \\}
+        ,
+        \\fn f(count: usize) void {
+        \\    if (count > 4) return;
+        \\    var array: [8]u32 = undefined;
+        \\    for (1..count) |index| array[index] = 1;
+        \\    _ = array[0];
+        \\}
+        ,
+        \\fn f(count: usize) void {
+        \\    if (count == 0 or count > 4) return;
+        \\    var array: [8]u32 = undefined;
+        \\    for (0..count) |index| array[index] = 1;
+        \\    array[0] = undefined;
+        \\    _ = array[0];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "integer domains: typed parameter bounds select literal and stored holes" {
+    for ([_]struct { source: []const u8, warns: bool }{
+        .{ .source =
+        \\fn f(index: u1) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        , .warns = false },
+        .{ .source =
+        \\fn f(index: u1) u16 {
+        \\    const array = [2]u16{ 1, undefined };
+        \\    return array[index];
+        \\}
+        , .warns = true },
+        .{ .source =
+        \\fn f(index: u2) u16 {
+        \\    var array: [3]u16 = undefined;
+        \\    array[0] = 1;
+        \\    array[1] = 2;
+        \\    return array[index];
+        \\}
+        , .warns = true },
+        .{ .source =
+        \\fn f(index: u1) u16 {
+        \\    var array: [3]u16 = undefined;
+        \\    array[0] = 1;
+        \\    array[1] = 2;
+        \\    return array[index];
+        \\}
+        , .warns = false },
+        .{ .source =
+        \\fn f(index: u0) u16 {
+        \\    const array = [1]u16{1};
+        \\    return array[index];
+        \\}
+        , .warns = false },
+        .{ .source =
+        \\fn f(index: i0) u16 {
+        \\    const array = [1]u16{1};
+        \\    return array[index];
+        \\}
+        , .warns = false },
+    }) |case| {
+        var problems = try analyze(std.testing.allocator, case.source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, diagnosedAt(problems.items, "use-undefined", case.source, "array[index]", 0));
+    }
+}
+
+test "integer domains: wide unsigned and signed parameters never truncate" {
+    for ([_][]const u8{ "u64", "u65", "u128", "i64", "i65", "i128" }) |ty| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "fn f(index: {s}) u16 {{ const array = [3]u16{{ 1, 2, undefined }}; return array[@intCast(index)]; }}", .{ty});
+        defer std.testing.allocator.free(source);
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[@intCast(index)]", 0));
+    }
+}
+
+test "integer domains: widening snapshots survive source writes but not destination writes" {
+    const source =
+        \\fn f(input: u1, unknown: usize) void {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    var narrow = input;
+        \\    var index: usize = narrow;
+        \\    narrow = 0;
+        \\    _ = array[index];
+        \\    index = unknown;
+        \\    _ = array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: typed computed undefined and aliased undefined overwrites remain reads" {
+    for ([_][]const u8{
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = undefined;
+        \\    return array[index];
+        \\}
+        ,
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = @as(u1, undefined);
+        \\    return array[index];
+        \\}
+        ,
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand: u1 = undefined;
+        \\    const index: u1 = @intCast(operand);
+        \\    return array[index];
+        \\}
+        ,
+        \\fn f(input: u1) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var index = input;
+        \\    const pointer = &index;
+        \\    pointer.* = undefined;
+        \\    return array[index];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+}
+
+test "integer domains: lexical shadows and separate graphs keep their own bounds" {
+    const source =
+        \\fn f(index: u1, wide: usize) void {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    { const index = wide; _ = array[index]; }
+        \\    _ = array[index];
+        \\}
+        \\fn g(index: u2) u16 {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+}
+
+test "integer domains: semantic aliases and generic actuals use the scalar binding" {
+    const source =
+        \\const Index = u1;
+        \\fn read(index: Index) u16 {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    return array[index];
+        \\}
+        \\fn generic(comptime T: type, index: T) u16 {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    return array[index];
+        \\}
+        \\fn f(index: u1) u16 { return read(index) + generic(u1, index); }
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    // An uninstantiated generic body has no actual scalar type here.
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+fn integerDomainOwnership(gpa: std.mem.Allocator) !void {
+    const source =
+        \\fn f(index: u1, flag: bool) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var saved: usize = index;
+        \\    if (flag) saved = 0;
+        \\    return array[saved];
+        \\}
+    ;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var index: u32 = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var graph = lower: {
+            var cache = file_cache_mod.FileCache.init(gpa, &tree);
+            defer cache.deinit();
+            break :lower (try cfg_builder.lowerFunctionFull(
+                gpa,
+                &tree,
+                node,
+                &config_mod.Default,
+                &cache,
+            )) orelse continue;
+        };
+        defer graph.deinit(gpa);
+        try check(gpa, &graph, .{ .path = "<test>" }, &problems);
+    }
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "integer domains: builder and worklist ownership survives allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, integerDomainOwnership, .{});
+}
+
+test "integer domains: resolved generic scalar result retains actual width only" {
+    const source =
+        \\fn identity(comptime T: type, value: T) T { return value; }
+        \\fn f(input: u1) u16 {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    const index = identity(u1, input);
+        \\    return array[index];
+        \\}
+        \\fn g(input: u2) u16 {
+        \\    const array = [3]u16{ 1, 2, undefined };
+        \\    const index = identity(u2, input);
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: undefined rebindings and aliased widening destinations revoke reads" {
+    for ([_][]const u8{
+        \\fn f(input: u1, flag: bool) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var index = input;
+        \\    if (flag) index = undefined;
+        \\    return array[index];
+        \\}
+        ,
+        \\fn f(input: u1) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var index: usize = input;
+        \\    const pointer = &index;
+        \\    pointer.* = undefined;
+        \\    return array[index];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+}
+
+test "integer domains: computed indices retain dynamic operand uncertainty" {
+    for ([_][]const u8{
+        \\fn f(input: u1) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var operand = input;
+        \\    const pointer = &operand;
+        \\    pointer.* = undefined;
+        \\    const index: u1 = @intCast(operand);
+        \\    return array[index];
+        \\}
+        ,
+        \\fn f(input: u1, flag: bool) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var operand = input;
+        \\    if (flag) operand = undefined;
+        \\    const index: u1 = @as(u1, operand);
+        \\    return array[index];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+}
+
+test "integer domains: call result types cannot certify literal or propagated undefined results" {
+    for ([_][]const u8{
+        \\fn bad() u1 { return undefined; }
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index = bad();
+        \\    return array[index];
+        \\}
+        ,
+        \\fn unknown() u1 { const value: u1 = undefined; return value; }
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index = unknown();
+        \\    return array[index];
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+}
+
+test "integer domains: computed snapshots freeze operand definedness at evaluation" {
+    const source =
+        \\fn f(input: u1) void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var operand = input;
+        \\    const index: u1 = @intCast(operand);
+        \\    const pointer = &operand;
+        \\    pointer.* = undefined;
+        \\    _ = array[index];
+        \\    const after: u1 = @intCast(operand);
+        \\    _ = array[after];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[after]", 0));
+}
+
+test "integer domains: computed selected payload cannot hide an index operand hole" {
+    const source =
+        \\fn f(which: u1) void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const source = [2]u1{ 0, undefined };
+        \\    const safe: u1 = source[0];
+        \\    _ = array[safe];
+        \\    const index: u1 = source[which];
+        \\    _ = array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[safe]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: scalar fields and escaped field names keep payload definedness" {
+    for ([_]struct { source: []const u8, warns: bool }{
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const obj = Entry{ .idx = 0 };
+        \\    const index: u1 = obj.idx;
+        \\    return array[index];
+        \\}
+        , .warns = false },
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const obj = Entry{ .idx = 0 };
+        \\    const index: u1 = @field(obj, "\x69dx");
+        \\    return array[index];
+        \\}
+        , .warns = false },
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const obj = Entry{ .idx = undefined };
+        \\    const index: u1 = obj.idx;
+        \\    return array[index];
+        \\}
+        , .warns = true },
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const obj = Entry{ .idx = undefined };
+        \\    const index: u1 = @field(obj, "\x69dx");
+        \\    return array[index];
+        \\}
+        , .warns = true },
+    }) |case| {
+        var problems = try analyze(std.testing.allocator, case.source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, diagnosedAt(problems.items, "use-undefined", case.source, "array[index]", 0));
+    }
+}
+
+test "integer domains: pointer scalar projections distinguish known holes from unknown pointees" {
+    for ([_]struct { source: []const u8, warns: bool }{
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var obj = Entry{ .idx = 0 };
+        \\    const p = &obj;
+        \\    _ = p;
+        \\    const index: u1 = p.idx;
+        \\    return array[index];
+        \\}
+        , .warns = false },
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var obj = Entry{ .idx = undefined };
+        \\    const p = &obj;
+        \\    _ = p;
+        \\    const index: u1 = p.idx;
+        \\    return array[index];
+        \\}
+        , .warns = true },
+        .{ .source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f(p: *Entry) u16 {
+        \\    _ = p;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = p.idx;
+        \\    return array[index];
+        \\}
+        , .warns = false },
+    }) |case| {
+        var problems = try analyze(std.testing.allocator, case.source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, diagnosedAt(problems.items, "use-undefined", case.source, "array[index]", 0));
+        try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", case.source, "p;", 0));
+    }
+}
+
+test "integer domains: ordinary field writes certify only defined scalar payloads" {
+    const source =
+        \\extern fn opaqueValue() u1;
+        \\const Entry = struct { idx: u1 };
+        \\fn f() void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var obj = Entry{ .idx = undefined };
+        \\    obj.idx = 1;
+        \\    const safe: u1 = obj.idx;
+        \\    _ = array[safe];
+        \\    const unknown: u1 = undefined;
+        \\    obj.idx = unknown;
+        \\    const index: u1 = obj.idx;
+        \\    _ = array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[safe]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: pointer rebindings cannot promote unsupported scalar field snapshots" {
+    const source =
+        \\const Entry = struct { idx: u1 };
+        \\fn f() void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var left = Entry{ .idx = undefined };
+        \\    var right = Entry{ .idx = undefined };
+        \\    var p = &left;
+        \\    const saved: u1 = p.idx;
+        \\    p = &right;
+        \\    _ = array[saved];
+        \\    const index: u1 = p.idx;
+        \\    _ = array[index];
+        \\    p = &left;
+        \\    _ = p;
+        \\    const restored: u1 = p.idx;
+        \\    _ = array[restored];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[saved]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[restored]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "p;", 0));
+}
+
+test "integer domains: undefined scalar stores cannot manufacture array coverage" {
+    const source =
+        \\extern fn opaqueValue() u1;
+        \\fn f() u1 {
+        \\    const bad: u1 = undefined;
+        \\    var array: [1]u1 = undefined;
+        \\    array[0] = bad;
+        \\    return array[0];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[0]", 1));
+}
+
+test "integer domains: unsupported signed widths retain scalar operand definedness" {
+    for ([_][]const u8{ "@truncate", "@intCast" }) |cast| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "fn f() u16 {{ const array=[2]u16{{1,2}}; const operand:i128=undefined; const index:u1={s}(operand); return array[index]; }}", .{cast});
+        defer std.testing.allocator.free(source);
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+    const source =
+        \\fn f(operand: i128) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = @truncate(operand);
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: repaired operands use current definedness rather than declaration poison" {
+    const source =
+        \\fn f() void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var operand: u1 = undefined;
+        \\    operand = 0;
+        \\    const index: u1 = @intCast(operand);
+        \\    _ = array[index];
+        \\    var assigned: u1 = undefined;
+        \\    assigned = @intCast(operand);
+        \\    _ = array[assigned];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[assigned]", 0));
+}
+
+test "integer domains: type-only builtin operands do not poison scalar values" {
+    const source =
+        \\fn f(input: u1) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = @as(@TypeOf(@as(u1, undefined)), input);
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: interior pointer fields cannot borrow sibling payload facts" {
+    const source =
+        \\const Inner = struct { idx: u1 };
+        \\const Outer = struct { idx: u1, child: Inner };
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var obj = Outer{ .idx = 0, .child = .{ .idx = undefined } };
+        \\    const p = &obj.child;
+        \\    const index: u1 = p.idx;
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: noninteger runtime operands retain proved undefined origins" {
+    for ([_][]const u8{
+        \\extern fn opaqueFloat() f64;
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand: f64 = undefined;
+        \\    const index: u1 = @intFromFloat(operand);
+        \\    return array[index];
+        \\}
+        ,
+        \\extern fn opaqueBool() bool;
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand: bool = undefined;
+        \\    const index: u1 = @intFromBool(operand);
+        \\    return array[index];
+        \\}
+        ,
+        \\const Tag = enum(u1) { zero, one };
+        \\extern fn opaqueTag() Tag;
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand: Tag = undefined;
+        \\    const index: u1 = @intFromEnum(operand);
+        \\    return array[index];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+    const source =
+        \\const Tag = enum(u1) { zero, one };
+        \\fn f(operand: bool) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = @intFromBool(operand);
+        \\    return array[index];
+        \\}
+        \\fn g(operand: Tag) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = @intFromEnum(operand);
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: undefined pointer fields cannot certify scalar index payloads" {
+    const source =
+        \\const Entry = struct { idx: u1 };
+        \\fn fetch() *Entry { return undefined; }
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const p = fetch();
+        \\    const index: u1 = p.idx;
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: scalar runtime copies arithmetic and repairs preserve definedness" {
+    const source =
+        \\const Tag = enum(u1) { zero, one };
+        \\fn floats(operand: f64) void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var repaired: f64 = undefined;
+        \\    repaired = 0;
+        \\    const copied = operand;
+        \\    const arithmetic: f64 = copied + repaired;
+        \\    const index: u1 = @intFromFloat(arithmetic);
+        \\    _ = array[index];
+        \\}
+        \\fn booleans(operand: bool) void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var repaired: bool = undefined;
+        \\    repaired = true;
+        \\    const copied = operand;
+        \\    const computed = copied and repaired;
+        \\    const index: u1 = @intFromBool(computed);
+        \\    _ = array[index];
+        \\}
+        \\fn enums(operand: Tag) void {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var repaired: Tag = undefined;
+        \\    repaired = .zero;
+        \\    const copied = operand;
+        \\    const index: u1 = @intFromEnum(copied);
+        \\    _ = array[index];
+        \\    const zero: u1 = @intFromEnum(repaired);
+        \\    _ = array[zero];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    for (0..3) |occurrence| {
+        try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", occurrence));
+    }
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[zero]", 0));
+}
+
+test "integer domains: scalar undefined origins survive arithmetic copies and aliased writes" {
+    for ([_][]const u8{
+        \\fn opaqueValue() f64 { return undefined; }
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand = opaqueValue();
+        \\    const copied = operand;
+        \\    const arithmetic = copied + 0;
+        \\    const index: u1 = @intFromFloat(arithmetic);
+        \\    return array[index];
+        \\}
+        ,
+        \\fn overwrite(value: *bool) void { value.* = undefined; }
+        \\fn f(input: bool) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    var operand = input;
+        \\    overwrite(&operand);
+        \\    const copied = operand;
+        \\    const index: u1 = @intFromBool(copied);
+        \\    return array[index];
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+}
+
+test "integer domains: aggregate vector and atomic pointer operands cannot certify scalar indices" {
+    for ([_][]const u8{
+        \\fn opaqueValue() @Vector(2, u1) { return undefined; }
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand = opaqueValue();
+        \\    const index: u1 = @reduce(.Or, operand);
+        \\    return array[index];
+        \\}
+        ,
+        \\const Bit = packed struct { value: u1 };
+        \\fn opaqueValue() Bit { return undefined; }
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand = opaqueValue();
+        \\    const index: u1 = @bitCast(operand);
+        \\    return array[index];
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    }
+}
+
+test "integer domains: undefined comparison operands cannot prune an indexed read" {
+    const source =
+        \\extern fn opaqueValue() u1;
+        \\fn f() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const index: u1 = undefined;
+        \\    const wide: u2 = index;
+        \\    if (wide == 2) return array[index];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: defined comparison operands keep existing feasibility pruning" {
+    const source =
+        \\fn f(index: u1) u16 {
+        \\    const array = [2]u16{ 1, undefined };
+        \\    const wide: u2 = index;
+        \\    if (wide == 2) return array[index];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: error set operands keep defined parameters and reject undefined values" {
+    const source =
+        \\extern fn opaqueValue() anyerror;
+        \\fn safe(operand: anyerror) u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const copied = operand;
+        \\    const index: u1 = @truncate(@intFromError(copied));
+        \\    return array[index];
+        \\}
+        \\fn unsafe() u16 {
+        \\    const array = [2]u16{ 1, 2 };
+        \\    const operand: anyerror = undefined;
+        \\    const index: u1 = @truncate(@intFromError(operand));
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: initialized header lengths and loop counter guards retain prefix proofs" {
+    const source =
+        \\fn f(source: []const u8, index: u1) u16 {
+        \\    var array: [2]u16 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count < array.len and count < source.len) : (count += 1) {
+        \\        array[count] = 1;
+        \\    }
+        \\    if (index < count) return array[index];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: copied fixed array lengths do not read undefined payload" {
+    const source =
+        \\fn f(index: usize) u16 {
+        \\    var array: [2]u16 = undefined;
+        \\    array[0] = 1;
+        \\    array[1] = 2;
+        \\    const count: usize = array.len;
+        \\    if (index < count) return array[index];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: fixed array length metadata does not initialize selected payload" {
+    const source =
+        \\fn f(index: usize) u16 {
+        \\    const array = [2]u16{ 1, undefined };
+        \\    const count: usize = array.len;
+        \\    if (index < count) return array[index];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: existing exact constant inputs survive scalar conversion" {
+    const source =
+        \\fn f() u16 {
+        \\    const zero = 0;
+        \\    const copied = zero;
+        \\    const index: u1 = @intCast(copied);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: undefined assignment cannot retain exact constant input" {
+    const source =
+        \\extern fn opaqueValue() u16;
+        \\fn f() u16 {
+        \\    var zero: u16 = 0;
+        \\    zero = undefined;
+        \\    const index: u1 = @truncate(zero);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: comptime float value inputs retain established definedness" {
+    const source =
+        \\fn f() u16 {
+        \\    const zero = 0.0;
+        \\    const copied = zero;
+        \\    const index: u1 = @intFromFloat(copied);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: short circuit results exclude unread opaque operands" {
+    const source =
+        \\extern fn opaqueBool() bool;
+        \\fn f() u16 {
+        \\    const operand: bool = opaqueBool();
+        \\    const zero: bool = false and operand;
+        \\    const one: bool = true or operand;
+        \\    const zero_index: u1 = @intFromBool(zero);
+        \\    const one_index: u1 = @intFromBool(one);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[zero_index] + array[one_index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[zero_index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[one_index]", 0));
+}
+
+test "integer domains: evaluated undefined condition cannot certify a boolean outcome" {
+    const source =
+        \\extern fn opaqueBool() bool;
+        \\fn f() u16 {
+        \\    const operand: bool = undefined;
+        \\    const computed: bool = operand and false;
+        \\    const index: u1 = @intFromBool(computed);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: selected undefined aggregate fields require current field certificates" {
+    const source =
+        \\const Box = struct { index: u1, other: u1 };
+        \\fn opaqueBox() Box { return undefined; }
+        \\fn repaired() u16 {
+        \\    var box = opaqueBox();
+        \\    box.index = 0;
+        \\    const index: u1 = box.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn other() u16 {
+        \\    var box = opaqueBox();
+        \\    box.index = 0;
+        \\    const index: u1 = box.other;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn conditional(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    if (flag) box.index = 0;
+        \\    const index: u1 = box.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn both(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    if (flag) box.index = 0 else box.index = 1;
+        \\    const index: u1 = box.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 3));
+}
+
+test "integer domains: selected ancestor overwrite invalidates repaired field payload" {
+    const source =
+        \\const Inner = struct { index: u1, other: u1 };
+        \\const Box = struct { inner: Inner };
+        \\extern fn opaqueBox() Box;
+        \\fn opaqueInner() Inner { return undefined; }
+        \\fn f() u16 {
+        \\    var box = opaqueBox();
+        \\    box.inner.index = 0;
+        \\    const saved: u1 = box.inner.index;
+        \\    box.inner = opaqueInner();
+        \\    const current: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    _ = array[saved];
+        \\    return array[current];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[saved]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[current]", 0));
+}
+
+test "integer domains: AST-only exact scalar inputs are not opaque whole values" {
+    const source =
+        \\fn f() u16 {
+        \\    const zero = 0;
+        \\    const copied = zero;
+        \\    const index: u1 = @intCast(copied);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: actual integer aliases retain copied fixed array length bounds" {
+    const source =
+        \\const Length = usize;
+        \\fn f(index: usize) u16 {
+        \\    var array: [2]u16 = undefined;
+        \\    array[0] = 1;
+        \\    array[1] = 2;
+        \\    const count: Length = array.len;
+        \\    if (index < count) return array[index];
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: mixed ancestor and leaf repairs preserve common selected fields" {
+    const source =
+        \\const Inner = struct { index: u1, sibling: u1 };
+        \\const Box = struct { inner: Inner };
+        \\fn opaqueBox() Box { return undefined; }
+        \\fn opaqueInner() Inner { return undefined; }
+        \\fn mixed(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) box.inner = prepared else box.inner.index = 0;
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn reversed(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) box.inner.index = 0 else box.inner = prepared;
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn sibling(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) box.inner = prepared else box.inner.index = 0;
+        \\    const index: u1 = box.inner.sibling;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn missing(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) box.inner = prepared;
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn undefinedLeaf(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) box.inner = prepared else box.inner.index = undefined;
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn repairedAfterUndefinedAncestor(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) {
+        \\        box.inner = prepared;
+        \\    } else {
+        \\        box.inner = undefined;
+        \\        box.inner.index = 0;
+        \\    }
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn overwritten(flag: bool) u16 {
+        \\    var box = opaqueBox();
+        \\    const prepared = Inner{ .index = 0, .sibling = 1 };
+        \\    if (flag) {
+        \\        box.inner = prepared;
+        \\    } else {
+        \\        box.inner.index = 0;
+        \\        box.inner = opaqueInner();
+        \\    }
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 3));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 4));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 5));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 6));
+}
+
+test "integer domains: current boolean snapshots precede short circuit right side writes" {
+    const source =
+        \\extern fn opaqueBool() bool;
+        \\fn skipped() u16 {
+        \\    var selector: bool = true;
+        \\    selector = false;
+        \\    const operand: bool = opaqueBool();
+        \\    const computed: bool = selector and operand;
+        \\    const index: u1 = @intFromBool(computed);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn changedAfterRead() u16 {
+        \\    var selector: bool = undefined;
+        \\    const computed: bool = selector and blk: {
+        \\        selector = false;
+        \\        break :blk true;
+        \\    };
+        \\    const index: u1 = @intFromBool(computed);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn unknownSelector() u16 {
+        \\    const selector: bool = undefined;
+        \\    const index: u1 = if (selector) 0 else 1;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn definedSelector(selector: bool) u16 {
+        \\    const index: u1 = if (selector) 0 else 1;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 3));
+}
+
+test "integer domains: selected aggregate construction checks current scalar and field inputs" {
+    const source =
+        \\const Entry = struct { index: u1 };
+        \\const Inner = struct { index: u1 };
+        \\const Box = struct { inner: Inner };
+        \\extern fn opaqueValue() u1;
+        \\extern fn opaqueBox() Box;
+        \\fn unknownScalar() u16 {
+        \\    var operand: u1 = 0;
+        \\    operand = undefined;
+        \\    const entry = Entry{ .index = operand };
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn definedScalar(operand: u1) u16 {
+        \\    const entry = Entry{ .index = operand };
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn unknownField() u16 {
+        \\    const original: Box = undefined;
+        \\    const inner = Inner{ .index = original.inner.index };
+        \\    const box = Box{ .inner = inner };
+        \\    const index: u1 = box.inner.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+}
+
+test "integer domains: selected omitted defaults use their owning source context" {
+    const source =
+        \\const Zero = struct { index: u1 = 0 };
+        \\const Hole = struct { index: u1 = undefined };
+        \\const Owner = struct {
+        \\    const limit: u1 = undefined;
+        \\    const Row = struct { index: u1 = limit };
+        \\};
+        \\fn zero() u16 {
+        \\    const row = Zero{};
+        \\    const index: u1 = row.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn hole() u16 {
+        \\    const row = Hole{};
+        \\    const index: u1 = row.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn separateOwner() u16 {
+        \\    const limit: u1 = 0;
+        \\    _ = limit;
+        \\    const row = Owner.Row{};
+        \\    const index: u1 = row.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+}
+
+test "integer domains: field stores cannot promote pointer projection headers to scalar payload" {
+    const source =
+        \\const Entry = struct { index: u1 };
+        \\const Box = struct { inner: Entry };
+        \\fn whole() u16 {
+        \\    var source = Entry{ .index = undefined };
+        \\    const p = &source;
+        \\    var destination = Entry{ .index = undefined };
+        \\    destination.index = p.index;
+        \\    const index: u1 = destination.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    _ = p;
+        \\    return array[index];
+        \\}
+        \\fn interior() u16 {
+        \\    var source = Box{ .inner = .{ .index = undefined } };
+        \\    const p = &source.inner;
+        \\    var destination = Entry{ .index = undefined };
+        \\    destination.index = p.index;
+        \\    const index: u1 = destination.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    _ = p;
+        \\    return array[index];
+        \\}
+        \\fn repairedValue() u16 {
+        \\    var source = Entry{ .index = undefined };
+        \\    source.index = 0;
+        \\    var destination = Entry{ .index = undefined };
+        \\    destination.index = source.index;
+        \\    const index: u1 = destination.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "_ = p", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "_ = p", 1));
+}
+
+test "integer domains: unknown aggregate writes revoke current fields but retain scalar snapshots" {
+    const source =
+        \\const Entry = struct { index: u1 };
+        \\fn mutate(value: *Entry) void { value.index = undefined; }
+        \\fn f() u16 {
+        \\    var entry = Entry{ .index = 0 };
+        \\    const saved: u1 = entry.index;
+        \\    mutate(&entry);
+        \\    const current: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    _ = array[saved];
+        \\    return array[current];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[saved]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[current]", 0));
+}
+
+test "integer domains: actual slice length certificates do not initialize sliced bytes" {
+    const source =
+        \\fn opaqueSlice() []u16 { return undefined; }
+        \\fn mutateSlice(value: *[]u16) void { value.* = undefined; }
+        \\fn header() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    const slice: []u16 = bytes[0..];
+        \\    const copied: []u16 = slice;
+        \\    const index: u1 = @intCast(copied.len - 1);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn payload() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    const slice: []u16 = bytes[0..];
+        \\    const index: u1 = @intCast(slice[0]);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn opaqueValue() u16 {
+        \\    const slice = opaqueSlice();
+        \\    const index: u1 = @intCast(slice.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn undefinedHeader() u16 {
+        \\    const slice: []u16 = undefined;
+        \\    const index: u1 = @intCast(slice.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn overwritten() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    var slice: []u16 = bytes[0..];
+        \\    const saved: u1 = @intCast(slice.len - 1);
+        \\    mutateSlice(&slice);
+        \\    const current: u1 = @intCast(slice.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    _ = array[saved];
+        \\    return array[current];
+        \\}
+        \\fn paramHeader(slice: []u16) u16 {
+        \\    const copied: []u16 = slice;
+        \\    const index: u1 = @intCast(copied.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 3));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[saved]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[current]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 4));
+}
+
+test "out credit: partial nested metadata is readable without defining inactive storage" {
+    const source =
+        \\const Big = struct { limbs: [8]u64, len: usize, fn empty(self: *const Big) bool { return self.len == 0; } };
+        \\const Decoded = struct { significand: Big, exponent: i64 };
+        \\fn decode(value: u64, out: *Decoded) void {
+        \\    out.significand.len = @intFromBool(value != 0);
+        \\    if (value != 0) out.significand.limbs[0] = value;
+        \\    out.exponent = 7;
+        \\}
+        \\fn f(value: u64) i64 {
+        \\    var decoded: Decoded = undefined;
+        \\    decode(value, &decoded);
+        \\    if (decoded.significand.empty()) return 0;
+        \\    return decoded.exponent;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "out credit: partial nested stores leave unwritten fields undefined" {
+    const source =
+        \\const Part = struct { written: u32, missing: u32 };
+        \\const Whole = struct { part: Part, tail: u32 };
+        \\fn fill(out: *Whole) void { out.part.written = 1; out.tail = 2; }
+        \\fn f() u32 {
+        \\    var value: Whole = undefined;
+        \\    fill(&value);
+        \\    return value.part.missing;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value.part.missing", 0));
+}
+
+test "out credit: false-success repair joins the true callee store" {
+    const source =
+        \\fn seed(accept: bool, out: *i8) bool { if (!accept) return false; out.* = 1; return true; }
+        \\fn f(accept: bool) i8 {
+        \\    var value: i8 = undefined;
+        \\    var seeded = false;
+        \\    seeded = seed(accept, &value);
+        \\    if (!seeded) value = -1;
+        \\    return value;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "out credit: unchecked success and opaque boolean callees remain undefined" {
+    for ([_][]const u8{
+        \\fn seed(accept: bool, out: *u32) bool { if (!accept) return false; out.* = 1; return true; }
+        \\fn f(accept: bool) u32 { var value: u32 = undefined; _ = seed(accept, &value); return value; }
+        ,
+        \\extern fn seed(out: *u32) bool;
+        \\fn f() u32 { var value: u32 = undefined; if (!seed(&value)) return 0; return value; }
+        ,
+        \\fn seed(accept: bool, out: *u32) bool { if (accept) return true; out.* = 1; return false; }
+        \\fn f(accept: bool) u32 { var value: u32 = undefined; const ok = seed(accept, &value); if (!ok) return 0; return value; }
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+    }
+}
+
+test "out credit: direct boolean success condition defines only its true arm" {
+    const source =
+        \\fn seed(accept: bool, out: *u32) bool { if (!accept) return false; out.* = 1; return true; }
+        \\fn f(accept: bool) u32 { var value: u32 = undefined; if (!seed(accept, &value)) return 0; return value; }
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "out credit: false-only boolean stores follow stored and direct results" {
+    const source =
+        \\fn seed(accept: bool, out: *u32) bool {
+        \\    if (accept) return true;
+        \\    out.* = 1;
+        \\    return false;
+        \\}
+        \\fn stored(accept: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    const ok = seed(accept, &value);
+        \\    if (ok) return 0;
+        \\    return value;
+        \\}
+        \\fn direct(accept: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    if (seed(accept, &value)) return 0;
+        \\    return value;
+        \\}
+        \\fn wrongArm(accept: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    if (!seed(accept, &value)) return 0;
+        \\    return value;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 2));
+}
+
+test "out credit: direct boolean conditions preserve evaluated input dependencies" {
+    const source =
+        \\fn seed(accept: bool, out: *u32) bool {
+        \\    if (!accept) return false;
+        \\    out.* = 1;
+        \\    return true;
+        \\}
+        \\fn good(accept: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    if (!seed(accept, &value)) return 0;
+        \\    return value;
+        \\}
+        \\fn skipped(accept: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    if (accept or seed(accept, &value)) return value;
+        \\    return 0;
+        \\}
+        \\fn unknownInput() u32 {
+        \\    const accept: bool = undefined;
+        \\    var value: u32 = undefined;
+        \\    if (!seed(accept, &value)) return 0;
+        \\    return value;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value", 2));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "seed(accept, &value)", 2));
+}
+
+test "out credit: discarded and stored error unions do not select success" {
+    const source =
+        \\fn fill(out: *u32, fail: bool) !void {
+        \\    if (fail) return error.Bad;
+        \\    out.* = 1;
+        \\}
+        \\fn discarded(fail: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    _ = fill(&value, fail);
+        \\    return value;
+        \\}
+        \\fn stored(fail: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    const outcome = fill(&value, fail);
+        \\    outcome catch {};
+        \\    return value;
+        \\}
+        \\fn selected(fail: bool) !u32 {
+        \\    var value: u32 = undefined;
+        \\    try fill(&value, fail);
+        \\    return value;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value", 2));
+}
+
+test "out credit: mutated slice bounds cannot certify the post-call prefix" {
+    const source =
+        \\fn fill(output: []u8, n: *usize) void {
+        \\    for (output) |*p| p.* = 1;
+        \\    n.* = 4;
+        \\}
+        \\fn bad() u8 {
+        \\    var n: usize = 2;
+        \\    var buffer: [4]u8 = undefined;
+        \\    fill(buffer[0..n], &n);
+        \\    if (n == 0) return 0;
+        \\    return buffer[n - 1];
+        \\}
+        \\fn aliased() u8 {
+        \\    var n: usize = 2;
+        \\    const alias = &n;
+        \\    var buffer: [4]u8 = undefined;
+        \\    fill(buffer[0..n], alias);
+        \\    if (n == 0) return 0;
+        \\    return buffer[n - 1];
+        \\}
+        \\fn stable(n: usize) u8 {
+        \\    if (n == 0 or n > 4) return 0;
+        \\    var changed: usize = 2;
+        \\    var buffer: [4]u8 = undefined;
+        \\    fill(buffer[0..n], &changed);
+        \\    return buffer[n - 1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return buffer[n - 1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return buffer[n - 1]", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return buffer[n - 1]", 2));
+}
+
+test "out credit: scalar C pointer stores do not define the addressed array" {
+    const source =
+        \\fn first(p: [*c]u32) void { p.* = 1; }
+        \\fn bad() u32 {
+        \\    var values: [4]u32 = undefined;
+        \\    first(&values);
+        \\    return values[3];
+        \\}
+        \\fn scalar() u32 {
+        \\    var value: u32 = undefined;
+        \\    first(&value);
+        \\    return value;
+        \\}
+        \\fn whole(out: *[4]u32) void { out.* = .{ 1, 2, 3, 4 }; }
+        \\fn complete() u32 {
+        \\    var values: [4]u32 = undefined;
+        \\    whole(&values);
+        \\    return values[3];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return values[3]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value;", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return values[3]", 1));
+}
+
+test "out credit: undefined pointer inputs never supply initialized output bytes" {
+    const source =
+        \\fn load(input: *const u32, out: *u32) void { out.* = input.*; }
+        \\fn bad(input: *u32) u32 {
+        \\    input.* = undefined;
+        \\    var output: u32 = undefined;
+        \\    load(input, &output);
+        \\    return output;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return output", 0));
+}
+
+test "out credit: replacing the success boolean cannot initialize the false output" {
+    const source =
+        \\fn seed(accept: bool, out: *u32) bool { if (!accept) return false; out.* = 1; return true; }
+        \\fn f(accept: bool) u32 {
+        \\    var value: u32 = undefined;
+        \\    var ok = seed(accept, &value);
+        \\    ok = true;
+        \\    if (!ok) value = 0;
+        \\    return value;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+}
+
+test "out credit: try return preserves a successful store certificate" {
+    const source =
+        \\fn fill(out: *u32, fail: bool) !void { if (fail) return error.NoValue; out.* = 1; }
+        \\fn f(fail: bool) !u32 { var value: u32 = undefined; try fill(&value, fail); return value; }
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "out credit: catch continuation does not inherit the success store" {
+    const source =
+        \\fn fill(out: *u32, fail: bool) !void { if (fail) return error.NoValue; out.* = 1; }
+        \\fn f(fail: bool) u32 { var value: u32 = undefined; fill(&value, fail) catch {}; return value; }
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+}
+
+test "out credit: initialized method field excludes an unwritten output buffer" {
+    const source =
+        \\const Context = struct { value: u32, fn activate(self: *Context) u32 { return self.value; } };
+        \\const Limited = struct {
+        \\    bytes: [64]u8, context: Context,
+        \\    fn init(self: *Limited, value: u32) !void { self.context = .{ .value = value }; }
+        \\};
+        \\fn f(value: u32) !u32 { var limited: Limited = undefined; try limited.init(value); return limited.context.activate(); }
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "out credit: returned array selects the definitely written output field" {
+    const source =
+        \\const Extra = struct { from: [4]f32 = .{0,0,0,0}, mode: [2]u32 = .{0,0} };
+        \\const Fill = union(enum) { solid: [4]f32, image: u32 };
+        \\fn fill(extra: *Extra, value: Fill) [4]f32 {
+        \\    switch (value) {
+        \\        .solid => |color| { extra.mode[0] = 0; extra.from = color; },
+        \\        .image => |index| { extra.mode[1] = index; extra.from = .{1,0,0,1}; },
+        \\    }
+        \\    return extra.from;
+        \\}
+        \\fn consume(_: [4]f32) void {}
+        \\fn f(value: Fill) void { var extra: Extra = .{}; const color = fill(&extra, value); consume(color); }
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "out credit: returned array cannot select an unwritten output field" {
+    const source =
+        \\const Extra = struct { from: [4]f32, mode: u32 };
+        \\fn fill(extra: *Extra) [4]f32 { extra.mode = 1; return extra.from; }
+        \\fn consume(_: [4]f32) void {}
+        \\fn f() void { var extra: Extra = undefined; const color = fill(&extra); consume(color); }
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "out credit: captured pointer payloads are unknown but explicit stored holes are undefined" {
+    const source =
+        \\const Extra = struct { from: [2]u8 };
+        \\const Fill = union(enum) { pointer: *const [2]u8, value: [2]u8 };
+        \\fn fill(extra: *Extra, input: Fill) [2]u8 {
+        \\    switch (input) {
+        \\        .pointer => |pointer| extra.from = pointer.*,
+        \\        .value => |value| extra.from = value,
+        \\    }
+        \\    return extra.from;
+        \\}
+        \\fn poison(extra: *Extra) [2]u8 { extra.from = undefined; return extra.from; }
+        \\pub fn unknownPointee() u8 {
+        \\    var hole: [2]u8 = undefined;
+        \\    var extra: Extra = undefined;
+        \\    const result = fill(&extra, .{ .pointer = &hole });
+        \\    return result[0];
+        \\}
+        \\pub fn bad() u8 {
+        \\    var extra: Extra = undefined;
+        \\    const result = poison(&extra);
+        \\    return result[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return result[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return result[0]", 1));
+}
+
+test "integer domains: readonly and disjoint field updates retain selected payload certificates" {
+    const source =
+        \\const Entry = struct { index: u1, other: u1 };
+        \\fn observe(value: *const Entry) void { _ = value.index; }
+        \\extern fn opaqueValue() u1;
+        \\fn poisonIndex(value: *Entry) void { value.index = undefined; }
+        \\fn readonly() u16 {
+        \\    var entry = Entry{ .index = 0, .other = 0 };
+        \\    observe(&entry);
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn disjoint() u16 {
+        \\    var entry = Entry{ .index = 0, .other = 0 };
+        \\    entry.other = opaqueValue();
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn bodyless() u16 {
+        \\    var entry = Entry{ .index = 0, .other = 0 };
+        \\    poisonIndex(&entry);
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+}
+
+test "integer domains: joined slice headers require defined certificates on every incoming path" {
+    const source =
+        \\fn opaqueSlice() []u16 { return undefined; }
+        \\fn both(flag: bool) u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    var slice: []u16 = undefined;
+        \\    if (flag) slice = bytes[0..] else slice = bytes[0..];
+        \\    const index: u1 = @intCast(slice.len - 1);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn oneUnknown(flag: bool) u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    var slice: []u16 = undefined;
+        \\    if (flag) slice = bytes[0..] else slice = opaqueSlice();
+        \\    const index: u1 = @intCast(slice.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: builtin runtime argument snapshots preserve evaluated definedness" {
+    const source =
+        \\fn skipped() u16 {
+        \\    const zero: u1 = @intFromBool(false and @as(bool, undefined));
+        \\    const one: u1 = @intFromBool(true or @as(bool, undefined));
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[zero] + array[one];
+        \\}
+        \\fn reached() u16 {
+        \\    const index: u1 = @intFromBool(true and @as(bool, undefined));
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn unknownLeft() u16 {
+        \\    const index: u1 = @intFromBool(@as(bool, undefined) and false);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn earlierArgument() u16 {
+        \\    var operand: u1 = undefined;
+        \\    const index: u1 = @max(operand, blk: {
+        \\        operand = 0;
+        \\        break :blk @as(u1, 0);
+        \\    });
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[zero]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[one]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+}
+
+test "integer domains: evaluated slice boundaries cannot use initialized header facts" {
+    const source =
+        \\fn undefinedEnd() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    const base: []u16 = bytes[0..];
+        \\    const end: usize = undefined;
+        \\    const sliced: []u16 = base[0..end];
+        \\    const index: u1 = @intCast(sliced.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn changedAfterRead() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    const base: []u16 = bytes[0..];
+        \\    var start: usize = undefined;
+        \\    const sliced: []u16 = base[start..blk: {
+        \\        start = 0;
+        \\        break :blk @as(usize, 2);
+        \\    }];
+        \\    const index: u1 = @intCast(sliced.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn selfSlice() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    var slice: []u16 = bytes[0..];
+        \\    slice = slice[0..];
+        \\    const index: u1 = @intCast(slice.len - 1);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 2));
+}
+
+test "integer domains: mulAdd saves earlier scalar uncertainty before later argument effects" {
+    const source =
+        \\fn f() u16 {
+        \\    var operand: f64 = undefined;
+        \\    const result = @mulAdd(f64, operand, blk: {
+        \\        operand = 0;
+        \\        break :blk @as(f64, 1);
+        \\    }, 0);
+        \\    const index: u1 = @intFromFloat(result);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+}
+
+test "integer domains: inferred slice self reslicing retains header but not obsolete length or coverage" {
+    const source =
+        \\fn opaqueSlice() []u16 { return undefined; }
+        \\fn header(input: []u16) u16 {
+        \\    var slice = input;
+        \\    slice = slice[0..];
+        \\    const index: u1 = @intCast(slice.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn opaqueValue() u16 {
+        \\    var slice = opaqueSlice();
+        \\    slice = slice[0..];
+        \\    const index: u1 = @intCast(slice.len);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn shortened() u16 {
+        \\    var bytes = [2]u16{ 0, undefined };
+        \\    var slice: []u16 = bytes[0..];
+        \\    slice = slice[0..1];
+        \\    const index: u1 = 1;
+        \\    return slice[index];
+        \\}
+        \\fn selected() u16 {
+        \\    var bytes = [2]u16{ 1, 2 };
+        \\    var slice: []u16 = bytes[0..];
+        \\    slice = slice[0..1];
+        \\    return slice[0];
+        \\}
+        \\fn hole() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    var slice: []u16 = bytes[0..];
+        \\    slice = slice[0..1];
+        \\    return slice[0];
+        \\}
+        \\fn full() u16 {
+        \\    var bytes = [2]u16{ 1, 2 };
+        \\    var slice: []u16 = bytes[0..];
+        \\    slice = slice[0..];
+        \\    return slice[1];
+        \\}
+        \\fn stale() u16 {
+        \\    var bytes = [2]u16{ 1, undefined };
+        \\    var slice: []u16 = bytes[0..];
+        \\    const index: u1 = 1;
+        \\    if (index < slice.len) {
+        \\        slice = slice[0..1];
+        \\        return slice[index];
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn guarded(input: []u16, index: usize) u16 {
+        \\    if (index < input.len) return input[index];
+        \\    return 0;
+        \\}
+        \\fn interior() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    bytes[0] = 1;
+        \\    const slice: []u16 = bytes[1..2];
+        \\    return slice[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "slice[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "slice[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "slice[0]", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "slice[1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "slice[index]", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "input[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "slice[0]", 2));
+}
+
+test "integer domains: field stores retain undefined pointee origins" {
+    const source =
+        \\const Entry = struct { index: u1 };
+        \\fn bad() u16 {
+        \\    var entry: Entry = undefined;
+        \\    var bit: u1 = undefined;
+        \\    const p = &bit;
+        \\    entry.index = p.*;
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn known() u16 {
+        \\    var entry: Entry = undefined;
+        \\    entry.index = 0;
+        \\    const index: u1 = entry.index;
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: field copy reads share decoded quoted field identity" {
+    const source =
+        \\const Entry = struct { x: u1, y: u1 };
+        \\fn repaired() u16 {
+        \\    var source: Entry = undefined;
+        \\    source.x = 0;
+        \\    var destination: Entry = undefined;
+        \\    destination.y = source.@"x";
+        \\    const index: u1 = destination.@"y";
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn missing() u16 {
+        \\    var source: Entry = undefined;
+        \\    var destination: Entry = undefined;
+        \\    destination.y = source.@"x";
+        \\    const index: u1 = destination.@"y";
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "integer domains: actual address coerced slice has initialized length but undefined bytes" {
+    const source =
+        \\fn header() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    const slice: []u16 = &bytes;
+        \\    const index: u1 = @intCast(slice.len - 1);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+        \\fn payload() u16 {
+        \\    var bytes: [2]u16 = undefined;
+        \\    const slice: []u16 = &bytes;
+        \\    const index: u1 = @intCast(slice[0]);
+        \\    const array = [2]u16{ 1, 2 };
+        \\    return array[index];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "array[index]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "array[index]", 1));
+}
+
+test "complete arrays: splat and repeated literals cover every slot, an unbounded index is not a hole" {
+    const source =
+        \\const Input = struct { slot: u32 };
+        \\fn consume(inputs: [8]?Input) u32 {
+        \\    return if (inputs[0]) |first| first.slot else 0;
+        \\}
+        \\pub fn viaSplat(i: usize) bool {
+        \\    var found: [3]bool = @splat(false);
+        \\    return found[i];
+        \\}
+        \\pub fn viaRepeat(source: u32) u32 {
+        \\    var inputs: [8]?Input = .{null} ** 8;
+        \\    inputs[0] = .{ .slot = source };
+        \\    return consume(inputs);
+        \\}
+        \\pub fn viaTypedRepeat(i: usize) u8 {
+        \\    var bytes: [4]u8 = [_]u8{0} ** 4;
+        \\    return bytes[i];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "complete arrays: undefined splat, undefined repeat and undefined storage still read as undefined" {
+    const source =
+        \\pub fn splatUndefined(i: usize) u8 {
+        \\    var bytes: [3]u8 = @splat(undefined);
+        \\    return bytes[i];
+        \\}
+        \\pub fn repeatUndefined(i: usize) u8 {
+        \\    var bytes: [3]u8 = .{undefined} ** 3;
+        \\    return bytes[i];
+        \\}
+        \\pub fn plainUndefined(i: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    return bytes[i];
+        \\}
+        \\pub fn undefinedIndex() u8 {
+        \\    var bytes: [3]u8 = @splat(0);
+        \\    var i: usize = undefined;
+        \\    return bytes[i];
+        \\}
+        \\pub fn hole(i: usize) u8 {
+        \\    var bytes: [3]u8 = @splat(0);
+        \\    bytes[1] = undefined;
+        \\    return bytes[i];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 5), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array copies: dereferencing an array pointer parameter copies caller-initialized storage" {
+    const source =
+        \\pub fn probe(captures: *[4]?u32, flag: bool) bool {
+        \\    const saved = captures.*;
+        \\    if (flag) captures.* = saved;
+        \\    return saved[0] != null;
+        \\}
+        \\pub fn constant(table: *const [4]u8) u8 {
+        \\    const copy = table.*;
+        \\    return copy[2];
+        \\}
+        \\pub fn runtime(table: *const [4]u8, i: usize) u8 {
+        \\    const copy = table.*;
+        \\    return copy[i];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array copies: dereferencing a local or an overwritten pointer still copies undefined storage" {
+    const source =
+        \\pub fn localAlias() u8 {
+        \\    var bytes: [4]u8 = undefined;
+        \\    const alias = &bytes;
+        \\    const copy = alias.*;
+        \\    return copy[2];
+        \\}
+        \\pub fn overwritten(table: *[4]u8) u8 {
+        \\    table.* = undefined;
+        \\    const copy = table.*;
+        \\    return copy[2];
+        \\}
+        \\pub fn memset(table: *[4]u8) u8 {
+        \\    @memset(table, undefined);
+        \\    const copy = table.*;
+        \\    return copy[2];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 3), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array copies: an array value returned by a call is the callee's initialized result" {
+    const source =
+        \\const Pair = struct { a: [2]u32, n: u32 };
+        \\const Choice = union(enum) { two: [2]u32, one: u32 };
+        \\fn pair(x: u32) Pair { return .{ .a = .{ x, x }, .n = x }; }
+        \\fn two(x: u32) [2]u32 { return .{ x, x }; }
+        \\fn choice(x: u32) Choice { return .{ .two = .{ x, x } }; }
+        \\const Ctx = struct {
+        \\    base: u32,
+        \\    fn data(self: Ctx, i: usize) Pair { _ = i; return .{ .a = .{ self.base, 1 }, .n = 0 }; }
+        \\};
+        \\pub fn direct(x: u32) u32 {
+        \\    const a: [2]u32 = two(x);
+        \\    return a[1];
+        \\}
+        \\pub fn field(x: u32) u32 {
+        \\    const a: [2]u32 = pair(x).a;
+        \\    return a[1];
+        \\}
+        \\pub fn variant(x: u32) u32 {
+        \\    const a: [2]u32 = choice(x).two;
+        \\    return a[1];
+        \\}
+        \\pub fn method(c: Ctx, i: usize) u32 {
+        \\    const a: [2]u32 = c.data(i).a;
+        \\    if (i >= a.len) return 0;
+        \\    return a[i];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array copies: a call result built from partially undefined local storage is still undefined" {
+    const source =
+        \\const Wrap = struct { arr: [2]u8 };
+        \\fn wrap(src: *const [2]u8) Wrap {
+        \\    _ = src;
+        \\    var w = Wrap{ .arr = undefined };
+        \\    w.arr[0] +%= 0;
+        \\    return w;
+        \\}
+        \\pub fn whole() u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    const a: [2]u8 = wrap(&bytes).arr;
+        \\    return a[1];
+        \\}
+        \\pub fn partial() u8 {
+        \\    var bytes: [2]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    const a: [2]u8 = wrap(&bytes).arr;
+        \\    return a[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "a[1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "a[0]", 0));
+}
+
+test "interior views: an offset view of caller-owned or call-returned bytes inherits their initialization" {
+    const source =
+        \\const Buffer = struct {
+        \\    items: []u8,
+        \\    fn view(self: *const Buffer) []u8 { return self.items; }
+        \\};
+        \\pub fn constantStart(data: []const u8) u8 {
+        \\    if (data.len < 2) return 0;
+        \\    const content = data[1..];
+        \\    return content[0];
+        \\}
+        \\pub fn runtimeStart(data: []const u8, start: usize, end: usize) usize {
+        \\    const slice = data[start..end];
+        \\    var k: usize = 0;
+        \\    while (k < slice.len) : (k += 1) {
+        \\        if (slice[k] == '}') return k;
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn viewOfView(data: []const u8, start: usize) u8 {
+        \\    const tail = data[start..];
+        \\    const head = tail[0..1];
+        \\    const inner = head[1..];
+        \\    return inner[0] +% head[0] +% tail[0];
+        \\}
+        \\pub fn callResult(buffer: *const Buffer, start: usize) u8 {
+        \\    const bytes = buffer.view();
+        \\    const tail = bytes[start..];
+        \\    return tail[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "interior views: an offset view of local undefined storage or an undefined header is still undefined" {
+    const source =
+        \\pub fn array(start: usize) u8 {
+        \\    var buf: [8]u8 = undefined;
+        \\    const tail = buf[start..];
+        \\    return tail[0];
+        \\}
+        \\pub fn header(start: usize) u8 {
+        \\    var bytes: []const u8 = undefined;
+        \\    const tail = bytes[start..];
+        \\    return tail[0];
+        \\}
+        \\pub fn backed(start: usize) u8 {
+        \\    var buf: [8]u8 = undefined;
+        \\    const bytes: []const u8 = buf[0..4];
+        \\    const tail = bytes[start..];
+        \\    return tail[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 3), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "slice stores: an element store or element address leaves the header and the filled bytes defined" {
+    const source =
+        \\const std = @import("std");
+        \\fn mark(flag: *bool) void { flag.* = true; }
+        \\fn bump(n: *usize) void { n.* += 1; }
+        \\pub fn distinct(gpa: std.mem.Allocator, count: usize, keys: []const usize) !usize {
+        \\    const seen = try gpa.alloc(bool, count);
+        \\    defer gpa.free(seen);
+        \\    @memset(seen, false);
+        \\    var n: usize = 0;
+        \\    for (keys) |k| {
+        \\        if (seen[k]) continue;
+        \\        seen[k] = true;
+        \\        n += 1;
+        \\    }
+        \\    return n;
+        \\}
+        \\pub fn histogram(gpa: std.mem.Allocator, count: usize, keys: []const usize) !usize {
+        \\    const counts = try gpa.alloc(usize, count);
+        \\    defer gpa.free(counts);
+        \\    @memset(counts, 0);
+        \\    for (keys) |k| counts[k] += 1;
+        \\    return counts[0];
+        \\}
+        \\pub fn byAddress(gpa: std.mem.Allocator, count: usize, keys: []const usize) !usize {
+        \\    const seen = try gpa.alloc(bool, count);
+        \\    defer gpa.free(seen);
+        \\    @memset(seen, false);
+        \\    const counts = try gpa.alloc(usize, count);
+        \\    defer gpa.free(counts);
+        \\    @memset(counts, 0);
+        \\    var n: usize = 0;
+        \\    for (keys) |k| {
+        \\        if (seen[k]) continue;
+        \\        mark(&seen[k]);
+        \\        bump(&counts[k]);
+        \\        n += counts[k];
+        \\    }
+        \\    return n;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "slice stores: a store through a slice still cannot define an undefined header or local array" {
+    const source =
+        \\pub fn headerUndefined(k: usize) bool {
+        \\    var s: []bool = undefined;
+        \\    s[k] = true;
+        \\    return s[0];
+        \\}
+        \\pub fn arrayUndefined(k: usize) bool {
+        \\    var a: [4]bool = undefined;
+        \\    a[0] = true;
+        \\    return a[k];
+        \\}
+        \\pub fn arrayConditional(k: usize, c: bool) bool {
+        \\    var a: [4]bool = undefined;
+        \\    if (c) a[1] = true;
+        \\    return a[1] or a[k];
+        \\}
+        \\pub fn viaSliceOfArray(k: usize) bool {
+        \\    var a: [4]bool = undefined;
+        \\    const s: []bool = &a;
+        \\    s[0] = true;
+        \\    return s[k];
+        \\}
+        \\pub fn viaSliceOfArrayRange() bool {
+        \\    var a: [4]bool = undefined;
+        \\    const s: []bool = a[0..];
+        \\    s[0] = true;
+        \\    return s[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 6), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: a guarded helper filling an array pointer certifies the returned prefix" {
+    const source =
+        \\const max_depth = 8;
+        \\fn collect(tags: []const u8, limit: usize, regions: *[max_depth]u32) ?usize {
+        \\    var depth: usize = 0;
+        \\    var t: u32 = 0;
+        \\    while (t < limit) : (t += 1) {
+        \\        if (tags[t] == '{') {
+        \\            if (depth == max_depth) return null;
+        \\            regions[depth] = t;
+        \\            depth += 1;
+        \\        }
+        \\    }
+        \\    return depth;
+        \\}
+        \\fn literal(limit: usize, slots: *[4]u32) ?usize {
+        \\    var used: usize = 0;
+        \\    while (used < limit) {
+        \\        if (used == slots.len) return null;
+        \\        slots[used] = 1;
+        \\        used += 1;
+        \\    }
+        \\    return used;
+        \\}
+        \\pub fn innermost(tags: []const u8, limit: usize) ?u32 {
+        \\    var regions: [max_depth]u32 = undefined;
+        \\    const len = collect(tags, limit, &regions) orelse return null;
+        \\    var i = len;
+        \\    while (i > 0) {
+        \\        i -= 1;
+        \\        const brace = regions[i];
+        \\        if (brace == 0) continue;
+        \\        if (tags[brace - 1] == 'c') return brace;
+        \\    }
+        \\    return null;
+        \\}
+        \\pub fn counted(limit: usize) u32 {
+        \\    var slots: [4]u32 = undefined;
+        \\    const used = literal(limit, &slots) orelse return 0;
+        \\    if (used == 0) return 0;
+        \\    return slots[used - 1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "indexed initialization: an array pointer helper without a matching capacity guard certifies nothing" {
+    for ([_][]const u8{
+        // no capacity guard: the store may leave the array
+        \\const cap = 4;
+        \\fn fill(limit: usize, out: *[cap]u32) ?usize {
+        \\    var n: usize = 0;
+        \\    while (n < limit) {
+        \\        out[n] = 1;
+        \\        n += 1;
+        \\    }
+        \\    return n;
+        \\}
+        \\pub fn f(limit: usize) u32 {
+        \\    var array: [cap]u32 = undefined;
+        \\    const n = fill(limit, &array) orelse return 0;
+        \\    if (n == 0) return 0;
+        \\    return array[n - 1];
+        \\}
+        ,
+        // guard names another constant than the array extent
+        \\const cap = 4;
+        \\const other = 2;
+        \\fn fill(limit: usize, out: *[cap]u32) ?usize {
+        \\    var n: usize = 0;
+        \\    while (n < limit) {
+        \\        if (n == other) return null;
+        \\        out[n] = 1;
+        \\        n += 1;
+        \\    }
+        \\    return n;
+        \\}
+        \\pub fn f(limit: usize) u32 {
+        \\    var array: [cap]u32 = undefined;
+        \\    const n = fill(limit, &array) orelse return 0;
+        \\    if (n == 0) return 0;
+        \\    return array[n - 1];
+        \\}
+        ,
+        // the prefix is the filled part only
+        \\const cap = 4;
+        \\fn fill(limit: usize, out: *[cap]u32) ?usize {
+        \\    var n: usize = 0;
+        \\    while (n < limit) {
+        \\        if (n == cap) return null;
+        \\        out[n] = 1;
+        \\        n += 1;
+        \\    }
+        \\    return n;
+        \\}
+        \\pub fn f(limit: usize) u32 {
+        \\    var array: [cap]u32 = undefined;
+        \\    const n = fill(limit, &array) orelse return 0;
+        \\    return array[n];
+        \\}
+        ,
+        // an undefined payload is not a fill
+        \\const cap = 4;
+        \\fn fill(limit: usize, out: *[cap]u32) ?usize {
+        \\    var n: usize = 0;
+        \\    while (n < limit) {
+        \\        if (n == cap) return null;
+        \\        out[n] = undefined;
+        \\        n += 1;
+        \\    }
+        \\    return n;
+        \\}
+        \\pub fn f(limit: usize) u32 {
+        \\    var array: [cap]u32 = undefined;
+        \\    const n = fill(limit, &array) orelse return 0;
+        \\    if (n == 0) return 0;
+        \\    return array[n - 1];
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(countRuleLines(problems.items, "use-undefined") >= 1);
+    }
+}
+
+test "undefined initialization: delegated whole-object initializers define the receiver and field operands" {
+    const source =
+        \\const Handle = struct { id: u32, ptr: *u8 };
+        \\const Context = struct {
+        \\    handle: Handle,
+        \\    a: u32,
+        \\    b: u32,
+        \\    fn init(self: *Context, handle: Handle) !void { try self.initWith(handle, 1); }
+        \\    fn initWith(self: *Context, handle: Handle, a: u32) !void {
+        \\        self.handle = handle;
+        \\        self.a = a;
+        \\        self.b = a + 1;
+        \\    }
+        \\};
+        \\const Session = struct {
+        \\    handle: Handle,
+        \\    context: Context,
+        \\    fn open(self: *Session, handle: Handle) !void {
+        \\        self.* = .{ .handle = handle, .context = undefined };
+        \\        try self.context.init(handle);
+        \\        self.handle = self.context.handle;
+        \\    }
+        \\};
+        \\fn receiver(handle: Handle) !u32 {
+        \\    var c: Context = undefined;
+        \\    try c.init(handle);
+        \\    return c.a + c.b;
+        \\}
+        \\fn viaAddress(handle: Handle) !u32 {
+        \\    var c: Context = undefined;
+        \\    try Context.init(&c, handle);
+        \\    return c.a;
+        \\}
+        \\fn viaFieldAddress(handle: Handle) !u32 {
+        \\    var s: Session = .{ .handle = handle, .context = undefined };
+        \\    try Context.init(&s.context, handle);
+        \\    return s.context.a;
+        \\}
+        \\fn viaFieldReceiver(handle: Handle) !u32 {
+        \\    var s: Session = .{ .handle = handle, .context = undefined };
+        \\    try s.context.init(handle);
+        \\    return s.context.b;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "use-undefined"))
+            std.debug.print("delegated initializer positive line {d}: {s}\n", .{ problem.start.line, problem.message });
+    }
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "undefined initialization: a delegated initializer that does not fully store keeps the read" {
+    const names = [_][]const u8{ "partial", "no_store", "by_value", "undefined_actual", "cycle", "field_partial" };
+    var correct = true;
+    for ([_][]const u8{
+        // the delegate writes only some fields
+        \\const Context = struct {
+        \\    a: u32,
+        \\    b: u32,
+        \\    fn init(self: *Context) !void { try self.initA(); }
+        \\    fn initA(self: *Context) !void { self.a = 1; }
+        \\};
+        \\fn f() !u32 {
+        \\    var c: Context = undefined;
+        \\    try c.init();
+        \\    return c.b;
+        \\}
+        ,
+        // the delegate never writes
+        \\const Context = struct {
+        \\    a: u32,
+        \\    fn init(self: *Context) !void { try self.nothing(); }
+        \\    fn nothing(self: *Context) !void { _ = self; }
+        \\};
+        \\fn f() !u32 {
+        \\    var c: Context = undefined;
+        \\    try c.init();
+        \\    return c.a;
+        \\}
+        ,
+        // a by-value receiver cannot store into the caller's object
+        \\const Context = struct {
+        \\    a: u32,
+        \\    fn init(self: Context) !void { _ = self; }
+        \\};
+        \\fn f() !u32 {
+        \\    var c: Context = undefined;
+        \\    try c.init();
+        \\    return c.a;
+        \\}
+        ,
+        // an undefined actual stored by the delegate is still undefined
+        \\const Handle = struct { id: u32 };
+        \\const Context = struct {
+        \\    handle: Handle,
+        \\    fn init(self: *Context, handle: Handle) !void { try self.initWith(handle); }
+        \\    fn initWith(self: *Context, handle: Handle) !void { self.handle = handle; }
+        \\};
+        \\fn f() !u32 {
+        \\    var c: Context = undefined;
+        \\    var h: Handle = undefined;
+        \\    try c.init(h);
+        \\    return c.handle.id;
+        \\}
+        ,
+        // mutually recursive delegates prove nothing
+        \\const Context = struct {
+        \\    a: u32,
+        \\    fn first(self: *Context) !void { try self.second(); }
+        \\    fn second(self: *Context) !void { try self.first(); }
+        \\};
+        \\fn f() !u32 {
+        \\    var c: Context = undefined;
+        \\    try c.first();
+        \\    return c.a;
+        \\}
+        ,
+        // a field operand whose delegate stores only one of its fields
+        \\const Inner = struct {
+        \\    a: u32,
+        \\    b: u32,
+        \\    fn init(self: *Inner) !void { try self.initA(); }
+        \\    fn initA(self: *Inner) !void { self.a = 1; }
+        \\};
+        \\const Holder = struct { tag: u32, inner: Inner };
+        \\fn f() !u32 {
+        \\    var h: Holder = .{ .tag = 1, .inner = undefined };
+        \\    try h.inner.init();
+        \\    return h.inner.b;
+        \\}
+    }, 0..) |source, case_index| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        if (countRuleLines(problems.items, "use-undefined") == 0) {
+            std.debug.print("delegated initializer unsafe case {s}: missing use-undefined\n", .{names[case_index]});
+            correct = false;
+        }
+    }
+    try std.testing.expect(correct);
+}
+
+test "stack_escape: an address-free result read through a view of a local buffer carries no address" {
+    const gpa = std.testing.allocator;
+    // `view` fills a local buffer and returns a slice over it. An element,
+    // a comparison and an aggregate of integers copied out of that slice hold
+    // no address; returning the slice itself, the local, a local array view,
+    // a struct holding `&local` or an inline field address still does.
+    const source =
+        \\const Index = enum(u32) { _ };
+        \\const Span = struct { first: u32, last: u32 };
+        \\const Call = struct { params: []const Index };
+        \\const Holder = struct { p: *const u32 };
+        \\const Inline = struct { field: u32, ptr: *const u32 };
+        \\fn view(buffer: *[1]Index, node: Index) ?Call {
+        \\    buffer[0] = node;
+        \\    return .{ .params = buffer };
+        \\}
+        \\fn scalarElement(node: Index) ?Index {
+        \\    var buffer: [1]Index = undefined;
+        \\    const call = view(&buffer, node) orelse return null;
+        \\    return call.params[0];
+        \\}
+        \\fn boolFromView(node: Index) bool {
+        \\    var buffer: [1]Index = undefined;
+        \\    return view(&buffer, node).?.params.len == 1;
+        \\}
+        \\fn aggregateOfInts(node: Index) Span {
+        \\    var buffer: [1]Index = undefined;
+        \\    const call = view(&buffer, node) orelse return .{ .first = 0, .last = 0 };
+        \\    return .{ .first = @intFromEnum(call.params[0]), .last = 1 };
+        \\}
+        \\fn leakView(node: Index) []const Index {
+        \\    var buffer: [1]Index = undefined;
+        \\    const call = view(&buffer, node) orelse return &.{};
+        \\    return call.params;
+        \\}
+        \\fn leakLocal() *const u32 {
+        \\    var local: u32 = 1;
+        \\    _ = &local;
+        \\    return &local;
+        \\}
+        \\fn leakBuffer() []const u8 {
+        \\    var local_buf: [4]u8 = undefined;
+        \\    return local_buf[0..];
+        \\}
+        \\fn leakHolder() Holder {
+        \\    var local: u32 = 1;
+        \\    _ = &local;
+        \\    return .{ .p = &local };
+        \\}
+        \\fn leakInline(shared: *const u32) *const u32 {
+        \\    var holder: Inline = .{ .field = 1, .ptr = shared };
+        \\    _ = &holder;
+        \\    return &holder.field;
+        \\}
+        \\
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return call.params[0]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return view(&buffer, node).?.params.len == 1", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return .{ .first = @intFromEnum", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return call.params;", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &local;", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return local_buf[0..];", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return .{ .p = &local };", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &holder.field;", 0));
+}
+
+test "stack_escape: a call that cannot store a pointer leaves a local buffer unborrowed" {
+    const gpa = std.testing.allocator;
+    // `fullProto` and `fill` hand a local buffer to a callee whose reachable
+    // mutable storage is pointer-free, so neither the tree's source slice nor
+    // an arena copy of the filled bytes borrows it. `stash` can store the
+    // buffer through `*Sink`, and a fixed-buffer allocator over a local
+    // array hands out local memory: both still escape.
+    const source =
+        \\const std = @import("std");
+        \\const Tree = struct { source: []const u8, tokens: []const u32 };
+        \\const Proto = struct { name_token: ?u32, params: []const u32 };
+        \\const Sink = struct { slice: []const u8 };
+        \\const Selection = struct { arena: std.heap.ArenaAllocator };
+        \\fn fullProto(tree: Tree, buffer: *[1]u32, node: u32) ?Proto {
+        \\    _ = tree;
+        \\    buffer[0] = node;
+        \\    return .{ .name_token = node, .params = buffer };
+        \\}
+        \\fn tokenSlice(tree: Tree, token: u32) []const u8 {
+        \\    return tree.source[token..];
+        \\}
+        \\fn fnName(tree: *const Tree, declaration: u32) []const u8 {
+        \\    var buffer: [1]u32 = undefined;
+        \\    const proto = fullProto(tree.*, &buffer, declaration) orelse return "?";
+        \\    return tokenSlice(tree.*, proto.name_token orelse return "?");
+        \\}
+        \\fn stash(sink: *Sink, buf: *[4]u8) void {
+        \\    sink.slice = buf;
+        \\}
+        \\fn leakViaSink(sink: *Sink) []const u8 {
+        \\    var buf: [4]u8 = undefined;
+        \\    stash(sink, &buf);
+        \\    return sink.slice;
+        \\}
+        \\fn fill(path: []const u8, out: *[64]u8) usize {
+        \\    @memcpy(out[0..path.len], path);
+        \\    return path.len;
+        \\}
+        \\fn canonical(self: *Selection, path: []const u8) ![]const u8 {
+        \\    var buffer: [64]u8 = undefined;
+        \\    const len = fill(path, &buffer);
+        \\    return self.arena.allocator().dupe(u8, buffer[0..len]);
+        \\}
+        \\fn leakFixed() ![]u8 {
+        \\    var backing: [32]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+        \\    return fixed.allocator().dupe(u8, "abc");
+        \\}
+        \\
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return tokenSlice(tree.*", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return self.arena.allocator().dupe", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return sink.slice;", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return fixed.allocator().dupe", 0));
+}
+
+test "stack_escape: an address through a pointer member or element names the pointee" {
+    const gpa = std.testing.allocator;
+    // `&copy.document.tree`, a `|*value|` capture of a field reached through
+    // a pointer parameter, and a lookup that only reads a local path return
+    // storage the pointer or the callee's own receiver owns. The controls
+    // reach into the frame: an inline field of the copy, a pointer to a local
+    // document, a capture of a local, and a callee that returns its argument.
+    const source =
+        \\const Document = struct { tree: u32 };
+        \\const Handle = struct { document: *Document, module: u32 };
+        \\const Store = struct { handle: Handle, value: ?u32 = null };
+        \\const Model = struct {
+        \\    types: []const u32,
+        \\    fn findQualified(self: *const Model, path: []const []const u8) ?*const u32 {
+        \\        if (path.len == 0) return null;
+        \\        for (self.types) |*candidate| {
+        \\            if (candidate.* == path.len) return candidate;
+        \\        }
+        \\        return null;
+        \\    }
+        \\};
+        \\fn splitPath(out: *[4][]const u8, name: []const u8) usize {
+        \\    out[0] = name;
+        \\    return 1;
+        \\}
+        \\fn identity(path: []const []const u8) []const []const u8 {
+        \\    return path;
+        \\}
+        \\fn treeOfCopy(store: *const Store) *const u32 {
+        \\    const copy = store.handle;
+        \\    return &copy.document.tree;
+        \\}
+        \\fn valueOrNull(store: *Store) ?*const u32 {
+        \\    return if (store.value) |*value| value else null;
+        \\}
+        \\fn find(model: *const Model, name: []const u8) ?*const u32 {
+        \\    var segments: [4][]const u8 = undefined;
+        \\    const count = splitPath(&segments, name);
+        \\    return model.findQualified(segments[0..count]);
+        \\}
+        \\fn inlineMember(store: *const Store) *const u32 {
+        \\    var copy = store.handle;
+        \\    _ = &copy;
+        \\    return &copy.module;
+        \\}
+        \\fn throughLocalPointer() *const u32 {
+        \\    var document: Document = .{ .tree = 1 };
+        \\    const copy: Handle = .{ .document = &document, .module = 0 };
+        \\    return &copy.document.tree;
+        \\}
+        \\fn localCapture() ?*const u32 {
+        \\    var value: ?u32 = 1;
+        \\    _ = &value;
+        \\    if (value) |*capture| return capture;
+        \\    return null;
+        \\}
+        \\fn leakPath(name: []const u8) []const []const u8 {
+        \\    var segments: [4][]const u8 = undefined;
+        \\    const count = splitPath(&segments, name);
+        \\    return identity(segments[0..count]);
+        \\}
+        \\
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return &copy.document.tree;", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return if (store.value)", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return model.findQualified", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &copy.module;", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return &copy.document.tree;", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return capture;", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return identity(segments", 0));
+}
+
+test "stack_escape: a scalar from a call over a struct holding a local pointer carries no address" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Workspace = struct { used: u32 = 0 };
+        \\const Query = struct {
+        \\    workspace: *Workspace,
+        \\    remaining: u32,
+        \\    fn survives(self: *Query, boundary: u32) !bool {
+        \\        self.workspace.used += boundary;
+        \\        return self.workspace.used > self.remaining;
+        \\    }
+        \\    fn handle(self: *Query) *Workspace {
+        \\        return self.workspace;
+        \\    }
+        \\};
+        \\fn survivesHandoff(remaining: u32, boundary: u32) !bool {
+        \\    var local_workspace: Workspace = .{};
+        \\    var query: Query = .{ .workspace = &local_workspace, .remaining = remaining };
+        \\    return query.survives(boundary);
+        \\}
+        \\fn leakHandoff() *Workspace {
+        \\    var local_workspace: Workspace = .{};
+        \\    var query: Query = .{ .workspace = &local_workspace, .remaining = 1 };
+        \\    return query.handle();
+        \\}
+        \\
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return query.survives(boundary);", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return query.handle();", 0));
+}
+
+test "stack_escape: a literal-returning callee borrows nothing and an inline array slice borrows the cell" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Buffer = struct {
+        \\    bytes: [1]u8,
+        \\};
+        \\fn slice(b: *const Buffer) []const u8 { return b.bytes[0..]; }
+        \\fn viaLit(b: *const Buffer) []const u8 { _ = b; return "static"; }
+        \\fn safeLit() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    return viaLit(&b);
+        \\}
+        \\fn badInit() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    return slice(&b);
+        \\}
+        \\fn badUndefined() []const u8 {
+        \\    var b: Buffer = undefined;
+        \\    return slice(&b);
+        \\}
+        \\
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return viaLit(&b);", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return slice(&b);", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return slice(&b);", 1));
+}
+
+test "defined under a guard: nested slice restore pins both catch and success retests" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Frame = struct { value: usize };
+        \\const Grammar = struct { stack: []Frame, stack_top: usize = 0 };
+        \\const Parser = struct {
+        \\    grammar: Grammar,
+        \\    fn next(self: *Parser, fail: bool) !void {
+        \\        if (fail) return error.Failure;
+        \\        if (self.grammar.stack_top < self.grammar.stack.len) {
+        \\            self.grammar.stack[self.grammar.stack_top] = .{ .value = 1 };
+        \\            self.grammar.stack_top += 1;
+        \\        }
+        \\    }
+        \\    pub fn peek(self: *Parser, fail: bool) !void {
+        \\        const saved_grammar = self.grammar;
+        \\        const saved_stack_top = self.grammar.stack_top;
+        \\        var saved_frame: Frame = undefined;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            saved_frame = self.grammar.stack[saved_stack_top];
+        \\        }
+        \\        self.next(fail) catch |err| {
+        \\            self.grammar = saved_grammar;
+        \\            if (saved_stack_top < self.grammar.stack.len) {
+        \\                self.grammar.stack[saved_stack_top] = saved_frame;
+        \\            }
+        \\            return err;
+        \\        };
+        \\        self.grammar = saved_grammar;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            self.grammar.stack[saved_stack_top] = saved_frame;
+        \\        }
+        \\    }
+        \\};
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "defined under a guard: catch retest without nested slice restore stays unsafe" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Frame = struct { value: usize };
+        \\const Grammar = struct { stack: []Frame, stack_top: usize = 0 };
+        \\const Parser = struct {
+        \\    grammar: Grammar,
+        \\    fn next(self: *Parser, replacement: []Frame) !void {
+        \\        self.grammar.stack = replacement;
+        \\        return error.Failure;
+        \\    }
+        \\    pub fn peek(self: *Parser, replacement: []Frame) !void {
+        \\        const saved_grammar = self.grammar;
+        \\        const saved_stack_top = self.grammar.stack_top;
+        \\        var saved_frame: Frame = undefined;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            saved_frame = self.grammar.stack[saved_stack_top];
+        \\        }
+        \\        self.next(replacement) catch |err| {
+        \\            if (saved_stack_top < self.grammar.stack.len) {
+        \\                self.grammar.stack[saved_stack_top] = saved_frame;
+        \\            }
+        \\            return err;
+        \\        };
+        \\        self.grammar = saved_grammar;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            self.grammar.stack[saved_stack_top] = saved_frame;
+        \\        }
+        \\    }
+        \\};
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "self.grammar.stack[saved_stack_top] = saved_frame;", 0));
+}
+
+test "defined under a guard: catch restore does not pin a changed guard" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Frame = struct { value: usize };
+        \\const Grammar = struct { stack: []Frame, stack_top: usize = 0 };
+        \\const Parser = struct {
+        \\    grammar: Grammar,
+        \\    fn next(self: *Parser, replacement: []Frame) !void {
+        \\        self.grammar.stack = replacement;
+        \\        return error.Failure;
+        \\    }
+        \\    pub fn peek(self: *Parser, replacement: []Frame) !void {
+        \\        const saved_grammar = self.grammar;
+        \\        const saved_stack_top = self.grammar.stack_top;
+        \\        var saved_frame: Frame = undefined;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            saved_frame = self.grammar.stack[saved_stack_top];
+        \\        }
+        \\        self.next(replacement) catch |err| {
+        \\            self.grammar = saved_grammar;
+        \\            if (saved_stack_top <= self.grammar.stack.len) {
+        \\                self.grammar.stack[saved_stack_top] = saved_frame;
+        \\            }
+        \\            return err;
+        \\        };
+        \\    }
+        \\};
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "self.grammar.stack[saved_stack_top] = saved_frame;", 0));
+}
+
+test "defined under a guard: a conditional catch restore cannot pin its retest" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Frame = struct { value: usize };
+        \\const Grammar = struct { stack: []Frame, stack_top: usize = 0 };
+        \\const Parser = struct {
+        \\    grammar: Grammar,
+        \\    fn next(self: *Parser, replacement: []Frame) !void {
+        \\        self.grammar.stack = replacement;
+        \\        return error.Failure;
+        \\    }
+        \\    pub fn peek(self: *Parser, replacement: []Frame, restore: bool) !void {
+        \\        const saved_grammar = self.grammar;
+        \\        const saved_stack_top = self.grammar.stack_top;
+        \\        var saved_frame: Frame = undefined;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            saved_frame = self.grammar.stack[saved_stack_top];
+        \\        }
+        \\        self.next(replacement) catch |err| {
+        \\            if (restore) self.grammar = saved_grammar;
+        \\            if (saved_stack_top < self.grammar.stack.len) {
+        \\                self.grammar.stack[saved_stack_top] = saved_frame;
+        \\            }
+        \\            return err;
+        \\        };
+        \\    }
+        \\};
+    ;
+    var problems = try analyze(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "self.grammar.stack[saved_stack_top] = saved_frame;", 0));
+}
+
+test "defined under a guard: a catch-only nested slice restore mints its guard pair" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Frame = struct { value: usize };
+        \\const Grammar = struct { stack: []Frame, stack_top: usize = 0 };
+        \\const Parser = struct {
+        \\    grammar: Grammar,
+        \\    fn next(self: *Parser, replacement: []Frame) !void {
+        \\        self.grammar.stack = replacement;
+        \\        return error.Failure;
+        \\    }
+        \\    pub fn peek(self: *Parser, replacement: []Frame) !void {
+        \\        const saved_grammar = self.grammar;
+        \\        const saved_stack_top = self.grammar.stack_top;
+        \\        var saved_frame: Frame = undefined;
+        \\        if (saved_stack_top < self.grammar.stack.len) {
+        \\            saved_frame = self.grammar.stack[saved_stack_top];
+        \\        }
+        \\        self.next(replacement) catch |err| {
+        \\            self.grammar = saved_grammar;
+        \\            if (saved_stack_top < self.grammar.stack.len) {
+        \\                self.grammar.stack[saved_stack_top] = saved_frame;
+        \\            }
+        \\            return err;
+        \\        };
+        \\    }
+        \\};
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "member indexed stores: defined runtime overwrites preserve initialized field arrays" {
+    const source =
+        \\const State = struct { bytes: [3]u8 = .{ 0, 0, 0 }, count: u2 = 1 };
+        \\pub fn local(k: usize, byte: u8) u8 {
+        \\    var state: State = .{};
+        \\    state.bytes[k % 3] = byte;
+        \\    const bytes = state.bytes;
+        \\    return bytes[1];
+        \\}
+        \\pub fn parameter(state: *State, byte: u8) u8 {
+        \\    const length: usize = state.count;
+        \\    if (length >= 3) return 0;
+        \\    state.bytes[length] = byte;
+        \\    state.count += 1;
+        \\    const count: usize = state.count;
+        \\    if (count == 0) return 0;
+        \\    const bytes = state.bytes;
+        \\    return bytes[1] ^ bytes[2];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "member indexed stores: unknown undefined writes revoke field coverage only" {
+    const source =
+        \\const State = struct { bytes: [3]u8 = .{ 0, 0, 0 }, other: [2]u8 = .{ 1, 2 } };
+        \\pub fn local(k: usize) u8 {
+        \\    var state: State = .{ .bytes = .{ 0, 0, 0 } };
+        \\    state.bytes[k % 3] = undefined;
+        \\    const bytes = state.bytes;
+        \\    const other = state.other;
+        \\    return bytes[1] ^ other[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "other[0]", 0));
+}
+
+test "member indexed stores: defined unknown-index writes cannot fill existing holes" {
+    const source =
+        \\const State = struct { bytes: [3]u8 };
+        \\pub fn local(k: usize, byte: u8) u8 {
+        \\    var state: State = .{ .bytes = .{ 0, undefined, 0 } };
+        \\    state.bytes[k % 3] = byte;
+        \\    const bytes = state.bytes;
+        \\    return bytes[0] ^ bytes[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 0));
+}
+
+test "member indexed stores: exact undefined writes retain sibling element coverage" {
+    const source =
+        \\const State = struct { bytes: [3]u8 = .{ 0, 0, 0 } };
+        \\pub fn local() u8 {
+        \\    var state: State = .{};
+        \\    state.bytes[1] = undefined;
+        \\    const bytes = state.bytes;
+        \\    return bytes[0] ^ bytes[1];
+        \\}
+        \\pub fn parameter(state: *State) u8 {
+        \\    state.bytes[1] = undefined;
+        \\    const bytes = state.bytes;
+        \\    return bytes[0] ^ bytes[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "bytes[0]", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "bytes[1]", 3));
+}
+
+test "std.mem.swap: initialized insertion sort and resolved alias preserve array coverage" {
+    const source =
+        \\const std = @import("std");
+        \\const exchange = std.mem.swap;
+        \\pub fn cuts(input_len: usize) [8]usize {
+        \\    var values = [8]usize{ 0, @min(input_len, 1), @min(input_len, 15), @min(input_len, 16), input_len / 3, input_len / 2, @min(input_len, 32), input_len };
+        \\    for (1..values.len) |index| {
+        \\        var cursor = index;
+        \\        while (cursor > 0 and values[cursor] < values[cursor - 1]) : (cursor -= 1) {
+        \\            std.mem.swap(usize, &values[cursor], &values[cursor - 1]);
+        \\        }
+        \\    }
+        \\    return values;
+        \\}
+        \\pub fn alias(index: usize) [2]u8 {
+        \\    var values = [2]u8{ 1, 2 };
+        \\    if (index >= values.len) return values;
+        \\    exchange(u8, &values[index], &values[0]);
+        \\    return values;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "std.mem.swap: partial arrays and cross-array holes cannot gain coverage" {
+    for ([_][]const u8{
+        \\const std = @import("std");
+        \\pub fn partial(index: usize) u8 {
+        \\    var values: [2]u8 = undefined;
+        \\    values[0] = 1;
+        \\    if (index >= values.len) return 0;
+        \\    std.mem.swap(u8, &values[index], &values[0]);
+        \\    return values[0];
+        \\}
+        ,
+        \\const std = @import("std");
+        \\pub fn cross(index: usize) u8 {
+        \\    var values = [2]u8{ 1, 2 };
+        \\    var holes: [2]u8 = undefined;
+        \\    if (index >= values.len) return 0;
+        \\    std.mem.swap(u8, &values[index], &holes[index]);
+        \\    return values[index];
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return values[", 0));
+    }
+}
+
+test "std.mem.swap: unknown writers stay silent and undefined name lookalikes report" {
+    for ([_][]const u8{
+        \\extern fn exchange(first: *u8, second: *u8) void;
+        \\pub fn opaqueValue(index: usize) u8 {
+        \\    var values = [2]u8{ 1, 2 };
+        \\    if (index >= values.len) return 0;
+        \\    exchange(&values[index], &values[0]);
+        \\    return values[index];
+        \\}
+        ,
+        \\const std = struct {
+        \\    const mem = struct {
+        \\        fn swap(comptime T: type, first: *T, second: *T) void {
+        \\            first.* = undefined;
+        \\            second.* = undefined;
+        \\        }
+        \\    };
+        \\};
+        \\pub fn shadow(index: usize) u8 {
+        \\    var values = [2]u8{ 1, 2 };
+        \\    if (index >= values.len) return 0;
+        \\    std.mem.swap(u8, &values[index], &values[0]);
+        \\    return values[index];
+        \\}
+        ,
+    }, 0..) |source, ordinal| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(ordinal == 1, diagnosedAt(problems.items, "use-undefined", source, "return values[", 0));
+    }
+}
+
+test "prefix memset preservation: runtime countdown stores retain the initialized prefix" {
+    const source =
+        \\const max_rank = 8;
+        \\pub fn probe(rank: usize) usize {
+        \\    var index: [max_rank]usize = undefined;
+        \\    @memset(index[0..rank], 0);
+        \\    var axis = rank;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        index[axis] = axis + 1;
+        \\    }
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "constant array preservation: initialized slice literals survive the reported scaling loop" {
+    const source =
+        \\pub fn unit(bytes: usize) []const u8 {
+        \\    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB" };
+        \\    var remaining: f64 = @floatFromInt(bytes);
+        \\    var unit_idx: usize = 0;
+        \\    while (remaining >= 1024.0 and unit_idx < units.len - 1) {
+        \\        remaining /= 1024.0;
+        \\        unit_idx += 1;
+        \\    }
+        \\    if (unit_idx == 0) {
+        \\        return units[unit_idx];
+        \\    }
+        \\    return units[unit_idx];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "prefix memset preservation: undefined fill and overwrite cannot certify bytes" {
+    for ([_][]const u8{
+        \\pub fn probe(rank: usize) usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], undefined);
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+        ,
+        \\pub fn probe(rank: usize) usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], 0);
+        \\    var axis = rank;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        index[axis] = undefined;
+        \\    }
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "index[read_axis]", 0));
+    }
+}
+
+test "prefix memset preservation: holes unknown indices and unknown counts remain unproved" {
+    for ([_][]const u8{
+        \\pub fn probe(rank: usize) usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[1..rank], 0);
+        \\    return index[0];
+        \\}
+        ,
+        \\pub fn probe(rank: usize) usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], 0);
+        \\    return index[rank];
+        \\}
+        ,
+        \\pub fn probe(rank: usize, unknown_index: usize) usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], 0);
+        \\    return index[unknown_index];
+        \\}
+        ,
+        \\extern fn mutate(count: *usize) void;
+        \\pub fn probe(rank: usize) usize {
+        \\    var count = rank;
+        \\    mutate(&count);
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..count], 0);
+        \\    return index[0];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return index[", 0));
+    }
+}
+
+test "initialized array preservation: splat and repeated arrays survive runtime loop stores" {
+    for ([_][]const u8{
+        \\pub fn probe(rank: usize) usize {
+        \\    var index: [8]usize = @splat(0);
+        \\    var axis = rank;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        index[axis] = axis + 1;
+        \\    }
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+        ,
+        \\pub fn probe(rank: usize) usize {
+        \\    var index = [_]usize{0} ** 8;
+        \\    var axis = rank;
+        \\    while (axis > 0) {
+        \\        axis -= 1;
+        \\        index[axis] = axis + 1;
+        \\    }
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+    }
+}
+
+test "constant array preservation: a literal hole survives the scaling loop" {
+    const source =
+        \\pub fn unit(bytes: usize) []const u8 {
+        \\    const units = [_][]const u8{ "B", undefined, "MiB", "GiB" };
+        \\    var remaining: f64 = @floatFromInt(bytes);
+        \\    var unit_idx: usize = 0;
+        \\    while (remaining >= 1024.0 and unit_idx < units.len - 1) {
+        \\        remaining /= 1024.0;
+        \\        unit_idx += 1;
+        \\    }
+        \\    return units[unit_idx];
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "units[unit_idx]", 0));
+}
+
+test "prefix memset preservation: selected defined fills certify only their prefix" {
+    for ([_][]const u8{
+        \\pub fn probe(rank: usize, value: usize) usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], value);
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+        ,
+        \\pub fn probe(rank: usize) usize {
+        \\    const fill = .{ .value = @as(usize, 7), .missing = @as(usize, undefined) };
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], fill.value);
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+        ,
+        \\pub fn probe() usize {
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..3], 1);
+        \\    return index[2];
+        \\}
+    }) |source| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+    }
+}
+
+test "prefix memset preservation: selected undefined fills report and unknown fills stay silent" {
+    for ([_][]const u8{
+        \\pub fn probe(rank: usize) usize {
+        \\    const fill = .{ .value = @as(usize, 7), .missing = @as(usize, undefined) };
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], fill.missing);
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+        ,
+        \\extern fn mutate(value: *usize) void;
+        \\pub fn probe(rank: usize) usize {
+        \\    var fill: usize = 7;
+        \\    mutate(&fill);
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..rank], fill);
+        \\    var sum: usize = 0;
+        \\    for (0..rank) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+    }, 0..) |source, ordinal| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(ordinal == 0, diagnosedAt(problems.items, "use-undefined", source, "index[read_axis]", 0));
+    }
+}
+
+test "prefix memset preservation: enlarging the count cannot enlarge initialized storage" {
+    const source =
+        \\pub fn probe(rank: usize) usize {
+        \\    if (rank >= 8) return 0;
+        \\    var count = rank;
+        \\    var index: [8]usize = undefined;
+        \\    @memset(index[0..count], 0);
+        \\    count += 1;
+        \\    var sum: usize = 0;
+        \\    for (0..count) |read_axis| sum += index[read_axis];
+        \\    return sum;
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "index[read_axis]", 0));
+}
+
+test "prefix memset preservation: proved-undefined fills poison bytes and opaque writes remain unknown" {
+    for ([_][]const u8{
+        \\pub fn probe(rank: usize) usize {
+        \\    if (rank == 0 or rank > 8) return 0;
+        \\    var index: [8]usize = @splat(7);
+        \\    @memset(index[0..rank], undefined);
+        \\    return index[0];
+        \\}
+        ,
+        \\extern fn mutate(value: *usize) void;
+        \\pub fn probe(rank: usize) usize {
+        \\    if (rank == 0 or rank > 8) return 0;
+        \\    var fill: usize = 7;
+        \\    mutate(&fill);
+        \\    var index: [8]usize = @splat(7);
+        \\    @memset(index[0..rank], fill);
+        \\    return index[0];
+        \\}
+    }, 0..) |source, ordinal| {
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(ordinal == 0, diagnosedAt(problems.items, "use-undefined", source, "return index[0]", 0));
+    }
+}
+
+test "member array copies: an explicit field store repairs only its selected payload" {
+    const source =
+        \\const State = struct { bytes: [3]u8, other: [2]u8 };
+        \\pub fn selected() u8 {
+        \\    var state: State = undefined;
+        \\    state.bytes = .{ 1, 2, 3 };
+        \\    const bytes = state.bytes;
+        \\    return bytes[0];
+        \\}
+        \\pub fn missing() u8 {
+        \\    var state: State = undefined;
+        \\    state.other = .{ 1, 2 };
+        \\    const bytes = state.bytes;
+        \\    return bytes[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return bytes[0]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return bytes[0]", 1));
+}
+
+test "member counters: compound stores require both old field and operand defined" {
+    var reported = true;
+    for ([_][]const u8{
+        \\const State = struct { count: usize };
+        \\pub fn missing() usize {
+        \\    var state: State = .{ .count = undefined };
+        \\    state.count += 1;
+        \\    return state.count;
+        \\}
+        ,
+        \\const State = struct { count: usize = 0 };
+        \\pub fn missing() usize {
+        \\    var state: State = .{};
+        \\    const amount: usize = undefined;
+        \\    state.count += amount;
+        \\    return state.count;
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        reported = reported and diagnosedAt(problems.items, "use-undefined", source, "return state.count", 0);
+    }
+    try std.testing.expect(reported);
+}
+
+test "member compound stores retain selected operand holes" {
+    const source =
+        \\const State = struct { count: usize = 1, amount: usize };
+        \\pub fn missing() usize {
+        \\    var state: State = .{ .amount = undefined };
+        \\    state.count += state.amount;
+        \\    return state.count;
+        \\}
+        \\pub fn defined() usize {
+        \\    var state: State = .{ .amount = 2 };
+        \\    state.count += state.amount;
+        \\    return state.count;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return state.count", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return state.count", 1));
+}
+
+test "array member compound stores preserve only already-defined elements" {
+    const source =
+        \\const Item = struct { count: usize, other: usize };
+        \\pub fn partial() usize {
+        \\    var values: [2]Item = undefined;
+        \\    values[0] = .{ .count = 1, .other = 2 };
+        \\    values[0].count += 1;
+        \\    return values[0].count ^ values[1].other;
+        \\}
+        \\pub fn missingOperand() usize {
+        \\    var values = [_]Item{.{ .count = 1, .other = 2 }} ** 2;
+        \\    const amount: usize = undefined;
+        \\    values[0].count += amount;
+        \\    return values[0].count ^ values[1].other;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "values[0].count ^", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[1].other", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[0].count ^", 1));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "values[1].other", 1));
+}
+
+test "indexed preservation keeps partial coverage without crediting unknown placement" {
+    const source =
+        \\pub fn partial(index: usize, value: u8) u8 {
+        \\    var values: [4]u8 = undefined;
+        \\    values[0] = 1;
+        \\    values[(index + 1) % 4] = value;
+        \\    return values[0] ^ values[1];
+        \\}
+        \\pub fn revoke(index: usize) u8 {
+        \\    var values: [4]u8 = undefined;
+        \\    values[0] = 1;
+        \\    values[(index + 1) % 4] = undefined;
+        \\    return values[0];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "values[0] ^", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "values[1]", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return values[0];", 0));
+}
+
+test "ocean element mutation: exact initialized-array-element-outparam repro stays quiet" {
+    // Preserve the reported nested-loop reproduction without simplifying the helper call.
+    const source =
+        \\fn add(total: *u64, amount: u64) !void {
+        \\    total.* += amount;
+        \\}
+        \\pub fn sum(amounts: []const u64) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    for (amounts) |amount| {
+        \\        for (0..3) |index| {
+        \\            try add(&totals[index], amount);
+        \\        }
+        \\    }
+        \\    var result: u64 = 0;
+        \\    for (0..3) |index| result += totals[index];
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean element mutation: renamed source helpers preserve full coverage" {
+    // The proof must use the helper body, not the spelling of add.
+    const source =
+        \\fn accumulateDefined(total: *u64, amount: u64) !void {
+        \\    total.* = total.* + amount;
+        \\}
+        \\pub fn sum(amounts: []const u64) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    for (amounts) |amount| {
+        \\        for (0..3) |index| {
+        \\            try accumulateDefined(&totals[index], amount);
+        \\        }
+        \\    }
+        \\    return totals[0] + totals[1] + totals[2];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean element mutation: generic scalar helper uses actual defined dependencies" {
+    const source =
+        \\fn accumulateDefined(total: anytype, amount: anytype) !void {
+        \\    total.* += amount;
+        \\}
+        \\pub fn sum(index: usize, amount: u64) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    try accumulateDefined(&totals[index % 3], amount);
+        \\    return totals[0] + totals[1] + totals[2];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean element mutation: preserving helper cannot initialize an old target hole" {
+    const source =
+        \\fn add(total: *u64, amount: u64) !void { total.* += amount; }
+        \\pub fn sum(index: usize, amount: u64) !u64 {
+        \\    var totals: [3]u64 = .{ 0, undefined, 0 };
+        \\    try add(&totals[index % 3], amount);
+        \\    return totals[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return totals[1]", 0));
+}
+
+test "ocean element mutation: undefined actual amount revokes initialized coverage" {
+    const source =
+        \\fn add(total: *u64, amount: u64) !void { total.* += amount; }
+        \\pub fn sum(index: usize) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    const amount: u64 = undefined;
+        \\    try add(&totals[index % 3], amount);
+        \\    return totals[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    // A warning on amount alone cannot satisfy this regression.
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return totals[1]", 0));
+}
+
+test "ocean element mutation: opaque scalar mutation does not prove undefined amount bytes" {
+    const source =
+        \\extern fn mutate(amount: *u64) void;
+        \\fn add(total: *u64, amount: u64) !void { total.* += amount; }
+        \\pub fn sum(index: usize) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    var amount: u64 = 1;
+        \\    mutate(&amount);
+        \\    try add(&totals[index % 3], amount);
+        \\    return totals[1];
+        \\}
+    ;
+    var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "sum", false);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean element mutation: opaque function pointers and unknown helpers stay silent" {
+    for ([_][]const u8{
+        \\pub fn sum(index: usize, mutate: *const fn (*u64, u64) void) u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    mutate(&totals[index % 3], 1);
+        \\    return totals[1];
+        \\}
+        ,
+        \\extern fn unknownMutation(total: *u64, amount: u64) void;
+        \\fn add(total: *u64, amount: u64) !void {
+        \\    unknownMutation(total, amount);
+        \\}
+        \\pub fn sum(index: usize) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    try add(&totals[index % 3], 1);
+        \\    return totals[1];
+        \\}
+    }) |source| {
+        var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "sum", false);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+    }
+}
+
+test "ocean element mutation: undefined helper stores report and opaque stores stay silent" {
+    for ([_][]const u8{
+        \\fn replace(total: *u64) void { total.* = undefined; }
+        \\pub fn sum(index: usize) u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    replace(&totals[index % 3]);
+        \\    return totals[1];
+        \\}
+        ,
+        \\extern fn opaqueAmount() u64;
+        \\fn replace(total: *u64) void { total.* = opaqueAmount(); }
+        \\pub fn sum(index: usize) u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    replace(&totals[index % 3]);
+        \\    return totals[1];
+        \\}
+    }, 0..) |source, ordinal| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(ordinal == 0, diagnosedAt(problems.items, "use-undefined", source, "return totals[1]", 0));
+    }
+}
+
+test "ocean runtime write preservation: enum splat retains conditional loop overwrites" {
+    // Match the initialized register array in riscv Emitter.frameRequest.
+    const source =
+        \\const Register = enum { zero, argument };
+        \\pub fn arguments(first: usize, enabled: bool, register: Register) [8]Register {
+        \\    var integer_arguments: [8]Register = @splat(.zero);
+        \\    if (enabled) {
+        \\        var index = @min(first, 8);
+        \\        while (index < 8) : (index += 1) {
+        \\            integer_arguments[index] = register;
+        \\        }
+        \\    }
+        \\    return integer_arguments;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean runtime write preservation: repeated optional slots survive null and defined assignments" {
+    // Match the expiry and complete slot updates in x86_64 RegisterAllocator.
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn update(index: usize, end: u64, clear: bool) [14]?Active {
+        \\    var active = [_]?Active{null} ** 14;
+        \\    active[index % active.len] = .{ .end = end, .fixed = false };
+        \\    for (&active) |*entry| {
+        \\        if (entry.*) |value| {
+        \\            if (value.end <= end) entry.* = null;
+        \\        }
+        \\    }
+        \\    if (clear) active[index % active.len] = null;
+        \\    active[(index +% 1) % active.len] = .{ .end = end, .fixed = true };
+        \\    for (active) |entry| {
+        \\        if (entry) |value| {
+        \\            if (value.fixed) return active;
+        \\        }
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean element mutation: checked add catch-return preserves member scalar amounts" {
+    // Preserve the full helper body used by CorpusRunner.addBaselineTotal.
+    const source =
+        \\const std = @import("std");
+        \\const Metrics = struct { instructions: u64, text_bytes: u64 };
+        \\fn addBaselineTotal(total: *u64, amount: u64) !void {
+        \\    total.* = std.math.add(u64, total.*, amount) catch return error.LimitExceeded;
+        \\}
+        \\pub fn sum(amounts: []const Metrics) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    for (amounts) |amount| {
+        \\        for (0..3) |index| {
+        \\            try addBaselineTotal(&totals[index], amount.instructions);
+        \\            try addBaselineTotal(&totals[index], amount.text_bytes);
+        \\        }
+        \\    }
+        \\    var result: u64 = 0;
+        \\    for (0..3) |index| result += totals[index];
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean element mutation: checked add undefined member amount revokes coverage" {
+    const source =
+        \\const std = @import("std");
+        \\const Metrics = struct { instructions: u64, text_bytes: u64 };
+        \\fn addBaselineTotal(total: *u64, amount: u64) !void {
+        \\    total.* = std.math.add(u64, total.*, amount) catch return error.LimitExceeded;
+        \\}
+        \\pub fn sum(index: usize) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    const amount = Metrics{ .instructions = undefined, .text_bytes = 1 };
+        \\    try addBaselineTotal(&totals[index % 3], amount.instructions);
+        \\    return totals[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return totals[1]", 0));
+}
+
+test "ocean element mutation: checked add with opaque-mutated member amount stays silent" {
+    const source =
+        \\const std = @import("std");
+        \\const Metrics = struct { instructions: u64, text_bytes: u64 };
+        \\extern fn mutate(amount: *Metrics) void;
+        \\fn addBaselineTotal(total: *u64, amount: u64) !void {
+        \\    total.* = std.math.add(u64, total.*, amount) catch return error.LimitExceeded;
+        \\}
+        \\pub fn sum(index: usize) !u64 {
+        \\    var totals: [3]u64 = .{ 0, 0, 0 };
+        \\    var amount = Metrics{ .instructions = 1, .text_bytes = 1 };
+        \\    mutate(&amount);
+        \\    try addBaselineTotal(&totals[index % 3], amount.instructions);
+        \\    return totals[1];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean lexical active expiry preserves complete optional slots" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn expire(start: u64) [14]?Active {
+        \\    var active = [_]?Active{null} ** 14;
+        \\    for (&active) |*entry| {
+        \\        if (entry.*) |active_interval| {
+        \\            if (active_interval.end <= start) entry.* = null;
+        \\        }
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean lexical pointer captures do not fill undefined slots" {
+    const source =
+        \\const Active = struct { end: u64 };
+        \\pub fn expire(start: u64) [3]?Active {
+        \\    var active: [3]?Active = .{ null, undefined, null };
+        \\    for (&active) |*entry| {
+        \\        if (entry.*) |value| {
+        \\            if (value.end <= start) entry.* = null;
+        \\        }
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical pointer capture undefined writes revoke complete coverage" {
+    const source =
+        \\pub fn clear(enabled: bool) [3]?u64 {
+        \\    var active = [_]?u64{null} ** 3;
+        \\    for (&active) |*entry| {
+        \\        if (enabled) entry.* = undefined;
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical mutations distinguish unknown captures from proved-undefined stores" {
+    for ([_][]const u8{
+        \\extern fn mutate(entry: *?u64) void;
+        \\pub fn clear() [3]?u64 {
+        \\    var active = [_]?u64{null} ** 3;
+        \\    for (&active) |*entry| mutate(entry);
+        \\    return active;
+        \\}
+        ,
+        \\extern fn mutate(entry: *?u64) void;
+        \\pub fn clear() [3]?u64 {
+        \\    var active = [_]?u64{null} ** 3;
+        \\    for (&active) |*entry| {
+        \\        const alias = entry;
+        \\        mutate(alias);
+        \\    }
+        \\    return active;
+        \\}
+        ,
+        \\pub fn clear() [3]u64 {
+        \\    var active = [_]u64{0} ** 3;
+        \\    for (&active) |*entry| {
+        \\        const alias = entry;
+        \\        alias.* = undefined;
+        \\    }
+        \\    return active;
+        \\}
+    }, 0..) |source, ordinal| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(ordinal == 2, diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+    }
+}
+
+test "ocean lexical element field writes do not certify whole elements" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn clear() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1, .fixed = false }} ** 3;
+        \\    for (&active) |*entry| entry.end = undefined;
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical reused capture names cannot restore a proved-undefined mutation" {
+    const source =
+        \\fn mutate(entry: *?u64) void { entry.* = undefined; }
+        \\pub fn clear() [3]?u64 {
+        \\    var active = [_]?u64{null} ** 3;
+        \\    for (&active) |*entry| mutate(entry);
+        \\    var other = [_]?u64{null} ** 3;
+        \\    for (&other) |*entry| entry.* = null;
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean optional insertion: generic null-slot helper preserves complete array payload" {
+    // Match RegisterAllocator.addActive with a defined aggregate actual value.
+    const source =
+        \\const Register = enum { zero, argument };
+        \\const Active = struct { input_index: usize, end: u64, register: Register, fixed: bool };
+        \\const Item = struct { input_index: usize };
+        \\const Interval = struct { end: u64 };
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize, item: Item, interval: Interval, required: Register) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    try insert(&active, Active{
+        \\        .input_index = item.input_index,
+        \\        .end = interval.end,
+        \\        .register = required,
+        \\        .fixed = true,
+        \\    });
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean optional insertion: undefined aggregate field revokes complete array payload" {
+    const source =
+        \\const Register = enum { zero, argument };
+        \\const Active = struct { input_index: usize, end: u64, register: Register, fixed: bool };
+        \\const Interval = struct { end: u64 };
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    const interval = Interval{ .end = undefined };
+        \\    try insert(&active, Active{
+        \\        .input_index = index,
+        \\        .end = interval.end,
+        \\        .register = .argument,
+        \\        .fixed = true,
+        \\    });
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(
+        diagnosedAt(problems.items, "use-undefined", source, "return active[", 0),
+    );
+}
+
+test "ocean optional insertion: undefined aggregate value revokes complete array payload" {
+    const source =
+        \\const Active = struct { input_index: usize, end: u64, fixed: bool };
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    const value: Active = undefined;
+        \\    try insert(&active, value);
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(
+        diagnosedAt(problems.items, "use-undefined", source, "return active[", 0),
+    );
+}
+
+test "ocean optional insertion: opaque aggregate mutation leaves unknown payload silent" {
+    const source =
+        \\const Active = struct { input_index: usize, end: u64, fixed: bool };
+        \\extern fn mutate(value: *Active) void;
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    var value = Active{ .input_index = index, .end = 1, .fixed = false };
+        \\    mutate(&value);
+        \\    try insert(&active, value);
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "probe", false);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean optional insertion: opaque helper mutation leaves unknown payload silent" {
+    const source =
+        \\const Active = struct { input_index: usize, end: u64, fixed: bool };
+        \\extern fn unknownMutation(entries: *[14]?Active) void;
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    unknownMutation(entries);
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    try insert(&active, Active{ .input_index = index, .end = 1, .fixed = false });
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "probe", false);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean lexical copied capture member writes revoke backing array" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn clear() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1, .fixed = false }} ** 3;
+        \\    for (&active) |*entry| {
+        \\        const alias = entry;
+        \\        alias.end = undefined;
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical nested member array writes revoke backing array" {
+    const source =
+        \\const Active = struct { bytes: [2]u8 };
+        \\pub fn clear(index: usize) [3]Active {
+        \\    var active = [_]Active{.{ .bytes = .{ 1, 2 } }} ** 3;
+        \\    for (&active) |*entry| entry.bytes[index % 2] = undefined;
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical whole-element stores retain defined aggregate dependencies" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn replace(end: u64, enabled: bool) [3]?Active {
+        \\    var active = [_]?Active{null} ** 3;
+        \\    for (&active) |*entry| {
+        \\        if (enabled) entry.* = .{ .end = end, .fixed = false };
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean lexical whole-element stores reject undefined aggregate dependencies" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn replace(enabled: bool) [3]?Active {
+        \\    var active = [_]?Active{null} ** 3;
+        \\    const end: u64 = undefined;
+        \\    for (&active) |*entry| {
+        \\        if (enabled) entry.* = .{ .end = end, .fixed = false };
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical preserving stores do not grant exhaustive initialization credit" {
+    const source =
+        \\pub fn replace() [3]?u64 {
+        \\    var active: [3]?u64 = undefined;
+        \\    for (&active) |*entry| entry.* = null;
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean optional insertion: preserving whole helper cannot initialize an old optional hole" {
+    const source =
+        \\const Register = enum { zero, argument };
+        \\const Active = struct { input_index: usize, end: u64, register: Register, fixed: bool };
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize, end: u64, required: Register) !?Active {
+        \\    var active = [_]?Active{ null, undefined, null };
+        \\    try insert(&active, Active{
+        \\        .input_index = index,
+        \\        .end = end,
+        \\        .register = required,
+        \\        .fixed = true,
+        \\    });
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(
+        diagnosedAt(problems.items, "use-undefined", source, "return active[", 0),
+    );
+}
+
+test "ocean lexical builtin writes through captures revoke backing array" {
+    for ([_][]const u8{
+        \\pub fn clear() [3][2]u8 {
+        \\    var active = [_][2]u8{.{ 1, 2 }} ** 3;
+        \\    for (&active) |*entry| @memset(entry, undefined);
+        \\    return active;
+        \\}
+        ,
+        \\pub fn clear() [3][2]u8 {
+        \\    var active = [_][2]u8{.{ 1, 2 }} ** 3;
+        \\    for (&active) |*entry| {
+        \\        const alias = entry;
+        \\        @memset(alias, undefined);
+        \\    }
+        \\    return active;
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+    }
+}
+
+test "ocean optional insertion: unresolved global constructor field cannot preserve payload" {
+    const source =
+        \\const unknown: u32 = undefined;
+        \\const Register = enum { zero, argument };
+        \\const Active = struct { input_index: usize, end: u32, register: Register, fixed: bool };
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    try insert(&active, Active{
+        \\        .input_index = index,
+        \\        .end = unknown,
+        \\        .register = .argument,
+        \\        .fixed = true,
+        \\    });
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(
+        diagnosedAt(problems.items, "use-undefined", source, "return active[", 0),
+    );
+}
+
+test "stack_escape: explicit comptime and global vtables are static but runtime vtables remain frame cells" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const VTable = struct { draw: *const fn (*u32) void };
+        \\const View = struct { ptr: *u32, vtable: *const VTable };
+        \\fn draw(pointer: *u32) void { pointer.* += 1; }
+        \\const global: VTable = .{ .draw = draw };
+        \\fn explicit(ptr: *u32) View {
+        \\    const vtable: VTable = comptime .{ .draw = draw };
+        \\    return .{ .ptr = ptr, .vtable = &vtable };
+        \\}
+        \\fn staticGlobal(ptr: *u32) View {
+        \\    return .{ .ptr = ptr, .vtable = &global };
+        \\}
+        \\fn runtime(ptr: *u32, callback: *const fn (*u32) void) View {
+        \\    const vtable: VTable = .{ .draw = callback };
+        \\    return .{ .ptr = ptr, .vtable = &vtable };
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return .{ .ptr = ptr, .vtable = &vtable };", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return .{ .ptr = ptr, .vtable = &global };", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return .{ .ptr = ptr, .vtable = &vtable };", 1));
+}
+
+test "ocean optional insertion: omitted undefined default field cannot preserve payload" {
+    const source =
+        \\const Register = enum { zero, argument };
+        \\const Active = struct {
+        \\    input_index: usize,
+        \\    end: u32 = undefined,
+        \\    register: Register,
+        \\    fixed: bool,
+        \\};
+        \\fn insert(entries: anytype, value: anytype) !void {
+        \\    for (entries) |*entry| {
+        \\        if (entry.* == null) {
+        \\            entry.* = value;
+        \\            return;
+        \\        }
+        \\    }
+        \\    return error.Full;
+        \\}
+        \\pub fn probe(index: usize) !?Active {
+        \\    var active: [14]?Active = [_]?Active{null} ** 14;
+        \\    try insert(&active, Active{
+        \\        .input_index = index,
+        \\        .register = .argument,
+        \\        .fixed = true,
+        \\    });
+        \\    return active[index % active.len];
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(
+        diagnosedAt(problems.items, "use-undefined", source, "return active[", 0),
+    );
+}
+
+test "ocean lexical mutable methods distinguish undefined stores from unknown writes" {
+    for ([_][]const u8{
+        \\const Active = struct {
+        \\    end: u64,
+        \\    fn mutate(self: *Active) void { self.end = undefined; }
+        \\};
+        \\pub fn clear() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1 }} ** 3;
+        \\    for (&active) |*entry| entry.mutate();
+        \\    return active;
+        \\}
+        ,
+        \\const Active = struct {
+        \\    end: u64,
+        \\    extern fn mutate(self: *Active) void;
+        \\};
+        \\pub fn clear() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1 }} ** 3;
+        \\    for (&active) |*entry| {
+        \\        const alias = entry;
+        \\        alias.mutate();
+        \\    }
+        \\    return active;
+        \\}
+    }, 0..) |source, ordinal| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(ordinal == 0, diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+    }
+}
+
+test "ocean lexical read-only method receivers retain backing array" {
+    const source =
+        \\const Active = struct {
+        \\    end: u64,
+        \\    fn inspect(self: *const Active) u64 { return self.end; }
+        \\};
+        \\pub fn inspect() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1 }} ** 3;
+        \\    for (&active) |*entry| {
+        \\        const alias = entry;
+        \\        _ = alias.inspect();
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean lexical copied aggregate holes cannot preserve complete array" {
+    for ([_][]const u8{
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn replace() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1, .fixed = false }} ** 3;
+        \\    const bad_record = Active{ .end = undefined, .fixed = false };
+        \\    for (&active) |*entry| entry.* = bad_record;
+        \\    return active;
+        \\}
+        ,
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn replace() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1, .fixed = false }} ** 3;
+        \\    var bad_record = Active{ .end = 1, .fixed = false };
+        \\    bad_record.end = undefined;
+        \\    for (&active) |*entry| entry.* = bad_record;
+        \\    return active;
+        \\}
+        ,
+        \\pub fn replace() [3][2]u8 {
+        \\    var active = [_][2]u8{.{ 1, 2 }} ** 3;
+        \\    const bad_record: [2]u8 = .{ 1, undefined };
+        \\    for (&active) |*entry| entry.* = bad_record;
+        \\    return active;
+        \\}
+    }) |source| {
+        var problems = try analyzeWithZls(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+    }
+}
+
+test "ocean lexical mutable copied receiver retains a proved-undefined mutation" {
+    const source =
+        \\const Active = struct {
+        \\    end: u64,
+        \\    fn mutate(self: *Active) void { self.end = undefined; }
+        \\};
+        \\pub fn clear() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1 }} ** 3;
+        \\    for (&active) |*entry| {
+        \\        var alias = entry;
+        \\        alias.mutate();
+        \\        alias = entry;
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical builtin copy of undefined bytes revokes backing array" {
+    const source =
+        \\pub fn clear() [3][2]u8 {
+        \\    var active = [_][2]u8{.{ 1, 2 }} ** 3;
+        \\    const bytes: [2]u8 = undefined;
+        \\    for (&active) |*entry| @memcpy(entry, &bytes);
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical source-only memory and type builtins retain backing array" {
+    const source =
+        \\pub fn inspect() [3][2]u8 {
+        \\    var active = [_][2]u8{.{ 1, 2 }} ** 3;
+        \\    for (&active) |*entry| {
+        \\        var copy: [2]u8 = undefined;
+        \\        @memcpy(&copy, entry);
+        \\        _ = @TypeOf(entry);
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "stack_escape: finite wide enum and synchronous scalar aggregates do not retain input cells" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\const Object = enum(u64) { integer = 1, floating = 2 };
+        \\extern fn join(values: *const [2]Object) ?Object;
+        \\extern fn opaqueAddress(values: *const [2]Object) ?*const Object;
+        \\fn safeEnum() ?Object {
+        \\    const args: [2]Object = .{ .integer, .floating };
+        \\    return join(&args);
+        \\}
+        \\fn unsafeAddress() ?*const Object {
+        \\    const args: [2]Object = .{ .integer, .floating };
+        \\    return opaqueAddress(&args);
+        \\}
+        \\const Kind = enum { integer, floating };
+        \\fn scalar(kind: *Kind, value: u64) !u64 { kind.* = .integer; return value; }
+        \\fn safeAggregate(value: u64) !struct { kind: Kind, word: u64 } {
+        \\    var kind: Kind = .floating;
+        \\    const word = try scalar(&kind, value);
+        \\    return .{ .kind = kind, .word = word };
+        \\}
+        \\fn identity(bits: usize) usize { return bits; }
+        \\fn unsafeBits() usize {
+        \\    var local: u8 = 1;
+        \\    return identity(@intFromPtr(&local));
+        \\}
+    ;
+    var problems = try analyzeWithZls(gpa, source);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return join(&args);", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return .{ .kind = kind", 0));
+    // Consuming &args does not prove that this opaque result retains it.
+    try std.testing.expect(!diagnosedAt(problems.items, "stack-escape", source, "return opaqueAddress(&args);", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "stack-escape", source, "return identity(@intFromPtr", 0));
+}
+
+test "ocean lexical copied defined records preserve complete arrays" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\pub fn replace(end: u64) [3]Active {
+        \\    var active = [_]Active{.{ .end = 1, .fixed = false }} ** 3;
+        \\    const record = Active{ .end = end, .fixed = true };
+        \\    for (&active) |*entry| entry.* = record;
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "ocean lexical undefined record dependencies revoke complete arrays" {
+    const source =
+        \\const Active = struct { end: u64, fixed: bool };
+        \\fn mutate(record: *Active) void { record.end = undefined; }
+        \\pub fn replace() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1, .fixed = false }} ** 3;
+        \\    var record = Active{ .end = 1, .fixed = true };
+        \\    mutate(&record);
+        \\    for (&active) |*entry| entry.* = record;
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return active", 0));
+}
+
+test "ocean lexical mutable receiver rebinding invalidates only current array owner" {
+    const source =
+        \\const Active = struct {
+        \\    end: u64,
+        \\    extern fn mutate(self: *Active) void;
+        \\};
+        \\pub fn clearOther() [3]Active {
+        \\    var active = [_]Active{.{ .end = 1 }} ** 3;
+        \\    var other = [_]Active{.{ .end = 2 }} ** 2;
+        \\    for (&active) |*entry| {
+        \\        var alias = entry;
+        \\        for (&other) |*other_entry| {
+        \\            alias = other_entry;
+        \\            alias.mutate();
+        \\        }
+        \\    }
+        \\    return active;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array payload casts: initialized vector parameters and fields survive runtime stores" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\const Lanes = @Vector(8, u64);
+        \\const Box = struct { lanes: Lanes };
+        \\pub fn vector(value: Lanes, index: u3, replacement: u64) [8]u64 {
+        \\    var copy: [8]u64 = value;
+        \\    copy[index] = replacement;
+        \\    return copy;
+        \\}
+        \\pub fn field(value: *Box, index: u3, replacement: u64) [8]u64 {
+        \\    var copy: [8]u64 = value.lanes;
+        \\    copy[index] = replacement;
+        \\    return copy;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array payload casts: undefined local vectors and fields stay unknown" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        \\pub fn vector() [8]u64 {
+        \\    var value: @Vector(8, u64) = undefined;
+        \\    var copy: [8]u64 = value;
+        \\    copy[0] = 1;
+        \\    return copy;
+        \\}
+        ,
+        \\const Box = struct { lanes: @Vector(8, u64) };
+        \\pub fn field() [8]u64 {
+        \\    var value: Box = undefined;
+        \\    const pointer = &value;
+        \\    var copy: [8]u64 = pointer.lanes;
+        \\    copy[0] = 1;
+        \\    return copy;
+        \\}
+        ,
+        \\const Box = struct { lanes: @Vector(8, u64) };
+        \\pub fn poisoned(value: *Box) [8]u64 {
+        \\    value.lanes = undefined;
+        \\    var copy: [8]u64 = value.lanes;
+        \\    copy[0] = 1;
+        \\    return copy;
+        \\}
+        ,
+    }) |source| {
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return copy;", 0));
+    }
+}
+
+test "array payload casts: bitCast transports all initialized fixed array bytes" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn caller(input: *const [6]u32) u64 {
+        \\    const words: [3]u64 = @bitCast(input.*);
+        \\    return words[0] ^ words[1] ^ words[2];
+        \\}
+        \\pub fn filled() u64 {
+        \\    var input: [2]u32 = undefined;
+        \\    input[0] = 1;
+        \\    input[1] = 2;
+        \\    const bytes: [8]u8 = @bitCast(input);
+        \\    return bytes[7];
+        \\}
+        \\const Box = struct { words: [2]u32 };
+        \\pub fn field(input: Box) u8 {
+        \\    const bytes: [8]u8 = @bitCast(input.words);
+        \\    return bytes[7];
+        \\}
+        \\pub fn pointerField(input: *const Box) u8 {
+        \\    const bytes: [8]u8 = @bitCast(input.words);
+        \\    return bytes[7];
+        \\}
+        \\pub fn literal() u8 {
+        \\    const bytes: [8]u8 = @bitCast([_]u32{ 1, 2 });
+        \\    return bytes[7];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array payload casts: proved holes taint bitCast results but opaque pointees do not" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        \\extern fn poison(input: *[2]u32) void;
+        \\pub fn invalidated(input: *[2]u32) u8 {
+        \\    poison(input);
+        \\    const bytes: [8]u8 = @bitCast(input.*);
+        \\    return bytes[0];
+        \\}
+        ,
+        \\pub fn literalHole() u8 {
+        \\    const bytes: [8]u8 = @bitCast([_]u32{ 1, undefined });
+        \\    return bytes[0];
+        \\}
+        ,
+        \\pub fn partial() u8 {
+        \\    var input: [2]u32 = undefined;
+        \\    input[0] = 1;
+        \\    const bytes: [8]u8 = @bitCast(input);
+        \\    return bytes[0];
+        \\}
+        ,
+        \\pub fn pointee() u8 {
+        \\    var input: [2]u32 = undefined;
+        \\    const pointer = &input;
+        \\    const bytes: [8]u8 = @bitCast(pointer.*);
+        \\    return bytes[0];
+        \\}
+        ,
+        \\const Box = struct { words: [2]u32 };
+        \\pub fn field() u8 {
+        \\    var input: Box = undefined;
+        \\    input.words[0] = 1;
+        \\    const bytes: [8]u8 = @bitCast(input.words);
+        \\    return bytes[0];
+        \\}
+        ,
+    }, 0..) |source, ordinal| {
+        var problems = try analyzeWithZls(gpa, source);
+        defer freeProblems(gpa, &problems);
+        try std.testing.expectEqual(ordinal != 0, diagnosedAt(problems.items, "use-undefined", source, "return bytes[0];", 0));
+    }
+}
+
+test "array extent credit: complete prefix supports an unrelated runtime index" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn good(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count < bytes.len) : (count += 1) {
+        \\        bytes[count] = 7;
+        \\    }
+        \\    return bytes[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array extent credit: a short prefix does not cover an unrelated runtime index" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn bad(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    while (count < bytes.len - 1) : (count += 1) {
+        \\        bytes[count] = 7;
+        \\    }
+        \\    return bytes[index];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(countRuleLines(problems.items, "use-undefined") != 0);
+}
+
+test "array extent credit: direct indexed RHS transfers full coverage credit" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn good(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    bytes[1] = 2;
+        \\    bytes[2] = 3;
+        \\    var output: [1]u8 = undefined;
+        \\    output[0] = bytes[index];
+        \\    return output[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), countRuleLines(problems.items, "use-undefined"));
+}
+
+test "array extent credit: direct indexed RHS does not transfer a source hole" {
+    const gpa = std.testing.allocator;
+    var problems = try analyzeWithZls(gpa,
+        \\pub fn bad(index: usize) u8 {
+        \\    var bytes: [3]u8 = undefined;
+        \\    bytes[0] = 1;
+        \\    bytes[2] = 3;
+        \\    var output: [1]u8 = undefined;
+        \\    output[0] = bytes[index];
+        \\    return output[0];
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    var reported_output_read = false;
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "use-undefined") and problem.start.line == 7) {
+            reported_output_read = true;
+        }
+    }
+    try std.testing.expect(reported_output_read);
+}
+
+test "out credit: scalar receiver projection still reads missing nested metadata" {
+    const source =
+        \\const Part = struct {
+        \\    written: u32, missing: u32,
+        \\    fn inspect(self: *const Part) u32 { return self.missing; }
+        \\};
+        \\const Whole = struct { part: Part };
+        \\fn fill(out: *Whole) void { out.part.written = 1; }
+        \\fn f() u32 {
+        \\    var value: Whole = undefined;
+        \\    fill(&value);
+        \\    return value.part.inspect();
+        \\}
+    ;
+    var problems = try analyze(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value.part.inspect()", 0));
+}
+
+test "out credit: escaped and payload-reading receivers retain aggregate reads" {
+    for ([_][]const u8{
+        "return opaqueValue(self);",
+        "return self.limbs[0];",
+        "return self.pointer.*;",
+    }) |body| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "extern fn opaqueValue(value: *const Part) u32; const Part = struct {{ limbs: [2]u32, pointer: *const u32, len: usize, fn inspect(self: *const Part) u32 {{ {s} }} }}; const Whole = struct {{ part: Part }}; fn fill(out: *Whole) void {{ out.part.len = 0; }} fn f() u32 {{ var value: Whole = undefined; fill(&value); return value.part.inspect(); }}", .{body});
+        defer std.testing.allocator.free(source);
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value.part.inspect()", 0));
+    }
+}
+
+test "out credit: direct scalar projections do not read inactive inline siblings" {
+    for ([_]struct { field: []const u8, warns: bool }{
+        .{ .field = "len", .warns = false },
+        .{ .field = "missing", .warns = true },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "const Header = struct {{ len: usize, missing: usize }}; const Part = struct {{ header: Header, limbs: [2]u32 }}; const Whole = struct {{ part: Part }}; fn fill(out: *Whole) void {{ out.part.header.len = 0; }} fn f() usize {{ var value: Whole = undefined; fill(&value); return value.part.header.{s}; }}", .{case.field});
+        defer std.testing.allocator.free(source);
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, diagnosedAt(problems.items, "use-undefined", source, "return value.part.header", 0));
+    }
+}
+
+test "out credit: receiver-relative scalar paths traverse inline metadata only" {
+    for ([_]struct { field: []const u8, warns: bool }{
+        .{ .field = "len", .warns = false },
+        .{ .field = "missing", .warns = true },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "const Header = struct {{ len: usize, missing: usize }}; const Part = struct {{ header: Header, limbs: [2]u32, fn inspect(self: *const Part) usize {{ return self.header.{s}; }} }}; const Whole = struct {{ part: Part }}; fn fill(out: *Whole) void {{ out.part.header.len = 0; }} fn f() usize {{ var value: Whole = undefined; fill(&value); return value.part.inspect(); }}", .{case.field});
+        defer std.testing.allocator.free(source);
+        var problems = try analyze(std.testing.allocator, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case.warns, diagnosedAt(problems.items, "use-undefined", source, "return value.part.inspect()", 0));
+    }
+}
+
+test "undefined diagnostics: definite output stores inside loops do not require value certificates" {
+    const source =
+        \\fn fastTwoSum(x: f64, y: f64, low: *f64) f64 {
+        \\    const sum = x + y;
+        \\    low.* = y - (sum - x);
+        \\    return sum;
+        \\}
+        \\fn conditional(x: f64, low: *f64, write: bool) f64 {
+        \\    if (write) low.* = x;
+        \\    return x;
+        \\}
+        \\fn safe(a: f64, n: usize) f64 {
+        \\    var total: f64 = 0;
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        var low: f64 = undefined;
+        \\        const high = fastTwoSum(a, total, &low);
+        \\        total = high + low;
+        \\    }
+        \\    return total;
+        \\}
+        \\fn unsafe(a: f64, n: usize, write: bool) f64 {
+        \\    var total: f64 = 0;
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        var low: f64 = undefined;
+        \\        const high = conditional(a, &low, write);
+        \\        total = high + low;
+        \\    }
+        \\    return total;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "total = high + low", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "total = high + low", 1));
+}
+
+test "undefined diagnostics: call results distinguish unknown returns from reached undefined returns" {
+    const source =
+        \\extern fn unprovedValue() u8;
+        \\fn unknownResult() u8 { return unprovedValue(); }
+        \\fn definedResult() u8 { return 7; }
+        \\fn undefinedResult(choose: bool) u8 {
+        \\    if (choose) return unprovedValue();
+        \\    const seed: u8 = undefined;
+        \\    return seed;
+        \\}
+        \\pub fn safe() void {
+        \\    const value = unknownResult();
+        \\    _ = value;
+        \\}
+        \\pub fn unsafe(choose: bool) void {
+        \\    const value = undefinedResult(choose);
+        \\    _ = value;
+        \\}
+    ;
+    var problems = try analyzeWithReturnCertificate(std.testing.allocator, source, "unknownResult", false);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "_ = value", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "_ = value", 1));
+    var positive_control = try analyzeWithReturnCertificate(std.testing.allocator, source, "definedResult", true);
+    defer freeProblems(std.testing.allocator, &positive_control);
+}
+
+test "undefined diagnostics: reached boolean output stores poison only their selected result" {
+    const source =
+        \\fn poison(value: *u8, flag: bool) bool {
+        \\    if (flag) { value.* = undefined; return true; }
+        \\    return false;
+        \\}
+        \\pub fn safe(flag: bool) u8 {
+        \\    var value: u8 = 7;
+        \\    if (!poison(&value, flag)) return value;
+        \\    return 0;
+        \\}
+        \\pub fn unsafe(flag: bool) u8 {
+        \\    var value: u8 = 7;
+        \\    if (poison(&value, flag)) return value;
+        \\    return 0;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return value", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return value", 1));
+}
+
+test "undefined diagnostics: selected returned fields retain byte masks without value certificates" {
+    const source =
+        \\const Pair = struct { hole: u32, unknown: u32 };
+        \\extern fn opaqueValue() u32;
+        \\fn pair() Pair {
+        \\    var result: Pair = undefined;
+        \\    result.hole = undefined;
+        \\    result.unknown = opaqueValue();
+        \\    return result;
+        \\}
+        \\pub fn safe() u32 { return pair().unknown; }
+        \\pub fn unsafe() u32 { return pair().hole; }
+        \\fn inlinePair() Pair { return .{ .hole = undefined, .unknown = opaqueValue() }; }
+        \\pub fn inlineSafe() u32 { return inlinePair().unknown; }
+        \\pub fn inlineUnsafe() u32 { return inlinePair().hole; }
+        \\pub fn rewritten() Pair {
+        \\    var result: Pair = undefined;
+        \\    result.hole = opaqueValue();
+        \\    result.unknown = opaqueValue();
+        \\    return result;
+        \\}
+        \\pub fn incomplete() Pair {
+        \\    var result: Pair = undefined;
+        \\    result.hole = opaqueValue();
+        \\    return result;
+        \\}
+    ;
+    var problems = try analyzeWithZls(std.testing.allocator, source);
+    defer freeProblems(std.testing.allocator, &problems);
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return pair().unknown", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return pair().hole", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return inlinePair().unknown", 0));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return inlinePair().hole", 0));
+    try std.testing.expect(!diagnosedAt(problems.items, "use-undefined", source, "return result", 1));
+    try std.testing.expect(diagnosedAt(problems.items, "use-undefined", source, "return result", 2));
 }

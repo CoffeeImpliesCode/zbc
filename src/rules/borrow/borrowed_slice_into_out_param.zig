@@ -4,6 +4,8 @@
 //! `<out>.field = ...<X>...`) pushes a view of `<X>` into a
 //! caller-visible out-parameter.  When the defer fires on
 //! function return, the out-param holds a dangling slice.
+//! Canonical returned-storage proofs distinguish independently owned snapshots
+//! from fresh outer allocations that still retain deferred storage.
 //!
 //! Real-world: oven-sh/bun#30151 (`query_string.* =
 //! ZigString.init(result.query_string)` where
@@ -19,12 +21,16 @@ const Ast = std.zig.Ast;
 const tokens = @import("../../ast/tokens.zig");
 const local_bindings = @import("../../model/local_bindings.zig");
 const query = @import("../../ast/token_query.zig");
-const file_model = @import("../../model/file_model.zig");
 const problem_mod = @import("../../problem.zig");
 const testing = @import("../../testing.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
-const fn_summary_mod = @import("../../model/fn_summary.zig");
+const return_storage = @import("../../cache/return_storage.zig");
+const storage_alias = @import("../../cache/storage_alias.zig");
+const call_summary = @import("../../cache/call_summary.zig");
+const type_query = @import("../../model/type_query.zig");
+const fresh_storage = @import("../../cache/fresh_storage.zig");
+const type_engine = @import("type_engine");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -95,16 +101,13 @@ fn checkFn(
 
     const bindings = try cache.localBindings(proto, body);
 
-    // Pointer params — bindings with .param origin whose declared
-    // type starts with `*` or `?*`.  We also record each pointer
-    // param's CONTAINER TYPE NAME (e.g. "PackageInstall" for
-    // `this: *PackageInstall`) so writes through it can be
-    // type-checked against the file model — a write to a primitive
-    // field (`this.file_count: usize = ...`) can't carry a borrowed
-    // slice and must not fire.
+    // Keep the complete parameter declaration and its lexical owner.
+    // A terminal name cannot distinguish nested or imported type graphs.
     const model = try cache.fileModel();
-    // Containing type for `*@This()` / `*Self` resolution.
-    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
+    const owner: ?file_cache_mod.FileCache.ResolvedType = if (model.containingTypeOf(fn_decl)) |ti|
+        .{ .model = model, .info = ti, .path = cache.file_path, .module = cache.module_id }
+    else
+        null;
 
     var pointer_params: std.ArrayListUnmanaged(PointerParam) = .empty;
     defer pointer_params.deinit(gpa);
@@ -113,7 +116,7 @@ fn checkFn(
         if (!isPointerType(tags, b.rhs_first, b.rhs_last)) continue;
         try pointer_params.append(gpa, .{
             .name = b.name,
-            .type_name = extractTypeName(tree, tags, b.rhs_first, b.rhs_last, self_type),
+            .declared = .{ .tree = tree, .first = b.rhs_first, .last = b.rhs_last, .owner = owner, .allow_array_length_expr = true },
         });
     }
     if (pointer_params.items.len == 0) return;
@@ -147,6 +150,7 @@ fn checkFn(
                 const range = enclosingScope(tags, t, first, last);
                 try deferred.append(gpa, .{
                     .name = name,
+                    .token = t,
                     .scope_open = range.open,
                     .scope_close = range.close,
                 });
@@ -158,6 +162,7 @@ fn checkFn(
             const range = enclosingScope(tags, t, first, last);
             try deferred.append(gpa, .{
                 .name = m.captureText(tree, 0).?,
+                .token = t,
                 .scope_open = range.open,
                 .scope_close = range.close,
             });
@@ -169,7 +174,7 @@ fn checkFn(
     if (deferred.items.len == 0) return;
 
     // Find writes through pointer params; check RHS for any deferred name.
-    try scanWrites(gpa, tree, cache, write_via_out, first, last, model, pointer_params.items, deferred.items, problems);
+    try scanWrites(gpa, tree, cache, write_via_out, first, last, pointer_params.items, deferred.items, problems);
 }
 
 fn scanWrites(
@@ -179,7 +184,6 @@ fn scanWrites(
     atoms: []const Atom,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
-    model: *const file_model.FileModel,
     pointer_params: []const PointerParam,
     deferred: []const DeferredItem,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -190,41 +194,17 @@ fn scanWrites(
     for (writes) |w| {
         const out_name = w.captureText(tree, 0).?;
         const pp = findPointerParam(out_name, pointer_params) orelse continue;
-        // Type-aware LHS check: when the write is `<out>.<field> = ...`
-        // and we can resolve <field>'s declared type via the FileModel,
-        // skip primitive-typed fields (`usize` / `u32` / `bool` /
-        // etc.) — those can't hold a borrowed slice.  The audit
-        // showed many FPs of the form `this.file_count =
-        // FileCopier.copy(subdir, ...);` where the RHS just mentions
-        // a deferred name as a CALL ARG (the call returns a primitive).
-        if (w.start + 2 <= last and tags[w.start + 1] == .period and tags[w.start + 2] == .identifier) {
-            const field_name = tree.tokenSlice(w.start + 2);
-            if (pp.type_name) |ty| {
-                if (model.fieldType(ty, field_name)) |ft| {
-                    if (isPrimitiveTypeName(ft)) continue;
-                }
-                // Qualified-path resolution: when the field's
-                // declared type is dotted (`Result.Pending.State`),
-                // resolve to the LEAF TypeInfo and skip when it's
-                // an enum (no payload, can't borrow) or a struct
-                // whose fields are all primitives / pointers.
-                if (model.resolveFieldTypeQualified(ty, field_name)) |leaf_ti| {
-                    if (leaf_ti.kind == .enum_) continue;
-                    if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
-                }
-                // Cross-file fallback: when the field's type is a
-                // simple identifier that resolves through the
-                // global type index to an enum (or pointer/primitive-
-                // only struct), the field can't hold a borrowed
-                // slice.  Handles \`field: AuthMethod\` where
-                // AuthMethod is an enum defined in another file.
-                if (model.fieldType(ty, field_name)) |ft| {
-                    if (cache.findTypeAcrossImports(ft)) |leaf_ti| {
-                        if (leaf_ti.kind == .enum_) continue;
-                        if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
-                    }
-                }
-            }
+        const sc = tokens.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
+        if (sc <= w.end + 1) continue;
+        const dn = rhsMentionsDeferred(tree, w.start, w.end, sc, first, last, deferred) orelse continue;
+        // A copied value is independent only if its entire retained graph
+        // carries no address. Resolve actual expressions in this document;
+        // the shared proof reads each nested field in its declaring frame.
+        // Integer representations of addresses still retain those addresses.
+        if (!rhsHasAddressBits(tree, w.end + 1, sc - 1)) {
+            if (try expressionIsAddressFree(cache, w.start, w.end - 1) or
+                try expressionIsAddressFree(cache, w.end + 1, sc - 1) or
+                (cache.zls == null and declaredFieldIsAddressFree(cache, pp, w.start, w.end - 1))) continue;
         }
         // RHS-shape check: when the assigned value comes from a
         // `*.toOwnedSlice(*)` / `*.dupe(*)` / `*.clone(*)` call, the
@@ -232,15 +212,7 @@ fn scanWrites(
         // arg), not a borrow of the deferred local.  The deferred
         // cleanup happens AFTER the copy is made; out-param holds
         // a valid allocation.
-        const sc = tokens.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
-        if (sc <= w.end + 1) continue;
         if (rhsContainsCopyingCall(tree, w.end + 1, sc - 1)) continue;
-        // RHS ending in `].*` — array dereference produces a
-        // by-value array copy.  Common pattern:
-        //   `.salt = salt_data.slice()[0..4].*`
-        // After the copy the field holds independent bytes; the
-        // deferred local's storage going away doesn't dangle it.
-        if (rhsEndsWithArrayDeref(tree, w.end + 1, sc - 1)) continue;
         // RHS contains `<X>.create(... allocator ... <slice> ...)`
         // — the call is an allocator-backed constructor that
         // canonically dupes its non-allocator args (Bun's
@@ -248,15 +220,10 @@ fn scanWrites(
         // body does `allocator.dupe(u8, slice)`).  The out-param
         // receives the new owned copy, not a borrow.
         if (rhsContainsAllocatorConstructor(tree, w.end + 1, sc - 1)) continue;
-        // Cross-fn dupe inference: if the RHS is a single same-file
-        // fn call whose body's returns NEVER mention any of its
-        // params, the result can't carry a borrow back from any
-        // arg.  Resolves the `this.x = makePlaceholder(decoded.rgba,
-        // decoded.width, decoded.height)` shape where makePlaceholder
-        // builds a new heap allocation and returns it independently
-        // of its args.
-        if (rhsCallIsResultIndependent(tree, cache, w.end + 1, sc - 1)) continue;
-        const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
+        // The canonical returned-storage proof checks the complete retained
+        // graph, including fields stored through a freshly allocated pointer.
+        // A fresh outer allocation alone cannot discharge a borrowed payload.
+        if (try rhsCallDoesNotBorrowDeferred(tree, cache, w.end + 1, sc - 1, dn)) continue;
         // Switch-scrutinee-only skip: when the RHS is
         // `switch (<expr-mentioning-deferred>) { <arms-not-mentioning-it> }`,
         // the deferred slice is consumed by the expression that the
@@ -269,20 +236,11 @@ fn scanWrites(
         // through the call), and the out-param holds independent
         // bytes (the unpacked Socket).
         if (deferredOnlyInSwitchScrutinee(tree, w.end + 1, sc - 1, dn)) continue;
-        // Per-arg suppression: the deferred variable appears in the
-        // RHS as an argument to some call, but the called function
-        // provably doesn't embed THAT SPECIFIC param in its returns
-        // (even if it embeds other params).  Handles the shape:
-        //   `ret.* = ok(transpileSourceCode(..., referrer_slice.slice(), ...))`
-        // where `input_specifier` (a different param) appears in
-        // transpileSourceCode's returns but `referrer` (param at the
-        // deferred-arg position) does not.
-        if (rhsCallArgNotEmbeddedInResult(tree, cache, w.end + 1, sc - 1, dn)) continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
 }
 
-const PointerParam = struct { name: []const u8, type_name: ?[]const u8 };
+const PointerParam = struct { name: []const u8, declared: type_query.TypeRef };
 
 /// A `defer X.deinit()` / `defer alloc.free(X)` paired with the
 /// lexical `{ ... }` it was declared inside.  Writes outside that
@@ -290,6 +248,8 @@ const PointerParam = struct { name: []const u8, type_name: ?[]const u8 };
 /// executed when control passes a sibling branch.
 const DeferredItem = struct {
     name: []const u8,
+    /// The `defer` keyword that registered the cleanup.
+    token: Ast.TokenIndex,
     scope_open: Ast.TokenIndex,
     scope_close: Ast.TokenIndex,
 };
@@ -346,105 +306,113 @@ fn findPointerParam(name: []const u8, params: []const PointerParam) ?PointerPara
     return null;
 }
 
-
-/// Walk type tokens for `(?)?*(const)?<id>(.<id>)?` and return the
-/// last identifier — the container type's name.  Handles `*T`,
-/// `?*T`, `*const T`, `*ns.T`, and `*@This()` / `*Self` (resolved
-/// to `self_type` when provided).  Returns null on shapes we can't
-/// confidently classify (slice/array/anytype/inline-struct).
-fn extractTypeName(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
+/// Unknown and address-bearing types both refuse the shared deep proof.
+/// The SDK frame, not a local token spelling, owns every actual field type.
+fn expressionIsAddressFree(
+    cache: *file_cache_mod.FileCache,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
-    self_type: ?[]const u8,
-) ?[]const u8 {
-    if (first > last) return null;
+) !bool {
+    const resolver = cache.zls orelse return false;
+    const node = cache.nodeForExactSpan(first, last) orelse return false;
+    const frame = resolver.resolutionFrame();
+    const actual = (try frame.typeOfNode(node)) orelse return false;
+    return actualTypeIsAddressFree(frame, actual, 0);
+}
+
+/// Extend the shared scalar/struct proof to unions. Every possible payload
+/// must carry no address, not just the tag or the currently selected member.
+fn actualTypeIsAddressFree(
+    frame: type_engine.TypeResolver.ResolutionFrame,
+    ty: type_engine.TypeResolver.ActualType,
+    depth: u8,
+) file_cache_mod.SummaryError!bool {
+    if (depth > type_query.max_element_depth) return false;
+    const actual = (try frame.resolver.normalizedType(ty)) orelse return false;
+    switch (actual.data) {
+        .array => |array| return actualTypeIsAddressFree(frame, array.elem_ty.*, depth + 1),
+        .optional => |payload| return actualTypeIsAddressFree(frame, payload.*, depth + 1),
+        .ip_index => {
+            const index = actual.ipIndex() orelse return false;
+            switch (frame.resolver.ctx.ip.zigTypeTag(index) orelse return false) {
+                .array, .vector, .optional => {
+                    const child = frame.resolver.childType(actual) orelse return false;
+                    return actualTypeIsAddressFree(frame, child, depth + 1);
+                },
+                else => {},
+            }
+        },
+        .container => |container| {
+            const declaring = frame.resolver.frameForContainer(container);
+            const tree = &declaring.handle.document.tree;
+            const node = container.scope_handle.toNode();
+            const kind = tree.tokenTag(tree.nodeMainToken(node));
+            switch (kind) {
+                .keyword_struct, .keyword_union => {},
+                else => return fresh_storage.actualTypeAddressFree(frame, actual, depth, null),
+            }
+            var buffer: [2]Ast.Node.Index = undefined;
+            const declaration = tree.fullContainerDecl(&buffer, node) orelse return false;
+            for (declaration.ast.members) |member| {
+                const field = tree.fullContainerField(member) orelse continue;
+                const type_node = field.ast.type_expr.unwrap() orelse {
+                    // A payloadless union member is void, not an unknown type.
+                    if (kind == .keyword_union) continue;
+                    return false;
+                };
+                const field_type = (try declaring.typeOfNode(type_node)) orelse return false;
+                if (!try actualTypeIsAddressFree(declaring, field_type, depth + 1)) return false;
+            }
+            return true;
+        },
+        else => {},
+    }
+    return fresh_storage.actualTypeAddressFree(frame, actual, depth, null);
+}
+
+/// Declaration fallback for runs without the SDK. Never look up a leaf
+/// name globally, or inspect a foreign field through the caller's tree.
+fn declaredFieldIsAddressFree(
+    cache: *file_cache_mod.FileCache,
+    param: PointerParam,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tree = param.declared.tree;
+    const tags = tree.tokens.items(.tag);
+    if (last != first + 2 or tags[first + 1] != .period or tags[last] != .identifier) return false;
+    var base = type_query.stripPointers(param.declared);
+    while (base.first <= base.last and tags[base.first] == .keyword_const) base.first += 1;
+    if (base.first > base.last) return false;
+    const owner = if (tags[base.first] == .builtin and
+        std.mem.eql(u8, tree.tokenSlice(base.first), "@This") and base.last == base.first + 2)
+        base.owner orelse return false
+    else blk: {
+        var buffer: [256]u8 = undefined;
+        const name = type_query.typePathName(&buffer, base) orelse return false;
+        break :blk if (base.owner) |scope|
+            cache.typePathInOwnerScope(scope, name) orelse return false
+        else
+            cache.resolvedTypePathAcrossImports(name) orelse return false;
+    };
+    const field = owner.info.findField(tree.tokenSlice(last)) orelse return false;
+    return type_query.typeRangeIsAddressFree(cache, .{
+        .tree = owner.model.tree,
+        .first = field.type_first,
+        .last = field.type_last,
+        .owner = owner,
+        .allow_array_length_expr = true,
+    }, 0);
+}
+
+fn rhsHasAddressBits(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
     var t = first;
     while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .asterisk, .keyword_const => continue,
-            .l_bracket => return null,
-            .identifier, .builtin => break,
-            else => return null,
-        }
-    }
-    if (t > last) return null;
-    // `@This()` → self_type.
-    if (tags[t] == .builtin) {
-        if (std.mem.eql(u8, tree.tokenSlice(t), "@This")) return self_type;
-        return null;
-    }
-    if (tags[t] != .identifier) return null;
-    var last_id = tree.tokenSlice(t);
-    // `Self` → self_type.
-    if (std.mem.eql(u8, last_id, "Self")) {
-        if (self_type) |st| return st;
-        return null;
-    }
-    while (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) : (t += 2) {
-        last_id = tree.tokenSlice(t + 2);
-    }
-    return last_id;
-}
-
-fn isPrimitiveTypeName(name: []const u8) bool {
-    // Zig primitives that can't hold a slice / borrow.  Slices and
-    // pointers are excluded — those CAN hold borrowed memory.  Bool
-    // and ints are sufficient to cover the common FP shape
-    // (`this.count: usize = fn(deferred, ...)`).
-    if (name.len == 0) return false;
-    // Numeric types: bool, void, type, anyerror, anyopaque, comptime_*,
-    // u<N>, i<N>, f<N>, c_*, usize, isize.
-    if (std.mem.eql(u8, name, "bool")) return true;
-    if (std.mem.eql(u8, name, "void")) return true;
-    if (std.mem.eql(u8, name, "type")) return true;
-    if (std.mem.eql(u8, name, "anyerror")) return true;
-    if (std.mem.eql(u8, name, "anyopaque")) return true;
-    if (std.mem.eql(u8, name, "usize")) return true;
-    if (std.mem.eql(u8, name, "isize")) return true;
-    if (std.mem.startsWith(u8, name, "comptime_")) return true;
-    if (std.mem.startsWith(u8, name, "c_")) return true;
-    // u<digits> / i<digits> / f<digits>.
-    if ((name[0] == 'u' or name[0] == 'i' or name[0] == 'f') and name.len >= 2) {
-        for (name[1..]) |c| if (c < '0' or c > '9') return false;
-        return true;
-    }
-    // Bitset/packed-flag naming convention: protocol-parsing code
-    // routinely declares packed-struct types named `*Flags`,
-    // `*Status`, `*Mode`, `*Kind`, `*Capabilities`, `*Bits`,
-    // `*Mask`.  These can be assumed to hold no slice/pointer
-    // fields (they're bit-flag wrappers around an integer base
-    // type), so a field of this shape can't carry a borrow.
-    // Imported across files, the structural check can't see this —
-    // the suffix is the next-best signal.
-    if (std.mem.endsWith(u8, name, "Flags")) return true;
-    if (std.mem.endsWith(u8, name, "Status")) return true;
-    if (std.mem.endsWith(u8, name, "Mode")) return true;
-    if (std.mem.endsWith(u8, name, "Kind")) return true;
-    if (std.mem.endsWith(u8, name, "Capabilities")) return true;
-    if (std.mem.endsWith(u8, name, "Bits")) return true;
-    if (std.mem.endsWith(u8, name, "Mask")) return true;
-    return false;
-}
-
-/// True iff `[start, end]` contains a `.<copy_method>(` shape where
-/// `<copy_method>` is a known copying call (returns owned, doesn't
-/// borrow from args).
-/// Token-level check for an `].*` suffix anywhere in the RHS — an
-/// array-value dereference.  When the assignment's value is the
-/// result of `<slice>[N..M].*` (or `<arr>[N..M].*`), the LHS gets
-/// a fresh stack-copied array, not a borrow into the slice's
-/// allocation.  The local's `defer .deinit()` freeing the slice
-/// doesn't dangle the copied bytes.
-fn rhsEndsWithArrayDeref(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start + 1 > end) return false;
-    var t: Ast.TokenIndex = start;
-    while (t + 1 <= end) : (t += 1) {
-        if (tags[t] != .r_bracket) continue;
-        if (tags[t + 1] != .period_asterisk) continue;
-        return true;
+        if (tags[t] != .builtin) continue;
+        const name = tree.tokenSlice(t);
+        if (std.mem.eql(u8, name, "@intFromPtr") or std.mem.eql(u8, name, "@ptrFromInt") or
+            std.mem.eql(u8, name, "@bitCast")) return true;
     }
     return false;
 }
@@ -473,32 +441,6 @@ fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.Toke
     return false;
 }
 
-/// True iff every field of `ti` is a primitive (`u32`/`bool`/etc.)
-/// or a pointer (`*T` / `?*T`).  Such structs hold no slice fields
-/// and can't carry a borrowed slice from a deferred local — the
-/// out-param write through `<out>.<field> = <call>` where `<field>`
-/// has this shape can't dangle into a deferred local.
-fn structOnlyHoldsPrimitivesOrPointers(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
-    const tags = tree.tokens.items(.tag);
-    if (ti.fields.len == 0) return false;
-    for (ti.fields) |f| {
-        // TypeInfo may have been built from a foreign tree — token indices
-        // out of range for this tree means we can't inspect safely.
-        if (f.type_first >= tags.len or f.type_last >= tags.len) return false;
-        var t = f.type_first;
-        while (t <= f.type_last and tags[t] == .question_mark) : (t += 1) {}
-        if (t > f.type_last) return false;
-        // Pointer field: `*T` / `?*T` — already past `?` strip.
-        if (tags[t] == .asterisk) continue;
-        // Slice or array: leak risk if contents are bytes.
-        if (tags[t] == .l_bracket) return false;
-        if (tags[t] != .identifier) return false;
-        const name = tree.tokenSlice(t);
-        if (!isPrimitiveTypeName(name)) return false;
-    }
-    return true;
-}
-
 fn isCopyingMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "toOwnedSlice") or
         std.mem.eql(u8, name, "toOwnedSliceSentinel") or
@@ -513,169 +455,55 @@ fn isCopyingMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "copyBackwards");
 }
 
-/// Find which 0-based argument index in a balanced call argument list
-/// (`arg_start..arg_end`, i.e. tokens between `(` and `)` exclusive)
-/// contains `deferred_name` as an unqualified identifier.  Commas at
-/// depth 0 delimit arguments; nested parens/brackets/braces are
-/// balanced.  Returns null when not found.
-fn findDeferredArgIdx(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    arg_start: Ast.TokenIndex,
-    arg_end: Ast.TokenIndex,
-    deferred_name: []const u8,
-) ?u32 {
-    var arg_idx: u32 = 0;
-    var depth: i32 = 0;
-    var t: Ast.TokenIndex = arg_start;
-    while (t <= arg_end) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren, .l_bracket, .l_brace => depth += 1,
-            .r_paren, .r_bracket, .r_brace => depth -= 1,
-            .comma => if (depth == 0) {
-                arg_idx += 1;
-            },
-            .identifier => if (depth == 0 and
-                std.mem.eql(u8, tree.tokenSlice(t), deferred_name))
-            {
-                return arg_idx;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-/// True iff the RHS at `[start, end]` is a call (or wrapper call)
-/// where `deferred_name` is passed as an argument at a position whose
-/// corresponding parameter is provably NOT embedded in any of the
-/// called function's non-recursive return expressions.  Uses the
-/// per-param `result_params_in_return` bitmask from FnSummary.
-///
-/// Handles the shape:
-///   `ret.* = ok(transpileSourceCode(..., referrer_slice.slice(), ...))`
-/// where `transpileSourceCode` stores `input_specifier` (a different
-/// param) in its returns but NOT `referrer` — the deferred arg's param.
-fn rhsCallArgNotEmbeddedInResult(
+/// An unresolved callee, incomplete storage set, or possible alias refuses
+/// independence. All semantic and source errors propagate to the caller.
+fn rhsCallDoesNotBorrowDeferred(
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     deferred_name: []const u8,
-) bool {
+) file_cache_mod.SummaryError!bool {
     const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = start;
-    if (t <= end and tags[t] == .keyword_try) t += 1;
-    if (t + 2 > end) return false;
-    var p: Ast.TokenIndex = t;
-    var last_ident: ?Ast.TokenIndex = null;
-    while (p <= end) : (p += 1) {
-        switch (tags[p]) {
-            .identifier => last_ident = p,
-            .period, .builtin => {},
-            .l_paren => break,
-            else => return false,
+    var first = start;
+    if (first <= end and tags[first] == .keyword_try) first += 1;
+    if (first > end) return false;
+    const node = cache.nodeForExactSpan(first, end) orelse return false;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, node) orelse return false;
+    const token = fresh_storage.calleeQueryToken(tree, call);
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    const context: storage_alias.QueryContext = .{ .remaining = &remaining };
+    const returned = try return_storage.returnedStorageAt(cache, token, context);
+    if (!returned.complete) return false;
+    if (returned.alternatives.len == 0) return true;
+    const actual = (try cache.actualCallSummaryAt(token, null)) orelse return false;
+    var saw_deferred = false;
+    var t = first;
+    while (t <= end) : (t += 1) {
+        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), deferred_name)) continue;
+        if (t > first and tags[t - 1] == .period) continue;
+        saw_deferred = true;
+        const deferred_node = cache.nodeForExactSpan(t, t) orelse return false;
+        for (returned.alternatives) |alternative| {
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const selected = (try return_storage.mappedStorageAt(
+                cache,
+                actual,
+                alternative,
+                &argument_buffer,
+            )) orelse return false;
+            if (try storage_alias.mayShareStorageAt(
+                cache,
+                node,
+                selected,
+                .{ .node = deferred_node },
+                .reachable_storage,
+                context,
+            )) return false;
         }
     }
-    if (p > end or tags[p] != .l_paren) return false;
-    const name_tok = last_ident orelse return false;
-    const fn_name = tree.tokenSlice(name_tok);
-    // Wrapper passthrough: `ok(inner_call)` — recurse into the arg.
-    if (isWrapperCtorName(fn_name)) {
-        const arg_start = p + 1;
-        const arg_end = matchParenEnd(tags, p, end) orelse return false;
-        return rhsCallArgNotEmbeddedInResult(tree, cache, arg_start, arg_end - 1, deferred_name);
-    }
-    // Look up the called function's summary.
-    const model = cache.fileModel() catch return false;
-    const fn_decl = findFnDeclByName(model, fn_name) orelse return false;
-    const summary = cache.summaryOfFn(fn_decl) catch return false;
-    const mask = summary.result_params_in_return;
-    // If no return statements were seen, we can't confirm independence.
-    if ((mask & fn_summary_mod.SAW_RETURN_BIT) == 0) return false;
-    // Find which arg position contains deferred_name.
-    const paren_end = matchParenEnd(tags, p, end) orelse return false;
-    const arg_idx = findDeferredArgIdx(tree, tags, p + 1, paren_end - 1, deferred_name) orelse return false;
-    if (arg_idx >= 31) return false;
-    // True when the specific param's bit is clear (not in any return).
-    return (mask >> @intCast(arg_idx)) & 1 == 0;
-}
-
-/// True iff the RHS contains a `<X>.create(...)` or `<X>.init(...)`
-/// or `<X>.new(...)` call whose args include an allocator token —
-/// strong heuristic that the constructor dupes its non-allocator
-/// args via that allocator (canonical Bun pattern:
-/// `ResolveMessage.create(global, allocator, msg, slice)` does
-/// `allocator.dupe(u8, slice)` internally).  Cross-fn dupe
-/// inference without an actual cross-fn lookup: the presence of
-/// an allocator in the call shape is the signal.
-/// Cross-fn dupe inference: the RHS is a single call `<X>(args...)`
-/// (optionally wrapped in `try`/`catch`); look up the fn by name in
-/// the file model, check its FnSummary's
-/// `result_independent_of_args`.  Returns true when the call's
-/// result demonstrably can't carry a borrow from any arg.
-///
-/// Conservative — only fires when the RHS shape is a SINGLE call
-/// expression (not a chain or struct-init wrapper) AND the called
-/// fn is in the local model.  Cross-file calls are unhandled
-/// (would need a project-wide model).
-fn rhsCallIsResultIndependent(
-    tree: *const Ast,
-    cache: *file_cache_mod.FileCache,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    // Peel optional leading `try`.
-    var t: Ast.TokenIndex = start;
-    if (t <= end and tags[t] == .keyword_try) t += 1;
-    if (t + 2 > end) return false;
-    // RHS shape: [`<recv>`,`.`]* `<id>` `(` ... `)` [`catch` ...].
-    // Walk to the FIRST `(` collecting the immediately-preceding
-    // identifier as the method/fn name.
-    var p: Ast.TokenIndex = t;
-    var last_ident: ?Ast.TokenIndex = null;
-    while (p <= end) : (p += 1) {
-        switch (tags[p]) {
-            .identifier => last_ident = p,
-            .period, .builtin => {},
-            .l_paren => break,
-            else => return false,
-        }
-    }
-    if (p > end or tags[p] != .l_paren) return false;
-    const name_tok = last_ident orelse return false;
-    const fn_name = tree.tokenSlice(name_tok);
-    const model = cache.fileModel() catch return false;
-    // Direct hit: the outer call is itself result-independent.
-    if (findFnDeclByName(model, fn_name)) |fn_decl| {
-        const summary = cache.summaryOfFn(fn_decl) catch return false;
-        if (summary.result_independent_of_args) return true;
-    }
-    // Wrapper passthrough: outer call is a wrapper constructor
-    // (`Errorable.ok(...)`, `Result.ok(...)`, `Maybe.success(...)`)
-    // — recurse into the FIRST arg, which is the wrapped value.
-    // If the inner call's result is independent of its args, the
-    // wrapped value's borrow lifetime is the inner call's, not the
-    // outer wrapper's.
-    if (isWrapperCtorName(fn_name)) {
-        const arg_start = p + 1;
-        const arg_end = matchParenEnd(tags, p, end) orelse return false;
-        return rhsCallIsResultIndependent(tree, cache, arg_start, arg_end - 1);
-    }
-    return false;
-}
-
-/// True iff the call name is a known wrapper constructor that
-/// boxes its first arg into an Ok/Success variant without
-/// changing the borrow lifetime.  Recursing through wrappers lets
-/// us inspect the underlying call.
-fn isWrapperCtorName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "ok") or
-        std.mem.eql(u8, name, "Ok") or
-        std.mem.eql(u8, name, "success") or
-        std.mem.eql(u8, name, "Success") or
-        std.mem.eql(u8, name, "result");
+    return saw_deferred;
 }
 
 /// True iff the RHS at `[start..end]` is a `switch (...) { ... }`
@@ -727,23 +555,6 @@ fn deferredOnlyInSwitchScrutinee(
 const matchBraceEnd = tokens.matchBrace;
 const matchParenEnd = tokens.matchParen;
 
-/// Find a fn_decl AST node by name — top-level OR a method of
-/// any type.  Conservative: returns null on the FIRST match;
-/// multiple methods with the same name across types collapse to
-/// the first.  Acceptable because the borrowed-slice analysis
-/// is opportunistic (false-negative is fine).
-fn findFnDeclByName(model: *const file_model.FileModel, name: []const u8) ?Ast.Node.Index {
-    for (model.fns) |f| {
-        if (std.mem.eql(u8, f.name, name)) return f.fn_decl;
-    }
-    for (model.types) |ti| {
-        for (ti.methods) |m| {
-            if (std.mem.eql(u8, m.name, name)) return m.fn_decl;
-        }
-    }
-    return null;
-}
-
 fn rhsContainsAllocatorConstructor(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -792,8 +603,8 @@ fn rhsContainsAllocatorConstructor(
     return false;
 }
 
-/// True iff the type expression at `[first, last]` starts with `*`
-/// or `?*` — the conservative "this looks like an out-pointer param" check.
+/// True iff the type expression starts with a pointer, including the
+/// lexer's combined `**` token and an optional pointer qualifier.
 fn isPointerType(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
     if (first > last) return false;
     var t: Ast.TokenIndex = first;
@@ -801,37 +612,34 @@ fn isPointerType(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: A
         if (t + 1 > last) return false;
         t += 1;
     }
-    return tags[t] == .asterisk;
+    return tags[t] == .asterisk or tags[t] == .asterisk_asterisk;
 }
 
 fn isDeinitOrClose(name: []const u8) bool {
     return std.mem.eql(u8, name, "deinit") or std.mem.eql(u8, name, "close");
 }
 
-/// True iff `[start, end]` mentions one of the deferred names as
-/// a VALUE — i.e. NOT preceded by `&` (by-reference pass).
-/// Returns the matched name on hit.
-///
-/// Rationale: `out.* = ZigString.init(arena)` passes `arena` by
-/// value; ZigString stores a borrow into arena's memory.  But
-/// `this.scripts = createList(buf, &top_level_dir, ...)` passes
-/// `&top_level_dir` by reference; createList typically reads from
-/// the pointer transiently rather than retaining it.  Skipping
-/// `&deferred` references trades a few FNs for many fewer FPs.
+/// Return a deferred local used by the RHS. An address of a local is
+/// still a borrow; transient call arguments require a callee proof.
+/// `write_first`/`write_eq` span the written place and its `=`; `stmt_end`
+/// is the write's `;`.  A cleanup that a later clearing defer outruns is
+/// not a registered cleanup for this write (see `clearedBeforeCleanup`).
 fn rhsMentionsDeferred(
     tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
+    write_first: Ast.TokenIndex,
+    write_eq: Ast.TokenIndex,
+    stmt_end: Ast.TokenIndex,
+    fn_first: Ast.TokenIndex,
+    fn_last: Ast.TokenIndex,
     deferred: []const DeferredItem,
 ) ?[]const u8 {
     const tags = tree.tokens.items(.tag);
+    const start = write_eq + 1;
+    const end = stmt_end - 1;
     if (start > end) return null;
     var t: Ast.TokenIndex = start;
     while (t <= end) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        // Skip `&deferred` — by-reference pass; the fn doesn't
-        // necessarily retain the borrow.
-        if (t > 0 and tags[t - 1] == .ampersand) continue;
         // Skip `<recv>.<deferred>` — a field/method named the
         // same as a deferred local isn't the local itself.
         // Without this, `ctx.body` matches a `body` local on the
@@ -845,71 +653,60 @@ fn rhsMentionsDeferred(
             // runs — it can't have registered cleanup.  Only count
             // defers whose enclosing scope encloses this write.
             if (t < d.scope_open or t > d.scope_close) continue;
-            // Scalar-field-access skip: `<deferred>.<scalar-field>`
-            // where the field is well-known to be scalar (width,
-            // height, len, count, etc.).  The borrow is into the
-            // scalar value, not into `<deferred>`'s allocation —
-            // the field's bytes already sit in the local's stack
-            // frame copy when accessed.  Conservative: only skip
-            // if the FIRST occurrence after `<deferred>` is a
-            // scalar-named field AND there are no other (more
-            // suspicious) mentions of `<deferred>` in the RHS.
-            if (allDeferredMentionsAreScalarFields(tree, start, end, d.name)) continue;
+            if (clearedBeforeCleanup(tree, d, write_first, write_eq, stmt_end, fn_first, fn_last)) continue;
             return d.name;
         }
     }
     return null;
 }
 
-/// True iff every occurrence of `name` in `[start, end]` is
-/// `<name>.<scalar-field>` form — the deferred local is only
-/// accessed for primitive-named fields, never as the whole value
-/// or via slice-bearing fields.  When this holds, no slice borrow
-/// is taken from the deferred.
-fn allDeferredMentionsAreScalarFields(
+/// True when the written place is reset by a `defer <place> = <literal>;`
+/// that runs before the cleanup `cleanup` registered.  Defers unwind
+/// last-in-first-out, so a clearing defer in the cleanup's own scope and
+/// registered after it runs first; the out-param never holds the freed
+/// storage when the cleanup fires.  The clearing defer must be in force on
+/// every exit that follows the write: registered before the write, or as
+/// the statement right after it (no `try`/`return` can run in between).
+/// The reset value must be a literal, which names no local and so
+/// borrows nothing.
+fn clearedBeforeCleanup(
     tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    name: []const u8,
+    cleanup: DeferredItem,
+    write_first: Ast.TokenIndex,
+    write_eq: Ast.TokenIndex,
+    stmt_end: Ast.TokenIndex,
+    fn_first: Ast.TokenIndex,
+    fn_last: Ast.TokenIndex,
 ) bool {
     const tags = tree.tokens.items(.tag);
-    var any_mention = false;
-    var t: Ast.TokenIndex = start;
-    while (t <= end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (t > 0 and tags[t - 1] == .ampersand) continue;
-        if (t > 0 and tags[t - 1] == .period) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
-        any_mention = true;
-        // Must be followed by `.<field>` where `<field>` is scalar.
-        if (t + 2 > end) return false;
-        if (tags[t + 1] != .period) return false;
-        if (tags[t + 2] != .identifier) return false;
-        if (!isScalarFieldName(tree.tokenSlice(t + 2))) return false;
+    const place_len = write_eq - write_first;
+    const write_scope = enclosingScope(tags, write_first, fn_first, fn_last);
+    const write_in_cleanup_scope = write_scope.open == cleanup.scope_open and write_scope.close == cleanup.scope_close;
+    var t: Ast.TokenIndex = cleanup.token + 1;
+    while (t + place_len + 2 <= cleanup.scope_close) : (t += 1) {
+        if (tags[t] != .keyword_defer) continue;
+        // After the write only the very next statement is guaranteed to
+        // be registered on every path that leaves the scope.
+        if (t > write_first and !(write_in_cleanup_scope and t == stmt_end + 1)) continue;
+        var i: Ast.TokenIndex = 0;
+        while (i < place_len) : (i += 1) {
+            if (tags[t + 1 + i] != tags[write_first + i]) break;
+            if (!std.mem.eql(u8, tree.tokenSlice(t + 1 + i), tree.tokenSlice(write_first + i))) break;
+        }
+        if (i != place_len or tags[t + 1 + place_len] != .equal) continue;
+        const clearing_scope = enclosingScope(tags, t, fn_first, fn_last);
+        if (clearing_scope.open != cleanup.scope_open or clearing_scope.close != cleanup.scope_close) continue;
+        var value = t + 2 + place_len;
+        var literal = value <= cleanup.scope_close;
+        while (literal and tags[value] != .semicolon) : (value += 1) {
+            literal = value < cleanup.scope_close and switch (tags[value]) {
+                .period, .l_brace, .r_brace, .ampersand, .string_literal, .number_literal => true,
+                .identifier => tags[value - 1] == .period or std.mem.eql(u8, tree.tokenSlice(value), "null"),
+                else => false,
+            };
+        }
+        if (literal) return true;
     }
-    return any_mention;
-}
-
-fn isScalarFieldName(name: []const u8) bool {
-    const known = [_][]const u8{
-        "width",   "height", "depth",    "len",      "size",
-        "count",   "cap",    "capacity", "num",      "n",
-        "w",       "h",      "x",        "y",        "z",
-        "x1",      "y1",     "x2",       "y2",       "rows",
-        "cols",    "fd",     "tag",      "kind",     "id",
-        "version", "flags",  "level",    "priority",
-    };
-    for (known) |k| {
-        if (std.mem.eql(u8, k, name)) return true;
-    }
-    // Suffix shapes.
-    if (std.mem.endsWith(u8, name, "_len") or
-        std.mem.endsWith(u8, name, "_count") or
-        std.mem.endsWith(u8, name, "_size") or
-        std.mem.endsWith(u8, name, "_bytes") or
-        std.mem.endsWith(u8, name, "_ms") or
-        std.mem.endsWith(u8, name, "_ns") or
-        std.mem.endsWith(u8, name, "_id")) return true;
     return false;
 }
 
@@ -931,8 +728,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, write_tok),
-        .end = Pos.fromTokenEnd(tree, write_tok),
+        .start = try Pos.fromTokenStart(tree, write_tok),
+        .end = try Pos.fromTokenEnd(tree, write_tok),
         .message = msg,
     });
 }
@@ -1026,8 +823,7 @@ test "RHS with toOwnedSlice copy doesn't fire" {
 }
 
 test "*@This() pointer param resolves field type via containing struct" {
-    // Param uses `*@This()` — extractTypeName must resolve to the
-    // containing type so the FileModel lookup hits.
+    // The declared parameter scope binds `@This()` to its container.
     try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const PI = struct {
@@ -1070,22 +866,16 @@ test "self-recursive fn: param only in recursive return — does NOT fire" {
 }
 
 test "deferred arg not embedded even when other param is — does NOT fire" {
-    // Mirrors bun's Bun__transpileFile / Bun__transpileVirtualModule:
-    //   `referrer_slice` is passed as `referrer` to `transpileSourceCode`,
-    //   but `transpileSourceCode` embeds `other` (a different param) in its
-    //   returns, not `referrer`.  The old code misfired because
-    //   `result_independent_of_args` was false (because `other` appeared in
-    //   returns); the per-param bitmask now correctly distinguishes which
-    //   specific arg is embedded.
-    try testing.expectNoFire(check,
+    // The retained parameter is disjoint from the private copied buffer.
+    // Canonical returned-storage facts, not scalar dependencies, own this proof.
+    try testing.expectNoFireTyped(check,
         \\const std = @import("std");
         \\const Result = struct { label: []const u8 };
         \\fn transpile(
         \\    referrer: []const u8,
         \\    other: []const u8,
         \\) Result {
-        \\    // `other` appears in the return — makes function NOT
-        \\    // result-independent overall — but `referrer` does NOT.
+        \\    _ = referrer;
         \\    return Result{ .label = other };
         \\}
         \\pub fn caller(
@@ -1093,12 +883,10 @@ test "deferred arg not embedded even when other param is — does NOT fire" {
         \\    raw: []const u8,
         \\    other: []const u8,
         \\    ret: *Result,
-        \\) void {
-        \\    var slice = std.ArrayList(u8).init(alloc);
-        \\    defer slice.deinit();
-        \\    // slice.items is passed as `referrer` — which is NOT embedded
-        \\    // in transpile's return (only `other` is).
-        \\    ret.* = transpile(slice.items, other);
+        \\) !void {
+        \\    const slice = try alloc.dupe(u8, raw);
+        \\    defer alloc.free(slice);
+        \\    ret.* = transpile(slice, other);
         \\}
     );
 }
@@ -1106,7 +894,7 @@ test "deferred arg not embedded even when other param is — does NOT fire" {
 test "deferred arg IS the embedded param — fires" {
     // Sanity check: when the deferred arg maps to a param that IS
     // embedded in the called function's return, we must still fire.
-    try testing.expectFires(check, R,
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
         \\const Result = struct { label: []const u8 };
         \\fn transpile(
@@ -1121,12 +909,10 @@ test "deferred arg IS the embedded param — fires" {
         \\    alloc: std.mem.Allocator,
         \\    other: []const u8,
         \\    ret: *Result,
-        \\) void {
-        \\    var slice = std.ArrayList(u8).init(alloc);
-        \\    defer slice.deinit();
-        \\    // slice.items is passed as `referrer` — which IS embedded
-        \\    // in transpile's return — so this must fire.
-        \\    ret.* = transpile(slice.items, other);
+        \\) !void {
+        \\    const slice = try alloc.dupe(u8, "borrowed");
+        \\    defer alloc.free(slice);
+        \\    ret.* = transpile(slice, other);
         \\}
     );
 }
@@ -1142,5 +928,380 @@ test "namespace defer (defer posix.close) is not tracked as local — does NOT f
         \\    client.* = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
         \\}
         \\
+    );
+}
+
+test "typed optional aggregate out copy retains no address" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const budget_mod = struct {
+        \\    pub const Limit = enum { nodes, time };
+        \\    pub const Stop = struct { limit: Limit, cap: u32 };
+        \\};
+        \\const Stop = budget_mod.Stop;
+        \\const Oracle = struct {
+        \\    stopped: ?Stop = null,
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Oracle) void { self.allocator.free(self.bytes); }
+        \\    fn merge(o: *Oracle, seed: Stop) !void {
+        \\        var child: Oracle = .{ .stopped = seed, .allocator = o.allocator, .bytes = try o.allocator.alloc(u8, 1) };
+        \\        defer child.deinit();
+        \\        o.stopped = o.stopped orelse child.stopped;
+        \\    }
+        \\};
+    );
+}
+
+test "typed optional aggregate out copy retains nullable pointer" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const budget_mod = struct {
+        \\    pub const Limit = enum { nodes, time };
+        \\    pub const Stop = struct { limit: Limit, cap: u32, detail: ?*u8 };
+        \\};
+        \\const Stop = budget_mod.Stop;
+        \\const Oracle = struct {
+        \\    stopped: ?Stop = null,
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Oracle) void { self.allocator.free(self.bytes); }
+        \\    fn merge(o: *Oracle) !void {
+        \\        const bytes = try o.allocator.alloc(u8, 1);
+        \\        var child: Oracle = .{
+        \\            .stopped = .{ .limit = .nodes, .cap = 1, .detail = &bytes[0] },
+        \\            .allocator = o.allocator,
+        \\            .bytes = bytes,
+        \\        };
+        \\        defer child.deinit();
+        \\        o.stopped = o.stopped orelse child.stopped;
+        \\    }
+        \\};
+    );
+}
+
+test "typed numeric union returned from deferred state retains no address" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const ranges = struct {
+        \\    pub const Range = union(enum) {
+        \\        unknown,
+        \\        integer: struct { min: i128, max: i128 },
+        \\        floating: struct { min: f64, max: f64 },
+        \\    };
+        \\};
+        \\const Range = ranges.Range;
+        \\const State = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *State) void { self.allocator.free(self.bytes); }
+        \\    fn rangeOf(self: *const State, name: []const u8) ?Range {
+        \\        _ = name;
+        \\        return .{ .integer = .{ .min = 0, .max = @intCast(self.bytes.len) } };
+        \\    }
+        \\};
+        \\const Output = struct { range: Range = .unknown };
+        \\pub fn copy(out: *Output, allocator: std.mem.Allocator) !void {
+        \\    var state: State = .{ .allocator = allocator, .bytes = try allocator.alloc(u8, 1) };
+        \\    defer state.deinit();
+        \\    out.range = state.rangeOf("") orelse .unknown;
+        \\}
+    );
+}
+
+test "typed slice-bearing union returned from deferred state retains an address" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const ranges = struct {
+        \\    pub const Range = union(enum) {
+        \\        unknown,
+        \\        integer: struct { min: i128, max: i128 },
+        \\        floating: struct { min: f64, max: f64, bytes: []const u8 },
+        \\    };
+        \\};
+        \\const Range = ranges.Range;
+        \\const State = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *State) void { self.allocator.free(self.bytes); }
+        \\    fn rangeOf(self: *const State, name: []const u8) ?Range {
+        \\        _ = name;
+        \\        return .{ .floating = .{ .min = 0, .max = 1, .bytes = self.bytes } };
+        \\    }
+        \\};
+        \\const Output = struct { range: Range = .unknown };
+        \\pub fn copy(out: *Output, allocator: std.mem.Allocator) !void {
+        \\    var state: State = .{ .allocator = allocator, .bytes = try allocator.alloc(u8, 1) };
+        \\    defer state.deinit();
+        \\    out.range = state.rangeOf("") orelse .unknown;
+        \\}
+    );
+}
+
+test "typed nested address-bearing aggregate is not a scalar suffix" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Payload = struct { data: []const u8 };
+        \\const Status = struct { tag: u32, nested: [1]Payload };
+        \\const Scratch = struct {
+        \\    width: Status,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Scratch) void { self.allocator.free(self.width.nested[0].data); }
+        \\};
+        \\const Output = struct { value: Status };
+        \\pub fn copy(out: *Output, allocator: std.mem.Allocator) !void {
+        \\    const bytes = try allocator.alloc(u8, 1);
+        \\    var scratch: Scratch = .{ .allocator = allocator, .width = .{ .tag = 1, .nested = .{.{ .data = bytes }} } };
+        \\    defer scratch.deinit();
+        \\    out.value = scratch.width;
+        \\}
+    );
+}
+
+test "typed scalar projection of address-bearing source retains no address" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Scratch = struct {
+        \\    score: ?u32,
+        \\    bytes: []const u8,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Scratch) void { self.allocator.free(self.bytes); }
+        \\};
+        \\pub fn copy(out: *?u32, allocator: std.mem.Allocator) !void {
+        \\    var scratch: Scratch = .{ .score = 7, .bytes = try allocator.alloc(u8, 1), .allocator = allocator };
+        \\    defer scratch.deinit();
+        \\    out.* = scratch.score;
+        \\}
+    );
+}
+
+test "typed scalar graph does not erase explicit address bits" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Output = struct { value: usize };
+        \\pub fn copy(out: *Output, allocator: std.mem.Allocator) !void {
+        \\    const bytes = try allocator.alloc(u8, 1);
+        \\    defer allocator.free(bytes);
+        \\    out.value = @intFromPtr(bytes.ptr);
+        \\}
+    );
+}
+
+test "typed address of deferred slice header still escapes" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Scratch = struct {
+        \\    bytes: []u8,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Scratch) void { self.allocator.free(self.bytes); }
+        \\};
+        \\pub fn copy(out: **[]u8, allocator: std.mem.Allocator) !void {
+        \\    var scratch: Scratch = .{ .bytes = try allocator.alloc(u8, 1), .allocator = allocator };
+        \\    defer scratch.deinit();
+        \\    out.* = &scratch.bytes;
+        \\}
+    );
+}
+
+test "typed double pointer can retain an independent slice header" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn copy(out: **[]u8, stable: *[]u8, allocator: std.mem.Allocator) !void {
+        \\    const bytes = try allocator.alloc(u8, 1);
+        \\    defer allocator.free(bytes);
+        \\    out.* = stable;
+        \\}
+    );
+}
+
+test "typed array copy retains borrowed element pointers" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Scratch = struct {
+        \\    slots: [1]*u8,
+        \\    bytes: []u8,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Scratch) void { self.allocator.free(self.bytes); }
+        \\};
+        \\pub fn copy(out: *[1]*u8, allocator: std.mem.Allocator) !void {
+        \\    const bytes = try allocator.alloc(u8, 1);
+        \\    var scratch: Scratch = .{ .slots = .{&bytes[0]}, .bytes = bytes, .allocator = allocator };
+        \\    defer scratch.deinit();
+        \\    out.* = scratch.slots[0..1].*;
+        \\}
+    );
+}
+
+test "later defer clearing the out-param before the cleanup doesn't fire" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Capture = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Capture) void { _ = self; }
+        \\};
+        \\const Oracle = struct { capture: ?*Capture = null };
+        \\pub fn after(o: *Oracle, gpa: std.mem.Allocator) !void {
+        \\    var exits: Capture = .{ .gpa = gpa };
+        \\    defer exits.deinit();
+        \\    o.capture = &exits;
+        \\    defer o.capture = null;
+        \\}
+        \\pub fn before(o: *Oracle, gpa: std.mem.Allocator) !void {
+        \\    var exits: Capture = .{ .gpa = gpa };
+        \\    defer exits.deinit();
+        \\    defer o.capture = null;
+        \\    o.capture = &exits;
+        \\}
+    );
+}
+
+test "clearing defer registered before the cleanup still fires" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Capture = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Capture) void { _ = self; }
+        \\};
+        \\const Oracle = struct { capture: ?*Capture = null };
+        \\pub fn run(o: *Oracle, gpa: std.mem.Allocator) !void {
+        \\    defer o.capture = null;
+        \\    var exits: Capture = .{ .gpa = gpa };
+        \\    defer exits.deinit();
+        \\    o.capture = &exits;
+        \\}
+    );
+}
+
+test "clearing defer registered after a possible early exit still fires" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Capture = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Capture) void { _ = self; }
+        \\};
+        \\const Oracle = struct { capture: ?*Capture = null };
+        \\fn step() !void {}
+        \\pub fn run(o: *Oracle, gpa: std.mem.Allocator) !void {
+        \\    var exits: Capture = .{ .gpa = gpa };
+        \\    defer exits.deinit();
+        \\    o.capture = &exits;
+        \\    try step();
+        \\    defer o.capture = null;
+        \\}
+    );
+}
+
+test "defer resetting the out-param to a local doesn't count as clearing" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Capture = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Capture) void { _ = self; }
+        \\};
+        \\const Oracle = struct { capture: ?*Capture = null };
+        \\pub fn run(o: *Oracle, gpa: std.mem.Allocator, other: *Capture) !void {
+        \\    var exits: Capture = .{ .gpa = gpa };
+        \\    defer exits.deinit();
+        \\    o.capture = &exits;
+        \\    defer o.capture = other;
+        \\}
+    );
+}
+
+test "deferred module owning snapshot is independent of its source storage" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Snapshot = struct { bytes: []u8 };
+        \\const Module = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Module) void { self.allocator.free(self.bytes); }
+        \\    fn snapshotData(self: *const Module, gpa: std.mem.Allocator) !*Snapshot {
+        \\        const snapshot = try gpa.create(Snapshot);
+        \\        errdefer gpa.destroy(snapshot);
+        \\        snapshot.* = .{ .bytes = try gpa.dupe(u8, self.bytes) };
+        \\        return snapshot;
+        \\    }
+        \\};
+        \\const Fixture = struct { data: ?*Snapshot = null };
+        \\pub fn init(out: *Fixture, gpa: std.mem.Allocator) !void {
+        \\    var module: Module = .{
+        \\        .allocator = gpa, .bytes = try gpa.dupe(u8, "owned"),
+        \\    };
+        \\    defer module.deinit();
+        \\    out.data = try module.snapshotData(gpa);
+        \\}
+    );
+}
+
+test "fresh snapshot allocation retaining deferred module bytes still escapes" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Snapshot = struct { bytes: []u8 };
+        \\const Module = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Module) void { self.allocator.free(self.bytes); }
+        \\    fn snapshotData(self: *const Module, gpa: std.mem.Allocator) !*Snapshot {
+        \\        const snapshot = try gpa.create(Snapshot);
+        \\        snapshot.* = .{ .bytes = self.bytes };
+        \\        return snapshot;
+        \\    }
+        \\};
+        \\const Fixture = struct { data: ?*Snapshot = null };
+        \\pub fn init(out: *Fixture, gpa: std.mem.Allocator) !void {
+        \\    var module: Module = .{
+        \\        .allocator = gpa, .bytes = try gpa.dupe(u8, "borrowed"),
+        \\    };
+        \\    defer module.deinit();
+        \\    out.data = try module.snapshotData(gpa);
+        \\}
+    );
+}
+
+test "deferred module borrowed return cannot inherit a same named owning summary" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Owning = struct {
+        \\    fn snapshotData(gpa: std.mem.Allocator) ![]u8 {
+        \\        return gpa.dupe(u8, "independent");
+        \\    }
+        \\};
+        \\const Module = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Module) void { self.allocator.free(self.bytes); }
+        \\    fn snapshotData(self: *const Module) []u8 { return self.bytes; }
+        \\};
+        \\pub fn init(out: *[]u8, gpa: std.mem.Allocator) !void {
+        \\    var module: Module = .{
+        \\        .allocator = gpa, .bytes = try gpa.dupe(u8, "borrowed"),
+        \\    };
+        \\    defer module.deinit();
+        \\    out.* = module.snapshotData();
+        \\}
+    );
+}
+
+test "snapshot copied into a deferred local arena still escapes" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Module = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Module) void { self.allocator.free(self.bytes); }
+        \\    fn snapshotData(self: *const Module, gpa: std.mem.Allocator) ![]u8 {
+        \\        var arena = std.heap.ArenaAllocator.init(gpa);
+        \\        defer arena.deinit();
+        \\        return arena.allocator().dupe(u8, self.bytes);
+        \\    }
+        \\};
+        \\pub fn init(out: *[]u8, gpa: std.mem.Allocator) !void {
+        \\    var module: Module = .{
+        \\        .allocator = gpa, .bytes = try gpa.dupe(u8, "borrowed"),
+        \\    };
+        \\    defer module.deinit();
+        \\    out.* = try module.snapshotData(gpa);
+        \\}
     );
 }

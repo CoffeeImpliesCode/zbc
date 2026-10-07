@@ -31,6 +31,7 @@ const R = "hashmap-getentry-forced-unwrap";
 
 const Range = struct { start: Ast.TokenIndex, end: Ast.TokenIndex };
 
+/// Returns `SourceTooWide` if the source or token count exceeds the AST position domain.
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -41,15 +42,17 @@ pub fn check(
     if (!config_mod.isEnabled(config, .hashmap_getentry_forced_unwrap)) return;
     _ = cache;
 
+    if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok: Ast.TokenIndex = tok_count -| 1;
 
     var test_ranges: std.ArrayListUnmanaged(Range) = .empty;
     defer test_ranges.deinit(gpa);
-    try collectTestRanges(gpa, tags, &test_ranges);
+    try collectTestRanges(gpa, tags, tok_count, &test_ranges);
 
     var t: Ast.TokenIndex = 0;
-    while (t + 2 <= last_tok) : (t += 1) {
+    while (t <= last_tok and last_tok - t >= 2) : (t += 1) {
         // Find `getEntry(`
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), "getEntry")) continue;
@@ -65,7 +68,7 @@ pub fn check(
         // `i` is now the token immediately after the closing `)`.
 
         // Fire if `.?` follows immediately.
-        if (i + 1 > last_tok) continue;
+        if (i >= last_tok) continue;
         if (tags[i] != .period) continue;
         if (tags[i + 1] != .question_mark) continue;
 
@@ -80,9 +83,9 @@ pub fn check(
 fn collectTestRanges(
     gpa: std.mem.Allocator,
     tags: []const std.zig.Token.Tag,
+    n: u32,
     out: *std.ArrayListUnmanaged(Range),
 ) !void {
-    const n: u32 = @intCast(tags.len);
     var i: Ast.TokenIndex = 0;
     while (i < n) : (i += 1) {
         if (tags[i] != .keyword_test) continue;
@@ -128,8 +131,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, getentry_tok),
-        .end = Pos.fromTokenEnd(tree, question_mark_tok),
+        .start = try Pos.fromTokenStart(tree, getentry_tok),
+        .end = try Pos.fromTokenEnd(tree, question_mark_tok),
         .message = msg,
     });
 }

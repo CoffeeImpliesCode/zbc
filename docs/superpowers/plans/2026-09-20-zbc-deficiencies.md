@@ -442,3 +442,41 @@ Lower-priority precision work: conjunction refinement retains only part of a mul
 This document is an assessment and implementation plan, not an implemented fix. No analyzer source or target-project source was changed by this assessment. Available upstream was fetched and found already current. Build outputs and the anyzig compiler cache were refreshed during validation. Only this plan and its JSON evidence are new tracked-file candidates.
 
 The JSON contains all 496 selected-file hashes, all 82 diagnostics with per-location classifications, parser-error lists, and raw minimal-probe outcomes. Temporary executable probes and snapshots remain under `/tmp/zbc-assessment-6j53ve64`; the durable evidence does not depend on their continued existence.
+
+## Verification overlay: 2026-10-07
+
+This section records later verification. The original assessment, source-review classifications, compiler observations, and unchecked plan items remain historical evidence.
+An unchecked item above does not override a verified result below. These results do not close every task or release gate.
+
+### Verified CLI contract
+
+- The parent ran all 28 CLI subprocess tests successfully.
+- A separate 25-case CLI smoke run covered the issue 81–85 cases and unsafe controls.
+- A two-worker mixed run selected four files and failed two. It retained findings from successful files and returned exit 2.
+- JSON stdout contained a bare diagnostic array. SARIF stdout contained the SARIF document. Coverage and operational errors used stderr.
+- Exit 0 means complete analysis without findings. Exit 1 means complete analysis with findings. Exit 2 means incomplete analysis or an operational failure.
+- Filesystem traces covered 260 syscall records. Excluded source trees had no read-capable opens, positive reads, directory enumeration, or mapped reads.
+  Positive controls confirmed source reads outside those exclusions. This is fixture-level boundary evidence, not a new five-project matrix.
+
+### Verified public Session contract
+
+- The parent compiled and ran an external named-module consumer with caller-owned `Session`, allocator, I/O, and source policy.
+- A genuine finding retained its original AST location: line 3, column 5, byte 50.
+- A new session saw replacement source and reported no finding for the safe replacement.
+- Invalid source returned `error.InvalidSyntax` with `expected_token` at line 1, column 8, byte 7.
+- A disallowed root failed before the consumer read the outside source.
+- Root strings remain borrowed. Callers must keep the policy inputs, allocator, and I/O backend alive until session teardown.
+
+### Verified compiler pin and rule retirement
+
+- The current compiler pin is Zig 0.16.0. The original development-compiler results above describe the September assessment only.
+- The exercised CLI listed 112 supported invariants and 99 documented rules.
+- The categorical `double-optional-ptr` rule is retired. Its detector, explainer, and list entry are absent.
+  `--explain double-optional-ptr` returned exit 2. An optional pointer to an optional value is not itself a defect.
+
+### Limits of this overlay
+
+These results do not establish a passing full test suite or default build. They do not establish that all 89 assessed issues are fixed.
+They do not replace the original five-project matrix, per-location diagnostic review, or release gates.
+The final integration record belongs here, after the parent completes the full build, suite, and runtime gates.
+That record must identify the final source state, compiler, commands, outcomes, and remaining failures.

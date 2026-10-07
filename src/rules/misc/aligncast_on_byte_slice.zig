@@ -87,12 +87,7 @@ pub fn check(
             if (sliceElemNotByteSized(cache, &ident_nodes, t + 2)) continue;
             // SEMANTIC: suppress only a guarded std.mem.Allocator context cast.
             if (try receiverIsAllocator(tree, cache, &ident_nodes, t, t + 2)) continue;
-            // Suppress when the receiver was declared with an explicit alignment
-            // annotation (`recv: []align(N) u8`) or via `alignedAlloc` — in those
-            // cases the alignment is guaranteed by construction and the @alignCast
-            // assertion is always safe.
-            if (!receiverHasUnknownAlignment(tree, tags, t, tree.tokenSlice(t + 2)))
-                continue;
+            if (receiverAlignmentProven(tree, cache, t, t + 2)) continue;
             try report(gpa, problems, tree, t, t + 5);
             continue;
         }
@@ -111,50 +106,248 @@ pub fn check(
         {
             if (sliceElemNotByteSized(cache, &ident_nodes, t + 4)) continue;
             if (try receiverIsAllocator(tree, cache, &ident_nodes, t, t + 4)) continue;
-            if (!receiverHasUnknownAlignment(tree, tags, t, tree.tokenSlice(t + 4)))
-                continue;
+            if (receiverAlignmentProven(tree, cache, t, t + 4)) continue;
             try report(gpa, problems, tree, t, t + 8);
             continue;
         }
     }
 }
 
-/// Returns true (fire) when the receiver's alignment is UNKNOWN (the common
-/// unsafe case), false (suppress) when the receiver is explicitly aligned:
-///   - Parameter with `align(N)` type annotation: `recv: []align(N) u8`
-///   - Local variable from `alignedAlloc(...)` or similar
-/// Scans backward 300 tokens, finds the first non-field-access declaration
-/// of `recv_name`, then checks the 20 tokens after it for `keyword_align`
-/// or an identifier containing "alignedalloc" (case-insensitive).
-fn receiverHasUnknownAlignment(
+/// Placement storage is safe only with a proof about this address and this
+/// target. Neither an allocation method's spelling nor unrelated `align`
+/// tokens establish that proof.
+fn receiverAlignmentProven(
     tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
+    cache: *file_cache_mod.FileCache,
     anchor: Ast.TokenIndex,
-    recv_name: []const u8,
+    recv_tok: Ast.TokenIndex,
 ) bool {
-    const back: Ast.TokenIndex = 300;
-    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
-
-    var k = start;
-    while (k < anchor) : (k += 1) {
-        if (tags[k] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(k), recv_name)) continue;
-        if (k > 0 and tags[k - 1] == .period) continue; // field access, skip
-
-        // Check 20 tokens after the receiver name for alignment signals.
-        const check_end = @min(k + 20, anchor);
-        var j = k + 1;
-        while (j < check_end) : (j += 1) {
-            if (tags[j] == .keyword_align) return false; // explicit alignment
-            if (tags[j] == .identifier) {
-                const s = tree.tokenSlice(j);
-                if (std.ascii.findIgnoreCase(s, "alignedalloc") != null or
-                    std.ascii.findIgnoreCase(s, "alignalloc") != null)
-                    return false; // alignedAlloc call in RHS
-            }
+    const body = bodyContaining(tree, anchor) orelse return false;
+    const target = castTargetTypeName(tree, anchor) orelse return false;
+    const name = tree.tokenSlice(recv_tok);
+    const target_alignment = castTargetAlignment(tree, anchor);
+    if (target_alignment == null) {
+        // An unsupported aligned pointer shape is unknown, not a request
+        // for the element's natural alignment.
+        const range = castTargetTypeRange(tree, anchor) orelse return false;
+        var t = range.first;
+        while (t <= range.last) : (t += 1) {
+            if (tree.tokenTag(t) == .keyword_align) return false;
         }
     }
-    return true; // no alignment guarantee found → unknown alignment
+    if (validatedAddressAlignment(tree, cache, body, anchor, name, target, target_alignment)) return true;
+    if (receiverMutatedAfter(tree, body.first, body.first, anchor, name)) return false;
+    if (receiverAddressEscapedBefore(tree, body.first, anchor, name)) return false;
+    if (localTypeNodeBefore(tree, name, anchor, body.first)) |type_node| {
+        if (alignedSliceType(tree, cache, type_node, target, target_alignment)) return true;
+    }
+    const fn_decl = tokens.enclosingFnDecl(tree, anchor) orelse return false;
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return false;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        const nt = param.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
+        if (param.type_expr) |type_node|
+            return alignedSliceType(tree, cache, type_node, target, target_alignment);
+        return false;
+    }
+    // The allocator's element alignment alone cannot prove an explicitly
+    // stronger pointer alignment.
+    if (target_alignment != null) return false;
+    const rhs = std_types.aliasInitializer(cache, tree, recv_tok) orelse return false;
+    const tags = tree.tokens.items(.tag);
+    const first = rhs.first + @as(u32, if (tags[rhs.first] == .keyword_try) 1 else 0);
+    // The binding must be the real std.mem.Allocator, not a duck-typed
+    // method that happens to be named alignedAlloc.
+    if (first + 8 > rhs.last or tags[first] != .identifier or
+        tags[first + 1] != .period or
+        !std.mem.eql(u8, tree.tokenSlice(first + 2), "alignedAlloc") or
+        tags[first + 3] != .l_paren or
+        !receiverTypeIsAllocator(tree, cache, first) or
+        !std.mem.eql(u8, tree.tokenSlice(first + 4), "u8") or
+        tags[first + 5] != .comma) return false;
+    const alignment_first = first + 6;
+    var alignment_last = alignment_first;
+    while (alignment_last < rhs.last and tags[alignment_last] != .comma) : (alignment_last += 1) {
+        if (tags[alignment_last] == .l_paren)
+            alignment_last = tokens.matchParen(tags, alignment_last, rhs.last) orelse return false;
+    }
+    if (alignment_last >= rhs.last) return false;
+    if (alignment_first + 5 == alignment_last and
+        tags[alignment_first] == .period and
+        std.mem.eql(u8, tree.tokenSlice(alignment_first + 1), "of") and
+        tags[alignment_first + 2] == .l_paren and
+        tags[alignment_first + 4] == .r_paren and
+        std.mem.eql(u8, tree.tokenSlice(alignment_first + 3), target))
+        return true;
+    return false;
+}
+
+fn alignedSliceType(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    node: Ast.Node.Index,
+    target: []const u8,
+    target_alignment: ?std_types.Range,
+) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    const tags = tree.tokens.items(.tag);
+    if (first + 5 > last or tags[first] != .l_bracket or tags[first + 1] != .r_bracket or
+        tags[first + 2] != .keyword_align or tags[first + 3] != .l_paren) return false;
+    const end = tokens.matchParen(tags, first + 3, last) orelse return false;
+    if (target_alignment) |required|
+        return sameAlignmentValue(tree, cache, .{ .first = first + 4, .last = end - 1 }, required);
+    return alignmentExpr(tree, cache, first + 4, end - 1, target, 0).covers_target;
+}
+
+const AlignmentProof = struct { power_of_two: bool = false, covers_target: bool = false };
+
+/// @max of two known alignment values remains a multiple of each. Arbitrary
+/// numeric lower bounds do not: max(3, alignOf(u16)) is not aligned to u16.
+fn alignmentExpr(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    target: []const u8,
+    depth: u8,
+) AlignmentProof {
+    if (first > last or depth == 8) return .{};
+    const tags = tree.tokens.items(.tag);
+    if (first == last and tags[first] == .identifier) {
+        const rhs = std_types.aliasInitializer(cache, tree, first) orelse return .{};
+        return alignmentExpr(tree, cache, rhs.first, rhs.last, target, depth + 1);
+    }
+    if (first == last and tags[first] == .number_literal) {
+        const value = std.fmt.parseInt(u64, tree.tokenSlice(first), 0) catch return .{};
+        return .{ .power_of_two = value != 0 and value & (value - 1) == 0 };
+    }
+    if (tags[first] != .builtin or first + 3 > last or tags[first + 1] != .l_paren or tags[last] != .r_paren)
+        return .{};
+    if (std.mem.eql(u8, tree.tokenSlice(first), "@alignOf")) {
+        return .{ .power_of_two = true, .covers_target = first + 3 == last and
+            std.mem.eql(u8, tree.tokenSlice(first + 2), target) };
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(first), "@max")) return .{};
+    var comma = first + 2;
+    while (comma < last and tags[comma] != .comma) : (comma += 1) {
+        if (tags[comma] == .l_paren)
+            comma = tokens.matchParen(tags, comma, last) orelse return .{};
+    }
+    if (comma >= last) return .{};
+    const left = alignmentExpr(tree, cache, first + 2, comma - 1, target, depth + 1);
+    const right = alignmentExpr(tree, cache, comma + 1, last - 1, target, depth + 1);
+    return .{ .power_of_two = left.power_of_two and right.power_of_two, .covers_target = left.power_of_two and right.power_of_two and
+        (left.covers_target or right.covers_target) };
+}
+
+/// Compare constant alignment values by their binding, not their spelling.
+/// An explicit pointer alignment is a comptime alignment by Zig's type
+/// contract. Opaque calls and mutable bindings still give no identity here.
+fn sameAlignmentValue(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    left: std_types.Range,
+    right: std_types.Range,
+) bool {
+    const lhs = alignmentValue(tree, cache, left, 0) orelse return false;
+    const rhs = alignmentValue(tree, cache, right, 0) orelse return false;
+    if (lhs.first == rhs.first and lhs.last == rhs.last) return true;
+    if (lhs.first == lhs.last and rhs.first == rhs.last and
+        tree.tokenTag(lhs.first) == .number_literal and tree.tokenTag(rhs.first) == .number_literal)
+    {
+        const a = std.fmt.parseInt(u64, tree.tokenSlice(lhs.first), 0) catch return false;
+        const b = std.fmt.parseInt(u64, tree.tokenSlice(rhs.first), 0) catch return false;
+        return a == b;
+    }
+    const a = std_types.declaration(cache, tree, lhs.first, lhs.last, .{}) orelse return false;
+    const b = std_types.declaration(cache, tree, rhs.first, rhs.last, .{}) orelse return false;
+    return std.mem.eql(u8, a.module, b.module) and std.mem.eql(u8, a.name, b.name);
+}
+
+fn alignmentValue(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    written: std_types.Range,
+    depth: u8,
+) ?std_types.Range {
+    if (depth == 8 or written.first > written.last) return null;
+    var range = written;
+    if (tree.tokenTag(range.first) == .keyword_comptime) range.first += 1;
+    if (range.first > range.last) return null;
+    if (range.first == range.last and tree.tokenTag(range.first) == .identifier) {
+        const rhs = std_types.aliasInitializer(cache, tree, range.first) orelse return null;
+        return alignmentValue(tree, cache, rhs, depth + 1);
+    }
+    if (alignmentExpr(tree, cache, range.first, range.last, "", 0).power_of_two)
+        return range;
+    const declaration = std_types.declaration(cache, tree, range.first, range.last, .{}) orelse return null;
+    if (declaration.name.len == 0) return null;
+    return range;
+}
+
+fn validatedAddressAlignment(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    body: BodyRange,
+    before: Ast.TokenIndex,
+    name: []const u8,
+    target: []const u8,
+    target_alignment: ?std_types.Range,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var cast_scope = ScopeStack.init(tree, body.first);
+    cast_scope.advanceTo(before);
+    var scope = ScopeStack.init(tree, body.first);
+    var t = body.first;
+    while (t + 12 < before) : (t += 1) {
+        scope.advanceTo(t);
+        if (!beginsStatement(tree, t) or !sameScope(scope.current(), cast_scope.current())) continue;
+        var condition: Ast.TokenIndex = undefined;
+        var close: Ast.TokenIndex = undefined;
+        const is_rejection = tags[t] == .keyword_if and tags[t + 1] == .l_paren;
+        if (is_rejection) {
+            condition = t + 2;
+            close = tokens.matchParen(tags, t + 1, before) orelse continue;
+        } else {
+            // Resolve the assertion's declaration. A custom std.debug.assert
+            // function is not a validation operation.
+            var lp = t;
+            while (lp < before and tags[lp] != .l_paren and tags[lp] != .semicolon) : (lp += 1) {}
+            if (lp == before or tags[lp] != .l_paren or
+                !std_types.isType(cache, tree, t, lp - 1, "debug", "assert", .{})) continue;
+            condition = lp + 1;
+            close = tokens.matchParen(tags, lp, before) orelse continue;
+        }
+        if (condition + 10 > close or tags[condition] != .builtin or
+            !std.mem.eql(u8, tree.tokenSlice(condition), "@intFromPtr") or
+            tags[condition + 1] != .l_paren or
+            !std.mem.eql(u8, tree.tokenSlice(condition + 2), name) or
+            tags[condition + 3] != .period or
+            !std.mem.eql(u8, tree.tokenSlice(condition + 4), "ptr") or
+            tags[condition + 5] != .r_paren or tags[condition + 6] != .percent) continue;
+        const comparison = close - 2;
+        if (tags[comparison] != (if (is_rejection) std.zig.Token.Tag.bang_equal else .equal_equal) or
+            !std.mem.eql(u8, tree.tokenSlice(close - 1), "0")) continue;
+        const modulus: std_types.Range = .{ .first = condition + 7, .last = comparison - 1 };
+        // With an explicit alignment, proving only the element's natural
+        // alignment is too weak. Match the exact constant used by the type.
+        if (target_alignment) |required| {
+            if (!sameAlignmentValue(tree, cache, modulus, required)) continue;
+        } else if (!alignmentExpr(tree, cache, modulus.first, modulus.last, target, 0).covers_target) continue;
+        const end = if (is_rejection)
+            guardFailureEnd(tree, close, before) orelse continue
+        else if (close + 1 < before and tags[close + 1] == .semicolon)
+            close + 1
+        else
+            continue;
+        if (receiverMutatedAfter(tree, body.first, end, before, name) or
+            receiverAddressEscapedBefore(tree, body.first, before, name)) continue;
+        return true;
+    }
+    return false;
 }
 
 /// True iff the receiver identifier at `recv_tok` resolves to a slice whose
@@ -229,6 +422,8 @@ fn localTypeNodeBefore(
     const tags = tree.tokens.items(.tag);
     var best: ?Ast.Node.Index = null;
     var best_tok: Ast.TokenIndex = 0;
+    var at_use = ScopeStack.init(tree, body_first);
+    at_use.advanceTo(before);
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
@@ -242,9 +437,11 @@ fn localTypeNodeBefore(
             name_tok >= tree.tokens.len or tags[name_tok] != .identifier or
             !std.mem.eql(u8, tree.tokenSlice(name_tok), name))
             continue;
-        const type_node = decl.ast.type_node.unwrap() orelse continue;
-        if (best == null or name_tok > best_tok) {
-            best = type_node;
+        var at_decl = ScopeStack.init(tree, body_first);
+        at_decl.advanceTo(name_tok);
+        if (!sameScope(at_decl.current(), at_use.current())) continue;
+        if (name_tok > best_tok) {
+            best = decl.ast.type_node.unwrap();
             best_tok = name_tok;
         }
     }
@@ -256,6 +453,34 @@ fn allocatorTypeNode(tree: *const Ast, cache: *file_cache_mod.FileCache, node: A
 }
 
 fn castTargetTypeName(tree: *const Ast, align_tok: Ast.TokenIndex) ?[]const u8 {
+    const range = castTargetTypeRange(tree, align_tok) orelse return null;
+    var last_name: ?Ast.TokenIndex = null;
+    var t = range.first;
+    while (t <= range.last) : (t += 1) {
+        if (tree.tokenTag(t) == .identifier) last_name = t;
+    }
+    return if (last_name) |name_tok| tree.tokenSlice(name_tok) else null;
+}
+
+fn castTargetAlignment(tree: *const Ast, align_tok: Ast.TokenIndex) ?std_types.Range {
+    const range = castTargetTypeRange(tree, align_tok) orelse return null;
+    const tags = tree.tokens.items(.tag);
+    var t = range.first;
+    if (tags[t] == .question_mark) t += 1;
+    if (t > range.last) return null;
+    if (tags[t] == .asterisk) {
+        t += 1;
+    } else if (t + 2 <= range.last and tags[t] == .l_bracket and
+        tags[t + 1] == .asterisk and tags[t + 2] == .r_bracket)
+    {
+        t += 3;
+    } else return null;
+    if (t + 3 > range.last or tags[t] != .keyword_align or tags[t + 1] != .l_paren) return null;
+    const close = tokens.matchParen(tags, t + 1, range.last) orelse return null;
+    return .{ .first = t + 2, .last = close - 1 };
+}
+
+fn castTargetTypeRange(tree: *const Ast, align_tok: Ast.TokenIndex) ?std_types.Range {
     const tags = tree.tokens.items(.tag);
     var eq: ?Ast.TokenIndex = null;
     var t = align_tok;
@@ -283,12 +508,8 @@ fn castTargetTypeName(tree: *const Ast, align_tok: Ast.TokenIndex) ?[]const u8 {
         }
     }
     const colon_tok = colon orelse return null;
-    var last_name: ?Ast.TokenIndex = null;
-    k = colon_tok + 1;
-    while (k < equal) : (k += 1) {
-        if (tags[k] == .identifier) last_name = k;
-    }
-    return if (last_name) |name_tok| tree.tokenSlice(name_tok) else null;
+    if (colon_tok + 1 >= equal) return null;
+    return .{ .first = colon_tok + 1, .last = equal - 1 };
 }
 
 fn bodyContaining(tree: *const Ast, tok: Ast.TokenIndex) ?BodyRange {
@@ -541,7 +762,10 @@ fn hasHelperVtableGuard(
         if (!sameScope(at_guard.current(), cast_scope)) continue;
         if (receiverMutatedAfter(tree, body.first, end, before, recv_name)) continue;
         if (receiverAddressEscapedBefore(tree, body.first, end, recv_name)) continue;
-        const helper = (try boundHelperDecl(tree, model, cache, t + 3)) orelse continue;
+        // The helper's prototype views this buffer; it must outlive the
+        // guard check below, so it belongs to this frame.
+        var helper_proto_buf: [1]Ast.Node.Index = undefined;
+        const helper = (try boundHelperDecl(tree, model, cache, t + 3, &helper_proto_buf)) orelse continue;
         if (declarationEstablishesGuard(tree, model, cache, helper, target_name)) return true;
     }
     return false;
@@ -563,19 +787,24 @@ fn hasHelperVtableGuard(
 /// enclosing frame binds the name.  That is a lexical base, not the
 /// compiler's own binding, and anything it cannot place — a member, a
 /// name this file never declares, a duplicate — is refused.
+/// The returned entry's `proto` views `proto_buf`, which the caller owns.
 fn boundHelperDecl(
     tree: *const Ast,
     model: *const file_model.FileModel,
     cache: *file_cache_mod.FileCache,
     callee_tok: Ast.TokenIndex,
+    proto_buf: *[1]Ast.Node.Index,
 ) !?tokens.FnDeclIter.Entry {
-    if (cache.zls != null) return typedCalleeDecl(tree, cache, callee_tok);
+    if (cache.zls != null) return typedCalleeDecl(tree, cache, callee_tok, proto_buf);
 
     const name = tree.tokenSlice(callee_tok);
-    var proto_buf: [1]Ast.Node.Index = undefined;
+    // The scan reuses one scratch buffer per declaration, so only the
+    // node of the match is kept; its prototype is rebuilt into the
+    // caller's buffer once the scan has settled on it.
+    var scan_buf: [1]Ast.Node.Index = undefined;
     var fns = tokens.iterFnDecls(tree);
-    var bound: ?tokens.FnDeclIter.Entry = null;
-    while (fns.next(&proto_buf)) |entry| {
+    var bound: ?Ast.Node.Index = null;
+    while (fns.next(&scan_buf)) |entry| {
         if (!std.mem.eql(u8, tree.tokenSlice(entry.name_token), name)) continue;
         // A declaration inside another function's body is that
         // function's own local; no other frame reaches it by name.
@@ -584,11 +813,11 @@ fn boundHelperDecl(
         // Two declarations of one name in file scope are a duplicate
         // the compiler rejects; nothing here may pick one.
         if (bound != null) return null;
-        bound = entry;
+        bound = entry.node;
     }
     const helper = bound orelse return null;
     if (try shadowedAt(cache, tree, callee_tok, name)) return null;
-    return helper;
+    return declEntryAt(tree, helper, proto_buf);
 }
 
 /// The declaration the compiler's own resolver names for the call
@@ -609,6 +838,7 @@ fn typedCalleeDecl(
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
     callee_tok: Ast.TokenIndex,
+    proto_buf: *[1]Ast.Node.Index,
 ) !?tokens.FnDeclIter.Entry {
     const resolver = cache.zls orelse return null;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
@@ -617,7 +847,6 @@ fn typedCalleeDecl(
             else => continue,
         }
         const node: Ast.Node.Index = @enumFromInt(index);
-        if (tree.nodeMainToken(node) != callee_tok) continue;
         var call_buf: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&call_buf, node) orelse continue;
         if (tree.nodeMainToken(call.ast.fn_expr) != callee_tok) continue;
@@ -627,14 +856,14 @@ fn typedCalleeDecl(
         };
         if (reference.tree != tree) return null;
         const fn_decl = tokens.enclosingFnDecl(reference.tree, reference.fn_token) orelse return null;
-        return declEntryAt(reference.tree, fn_decl);
+        return declEntryAt(reference.tree, fn_decl, proto_buf);
     }
     return null;
 }
 
-fn declEntryAt(tree: *const Ast, fn_decl: Ast.Node.Index) ?tokens.FnDeclIter.Entry {
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return null;
+/// The entry's `proto` views `proto_buf`, which the caller owns.
+fn declEntryAt(tree: *const Ast, fn_decl: Ast.Node.Index, proto_buf: *[1]Ast.Node.Index) ?tokens.FnDeclIter.Entry {
+    const proto = tokens.fnProto(tree, proto_buf, fn_decl) orelse return null;
     const name_token = proto.name_token orelse return null;
     const body = tokens.bodyOf(tree, fn_decl) orelse return null;
     return .{ .node = fn_decl, .name_token = name_token, .body = body, .proto = proto };
@@ -815,8 +1044,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, start_tok),
-        .end = Pos.fromTokenEnd(tree, end_tok),
+        .start = try Pos.fromTokenStart(tree, start_tok),
+        .end = try Pos.fromTokenEnd(tree, end_tok),
         .message = msg,
     });
 }
@@ -861,8 +1090,10 @@ test "aligncast-on-byte-slice: alignCast on field (non-ptr) does not fire" {
 
 test "aligncast-on-byte-slice: explicit align param suppressed" {
     try testing.expectNoFire(check,
-        \\pub fn free(mem: []align(std.heap.page_size_min) u8) void {
-        \\    windows.VirtualFree(@ptrCast(@alignCast(mem.ptr)), 0, windows.MEM_RELEASE);
+        \\const Header = struct { value: u64 };
+        \\pub fn place(mem: []align(@alignOf(Header)) u8) *Header {
+        \\    const h: *Header = @ptrCast(@alignCast(mem.ptr));
+        \\    return h;
         \\}
         \\
     );
@@ -870,7 +1101,9 @@ test "aligncast-on-byte-slice: explicit align param suppressed" {
 
 test "aligncast-on-byte-slice: alignedAlloc receiver suppressed" {
     try testing.expectNoFire(check,
-        \\fn makeHeader(alloc: Allocator) !*Header {
+        \\const std = @import("std");
+        \\const Header = struct { value: u64 };
+        \\fn makeHeader(alloc: std.mem.Allocator) !*Header {
         \\    const buf = try alloc.alignedAlloc(u8, .of(Header), @sizeOf(Header));
         \\    const h: *Header = @ptrCast(@alignCast(buf.ptr));
         \\    return h;
@@ -925,6 +1158,33 @@ test "skript residual: allocator alias helper vtable guard suppresses context ca
         \\}
         \\
     );
+}
+
+test "allocator context: unrelated initializer nodes do not spend the type query budget" {
+    const src =
+        "const ballast = [_]u8{" ++ "0," ** 8192 ++ "};\n" ++
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const Context = struct {
+        \\    const vtable: Allocator.VTable = undefined;
+        \\    active: bool,
+        \\};
+        \\fn recognizes(alloc: Allocator) bool {
+        \\    if (alloc.vtable != &Context.vtable) return false;
+        \\    const context: *const Context = @ptrCast(@alignCast(alloc.ptr));
+        \\    return context.active;
+        \\}
+        \\fn recover(alloc: Allocator) ?*const Context {
+        \\    if (!recognizes(alloc)) return null;
+        \\    const context: *const Context = @ptrCast(@alignCast(alloc.ptr));
+        \\    return context;
+        \\}
+        \\fn unchecked(alloc: Allocator) *const Context {
+        \\    const context: *const Context = @ptrCast(@alignCast(alloc.ptr));
+        \\    return context;
+        \\}
+        ;
+    try testing.expectCount(check, R, 1, src);
 }
 
 test "skript residual: allocator alias context cast without vtable guard still fires" {
@@ -1057,6 +1317,34 @@ test "allocator helper may inspect its guarded context" {
         \\    if (!accountsValues(alloc)) return null;
         \\    const account: *const AccountAllocator = @ptrCast(@alignCast(alloc.ptr));
         \\    return account;
+        \\}
+        \\
+    );
+}
+
+test "aligncast-on-byte-slice: a later declaration does not overwrite the helper's parameter" {
+    // Every one-parameter prototype in this file is read into a one-slot
+    // buffer.  `count` is declared after the helper, so a scan that kept
+    // the helper's prototype in a reused buffer would read `count: usize`
+    // as the helper's parameter and lose the allocator guard.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const MemAllocator = std.mem.Allocator;
+        \\const AccountAllocator = struct {
+        \\    const vtable: MemAllocator.VTable = undefined;
+        \\    active: bool,
+        \\};
+        \\fn accountsValues(alloc: MemAllocator) bool {
+        \\    if (alloc.vtable != &AccountAllocator.vtable) return false;
+        \\    return true;
+        \\}
+        \\fn recover(alloc: MemAllocator) ?*const AccountAllocator {
+        \\    if (!accountsValues(alloc)) return null;
+        \\    const account: *const AccountAllocator = @ptrCast(@alignCast(alloc.ptr));
+        \\    return account;
+        \\}
+        \\fn count(items: usize) usize {
+        \\    return items;
         \\}
         \\
     );
@@ -1569,6 +1857,316 @@ test "aligncast-on-byte-slice: a type factory's comptime allocator alias retains
         \\            return context.active;
         \\        }
         \\    };
+        \\}
+    );
+}
+
+test "placement storage: rejecting a misaligned address proves the target alignment" {
+    try testing.expectNoFire(check,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(block: []u8) !*Link {
+        \\    if (@intFromPtr(block.ptr) % @alignOf(Link) != 0) {
+        \\        return error.Misaligned;
+        \\    }
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "placement storage: standard assertion with a resolved maximum alignment proves the target" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Link = struct { next: ?*Link };
+        \\const other_alignment = @max(@alignOf(u64), @alignOf(u32));
+        \\const storage_alignment = @max(other_alignment, @alignOf(Link));
+        \\fn place(block: []u8) *Link {
+        \\    std.debug.assert(@intFromPtr(block.ptr) % storage_alignment == 0);
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "placement storage: branch-only alignment validation does not prove a later cast" {
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(block: []u8, validate: bool) !*Link {
+        \\    if (validate) {
+        \\        if (@intFromPtr(block.ptr) % @alignOf(Link) != 0) return error.Misaligned;
+        \\    }
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "placement storage: alignment validation cannot survive replacing the slice" {
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(input: []u8, replacement: []u8) !*Link {
+        \\    var block = input;
+        \\    if (@intFromPtr(block.ptr) % @alignOf(Link) != 0) return error.Misaligned;
+        \\    block = replacement;
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "placement storage: weaker alignment and lookalike allocators remain unknown" {
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(alloc: FakeAllocator) !*Link {
+        \\    const block = try alloc.unalignedAlloc(u8, @sizeOf(Link));
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(block: []align(1) u8) *Link {
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "placement storage: a counterfeit assert and arbitrary modulus cannot prove alignment" {
+    try testing.expectFires(check, R,
+        \\const std = struct { const debug = struct { fn assert(_: bool) void {} }; };
+        \\const Link = struct { next: ?*Link };
+        \\fn place(block: []u8) *Link {
+        \\    std.debug.assert(@intFromPtr(block.ptr) % @alignOf(Link) == 0);
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Link = struct { next: ?*Link };
+        \\const storage_alignment = @max(3, @alignOf(Link));
+        \\fn place(block: []u8) *Link {
+        \\    std.debug.assert(@intFromPtr(block.ptr) % storage_alignment == 0);
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+/// Shared null proof for the forced-unwrap rule. Reject unknown scopes,
+/// branch-only guards, reassignments, and address escapes.
+pub fn nullRejectedBefore(tree: *const Ast, before: Ast.TokenIndex, name: []const u8) bool {
+    const body = bodyContaining(tree, before) orelse return false;
+    const tags = tree.tokens.items(.tag);
+    var at_cast = ScopeStack.init(tree, body.first);
+    at_cast.advanceTo(before);
+    var at_guard = ScopeStack.init(tree, body.first);
+    var t = body.first;
+    while (t + 6 < before) : (t += 1) {
+        at_guard.advanceTo(t);
+        if (!beginsStatement(tree, t) or !sameScope(at_guard.current(), at_cast.current())) continue;
+        if (tags[t] != .keyword_if or tags[t + 1] != .l_paren or
+            tags[t + 2] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t + 2), name) or
+            tags[t + 3] != .equal_equal or tags[t + 4] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t + 4), "null") or
+            tags[t + 5] != .r_paren) continue;
+        const end = guardFailureEnd(tree, t + 5, before) orelse continue;
+        if (receiverMutatedAfter(tree, body.first, end, before, name) or
+            receiverAddressEscapedBefore(tree, body.first, before, name)) continue;
+        return true;
+    }
+    return false;
+}
+
+test "placement storage: method name and an unrelated aligned declaration cannot supply proof" {
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(alloc: FakeAllocator) !*Link {
+        \\    const block = try alloc.alignedAlloc(u8, .of(Link), @sizeOf(Link));
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(input: []u8) *Link {
+        \\    { const block: []align(@alignOf(Link)) u8 = undefined; _ = block; }
+        \\    const block = input;
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "placement storage: type factory alignment constants prove the nested slab target" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\fn Pool(comptime T: type) type {
+        \\    return struct {
+        \\        const Link = struct { next: ?*Link };
+        \\        const Slab = struct { next: ?*Slab, bytes: []u8 };
+        \\        const object_alignment = @max(@alignOf(T), @alignOf(Link));
+        \\        const allocation_alignment = @max(object_alignment, @alignOf(Slab));
+        \\        fn place(bytes: []u8) *Slab {
+        \\            std.debug.assert(@intFromPtr(bytes.ptr) % allocation_alignment == 0);
+        \\            const slab: *Slab = @ptrCast(@alignCast(bytes.ptr));
+        \\            return slab;
+        \\        }
+        \\    };
+        \\}
+    );
+}
+
+test "placement storage: validating a different target or allocating weaker alignment still fires" {
+    try testing.expectFires(check, R,
+        \\const Link = struct { next: ?*Link };
+        \\fn place(block: []u8) !*Link {
+        \\    if (@intFromPtr(block.ptr) % @alignOf(u8) != 0) return error.Misaligned;
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Link = struct { next: ?*Link };
+        \\fn place(allocator: std.mem.Allocator) !*Link {
+        \\    const block = try allocator.alignedAlloc(u8, .of(u8), @sizeOf(Link));
+        \\    const node: *Link = @ptrCast(@alignCast(block.ptr));
+        \\    return node;
+        \\}
+    );
+}
+
+test "page mapping: address assertion proves the explicit pointer alignment after type erasure" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    memory: []u8,
+        \\    fn init(length: usize) !Store {
+        \\        return .{ .memory = try std.posix.mmap(null, length, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) };
+        \\    }
+        \\    fn unmap(memory: []u8) void {
+        \\        const pg = comptime std.heap.page_size_min;
+        \\        std.debug.assert(@intFromPtr(memory.ptr) % pg == 0);
+        \\        const ptr: [*]align(pg) u8 = @alignCast(memory.ptr);
+        \\        std.posix.munmap(ptr[0..memory.len]);
+        \\    }
+        \\    fn deinit(self: *Store) void { unmap(self.memory); }
+        \\};
+    );
+}
+
+test "page mapping: an erased mapping field without an address proof remains conservative" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    memory: []u8,
+        \\    fn init(length: usize) !Store {
+        \\        return .{ .memory = try std.posix.mmap(null, length, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) };
+        \\    }
+        \\    fn unmap(memory: []u8) void {
+        \\        const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(memory.ptr);
+        \\        std.posix.munmap(ptr[0..memory.len]);
+        \\    }
+        \\    fn deinit(self: *Store) void { unmap(self.memory); }
+        \\};
+    );
+}
+
+test "explicit pointer alignment: a different modulus does not prove the target" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn recover(memory: []u8) void {
+        \\    const pg = comptime std.heap.page_size_min;
+        \\    const other_alignment = 1;
+        \\    std.debug.assert(@intFromPtr(memory.ptr) % other_alignment == 0);
+        \\    const ptr: [*]align(pg) u8 = @alignCast(memory.ptr);
+        \\    _ = ptr;
+        \\}
+    );
+}
+
+test "explicit pointer alignment: validation cannot survive moving the base address" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn recover(input: []u8) void {
+        \\    var memory = input;
+        \\    const pg = comptime std.heap.page_size_min;
+        \\    std.debug.assert(@intFromPtr(memory.ptr) % pg == 0);
+        \\    memory = memory[1..];
+        \\    const ptr: [*]align(pg) u8 = @alignCast(memory.ptr);
+        \\    _ = ptr;
+        \\}
+    );
+}
+
+test "explicit pointer alignment: natural byte alignment is not enough" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn recover(memory: []align(@alignOf(u8)) u8) void {
+        \\    std.debug.assert(@intFromPtr(memory.ptr) % @alignOf(u8) == 0);
+        \\    const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(memory.ptr);
+        \\    _ = ptr;
+        \\}
+    );
+}
+
+test "explicit pointer alignment: opaque alignment calls do not provide a proof" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const foreign = @import("alignment.zig");
+        \\fn recover(memory: []u8) void {
+        \\    const pg = comptime foreign.alignment();
+        \\    std.debug.assert(@intFromPtr(memory.ptr) % pg == 0);
+        \\    const ptr: [*]align(pg) u8 = @alignCast(memory.ptr);
+        \\    _ = ptr;
+        \\}
+    );
+}
+
+test "allocator context: typed helper lookup uses the callee token, not the call parenthesis" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Context = struct {
+        \\    const vtable: std.mem.Allocator.VTable = undefined;
+        \\    active: bool,
+        \\};
+        \\fn recognizes(alloc: std.mem.Allocator) bool {
+        \\    if (alloc.vtable != &Context.vtable) return false;
+        \\    return true;
+        \\}
+        \\fn recover(alloc: std.mem.Allocator) ?*const Context {
+        \\    if (!recognizes(alloc)) return null;
+        \\    const context: *const Context = @ptrCast(@alignCast(alloc.ptr));
+        \\    return context;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Context = struct {
+        \\    const vtable: std.mem.Allocator.VTable = undefined;
+        \\    active: bool,
+        \\};
+        \\fn recognizes(alloc: std.mem.Allocator) bool {
+        \\    _ = alloc;
+        \\    return true;
+        \\}
+        \\fn recover(alloc: std.mem.Allocator) ?*const Context {
+        \\    if (!recognizes(alloc)) return null;
+        \\    const context: *const Context = @ptrCast(@alignCast(alloc.ptr));
+        \\    return context;
+        \\}
+    );
+}
+
+test "page mapping: a lookalike mmap method is not an alignment contract" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Fake = struct { fn mmap(bytes: []u8) []u8 { return bytes; } };
+        \\fn recover(bytes: []u8) void {
+        \\    const memory = Fake.mmap(bytes);
+        \\    const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(memory.ptr);
+        \\    _ = ptr;
         \\}
     );
 }

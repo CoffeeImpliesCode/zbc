@@ -282,6 +282,15 @@ pub fn isPrunedDirectoryName(name: []const u8) bool {
     return false;
 }
 
+test "source width admission includes the last valid length only" {
+    const bound: u64 = SourcePolicy.max_source_bytes;
+    try std.testing.expect(SourcePolicy.admitsSourceLength(0));
+    try std.testing.expect(SourcePolicy.admitsSourceLength(bound - 1));
+    try std.testing.expect(!SourcePolicy.admitsSourceLength(bound));
+    try std.testing.expect(!SourcePolicy.admitsSourceLength(bound + 1));
+    try std.testing.expect(!SourcePolicy.admitsSourceLength(std.math.maxInt(u64)));
+}
+
 test "source boundaries reject dependencies and sibling-prefix escapes" {
     const policy: SourcePolicy = .{ .roots = &.{"/project"}, .excludes = &.{ "/project/generated", "scratch" } };
     try std.testing.expect(policy.allowsAbsolutePath("/project/src/main.zig"));

@@ -36,6 +36,7 @@ const matchBrace = tokens.matchBrace;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
+/// Returns `SourceTooWide` if the source or token count exceeds the AST position domain.
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -46,13 +47,14 @@ pub fn check(
     if (!config_mod.isEnabled(config, .reset_skips_pooled_resource_release)) return;
     _ = cache;
 
+    if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
     if (tok_count == 0) return;
     const last: Ast.TokenIndex = tok_count - 1;
 
     var t: Ast.TokenIndex = 0;
-    while (t + 1 < last) : (t += 1) {
+    while (t < last and last - t > 1) : (t += 1) {
         if (tags[t] != .keyword_struct) continue;
         if (tags[t + 1] != .l_brace) continue;
         const body_start = t + 1;
@@ -89,7 +91,7 @@ fn checkStruct(
     defer other_fns.deinit(gpa);
 
     var t: Ast.TokenIndex = start;
-    while (t + 2 <= end) : (t += 1) {
+    while (t <= end and end - t >= 2) : (t += 1) {
         if (tags[t] == .l_brace) {
             t = matchBrace(tags, t, end) orelse break;
             continue;
@@ -185,7 +187,7 @@ fn receiverReacquiredElsewhere(
     const tags = tree.tokens.items(.tag);
     for (others) |fn_info| {
         var t: Ast.TokenIndex = fn_info.body_start;
-        while (t + 3 <= fn_info.body_end) : (t += 1) {
+        while (t <= fn_info.body_end and fn_info.body_end - t >= 3) : (t += 1) {
             if (tags[t] != .identifier) continue;
             if (!std.mem.eql(u8, tree.tokenSlice(t), recv)) continue;
             if (tags[t + 1] != .period) continue;
@@ -233,7 +235,7 @@ fn collectCleanups(
     const tags = tree.tokens.items(.tag);
     if (start > end) return;
     var t: Ast.TokenIndex = start;
-    while (t + 3 <= end) : (t += 1) {
+    while (t <= end and end - t >= 3) : (t += 1) {
         if (tags[t] != .identifier) continue;
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
@@ -302,8 +304,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "reset-skips-pooled-resource-release",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, reset_name_tok),
-        .end = Pos.fromTokenEnd(tree, reset_name_tok),
+        .start = try Pos.fromTokenStart(tree, reset_name_tok),
+        .end = try Pos.fromTokenEnd(tree, reset_name_tok),
         .message = msg,
     });
 }

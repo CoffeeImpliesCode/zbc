@@ -2607,7 +2607,8 @@ fn coerceInMemoryAllowed(
             const maybe_dest_ptr_ty = ip.optionalPtrTy(dest_ty);
             const maybe_src_ptr_ty = ip.optionalPtrTy(src_ty);
             if (maybe_dest_ptr_ty != .none and maybe_src_ptr_ty != .none) {
-                return try ip.coerceInMemoryAllowedPtrs(arena, dest_ty, src_ty, dest_is_const, target);
+                // Compare the payload pointers; the optional keys carry no pointer info.
+                return try ip.coerceInMemoryAllowedPtrs(arena, maybe_dest_ptr_ty, maybe_src_ptr_ty, dest_is_const, target);
             }
 
             if (maybe_dest_ptr_ty != maybe_src_ptr_ty) {
@@ -5227,6 +5228,8 @@ test "resolvePeerTypes pointers" {
     try ip.testResolvePeerTypes(@"*u32", @"?*u32", @"?*u32");
     try ip.testResolvePeerTypesInOrder(@"*u32", @"?[*]u32", @"?[*]u32");
     try ip.testResolvePeerTypesInOrder(@"[*]u32", @"?*u32", @"?*u32");
+    // two pointer-like optionals compare their payload pointers
+    try ip.testResolvePeerTypes(@"?*u32", @"?*const u32", @"?*const u32");
 
     try ip.testResolvePeerTypes(@"[*c]u32", .comptime_int_type, @"[*c]u32");
     try ip.testResolvePeerTypes(@"[*c]u32", .u32_type, @"[*c]u32");

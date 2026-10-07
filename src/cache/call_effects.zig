@@ -52,6 +52,9 @@ pub const Scan = struct {
     depth: usize = 1,
     visited: u32 = 0,
     pending: ?Ast.Node.Index = null,
+    /// A semantic consumer may narrow the pending node's children only after
+    /// proving its instantiated branch. The condition remains in that iterator.
+    pending_children: ?Iterator = null,
     invalid_root: bool = false,
 
     pub fn init(tree: *const Ast, fn_decl: Ast.Node.Index, bindings: *const LocalBindings) Scan {
@@ -72,14 +75,17 @@ pub const Scan = struct {
         }
         if (self.pending) |node| {
             self.pending = null;
+            const narrowed = self.pending_children;
+            self.pending_children = null;
             const node_effect = self.effect(node);
             // A nested declaration does not execute its function body. Inline
             // assembly has opaque children the ordinary iterator cannot decode.
             switch (self.tree.nodeTag(node)) {
-                .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple,
-                .@"asm", .asm_simple, .asm_input, .asm_output => {},
+                .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple, .@"asm", .asm_simple, .asm_input, .asm_output => {},
                 else => {
-                    const frame: Frame = if (self.tree.fullSwitch(node)) |sw|
+                    const frame: Frame = if (narrowed) |children|
+                        .{ .children = children }
+                    else if (self.tree.fullSwitch(node)) |sw|
                         .{ .switch_children = .{ .condition = sw.ast.condition, .cases = sw.ast.cases } }
                     else
                         .{ .children = Iterator.init(self.tree, node) };
@@ -109,10 +115,7 @@ pub const Scan = struct {
         const tree = self.tree;
         switch (tree.nodeTag(node)) {
             .call, .call_comma, .call_one, .call_one_comma => return .{ .call = node },
-            .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub,
-            .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor,
-            .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap,
-            .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
+            .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
                 const lhs = tree.nodeData(node).node_and_node[0];
                 if (tree.nodeTag(lhs) == .identifier) {
                     const token = tree.nodeMainToken(lhs);
@@ -140,38 +143,8 @@ pub const Scan = struct {
                 }
                 return .{ .write_or_unknown = node };
             },
-            .assign_destructure, .@"asm", .asm_simple, .asm_input, .asm_output,
-            .@"suspend", .@"resume", .@"nosuspend", .test_decl => return .{ .write_or_unknown = node },
-            .bool_not, .negation, .bit_not, .negation_wrap, .address_of, .@"try",
-            .optional_type, .deref, .@"comptime", .@"defer", .@"return", .@"errdefer",
-            .@"catch", .equal_equal, .bang_equal, .less_than, .greater_than,
-            .less_or_equal, .greater_or_equal, .merge_error_sets, .mul, .div, .mod,
-            .mul_wrap, .mul_sat, .add, .sub, .array_cat, .array_mult, .add_wrap,
-            .sub_wrap, .add_sat, .sub_sat, .shl, .shl_sat, .shr, .bit_and,
-            .bit_xor, .bit_or, .@"orelse", .bool_and, .bool_or, .array_type,
-            .array_access, .array_init_one, .array_init_one_comma, .switch_range,
-            .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple,
-            .container_field_align, .error_union, .struct_init_one,
-            .struct_init_one_comma, .container_field_init, .for_range,
-            .array_init_dot_two, .array_init_dot_two_comma, .struct_init_dot_two,
-            .struct_init_dot_two_comma, .block_two, .block_two_semicolon,
-            .container_decl_two, .container_decl_two_trailing, .tagged_union_two,
-            .tagged_union_two_trailing, .field_access, .unwrap_optional,
-            .grouped_expression, .anyframe_type, .@"break", .@"continue",
-            .array_init_dot, .array_init_dot_comma, .struct_init_dot,
-            .struct_init_dot_comma, .container_decl, .container_decl_trailing,
-            .tagged_union, .tagged_union_trailing, .block, .block_semicolon,
-            .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl,
-            .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type,
-            .ptr_type_bit_range, .slice_open, .slice, .slice_sentinel,
-            .array_init, .array_init_comma, .struct_init, .struct_init_comma,
-            .container_decl_arg, .container_decl_arg_trailing, .tagged_union_enum_tag,
-            .tagged_union_enum_tag_trailing, .switch_case_one, .switch_case_inline_one,
-            .switch_case, .switch_case_inline, .while_simple, .while_cont, .@"while",
-            .for_simple, .@"for", .@"if", .if_simple, .container_field,
-            .anyframe_literal, .char_literal, .number_literal, .unreachable_literal,
-            .identifier, .enum_literal, .string_literal, .multiline_string_literal,
-            .error_set_decl, .error_value => return null,
+            .assign_destructure, .@"asm", .asm_simple, .asm_input, .asm_output, .@"suspend", .@"resume", .@"nosuspend", .test_decl => return .{ .write_or_unknown = node },
+            .bool_not, .negation, .bit_not, .negation_wrap, .address_of, .@"try", .optional_type, .deref, .@"comptime", .@"defer", .@"return", .@"errdefer", .@"catch", .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .merge_error_sets, .mul, .div, .mod, .mul_wrap, .mul_sat, .add, .sub, .array_cat, .array_mult, .add_wrap, .sub_wrap, .add_sat, .sub_sat, .shl, .shl_sat, .shr, .bit_and, .bit_xor, .bit_or, .@"orelse", .bool_and, .bool_or, .array_type, .array_access, .array_init_one, .array_init_one_comma, .switch_range, .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple, .container_field_align, .error_union, .struct_init_one, .struct_init_one_comma, .container_field_init, .for_range, .array_init_dot_two, .array_init_dot_two_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .block_two, .block_two_semicolon, .container_decl_two, .container_decl_two_trailing, .tagged_union_two, .tagged_union_two_trailing, .field_access, .unwrap_optional, .grouped_expression, .anyframe_type, .@"break", .@"continue", .array_init_dot, .array_init_dot_comma, .struct_init_dot, .struct_init_dot_comma, .container_decl, .container_decl_trailing, .tagged_union, .tagged_union_trailing, .block, .block_semicolon, .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl, .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range, .slice_open, .slice, .slice_sentinel, .array_init, .array_init_comma, .struct_init, .struct_init_comma, .container_decl_arg, .container_decl_arg_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline, .while_simple, .while_cont, .@"while", .for_simple, .@"for", .@"if", .if_simple, .container_field, .anyframe_literal, .char_literal, .number_literal, .unreachable_literal, .identifier, .enum_literal, .string_literal, .multiline_string_literal, .error_set_decl, .error_value => return null,
             else => {
                 if (tree.fullSwitch(node) != null) return null;
                 return .{ .write_or_unknown = node };
@@ -188,8 +161,13 @@ pub const Scan = struct {
             if (proto.name_token) |token| name.set(self.tree.tokenSlice(token));
         }
         return budget_mod.fail(.{
-            .limit = limit, .limit_value = cap, .reached = cap,
-            .byte = byte, .line = position.line, .column = position.column, .function = name,
+            .limit = limit,
+            .limit_value = cap,
+            .reached = cap,
+            .byte = byte,
+            .line = position.line,
+            .column = position.column,
+            .function = name,
         });
     }
 };
@@ -197,18 +175,19 @@ pub const Scan = struct {
 // Compiler intrinsic semantics only; ordinary callee spellings never occur here.
 // In particular memory writes, atomics, imports and unknown builtins fail closed.
 const read_intrinsics = [_][]const u8{
-    "@as", "@bitCast", "@intCast", "@floatCast", "@ptrCast", "@alignCast",
-    "@constCast", "@volatileCast", "@addrSpaceCast", "@truncate", "@intFromPtr",
-    "@ptrFromInt", "@intFromEnum", "@enumFromInt", "@intFromBool", "@floatFromInt",
-    "@intFromFloat", "@errorCast", "@errorFromInt", "@intFromError", "@errorName",
-    "@TypeOf", "@typeInfo", "@sizeOf", "@alignOf", "@bitSizeOf", "@offsetOf",
-    "@bitOffsetOf", "@typeName", "@tagName", "@hasField", "@hasDecl", "@FieldType", "@field",
-    "@min", "@max", "@abs", "@clz", "@ctz", "@popCount", "@byteSwap", "@bitReverse",
-    "@addWithOverflow", "@subWithOverflow", "@mulWithOverflow", "@shlWithOverflow",
-    "@divExact", "@divFloor", "@divTrunc", "@mod", "@rem", "@sqrt", "@sin", "@cos",
-    "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc",
-    "@round", "@mulAdd", "@splat", "@shuffle", "@select", "@reduce", "@Vector",
-    "@branchHint", "@compileError", "@compileLog", "@returnAddress",
+    "@as",           "@bitCast",         "@intCast",         "@floatCast",              "@ptrCast",         "@alignCast",
+    "@constCast",    "@volatileCast",    "@addrSpaceCast",   "@truncate",               "@intFromPtr",      "@ptrFromInt",
+    "@intFromEnum",  "@enumFromInt",     "@intFromBool",     "@floatFromInt",           "@intFromFloat",    "@errorCast",
+    "@errorFromInt", "@intFromError",    "@errorName",       "@TypeOf",                 "@typeInfo",        "@sizeOf",
+    "@alignOf",      "@bitSizeOf",       "@offsetOf",        "@bitOffsetOf",            "@typeName",        "@tagName",
+    "@hasField",     "@hasDecl",         "@FieldType",       "@field",                  "@Int",             "@min",
+    "@max",          "@abs",             "@clz",             "@ctz",                    "@popCount",        "@byteSwap",
+    "@bitReverse",   "@addWithOverflow", "@subWithOverflow", "@mulWithOverflow",        "@shlWithOverflow", "@divExact",
+    "@divFloor",     "@divTrunc",        "@mod",             "@rem",                    "@sqrt",            "@sin",
+    "@cos",          "@tan",             "@exp",             "@exp2",                   "@log",             "@log2",
+    "@log10",        "@floor",           "@ceil",            "@trunc",                  "@round",           "@mulAdd",
+    "@splat",        "@shuffle",         "@select",          "@reduce",                 "@Vector",          "@branchHint",
+    "@compileError", "@compileLog",      "@returnAddress",   "@disableInstrumentation",
 };
 
 test "closed scan retains exact indexed store target and written value" {

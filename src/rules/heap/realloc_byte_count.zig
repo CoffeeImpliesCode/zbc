@@ -19,6 +19,7 @@ const testing = @import("../../testing.zig");
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
+/// Returns `SourceTooWide` if the source or token count exceeds the AST position domain.
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -29,10 +30,12 @@ pub fn check(
     if (!config_mod.isEnabled(config, .realloc_byte_count)) return;
     _ = cache;
 
+    if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok: Ast.TokenIndex = tok_count -| 1;
     var t: Ast.TokenIndex = 0;
-    while (t + 3 < last_tok) : (t += 1) {
+    while (t < last_tok and last_tok - t > 3) : (t += 1) {
         // Match `.realloc (`.
         if (tags[t] != .period) continue;
         if (tags[t + 1] != .identifier) continue;
@@ -97,7 +100,7 @@ fn arg2ContainsSizeofMul(tree: *const Ast, start: Ast.TokenIndex, end: Ast.Token
                 // Pattern `@sizeOf(…) * <rhs>` — find the matching
                 // `)` for this builtin call, then check the next
                 // top-level token.
-                if (t + 1 >= end or tags[t + 1] != .l_paren) continue;
+                if (end - t <= 1 or tags[t + 1] != .l_paren) continue;
                 var d: u32 = 1;
                 var u: Ast.TokenIndex = t + 2;
                 while (u < end) : (u += 1) {
@@ -111,7 +114,7 @@ fn arg2ContainsSizeofMul(tree: *const Ast, start: Ast.TokenIndex, end: Ast.Token
                     }
                 }
                 if (d != 0) continue;
-                if (u + 1 < end and tags[u + 1] == .asterisk) return true;
+                if (end - u > 1 and tags[u + 1] == .asterisk) return true;
             },
             else => {},
         }
@@ -135,8 +138,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "realloc-byte-count",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, period_tok + 1),
-        .end = Pos.fromTokenEnd(tree, period_tok + 1),
+        .start = try Pos.fromTokenStart(tree, period_tok + 1),
+        .end = try Pos.fromTokenEnd(tree, period_tok + 1),
         .message = msg,
     });
 }

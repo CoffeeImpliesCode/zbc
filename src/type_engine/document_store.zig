@@ -30,7 +30,7 @@ source_aliases: Uri.ArrayHashMap(Uri) = .empty,
 /// The failure the most recent lookup published.  Written and read under
 /// `mutex`, so a caller always sees one coherent (cause, position) pair
 /// and never one half of a newer snapshot with the other half of an older.
-source_failure: ?anyerror = null,
+source_failure: ?SourceLoadError = null,
 parse_failure: ?ParseFailure = null,
 /// Interned module identities.  Owned here; a `TypeContext` borrows it.
 modules: *ModuleRegistry,
@@ -38,7 +38,8 @@ modules: *ModuleRegistry,
 config: Config,
 mutex: std.Io.Mutex = .init,
 wait_group: if (supports_build_system) std.Io.Group else void = if (supports_build_system) .init else {},
-documents: Uri.ArrayHashMap(*SourceDocument.Future) = .empty,
+/// Contains only fully initialized, parsed documents. Failed loads add no entry.
+documents: Uri.ArrayHashMap(*SourceDocument) = .empty,
 build_files: if (supports_build_system) Uri.ArrayHashMap(*BuildFile) else void = if (supports_build_system) .empty else {},
 diagnostics_collection: *DiagnosticsCollection,
 builds_in_progress: std.atomic.Value(i32) = .init(0),
@@ -589,7 +590,7 @@ pub const SourceDocument = struct {
         document: *SourceDocument,
         /// Old state will be moved into this document to be deallocated after returning.
         old_document: *SourceDocument,
-        /// Takes ownership.
+        /// Takes ownership only on success.
         text: [:0]const u8,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!void {
@@ -601,7 +602,10 @@ pub const SourceDocument = struct {
         errdefer new_tree.deinit(allocator);
 
         var new_file_imports: std.ArrayList(Uri) = .empty;
-        errdefer new_file_imports.deinit(allocator);
+        errdefer {
+            for (new_file_imports.items) |imported| imported.deinit(allocator);
+            new_file_imports.deinit(allocator);
+        }
 
         try collectImports(
             allocator,
@@ -626,6 +630,11 @@ pub const SourceDocument = struct {
 
         old_document.document_scope = document.document_scope;
         document.document_scope = .unset;
+
+        old_document.impl.associated_build_file = document.impl.associated_build_file;
+        document.impl.associated_build_file = .init;
+        old_document.impl.associated_compilation_units = document.impl.associated_compilation_units;
+        document.impl.associated_compilation_units = .unresolved;
     }
 
     /// The source domain every reported position lives in.
@@ -756,19 +765,6 @@ pub const SourceDocument = struct {
         self.* = undefined;
     }
 
-    const Future = struct {
-        /// Signalled when this entry's load finishes, so a second caller
-        /// can await the one in flight instead of starting its own.
-        event: std.Io.Event,
-        document: SourceDocument,
-        err: ?ReadFileError,
-
-        pub fn await(f: *Future, io: std.Io) ReadFileError!*SourceDocument {
-            try f.event.wait(io);
-            return f.err orelse return &f.document;
-        }
-    };
-
     fn Lazy(comptime T: type, comptime Context: type) type {
         return struct {
             mutex: std.Io.Mutex,
@@ -862,7 +858,7 @@ pub const Handle = struct {
 /// Publishes the failure a lookup observed, and clears it when `null`.
 /// Both halves are written under `mutex` so a reader can never see one
 /// half of a newer snapshot beside the other half of an older one.
-fn publishFailure(self: *DocumentStore, source_failure: ?anyerror, parse_failure: ?ParseFailure) void {
+fn publishFailure(self: *DocumentStore, source_failure: ?SourceLoadError, parse_failure: ?ParseFailure) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     self.source_failure = source_failure;
@@ -877,7 +873,7 @@ pub fn clearFailure(self: *DocumentStore) void {
 }
 
 /// The cause and position of the last failure, read as one snapshot.
-pub fn failureSnapshot(self: *DocumentStore) struct { source_failure: ?anyerror, parse_failure: ?ParseFailure } {
+pub fn failureSnapshot(self: *DocumentStore) struct { source_failure: ?SourceLoadError, parse_failure: ?ParseFailure } {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     return .{ .source_failure = self.source_failure, .parse_failure = self.parse_failure };
@@ -891,16 +887,11 @@ pub const HandleIterator = struct {
     pub fn next(it: *HandleIterator) ?Handle {
         it.store.mutex.lockUncancelable(it.store.io);
         defer it.store.mutex.unlock(it.store.io);
-        while (true) {
-            defer it.i += 1;
-            switch (std.math.order(it.i, it.store.documents.count())) {
-                .lt => {},
-                .eq => return null,
-                .gt => unreachable, // document count decreased
-            }
-            const document = it.store.documents.values()[it.i].await(it.store.io) catch continue;
-            return .{ .document = document, .module = .unscoped };
-        }
+        if (it.i == it.store.documents.count()) return null;
+        std.debug.assert(it.i < it.store.documents.count());
+        const document = it.store.documents.values()[it.i];
+        it.i += 1;
+        return .{ .document = document, .module = .unscoped };
     }
 };
 
@@ -915,14 +906,18 @@ pub fn deinit(self: *DocumentStore) void {
         self.wait_group.cancel(self.io);
     }
 
-    for (self.documents.keys(), self.documents.values()) |uri, future| {
-        if (future.await(self.io)) |document| document.deinit(self.allocator) else |_| {}
-        uri.deinit(self.allocator);
-        self.allocator.destroy(future);
-    }
-    self.documents.deinit(self.allocator);
     for (self.source_aliases.keys()) |uri| uri.deinit(self.allocator);
     self.source_aliases.deinit(self.allocator);
+    while (self.documents.count() != 0) {
+        const index = self.documents.count() - 1;
+        const uri = self.documents.keys()[index];
+        const document = self.documents.values()[index];
+        self.documents.swapRemoveAt(index);
+        document.deinit(self.allocator);
+        uri.deinit(self.allocator);
+        self.allocator.destroy(document);
+    }
+    self.documents.deinit(self.allocator);
     self.canonical_paths.deinit(self.allocator);
 
     if (supports_build_system) {
@@ -946,21 +941,13 @@ pub fn getHandle(self: *DocumentStore, uri: Uri, module: ModuleId) ?Handle {
     return .{ .document = document, .module = module };
 }
 
-/// The document the store already serves for `uri`, or null when it has
-/// none or the one it has failed. Missing and excluded documents publish
-/// nothing; other failures retain their source attribution under the lock.
+/// The parsed document already served for `uri`, or null when absent.
+/// Failed loads publish no document; malformed parses keep their attribution.
 fn documentFor(self: *DocumentStore, uri: Uri) ?*SourceDocument {
-    const future = future: {
+    const document = document: {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        break :future self.documents.get(self.source_aliases.get(uri) orelse uri) orelse return null;
-    };
-    const document = future.await(self.io) catch |err| {
-        switch (err) {
-            error.SourceExcluded, error.FileNotFound, error.NotDir => {},
-            else => self.publishFailure(err, null),
-        }
-        return null;
+        break :document self.documents.get(self.source_aliases.get(uri) orelse uri) orelse return null;
     };
     if (document.tree.errors.len != 0) {
         self.publishFailure(error.ImportInvalidSyntax, .fromTree(document.uri.raw, &document.tree));
@@ -970,6 +957,10 @@ fn documentFor(self: *DocumentStore, uri: Uri) ?*SourceDocument {
 }
 
 const ReadFileError = SourcePolicy.ReadSourceError || std.Io.Dir.RealPathFileError || error{SourceExcluded};
+
+/// Failures from loading a source and rejecting its parsed syntax.
+/// The load portion preserves the reader's full I/O error set.
+pub const SourceLoadError = ReadFileError || error{ImportInvalidSyntax};
 
 /// Must satisfy `uri.isFileScheme()`.
 fn readFile(self: *DocumentStore, uri: Uri) ReadFileError![:0]u8 {
@@ -1285,6 +1276,20 @@ pub fn openLspSyncedDocument(self: *DocumentStore, uri: Uri, text: []const u8) e
     };
 }
 
+/// Retire aliases before the canonical URI they borrow is released.
+fn forgetSourceAliases(self: *DocumentStore, canonical: Uri) void {
+    var index: usize = 0;
+    while (index < self.source_aliases.count()) {
+        if (!self.source_aliases.values()[index].eql(canonical)) {
+            index += 1;
+            continue;
+        }
+        const alias = self.source_aliases.keys()[index];
+        self.source_aliases.swapRemoveAt(index);
+        alias.deinit(self.allocator);
+    }
+}
+
 /// Closes a document that has been synced over the LSP protocol (`textDocument/didClose`).
 /// **Not thread safe**
 pub fn closeLspSyncedDocument(self: *DocumentStore, uri: Uri) void {
@@ -1295,20 +1300,16 @@ pub fn closeLspSyncedDocument(self: *DocumentStore, uri: Uri) void {
         log.warn("Document not found: {s}", .{uri.raw});
         return;
     };
-    defer self.documents.swapRemoveAt(document_index);
-
     const document_uri = self.documents.keys()[document_index];
-    defer document_uri.deinit(self.allocator);
-
-    const document_future = self.documents.values()[document_index];
-    defer self.allocator.destroy(document_future);
-
-    if (document_future.await(self.io)) |document| {
-        if (!document.lsp_synced) {
-            log.warn("Document already closed: {s}", .{uri.raw});
-        }
-        document.deinit(self.allocator);
-    } else |_| {}
+    const document = self.documents.values()[document_index];
+    self.documents.swapRemoveAt(document_index);
+    self.forgetSourceAliases(document_uri);
+    if (!document.lsp_synced) {
+        log.warn("Document already closed: {s}", .{uri.raw});
+    }
+    document.deinit(self.allocator);
+    document_uri.deinit(self.allocator);
+    self.allocator.destroy(document);
 }
 
 /// Updates a document that is synced over the LSP protocol (`textDocument/didChange`).
@@ -1350,13 +1351,14 @@ pub fn refreshDocumentFromFileSystem(self: *DocumentStore, uri: Uri, should_dele
 
     if (should_delete) {
         const index = self.documents.getIndex(uri) orelse return false;
-        const document_future = self.documents.values()[index];
-        const document = document_future.await(self.io) catch return false;
+        const document = self.documents.values()[index];
         if (document.lsp_synced) return false;
         self.documents.swapRemoveAt(index);
-        document.uri.deinit(self.allocator);
+        const document_uri = document.uri;
+        self.forgetSourceAliases(document_uri);
         document.deinit(self.allocator);
-        self.allocator.destroy(document_future);
+        document_uri.deinit(self.allocator);
+        self.allocator.destroy(document);
     } else {
         if (self.getHandle(uri, .unscoped)) |handle| {
             if (handle.document.lsp_synced) return false;
@@ -2492,10 +2494,11 @@ fn createAndStoreDocument(
         .text => {},
         .uri => std.debug.assert(uri.isFileScheme()),
     }
-    errdefer switch (file_source) {
-        .text => |text| store.allocator.free(text),
-        .uri => {},
+    var owned_text: ?[:0]const u8 = switch (file_source) {
+        .text => |text| text,
+        .uri => null,
     };
+    errdefer if (owned_text) |text| store.allocator.free(text);
 
     if (supports_build_system and options.lsp_synced and isBuildFile(uri) and !isInStd(uri)) {
         switch (options.load_build_file_behaviour) {
@@ -2509,121 +2512,60 @@ fn createAndStoreDocument(
         }
     }
 
-    const document_future: *SourceDocument.Future = document_future: {
-        try store.mutex.lock(store.io);
-        defer store.mutex.unlock(store.io);
+    // One lock covers lookup, loading, and publication. No pending entry or
+    // map pointer escapes into parsing, and a failed load has nothing to retire.
+    // Source reads and import collection do not recurse into this store.
+    try store.mutex.lock(store.io);
+    defer store.mutex.unlock(store.io);
 
-        const gop = try store.documents.getOrPut(store.allocator, uri);
-
-        var previous_err: ?ReadFileError = null;
-        if (gop.found_existing) {
-            if (gop.value_ptr.*.await(store.io)) |old_document| {
-                if (!options.override) return old_document;
-                gop.value_ptr.*.event.reset();
-            } else |err| {
-                const retry = switch (err) {
-                    error.Canceled => true,
-                    else => file_source == .text,
-                };
-                if (options.override and !retry) return err;
-                previous_err = err;
-                // A re-read of an entry whose load failed is the same
-                // replacement an override is, and the snapshot that failed
-                // load kept is still the one a reader is holding.
-                gop.value_ptr.*.event.reset();
-            }
-        } else {
-            errdefer store.documents.swapRemoveAt(gop.index);
-
-            gop.key_ptr.* = try uri.dupe(store.allocator);
-            errdefer gop.key_ptr.*.deinit(store.allocator);
-
-            gop.value_ptr.* = try store.allocator.create(SourceDocument.Future);
-            errdefer store.allocator.destroy(gop.value_ptr.*);
-        }
-        if (!gop.found_existing) {
-            gop.value_ptr.*.* = .{
-                .event = .unset,
-                .document = .{
-                    .uri = gop.key_ptr.*,
-                    .tree = undefined,
-                    .file_imports = &.{},
-                    .lsp_synced = options.lsp_synced,
-                    .impl = .{
-                        .store = store,
-                        .has_tree_and_source = false,
-                    },
-                },
-                .err = previous_err,
-            };
-        } else {
-            // The document this entry already holds is left exactly where it
-            // is.  `SourceDocument.refresh` moves the text, tree, imports and
-            // scope a reader already has aside precisely because the
-            // replacement has parsed by the time it does so, and this load
-            // frees that `old_document` on the way out.  Rebuilding the
-            // document here instead drops all of it before the replacement
-            // exists: leaked when the load succeeds, and the client's only
-            // snapshot lost outright when the load is rejected — which is
-            // the one case the surrounding contract promises keeps it.
-            gop.value_ptr.*.err = previous_err;
-            // These two are answered from the source being replaced, and
-            // `refresh` does not move them aside with the rest, so they are
-            // released here rather than carried into a snapshot whose text
-            // they were never asked about.
-            gop.value_ptr.*.document.impl.associated_build_file.deinit(store.allocator);
-            gop.value_ptr.*.document.impl.associated_build_file = .init;
-            gop.value_ptr.*.document.impl.associated_compilation_units.deinit(store.allocator);
-            gop.value_ptr.*.document.impl.associated_compilation_units = .unresolved;
-        }
-        break :document_future gop.value_ptr.*;
-    };
-    defer document_future.event.set(store.io);
-
-    // What a reader already has, and what it keeps if this load is
-    // rejected.  `SourceDocument.refresh` only moves the previous tree
-    // aside once a replacement has parsed, so the snapshot is still
-    // intact at the point of failure and has to be *left* intact:
-    // dropping it would leak its text, tree and imports, and would dangle
-    // every view already handed out for this document.
-    const had_snapshot = document_future.document.impl.has_tree_and_source;
+    const existing = store.documents.get(uri);
+    if (existing) |document| {
+        if (!options.override) return document;
+    }
 
     const text: [:0]const u8 = switch (file_source) {
         .text => |text| text,
-        .uri => store.readFile(uri) catch |err| {
-            const should_log = err != error.Canceled and err != error.FileNotFound and err != error.SourceExcluded;
-            if (should_log) log.err("failed to read document '{s}': {}", .{ uri.raw, err });
-            if (!had_snapshot) {
-                document_future.document.deinit(store.allocator);
-                document_future.err = err;
-            }
-            return err;
-        },
+        // The load error is delivered to the caller, directly or through the
+        // failure snapshot. Reporting it here would report the same cause twice.
+        .uri => try store.readFile(uri),
+    };
+    owned_text = text;
+
+    const document = existing orelse document: {
+        const owned_uri = try uri.dupe(store.allocator);
+        errdefer owned_uri.deinit(store.allocator);
+        const allocated = try store.allocator.create(SourceDocument);
+        allocated.* = .{
+            .uri = owned_uri,
+            .tree = undefined,
+            .file_imports = &.{},
+            .lsp_synced = options.lsp_synced,
+            .impl = .{
+                .store = store,
+                .has_tree_and_source = false,
+            },
+        };
+        break :document allocated;
+    };
+    errdefer if (existing == null) {
+        const owned_uri = document.uri;
+        document.deinit(store.allocator);
+        owned_uri.deinit(store.allocator);
+        store.allocator.destroy(document);
     };
 
     var old_document: SourceDocument = .dead;
-    SourceDocument.refresh(
-        &document_future.document,
-        &old_document,
-        text,
-        store.allocator,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => {
-            // Propagate allocation failure to the caller that reports it.
-            // A rejection leaves the open document exactly as it was; see
-            // `refreshLspSyncedDocument`.
-            if (!had_snapshot) {
-                document_future.document.deinit(store.allocator);
-                document_future.err = err;
-            }
-            return err;
-        },
-    };
+    try SourceDocument.refresh(document, &old_document, text, store.allocator);
+    owned_text = null;
     old_document.deinit(store.allocator);
-    document_future.document.lsp_synced = options.lsp_synced;
+    document.lsp_synced = options.lsp_synced;
 
-    document_future.err = null;
-    return &document_future.document;
+    // Every resource is initialized before the URI becomes visible. A failed
+    // insertion releases the complete candidate without a partial key in the map.
+    if (existing == null) {
+        try store.documents.putNoClobber(store.allocator, document.uri, document);
+    }
+    return document;
 }
 
 /// One resolved import target: the file, and the module it is read in.
@@ -2902,6 +2844,87 @@ fn testStore(gpa: std.mem.Allocator, io: std.Io, modules: *ModuleRegistry, diagn
     };
 }
 
+fn rejectedOpenPublishesNoDocument(gpa: std.mem.Allocator, io: std.Io) !void {
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var diagnostics: DiagnosticsCollection = .{ .io = io, .allocator = gpa };
+    var modules: ModuleRegistry = .init(gpa);
+    defer modules.deinit();
+    var store = testStore(gpa, io, &modules, &diagnostics, &environ);
+    defer store.deinit();
+    const uri = try Uri.fromPath(gpa, "/project/main.zig");
+    defer uri.deinit(gpa);
+    const text =
+        \\const first = @import("first.zig");
+        \\const second = @import("second.zig");
+        \\pub const value: u8 = 7;
+    ;
+    store.openLspSyncedDocument(uri, text) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expect(store.getHandle(uri, .unscoped) == null);
+        try std.testing.expectEqual(@as(?SourceLoadError, null), store.failureSnapshot().source_failure);
+        return err;
+    };
+    const opened = store.getHandle(uri, .unscoped) orelse return error.DocumentNotOpened;
+    try std.testing.expectEqualStrings(text, opened.document.tree.source);
+}
+
+test "a rejected first open releases its source and imports without publishing a document" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        rejectedOpenPublishesNoDocument,
+        .{std.testing.io},
+    );
+}
+
+fn rejectedFilesystemLoadPublishesNoDocument(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    path: []const u8,
+    text: []const u8,
+) !void {
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var diagnostics: DiagnosticsCollection = .{ .io = io, .allocator = gpa };
+    var modules: ModuleRegistry = .init(gpa);
+    defer modules.deinit();
+    var store = testStore(gpa, io, &modules, &diagnostics, &environ);
+    defer store.deinit();
+    store.source_policy = .{ .roots = &.{root} };
+    const uri = try Uri.fromPath(gpa, path);
+    defer uri.deinit(gpa);
+    const handle = store.getOrLoadHandle(uri, .unscoped) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expect(store.getHandle(uri, .unscoped) == null);
+        try std.testing.expectEqual(@as(?SourceLoadError, null), store.failureSnapshot().source_failure);
+        return err;
+    } orelse return error.DocumentNotLoaded;
+    try std.testing.expectEqualStrings(text, handle.document.tree.source);
+}
+
+test "a rejected filesystem load releases its source and imports without publishing a document" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text =
+        \\const first = @import("first.zig");
+        \\const second = @import("second.zig");
+        \\pub const value: u8 = 7;
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = text });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "main.zig" });
+    defer gpa.free(path);
+    try std.testing.checkAllAllocationFailures(
+        gpa,
+        rejectedFilesystemLoadPublishesNoDocument,
+        .{ io, root, path, text },
+    );
+}
+
 /// A rejected refresh leaves the open document exactly as
 /// `refreshLspSyncedDocument` promises: `new_text` is released and the
 /// document is left untouched, so the snapshot a client already has stays
@@ -2946,7 +2969,7 @@ fn rejectedRefreshKeepsTheOpenDocument(
         const kept = store.getHandle(uri, .unscoped) orelse return error.RejectedRefreshDroppedDocument;
         try std.testing.expect(std.mem.eql(u8, old_text, kept.document.tree.source));
         try std.testing.expectEqual(initial_lsp_synced, kept.document.lsp_synced);
-        try std.testing.expectEqual(@as(?anyerror, null), store.failureSnapshot().source_failure);
+        try std.testing.expectEqual(@as(?SourceLoadError, null), store.failureSnapshot().source_failure);
         return err;
     };
 
@@ -2963,8 +2986,8 @@ test "a rejected LSP refresh keeps the stored document source and original sync 
             rejectedRefreshKeepsTheOpenDocument,
             .{
                 std.testing.io,
-                "pub const value: u8 = 7;\n",
-                "pub const value: u8 = 9;\n",
+                "const old = @import(\"old.zig\");\npub const value: u8 = 7;\n",
+                "const first = @import(\"first.zig\");\nconst second = @import(\"second.zig\");\npub const value: u8 = 9;\n",
                 initial_lsp_synced,
             },
         );
@@ -3054,7 +3077,7 @@ test "an exclusion reports itself instead of another document's published failur
     try std.testing.expectError(error.SourceExcluded, store.getOrLoadHandle(uri, .unscoped));
     // The exclusion named itself; it did not publish a cause, so a later
     // reader cannot attribute one to this file.
-    try std.testing.expectEqual(@as(?anyerror, null), store.failureSnapshot().source_failure);
+    try std.testing.expectEqual(@as(?SourceLoadError, null), store.failureSnapshot().source_failure);
 }
 
 test "an excluded lookup reports its own error without erasing a malformed source" {
@@ -3075,7 +3098,7 @@ test "an excluded lookup reports its own error without erasing a malformed sourc
     try store.openLspSyncedDocument(broken, "pub const Value = struct { field: ; };\n");
     try std.testing.expect(store.getHandle(broken, .unscoped) == null);
     const previous = store.failureSnapshot();
-    try std.testing.expectEqual(@as(?anyerror, error.ImportInvalidSyntax), previous.source_failure);
+    try std.testing.expectEqual(@as(?SourceLoadError, error.ImportInvalidSyntax), previous.source_failure);
     try std.testing.expectEqualStrings(broken.raw, previous.parse_failure.?.source_path.?);
 
     const uri = try Uri.fromPath(gpa, "/elsewhere/other.zig");
@@ -3083,7 +3106,7 @@ test "an excluded lookup reports its own error without erasing a malformed sourc
     try std.testing.expectError(error.SourceExcluded, store.getOrLoadHandle(uri, .unscoped));
 
     const current = store.failureSnapshot();
-    try std.testing.expectEqual(@as(?anyerror, error.ImportInvalidSyntax), current.source_failure);
+    try std.testing.expectEqual(@as(?SourceLoadError, error.ImportInvalidSyntax), current.source_failure);
     try std.testing.expectEqualStrings(broken.raw, current.parse_failure.?.source_path.?);
 }
 

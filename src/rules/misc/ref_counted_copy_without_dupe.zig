@@ -43,9 +43,9 @@
 //!     is bound from the literal's own type expression (`Owner`,
 //!     `pkg.Owner`, `Outer.Inner`, at whatever depth it is written), or —
 //!     for an anonymous literal (`.{ … }`) — from the context that names
-//!     it: the type the enclosing function returns, or the type an
-//!     annotated local is declared with.  Nothing else names an anonymous
-//!     literal, and the SOURCE's type is never a stand-in for it.
+//!     it: the type the enclosing function returns, an annotated local,
+//!     or the callee parameter an argument literal is passed to. The
+//!     SOURCE's type is never a stand-in for the destination.
 //!
 //!     Then the declaration itself answers, with nothing else in the file
 //!     consulted:
@@ -86,25 +86,34 @@
 //!     same acquire written in the same branch as the copy is the fix for
 //!     that copy and for nothing else.
 //!
-//!   Pass 3 — whole-value copies, bound to the SOURCE DECLARATION:
-//!     One reference is duplicated just as surely by handing the whole
-//!     handle on as by spelling a field out of a literal:
-//!     `pub fn copy(source: Shared) Shared { return source; }` gives
-//!     the caller a second owner of the one reference `Shared` holds.
-//!     Every `return <param>;` and every `const|var <name> =
-//!     <param>;` whose source is a BY-VALUE parameter of a declaration
-//!     that runs a reference protocol on any of its own fields is one
-//!     report, and that same declaration decides it: `Shared.deref`
-//!     hands the reference its `ref` field holds back, so the copy is a
-//!     second owner of one reference.  The destination IS that value —
-//!     a `return` hands it to the caller, a binding makes it a second
-//!     local — so there is nothing further to read.
+//!     Raw slices have no reference-acquire protocol or implicit local
+//!     destructor. Report only a proved second teardown obligation: a
+//!     source cleanup that runs on success, a later owning use, or
+//!     overlapping error cleanups. Fresh locals and optional takes can
+//!     hand their slices to one returned owner. A temporary header adds
+//!     no owner unless its uses prove cleanup or publication. Incomplete
+//!     helper effects, escaped aliases, and unknown outcomes are not
+//!     evidence of duplicate ownership and stay silent.
 //!
-//!     Only a parameter is a source.  A by-value parameter is itself
-//!     copied into the frame, so the caller still holds the original
-//!     and the copy is genuinely a second owner; a local the frame
-//!     just built has one owner either way, and `return <local>;` is a
-//!     move rather than a duplication.
+//!   Pass 3 — whole-value copies, bound to the SOURCE DECLARATION:
+//!     The declaration identifies the fields with cleanup obligations,
+//!     but Zig has no automatic parameter destructors. Returning a
+//!     parameter, or binding it to a local that owns cleanup only on
+//!     error before handing it on, can transfer the one reference.
+//!     Scalar reads and complete read-only methods do not add an owner.
+//!     A resolved SDK append mutates its existing header. A straight-line
+//!     move body must replace the whole receiver with proved fresh defaults,
+//!     or disarm every returned owning field; its method name proves nothing.
+//!     Distinct terminal returns, including an `orelse return` followed by
+//!     one transfer on the present-value path, are exclusive handoffs.
+//!     Additional aliases, unread mutation and overlapping cleanup stay charged.
+//!     Error-only cleanup does not overlap a successful handoff unless a
+//!     later failure can reach it. Unconditional cleanup requires a proved
+//!     disarm before handoff. Repeated cleanup, an additional
+//!     alias, or another use whose ownership cannot be resolved remains
+//!     charged. No type name or source path supplies a transfer proof.
+//!     A local the frame just built has one owner either way, and
+//!     `return <local>;` is a move rather than a duplication.
 //!
 //!     An acquire that reaches the field the copy duplicates —
 //!     `source.ref.retain();` before the return, or
@@ -241,6 +250,18 @@ const CheckState = struct {
     cache: *file_cache_mod.FileCache,
 };
 
+/// Admit the AST's byte, token-count, and node-count domains before any
+/// bounded index walk. Counts stay counts until this checked conversion.
+fn admittedTokenCount(source_len: usize, token_count: usize, node_count: usize) error{SourceTooWide}!Ast.TokenIndex {
+    if (source_len >= std.math.maxInt(u32) or node_count > std.math.maxInt(u32))
+        return error.SourceTooWide;
+    return std.math.cast(Ast.TokenIndex, token_count) orelse error.SourceTooWide;
+}
+
+fn admitSource(tree: *const Ast) error{SourceTooWide}!Ast.TokenIndex {
+    return admittedTokenCount(tree.source.len, tree.tokens.len, tree.nodes.len);
+}
+
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -249,9 +270,14 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .ref_counted_copy_without_dupe)) return;
+    const token_count = try admitSource(tree);
+    if (token_count == 0) return;
+    // All later root-model questions borrow this admitted model; a failed
+    // build is an analysis error, never missing ownership evidence.
+    _ = try cache.fileModel();
 
     const tags = tree.tokens.items(.tag);
-    const last_tok = tree.lastToken(.root);
+    const last_tok = token_count - 1;
 
     // ── Pass 1: collect evidenced field names ─────────────────────────────
     // Scan the whole file for `identifier . FIELD . <acquire_or_release> (`.
@@ -262,7 +288,7 @@ pub fn check(
 
     if (last_tok >= 5) {
         var t: Ast.TokenIndex = 0;
-        while (t + 5 <= last_tok) : (t += 1) {
+        while (last_tok - t >= 5) : (t += 1) {
             if (tags[t] != .identifier) continue;
             if (tags[t + 1] != .period) continue;
             if (tags[t + 2] != .identifier) continue;
@@ -384,9 +410,9 @@ fn unacquiredOwnedRef(
     body_first: Ast.TokenIndex,
     copy_tok: Ast.TokenIndex,
     source: []const u8,
-) ?OwnedRef {
+) !?OwnedRef {
     for (dest.info.fields) |*field| {
-        const teardown = lifecycleMethodOnField(cache, dest.tree, dest.info, field.name) orelse continue;
+        const teardown = (try lifecycleMethodOnField(cache, dest.tree, dest.info, field.name)) orelse continue;
         // An acquire balances a copy ONLY when this declaration drives
         // the field through the field's own reference protocol.  A
         // teardown that hands the field's storage to an allocator takes
@@ -400,7 +426,7 @@ fn unacquiredOwnedRef(
             if (hasRefAcquireCall(tree, tags, body_first, copy_tok -| 1, copy_tok, source, field.name)) continue;
             // A wrapper field holds nothing of its own to acquire: the
             // reference it hands back is the one its pointee holds.
-            if (leafRefOfField(cache, dest, field)) |leaf| {
+            if (try leafRefOfField(cache, dest, field)) |leaf| {
                 if (hasLeafRefAcquireCall(tree, tags, body_first, copy_tok -| 1, copy_tok, source, field.name, leaf)) continue;
             }
             if (hasAliasRefAcquireCall(
@@ -523,7 +549,7 @@ fn leafRefOfField(
     cache: *file_cache_mod.FileCache,
     dest: DestType,
     field: *const file_model_mod.FieldInfo,
-) ?[]const u8 {
+) !?[]const u8 {
     const pointee = pointeeDeclOfField(cache, dest, field) orelse return null;
     if (pointee.tree != dest.tree) return null;
     if (declaresOwnStorageHandoff(pointee.tree, pointee.info)) return null;
@@ -537,7 +563,7 @@ fn leafRefOfField(
     for (pointee.info.methods) |*m| {
         const receiver = m.receiver orelse continue;
         for (pointee.info.fields) |*member| {
-            if (methodReachesField(cache, pointee.tree, pointee.info, m, receiver.name, member.name) == null) continue;
+            if ((try methodReachesField(cache, pointee.tree, pointee.info, m, receiver.name, member.name)) == null) continue;
             if (leaf) |reached| {
                 if (!std.mem.eql(u8, reached, member.name)) return null;
                 continue;
@@ -674,13 +700,17 @@ fn checkFnWholeValueCopies(
         const source_tok = wholeValueCopySourceAt(tags, t, body_last) orelse continue;
         const name = tree.tokenSlice(source_tok);
         const dest = paramHandleType(state.cache, tree, proto, name) orelse continue;
+        // Zig does not run a parameter destructor. A sole use transfers
+        // ownership, unless the local copy is itself cleaned twice or
+        // cleaned on success while it is also handed to another owner.
+        if (try wholeCopyIsHandoff(state.cache, dest, tree, tags, t, source_tok, body_first, body_last, name)) continue;
         // The fix for a whole-value copy is an acquire that reaches
         // EVERY field the copy duplicates: `source.ref.retain();` and
         // `source.tail.retain();` before the return balance one second
         // owner each.  Only an acquire WRITTEN BEFORE the copy can
         // balance it, so the scan ends at the copy — one that runs
         // afterwards is a statement the copy can no longer reach.
-        const unacquired = unacquiredOwnedRef(
+        const unacquired = try unacquiredOwnedRef(
             state.cache,
             proto,
             body,
@@ -693,6 +723,349 @@ fn checkFnWholeValueCopies(
         ) orelse continue;
         try reportWholeCopy(gpa, state.problems, tree, source_tok, name, dest.info.name, unacquired);
     }
+}
+
+/// Prove the absence of a second owner in this function. Unknown extra
+/// uses of either handle stay charged; no type or path spelling exempts it.
+fn wholeCopyIsHandoff(
+    cache: *file_cache_mod.FileCache,
+    owner: DestType,
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    copy_start: Ast.TokenIndex,
+    source_tok: Ast.TokenIndex,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    source: []const u8,
+) !bool {
+    const returning = tags[copy_start] == .keyword_return;
+    var t = first;
+    while (t <= last) : (t += 1) {
+        if (t == source_tok or tags[t] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(t), source)) continue;
+        if (t > first and tags[t - 1] == .period) continue;
+        if (returning and wholeTerminalReturnUse(tree, source_tok, t, last, source)) continue;
+        return false;
+    }
+    if (returning) return true;
+    const alias = tree.tokenSlice(copy_start + 1);
+    var cleanups: usize = 0;
+    var unconditional_cleanup = false;
+    var handoffs: usize = 0;
+    var disarmed = false;
+    t = source_tok + 1;
+    while (t <= last) : (t += 1) {
+        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), alias)) continue;
+        // Member spellings do not refer to the local binding.
+        if (t > first and tags[t - 1] == .period) continue;
+        if (t + 1 <= last and tags[t + 1] == .equal) {
+            if (handoffs != 1) return false;
+            if (fallibleAfterHandoff(tree, tags, source_tok, t - 1, alias)) return false;
+            var frames: ReachFrames = .{};
+            collectReachFrames(tags, first, last, &frames);
+            if (!reachesCopy(&frames, t, last)) return false;
+            const reset_end = try freshHandleReset(cache, owner, tree, tags, t, last, alias) orelse return false;
+            disarmed = true;
+            t = reset_end;
+            continue;
+        }
+        var end = t;
+        while (end + 2 <= last and tags[end + 1] == .period and tags[end + 2] == .identifier)
+            end += 2;
+        if (end > t and end + 1 <= last and tags[end + 1] == .l_paren) {
+            const close = tokens.matchParen(tags, end + 1, last) orelse return false;
+            if (end == t + 2 and try wholeMethodDisarms(cache, owner, tree.tokenSlice(end))) {
+                if (disarmed or deferredCall(tree, t)) return false;
+                handoffs += 1;
+                disarmed = true;
+            } else if (isRefReleaseName(tree.tokenSlice(end))) {
+                cleanups += 1;
+                if (sliceDeferredAt(tree, t) != .error_only) unconditional_cleanup = true;
+            } else if (!try wholeCallBorrowsReceiver(cache, tree, t)) {
+                return false;
+            }
+            // Arguments can themselves name the local. Do not skip them.
+            t = end;
+            _ = close;
+        } else if (end > t and try sliceMemberIsScalar(cache, t, end)) {
+            // A scalar value cannot carry another cleanup obligation.
+            if (t > first and tags[t - 1] == .ampersand) return false;
+            t = end;
+        } else if (t > first and tags[t - 1] == .equal) {
+            // An additional alias can carry a second cleanup obligation.
+            return false;
+        } else if (t > first and tags[t - 1] == .keyword_return) {
+            handoffs += 1;
+        } else if (end == t and t + 1 <= last and
+            (tags[t + 1] == .r_paren or tags[t + 1] == .comma))
+        {
+            // A by-value argument hands the one handle on. Error-only
+            // cleanup retains responsibility only if that handoff fails.
+            handoffs += 1;
+        } else {
+            return false;
+        }
+    }
+    return cleanups <= 1 and handoffs <= 1 and
+        !(unconditional_cleanup and handoffs != 0 and !disarmed) and
+        (cleanups == 0 or handoffs == 0 or disarmed or !fallibleAfterHandoff(tree, tags, source_tok, last, alias));
+}
+
+/// Distinct non-deferred returns cannot execute on the same path. An
+/// `orelse return` also excludes a sole later transfer, even when the
+/// later call stores its result rather than returning it immediately.
+fn wholeTerminalReturnUse(tree: *const Ast, copied: Ast.TokenIndex, other: Ast.TokenIndex, last: Ast.TokenIndex, source: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    if (deferredCall(tree, copied) or deferredCall(tree, other)) return false;
+    var copied_return: ?Ast.Node.Index = null;
+    var other_return: ?Ast.Node.Index = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const start = tree.firstToken(node);
+        const stop = tree.lastToken(node);
+        if (copied >= start and copied <= stop) copied_return = node;
+        if (other < start or other > stop) continue;
+        var count: usize = 0;
+        var t = start;
+        while (t <= stop) : (t += 1) {
+            if (tags[t] == .identifier and std.mem.eql(u8, tree.tokenSlice(t), source) and
+                (t == start or tags[t - 1] != .period)) count += 1;
+        }
+        if (count != 1) return false;
+        other_return = node;
+    }
+    if (other + 1 >= tags.len or
+        (tags[other + 1] != .semicolon and tags[other + 1] != .comma and tags[other + 1] != .r_paren)) return false;
+    const early = copied_return orelse return false;
+    if (other_return) |later| return early != later;
+    const start = tree.firstToken(early);
+    const stop = tree.lastToken(early);
+    if (start == 0 or tags[start - 1] != .keyword_orelse or other <= stop or
+        (other > 0 and tags[other - 1] == .ampersand)) return false;
+    var count: usize = 0;
+    var t = stop + 1;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .identifier and std.mem.eql(u8, tree.tokenSlice(t), source) and
+            tags[t - 1] != .period) count += 1;
+    }
+    return count == 1;
+}
+
+/// Prove a self-disarming operation from a complete, straight-line body.
+/// The direct form copies the receiver, replaces it with independent storage,
+/// then returns the copy. The aggregate form transfers every owning field
+/// through another proved disarming operation; the remaining fields are scalar.
+/// Recursive descents only follow by-value fields, never pointer cycles.
+fn wholeMethodDisarms(cache: *file_cache_mod.FileCache, owner: DestType, name: []const u8) anyerror!bool {
+    const tree = owner.tree;
+    if (tree != cache.tree) return false;
+    const tags = tree.tokens.items(.tag);
+    const method = owner.info.findMethod(name) orelse return false;
+    const receiver = method.receiver orelse return false;
+    var buf: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buf, method.fn_decl) orelse return false;
+    const result_type = proto.ast.return_type.unwrap() orelse return false;
+    const result_owner = bindTypeExpr(cache, tree, result_type) orelse return false;
+    if (result_owner.info != owner.info) return false;
+    var params = proto.iterate(tree);
+    const recv_param = params.next() orelse return false;
+    if (params.next() != null) return false;
+    const recv_type = recv_param.type_expr orelse return false;
+    const recv_first = tree.firstToken(recv_type);
+    if (tags[recv_first] != .asterisk or tags[recv_first + 1] == .keyword_const) return false;
+    var t = method.body_first + 1;
+    const last = method.body_last;
+    if (t + 16 == last and tags[t] == .keyword_const and tags[t + 1] == .identifier and
+        tags[t + 2] == .equal and tags[t + 3] == .identifier and
+        std.mem.eql(u8, tree.tokenSlice(t + 3), receiver.name) and tags[t + 4] == .period_asterisk and
+        tags[t + 5] == .semicolon and tags[t + 6] == .identifier and
+        std.mem.eql(u8, tree.tokenSlice(t + 6), receiver.name) and tags[t + 7] == .period_asterisk and
+        tags[t + 8] == .equal and tags[t + 9] == .period and tags[t + 10] == .l_brace and
+        tags[t + 11] == .r_brace and tags[t + 12] == .semicolon and tags[t + 13] == .keyword_return and
+        tags[t + 14] == .identifier and std.mem.eql(u8, tree.tokenSlice(t + 14), tree.tokenSlice(t + 1)) and
+        tags[t + 15] == .semicolon)
+    {
+        return try cache.provesFreshStorage(.{
+            .first = t + 9,
+            .last = t + 11,
+            .type_first = tree.firstToken(result_type),
+            .type_last = tree.lastToken(result_type),
+        }, null);
+    }
+    const captures_first = t;
+    while (t + 12 < last and tags[t] == .keyword_const) {
+        if (tags[t + 1] != .identifier or tags[t + 2] != .equal or
+            tags[t + 5] != .identifier or tags[t + 6] != .semicolon or
+            !isRecvFieldAt(tree, tags, t + 3, last, receiver.name, tree.tokenSlice(t + 5)) or
+            !isRecvFieldAt(tree, tags, t + 7, last, receiver.name, tree.tokenSlice(t + 5)) or
+            tags[t + 10] != .equal or tags[t + 11] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(t + 11), "null") or tags[t + 12] != .semicolon) return false;
+        const field = owner.info.findField(tree.tokenSlice(t + 5)) orelse return false;
+        if (tags[field.type_first] != .question_mark) return false;
+        t += 13;
+    }
+    const captures_last = t;
+    if (t + 3 > last or tags[t] != .keyword_return or tags[t + 1] != .period or
+        tags[t + 2] != .l_brace) return false;
+    t += 3;
+    for (owner.info.fields) |field| {
+        if (t + 3 > last or tags[t] != .period or tags[t + 1] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(t + 1), field.name) or tags[t + 2] != .equal) return false;
+        const value = t + 3;
+        if (tags[value] == .identifier and value + 1 <= last and
+            (tags[value + 1] == .comma or tags[value + 1] == .r_brace))
+        {
+            var capture = captures_first;
+            while (capture < captures_last) : (capture += 13) {
+                if (std.mem.eql(u8, tree.tokenSlice(capture + 1), tree.tokenSlice(value)) and
+                    std.mem.eql(u8, tree.tokenSlice(capture + 5), field.name)) break;
+            }
+            if (capture == captures_last) return false;
+            t = value + 1;
+            if (tags[t] == .comma) t += 1 else if (tags[t] != .r_brace) return false;
+            continue;
+        }
+        if (!isRecvFieldAt(tree, tags, value, last, receiver.name, field.name)) return false;
+        t += 6;
+        if (t + 3 <= last and tags[t] == .period and tags[t + 1] == .identifier and
+            tags[t + 2] == .l_paren and tags[t + 3] == .r_paren)
+        {
+            if (tags[field.type_first] == .asterisk or tags[field.type_first] == .question_mark) return false;
+            const nested = bindTypeRange(cache, tree, field.type_first, field.type_last) orelse return false;
+            if (!try wholeMethodDisarms(cache, nested, tree.tokenSlice(t + 1))) return false;
+            t += 4;
+        } else if (!try sliceMemberIsScalar(cache, value, value + 2)) {
+            return false;
+        }
+        if (tags[t] == .comma) t += 1 else if (tags[t] != .r_brace) return false;
+    }
+    return t + 2 == last and tags[t] == .r_brace and tags[t + 1] == .semicolon;
+}
+
+/// Complete read-only calls with pointer receivers and address-free results
+/// cannot publish another owner. The resolved SDK append is also safe:
+/// it updates its own header rather than returning or storing a second one.
+fn wholeCallBorrowsReceiver(cache: *file_cache_mod.FileCache, tree: *const Ast, use: Ast.TokenIndex) !bool {
+    const call_node = sliceCallContaining(tree, use) orelse return false;
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buf, call_node) orelse return false;
+    const actual = (try cache.actualCallSummaryAt(tree.nodeMainToken(call.ast.fn_expr), null)) orelse return false;
+    if (actual.argument_offset != 1) return false;
+    const declared = (try actual.declaringCache(cache)) orelse return false;
+    const resolver = declared.zls orelse return false;
+    const frame = resolver.frameForFunction(actual.callee.reference);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(actual.callee.tree, &proto_buf, actual.callee.declaration) orelse return false;
+    var params = proto.iterate(actual.callee.tree);
+    const receiver = params.next() orelse return false;
+    const receiver_node = receiver.type_expr orelse return false;
+    const receiver_type = (try frame.typeOfNode(receiver_node)) orelse return false;
+    if (resolver.typeTag(receiver_type) != .pointer) return false;
+    var return_node = proto.ast.return_type.unwrap() orelse return false;
+    while (actual.callee.tree.nodeTag(return_node) == .error_union)
+        return_node = actual.callee.tree.nodeData(return_node).node_and_node[1];
+    const returned = (try frame.typeOfNode(return_node)) orelse return false;
+    if (!try @import("../../cache/fresh_storage.zig").actualTypeAddressFree(frame, returned, 0, null)) return false;
+    const caller = actual.callee.caller_frame orelse (cache.zls orelse return false).resolutionFrame();
+    // The resolved SDK append updates its own owning header. Growth may
+    // invalidate old element addresses, but does not publish a second header.
+    if (try caller.stdCollectionAppendOf(call.ast.fn_expr, call.ast.params.len) != .no) return true;
+    // Mutation effects alone do not prove that a project method neither
+    // retains nor frees storage. Require a complete whole-body read-only fact.
+    return (try cache.callEffectAt(tree.nodeMainToken(call.ast.fn_expr), .{ .whole = actual.callee }, .{})) == .read_only;
+}
+
+/// A pending error cleanup cannot follow a successful transfer across
+/// another fallible operation unless the local's old payload is disarmed.
+fn fallibleAfterHandoff(tree: *const Ast, tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: Ast.TokenIndex, alias: []const u8) bool {
+    var transferred = false;
+    var t = first + 1;
+    while (t <= last) : (t += 1) {
+        if (transferred and (tags[t] == .keyword_try or
+            (tags[t] == .keyword_return and t + 1 <= last and tags[t + 1] == .keyword_error))) return true;
+        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), alias)) continue;
+        if (t + 1 <= last and (tags[t + 1] == .comma or tags[t + 1] == .r_paren)) transferred = true;
+    }
+    return false;
+}
+
+/// Read the reset declaration, not the method's spelling. Only an
+/// allocator capability may flow from the old handle into a fresh value.
+fn freshHandleReset(cache: *file_cache_mod.FileCache, owner: DestType, tree: *const Ast, tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex, alias: []const u8) !?Ast.TokenIndex {
+    var method_tok = start + 2;
+    if (method_tok > last or tags[method_tok] != .identifier) return null;
+    const type_first = method_tok;
+    while (method_tok + 2 <= last and tags[method_tok + 1] == .period and tags[method_tok + 2] == .identifier)
+        method_tok += 2;
+    if (method_tok == type_first or method_tok + 6 > last or tags[method_tok + 1] != .l_paren) return null;
+    const reset_type = bindTypeRange(cache, tree, type_first, method_tok - 2) orelse return null;
+    if (reset_type.info != owner.info or reset_type.tree != owner.tree) return null;
+    const arg = method_tok + 2;
+    if (!isRecvFieldAt(tree, tags, arg, last, alias, tree.tokenSlice(arg + 2))) return null;
+    if (tags[arg + 3] != .r_paren or tags[arg + 4] != .semicolon) return null;
+    const capability = owner.info.findField(tree.tokenSlice(arg + 2)) orelse return null;
+    if (!std_type_query.isType(cache, owner.tree, capability.type_first, capability.type_last, "mem", "Allocator", .{ .allow_pointer = false })) return null;
+    if (!try allocatorFactory(cache, reset_type, tree.tokenSlice(method_tok), 0)) return null;
+    return arg + 4;
+}
+
+/// A bounded declaration proof: one allocator parameter, one returned
+/// literal, and only that capability or another proved constructor in
+/// its fields. Captures, opaque methods and control flow stay unknown.
+fn allocatorFactory(cache: *file_cache_mod.FileCache, owner: DestType, method_name: []const u8, depth: usize) !bool {
+    if (depth == 16) return false;
+    const tree = owner.tree;
+    _ = try admitSource(tree);
+    const tags = tree.tokens.items(.tag);
+    const method = owner.info.findMethod(method_name) orelse return false;
+    if (method.receiver != null) return false;
+    var buf: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buf, method.fn_decl) orelse return false;
+    var params = proto.iterate(tree);
+    const param = params.next() orelse return false;
+    if (params.next() != null) return false;
+    const param_name = tree.tokenSlice(param.name_token orelse return false);
+    const param_type = param.type_expr orelse return false;
+    if (!std_type_query.isType(cache, tree, tree.firstToken(param_type), tree.lastToken(param_type), "mem", "Allocator", .{ .allow_pointer = false })) return false;
+    // Unknown defaults can retain an external owner rather than create
+    // an empty container; they cannot prove this reset.
+    for (owner.info.fields) |field| {
+        if (!field.has_default) continue;
+        const value = field.type_last + 2;
+        switch (tags[value]) {
+            .number_literal => {},
+            .identifier => {
+                const literal = tree.tokenSlice(value);
+                if (!std.mem.eql(u8, literal, "null") and
+                    !std.mem.eql(u8, literal, "true") and
+                    !std.mem.eql(u8, literal, "false")) return false;
+            },
+            .period => if (tags[value + 1] != .identifier or !std.mem.eql(u8, tree.tokenSlice(value + 1), "empty")) return false,
+            else => return false,
+        }
+    }
+    var t = method.body_first + 1;
+    if (t + 3 > method.body_last or tags[t] != .keyword_return or tags[t + 1] != .period or tags[t + 2] != .l_brace) return false;
+    t += 3;
+    while (t < method.body_last and tags[t] != .r_brace) {
+        if (t + 3 > method.body_last or tags[t] != .period or tags[t + 1] != .identifier or tags[t + 2] != .equal) return false;
+        t += 3;
+        if (tags[t] != .identifier) return false;
+        if (std.mem.eql(u8, tree.tokenSlice(t), param_name)) {
+            t += 1;
+        } else {
+            const type_first = t;
+            while (t + 2 <= method.body_last and tags[t + 1] == .period and tags[t + 2] == .identifier) t += 2;
+            if (t == type_first or t + 3 > method.body_last or tags[t + 1] != .l_paren or
+                tags[t + 2] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t + 2), param_name) or tags[t + 3] != .r_paren) return false;
+            const nested = bindTypeRange(cache, tree, type_first, t - 2) orelse return false;
+            if (!try allocatorFactory(cache, nested, tree.tokenSlice(t), depth + 1)) return false;
+            t += 4;
+        }
+        if (tags[t] == .comma) t += 1 else if (tags[t] != .r_brace) return false;
+    }
+    return t + 2 == method.body_last and tags[t] == .r_brace and tags[t + 1] == .semicolon;
 }
 
 /// The identifier a whole-value copy at `t` copies, when that copy's
@@ -850,7 +1223,7 @@ fn checkStructInit(
         if (sourceIsClearedAfter(tree, tags, t + 6, @min(t + 100, fn_last), source_recv, source_field)) continue;
 
         if (!dest_bound) {
-            dest = bindDestination(state.cache, tree, init);
+            dest = try bindDestination(state.cache, tree, init);
             dest_bound = true;
         }
 
@@ -859,7 +1232,7 @@ fn checkStructInit(
         // neither the spelling of the name nor a lifecycle call some
         // other type in the file happens to make on the same name has
         // any say in it.
-        const verdict = verdictOnField(state.cache, dest, dest_field);
+        const verdict = try verdictOnField(state.cache, dest, dest_field);
         var balances_by_acquire = false;
         switch (verdict) {
             .borrowed => continue,
@@ -876,6 +1249,25 @@ fn checkStructInit(
                 // appear with `.ref.deinit()` or `.ref.clone()`.
                 if (!state.evidenced.contains(dest_field)) continue;
             },
+        }
+
+        // A failed handoff proof is not a duplicate-ownership proof.
+        // Raw slices stay silent unless actual uses prove overlap.
+        if (!balances_by_acquire) {
+            switch (try sliceLiteralIsHandoff(
+                state.cache,
+                tree,
+                fn_decl,
+                body,
+                init,
+                dest,
+                field_tok,
+                t + 3,
+                source_field,
+            )) {
+                .handoff, .unknown => continue,
+                .not_slice, .overlap => {},
+            }
         }
 
         // An acquire balances the copy only where the declaration
@@ -896,6 +1288,754 @@ fn checkStructInit(
 
         try report(gpa, state.problems, tree, field_tok, dest_field, source_recv);
     }
+}
+
+const SliceOwnership = enum { not_slice, handoff, overlap, unknown };
+
+/// Raw slices require positive overlap evidence. Unknown effects cannot
+/// prove either a single handoff or duplicate ownership.
+fn sliceLiteralIsHandoff(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    fn_decl: Ast.Node.Index,
+    body: Ast.Node.Index,
+    init: Ast.Node.Index,
+    dest: ?DestType,
+    copy_token: Ast.TokenIndex,
+    source_token: Ast.TokenIndex,
+    field_name: []const u8,
+) !SliceOwnership {
+    const rhs_end = source_token + 3;
+    if (rhs_end >= tree.tokens.len or
+        (tree.tokenTag(rhs_end) != .comma and tree.tokenTag(rhs_end) != .r_brace)) return .not_slice;
+    const resolver = cache.zls orelse return .not_slice;
+    const rhs = cache.nodeForExactSpan(source_token, source_token + 2) orelse return .not_slice;
+    const actual_type = (try resolver.resolutionFrame().typeOfNode(rhs)) orelse return .not_slice;
+    if (resolver.pointerSize(actual_type) != .slice) return .not_slice;
+    const destination = dest orelse return .unknown;
+    _ = destination.info.findField(field_name) orelse return .unknown;
+
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return .unknown;
+    // The item arena outlives queries that grow the cache's binding table.
+    const bindings = (try cache.localBindings(proto, body)).*;
+    const local_dest = sliceLiteralBinding(tree, &bindings, init);
+    var destination_uses: ?bool = null;
+    if (local_dest) |local| {
+        destination_uses = try sliceBindingUsesAreDisjoint(cache, tree, &bindings, body, local, field_name, null, false, false, null);
+        if (destination_uses == true) return .handoff;
+    }
+
+    const source = (bindings.findAt(tree.tokenSlice(source_token), source_token) orelse return .unknown).*;
+    var source_error_cleanups: usize = 0;
+    const source_uses = try sliceBindingUsesAreDisjoint(cache, tree, &bindings, body, source, field_name, source_token, false, true, &source_error_cleanups);
+    if (source_uses == false) return .overlap;
+    const fresh = switch (source.origin) {
+        .call, .method_call, .try_call, .try_method_call => try cache.provesFreshStorage(
+            @import("../../model/fn_summary.zig").claimFor(tree, &source),
+            null,
+        ),
+        else => false,
+    };
+    const taken = if (fresh) true else try sliceOwnerWasTaken(cache, tree, &bindings, body, source, field_name, copy_token);
+    if (taken == false and source_uses == true and
+        (local_dest == null or destination_uses == false)) return .overlap;
+    if (local_dest) |local| {
+        // A result's error cleanup is a duplicate only if the source also
+        // retains an error cleanup. Otherwise it is the one local owner.
+        const result_uses = try sliceBindingUsesAreDisjoint(cache, tree, &bindings, body, local, field_name, null, true, source_error_cleanups == 0, null);
+        if (result_uses == false) return .overlap;
+        if (result_uses == null or source_uses == null or taken == null) return .unknown;
+        return .handoff;
+    }
+    if (source_uses == null or taken == null) return .unknown;
+    const first = tree.firstToken(init);
+    return if (first > 0 and tree.tokenTag(first - 1) == .keyword_return) .handoff else .unknown;
+}
+
+fn sliceLiteralBinding(
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    init: Ast.Node.Index,
+) ?local_bindings.Binding {
+    for (tree.nodes.items(.tag), 0..) |_, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const declaration = tree.fullVarDecl(node) orelse continue;
+        if (declaration.ast.init_node.unwrap() != init) continue;
+        const name_token = tree.nodeMainToken(node) + 1;
+        return (bindings.findAt(tree.tokenSlice(name_token), name_token) orelse return null).*;
+    }
+    return null;
+}
+
+/// A take is authenticated by its exact local binding and owning slot.
+/// No other alias, restore, or conditional clear may retain that slot.
+fn sliceOwnerWasTaken(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    body: Ast.Node.Index,
+    source: local_bindings.Binding,
+    field_name: []const u8,
+    copy: Ast.TokenIndex,
+) !?bool {
+    const tags = tree.tokens.items(.tag);
+    const first = source.rhs_first;
+    if (source.origin == .param) {
+        const head = if (tags[first] == .asterisk) first + 1 else first;
+        const owner = bindTypeRange(cache, tree, head, source.rhs_last) orelse return null;
+        // No automatic destruction is implied, but a pointer parameter's
+        // declared owner remains in the caller unless this body disarms it.
+        if (tags[first] != .asterisk) return null;
+        if ((try verdictOnField(cache, owner, field_name)) == .owned) return false;
+        return null;
+    }
+    if (!source.is_const) return null;
+    if (source.rhs_last != first + 4 or tags[first] != .identifier or
+        tags[first + 1] != .period or tags[first + 2] != .identifier or
+        tags[first + 3] != .period or tags[first + 4] != .question_mark) return null;
+    const owner_name = tree.tokenSlice(first);
+    const owner = bindings.findAt(owner_name, first) orelse return null;
+    if (owner.origin != .param or tags[owner.rhs_first] != .asterisk) return null;
+    const owner_type = bindTypeRange(cache, tree, owner.rhs_first + 1, owner.rhs_last) orelse return null;
+    if (try verdictOnField(cache, owner_type, tree.tokenSlice(first + 2)) != .owned) return null;
+    const slot = tree.tokenSlice(first + 2);
+    // An alias alone is unknown. A snapshot through that alias with its
+    // own proved cleanup is a concrete second teardown obligation.
+    for (bindings.items) |alias| {
+        if (alias.origin != .alias or !std.mem.eql(u8, alias.origin.alias, owner_name)) continue;
+        const root = bindings.findAt(owner_name, alias.rhs_first) orelse continue;
+        if (root.name_token != owner.name_token) continue;
+        for (bindings.items) |snapshot| {
+            const at = snapshot.rhs_first;
+            if (snapshot.rhs_last != at + 4 or tags[at] != .identifier or
+                tags[at + 1] != .period or tags[at + 2] != .identifier or
+                tags[at + 3] != .period or tags[at + 4] != .question_mark or
+                !std.mem.eql(u8, tree.tokenSlice(at), alias.name) or
+                !std.mem.eql(u8, tree.tokenSlice(at + 2), slot)) continue;
+            const used_alias = bindings.findAt(alias.name, at) orelse continue;
+            if (used_alias.name_token != alias.name_token) continue;
+            if (try sliceBindingUsesAreDisjoint(cache, tree, bindings, body, snapshot, field_name, null, false, false, null) == false)
+                return false;
+        }
+    }
+    const body_first = tree.firstToken(body);
+    const body_last = tree.lastToken(body);
+    var frames: ReachFrames = .{};
+    collectReachFrames(tags, body_first, body_last, &frames);
+    var cleared = false;
+    var unknown = false;
+    var t = body_first;
+    while (t + 2 <= body_last) : (t += 1) {
+        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), owner_name)) continue;
+        if (t > body_first and tags[t - 1] == .period) continue;
+        const used_owner = bindings.findAt(owner_name, t) orelse {
+            unknown = true;
+            continue;
+        };
+        if (used_owner.name_token != owner.name_token) continue;
+        // A pointer alias, address escape, or receiver call could take a
+        // second snapshot through another spelling. Only direct members
+        // are admitted; the selected slot is checked separately below.
+        if (tags[t + 1] != .period or tags[t + 2] != .identifier or
+            (t + 3 <= body_last and tags[t + 3] == .l_paren)) {
+            unknown = true;
+            continue;
+        }
+        if (!isRecvFieldAt(tree, tags, t, body_last, owner_name, slot)) continue;
+        if (t == first) continue;
+        if (t + 5 > body_last or tags[t + 3] != .equal or
+            tags[t + 4] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t + 4), "null") or
+            tags[t + 5] != .semicolon) {
+            unknown = true;
+            continue;
+        }
+        if (t <= source.rhs_last or t >= copy or cleared) {
+            unknown = true;
+            continue;
+        }
+        if (sliceDeferredAt(tree, t) == .error_only) return false;
+        if (!reachesCopy(&frames, t, copy)) return false;
+        cleared = true;
+        t += 5;
+    }
+    return if (unknown) null else cleared;
+}
+
+const SliceDeferred = enum { immediate, error_only, unconditional };
+
+fn sliceDeferredAt(tree: *const Ast, use: Ast.TokenIndex) SliceDeferred {
+    var result: SliceDeferred = .immediate;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .@"defer" and tag != .@"errdefer") continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.firstToken(node) > use or tree.lastToken(node) < use) continue;
+        if (tag == .@"defer") return .unconditional;
+        result = .error_only;
+    }
+    return result;
+}
+
+/// Select the innermost real call containing a use, not a method-name
+/// heuristic. Its complete outcome summary is the non-cleanup certificate.
+fn sliceCallContaining(tree: *const Ast, use: Ast.TokenIndex) ?Ast.Node.Index {
+    var found: ?Ast.Node.Index = null;
+    var width: Ast.TokenIndex = std.math.maxInt(Ast.TokenIndex);
+    for (tree.nodes.items(.tag), 0..) |_, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [1]Ast.Node.Index = undefined;
+        _ = tree.fullCall(&buffer, node) orelse continue;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        if (first <= use and use <= last and last - first < width) {
+            found = node;
+            width = last - first;
+        }
+    }
+    return found;
+}
+
+fn sliceBindingUsesAreDisjoint(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    body: Ast.Node.Index,
+    local: local_bindings.Binding,
+    field: ?[]const u8,
+    copy_use: ?Ast.TokenIndex,
+    allow_return: bool,
+    allow_error_cleanup: bool,
+    cleanup_count: ?*usize,
+) anyerror!?bool {
+    const tags = tree.tokens.items(.tag);
+    const last = @min(local.scope_close, tree.lastToken(body));
+    var last_error_cleanup: ?Ast.TokenIndex = null;
+    var returns: usize = 0;
+    var unknown = false;
+    var t = local.name_token + 1;
+    while (t <= last) : (t += 1) {
+        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), local.name)) continue;
+        if (t > 0 and tags[t - 1] == .period) continue;
+        const used = bindings.findAt(local.name, t) orelse {
+            unknown = true;
+            continue;
+        };
+        if (used.name_token != local.name_token) continue;
+        if (copy_use == t) {
+            t += 2;
+            continue;
+        }
+        // Reading/writing another scalar member does not alias this slice.
+        if (field) |selected| {
+            if (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier and
+                !std.mem.eql(u8, tree.tokenSlice(t + 2), selected) and
+                (t + 3 > last or tags[t + 3] != .l_paren) and
+                try sliceMemberIsScalar(cache, t, t + 2)) continue;
+        }
+        // Follow local headers/slices/addresses that could carry this
+        // storage. Descents strictly advance declaration tokens: no cap
+        // or guessed alias names are needed, and no cycle can recurse.
+        var derived: ?local_bindings.Binding = null;
+        for (bindings.items) |candidate| {
+            if (candidate.name_token <= local.name_token or candidate.origin == .param or
+                candidate.origin == .loop_capture or t < candidate.rhs_first or t > candidate.rhs_last) continue;
+            if (derived == null or candidate.rhs_last - candidate.rhs_first <
+                derived.?.rhs_last - derived.?.rhs_first) derived = candidate;
+        }
+        if (derived) |alias| {
+            if (try sliceMemberIsScalar(cache, alias.rhs_first, alias.rhs_last)) {
+                t = alias.rhs_last;
+                continue;
+            }
+            // Unread call results and opaque aliases are not overlap proof.
+            switch (alias.origin) {
+                .call, .method_call, .try_call, .try_method_call, .unknown => unknown = true,
+                else => {
+                    const alias_uses = try sliceBindingUsesAreDisjoint(cache, tree, bindings, body, alias, null, null, false, false, null);
+                    if (alias_uses == false) return false;
+                    if (alias_uses == null) unknown = true;
+                },
+            }
+            t = alias.rhs_last;
+            continue;
+        }
+        if (sliceCallContaining(tree, t)) |call_node| {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, call_node).?;
+            const actual = (try cache.actualCallSummaryAt(tree.nodeMainToken(call.ast.fn_expr), null)) orelse {
+                unknown = true;
+                t = tree.lastToken(call_node);
+                continue;
+            };
+            const summary = try cache.summaryOfResolvedMethod(actual.callee);
+            // Standard allocator release primitives have declared SDK
+            // semantics even when their implementation's generic helpers
+            // cannot produce a complete ordered function summary.
+            const releases = if (try sliceAllocatorReleasesLocal(cache, tree, bindings, actual, local, field))
+                1
+            else if (summary) |known|
+                if (known.normal_success_storage_effects_complete)
+                    try sliceCallReleaseCount(cache, tree, bindings, actual, known.normal_success_storage_outcomes, local, field)
+                else
+                    0
+            else
+                0;
+            if (releases != 0) {
+                const deferred = sliceDeferredAt(tree, t);
+                if (deferred != .error_only) return false;
+                // An errdefer without a later error exit cannot run.
+                if (!sliceHasLaterErrorExit(tree, body, t)) {
+                    t = tree.lastToken(call_node);
+                    continue;
+                }
+                if (releases > 1 or !allow_error_cleanup) return false;
+                if (last_error_cleanup) |previous| {
+                    if (sliceCleanupScopeContains(tree, body, previous, t) and
+                        sliceCleanupScopeContains(tree, body, t, previous)) return false;
+                }
+                last_error_cleanup = t;
+                if (cleanup_count) |count| {
+                    if (copy_use == null or sliceCleanupScopeContains(tree, body, t, copy_use.?)) count.* += 1;
+                }
+            } else {
+                const known = summary orelse {
+                    unknown = true;
+                    t = tree.lastToken(call_node);
+                    continue;
+                };
+                if (!known.normal_success_effects_complete or
+                    !known.error_effects_complete or
+                    !try sliceCallCannotPublish(cache, actual)) unknown = true;
+                if (known.normal_success_effects_complete and
+                    try sliceCallPublishesLocal(cache, tree, bindings, actual, local, field)) return false;
+                for (known.retained_owned_params) |parameter| {
+                    if (try sliceCallNamesLocal(cache, tree, bindings, actual, .{ .param = parameter, .path = "" }, local, null))
+                        return false;
+                }
+            }
+            t = tree.lastToken(call_node);
+            continue;
+        }
+        if (t > 0 and tags[t - 1] == .keyword_return and t + 1 <= last and tags[t + 1] == .semicolon) {
+            if (!allow_return) {
+                if (try sliceReturnOwnsPayload(cache, tree, t, field)) return false;
+                unknown = true;
+                continue;
+            }
+            if (returns != 0) unknown = true;
+            returns += 1;
+            continue;
+        }
+        // Plain element access and slice length inspect the allocation;
+        // they do not hand an owning header to another cleanup.
+        var after = t + 1;
+        if (field != null and after + 1 <= last and tags[after] == .period and tags[after + 1] == .identifier)
+            after += 2;
+        if (after <= last and tags[after] == .l_bracket) {
+            if (t > 0 and (tags[t - 1] == .ampersand or tags[t - 1] == .keyword_return)) {
+                unknown = true;
+                continue;
+            }
+            const close = tokens.matchBracket(tags, after, last) orelse {
+                unknown = true;
+                continue;
+            };
+            var k = after + 1;
+            while (k < close) : (k += 1) {
+                if (tags[k] == .ellipsis2) unknown = true;
+            }
+            continue;
+        }
+        if (after + 1 <= last and tags[after] == .period and tags[after + 1] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(after + 1), "len")) continue;
+        // Error-only resets do not disarm the caller's owner on success.
+        if (field != null and t + 8 <= last and tags[t + 1] == .period and
+            tags[t + 2] == .identifier and std.mem.eql(u8, tree.tokenSlice(t + 2), field.?) and
+            tags[t + 3] == .equal and tags[t + 4] == .ampersand and
+            tags[t + 5] == .period and tags[t + 6] == .l_brace and
+            tags[t + 7] == .r_brace and tags[t + 8] == .semicolon and
+            sliceDeferredAt(tree, t) == .error_only) {
+            t += 8;
+            continue;
+        }
+        if (copy_use) |copy| {
+            if (t > copy and t + 8 <= last and tags[t + 1] == .period and
+                tags[t + 2] == .identifier and tags[t + 3] == .equal and
+                tags[t + 4] == .ampersand and tags[t + 5] == .period and
+                tags[t + 6] == .l_brace and tags[t + 7] == .r_brace and
+                tags[t + 8] == .semicolon and
+                sliceClearHasSuccessfulBypass(tree, bindings, body, copy, t)) return false;
+        }
+        if (try sliceUseIsOwningStore(cache, tree, bindings, t)) return false;
+        if (try sliceUseIsOwningLiteral(cache, tree, t)) return false;
+        unknown = true;
+    }
+    if (unknown or (allow_return and returns != 1)) return null;
+    return true;
+}
+
+fn sliceMemberIsScalar(cache: *file_cache_mod.FileCache, first: Ast.TokenIndex, last: Ast.TokenIndex) !bool {
+    const resolver = cache.zls orelse return false;
+    const node = cache.nodeForExactSpan(first, last) orelse return false;
+    const frame = resolver.resolutionFrame();
+    const actual = (try frame.typeOfNode(node)) orelse return false;
+    return @import("../../cache/fresh_storage.zig").actualTypeAddressFree(frame, actual, 0, null);
+}
+
+fn sliceCleanupScopeClose(tree: *const Ast, body: Ast.Node.Index, use: Ast.TokenIndex) Ast.TokenIndex {
+    var registration = use;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .@"errdefer") continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.firstToken(node) <= use and tree.lastToken(node) >= use)
+            registration = @min(registration, tree.firstToken(node));
+    }
+    var close = tree.lastToken(body);
+    var at = tree.firstToken(body);
+    while (at < registration) : (at += 1) {
+        if (tree.tokenTag(at) != .l_brace) continue;
+        const end = matchingBrace(tree, at);
+        if (end > use) close = @min(close, end);
+    }
+    return close;
+}
+
+fn sliceCleanupScopeContains(tree: *const Ast, body: Ast.Node.Index, cleanup: Ast.TokenIndex, use: Ast.TokenIndex) bool {
+    const close = sliceCleanupScopeClose(tree, body, cleanup);
+    if (use > close) return false;
+    var first = tree.firstToken(body);
+    var at = first;
+    while (at < cleanup) : (at += 1) {
+        if (tree.tokenTag(at) == .l_brace and matchingBrace(tree, at) == close) first = at;
+    }
+    return first <= use;
+}
+
+fn sliceHasLaterErrorExit(tree: *const Ast, body: Ast.Node.Index, cleanup: Ast.TokenIndex) bool {
+    const close = sliceCleanupScopeClose(tree, body, cleanup);
+    var first = cleanup;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .@"errdefer") continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.firstToken(node) <= cleanup and tree.lastToken(node) >= cleanup)
+            first = @max(first, tree.lastToken(node));
+    }
+    var at = first + 1;
+    while (at < close) : (at += 1) {
+        if (tree.tokenTag(at) == .keyword_try) return true;
+        if (tree.tokenTag(at) == .keyword_return and at + 1 < close and
+            tree.tokenTag(at + 1) == .keyword_error) return true;
+    }
+    return false;
+}
+
+fn sliceReturnOwnsPayload(cache: *file_cache_mod.FileCache, tree: *const Ast, use: Ast.TokenIndex, field: ?[]const u8) !bool {
+    const fn_decl = tokens.enclosingFnDecl(tree, use) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, fn_decl) orelse return false;
+    var result = proto.ast.return_type.unwrap() orelse return false;
+    while (tree.nodeTag(result) == .error_union)
+        result = tree.nodeData(result).node_and_node[1];
+    const owner = bindTypeExpr(cache, tree, result) orelse return false;
+    if (field) |selected| return (try verdictOnField(cache, owner, selected)) == .owned;
+    for (owner.info.fields) |member| {
+        if ((try verdictOnField(cache, owner, member.name)) == .owned) return true;
+    }
+    return false;
+}
+
+fn sliceAllocatorReleasesLocal(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    actual: file_cache_mod.FileCache.ActualCallSummary,
+    local: local_bindings.Binding,
+    field: ?[]const u8,
+) !bool {
+    const primitive = (try @import("../../cache/fresh_storage.zig").allocatorPrimitive(cache, actual, .{
+        .claim = .{ .first = tree.firstToken(actual.callee.call_node), .last = tree.lastToken(actual.callee.call_node) },
+        .depth = 0,
+        .frame = actual.callee.caller_frame,
+    })) orelse return false;
+    if (primitive.operation != .release) return false;
+    const parameter = primitive.previous_parameter orelse return false;
+    const resolver = cache.zls orelse return false;
+    const frame = actual.callee.caller_frame orelse resolver.resolutionFrame();
+    var buffer: [2]Ast.Node.Index = undefined;
+    const allocator = (try actual.callArgumentFor(cache, &buffer, primitive.allocator_parameter)) orelse return false;
+    if ((try frame.isStdAllocator(allocator)) != true) return false;
+    return sliceCallNamesLocal(cache, tree, bindings, actual, .{ .param = parameter, .path = "" }, local, field);
+}
+
+/// Count releases of the selected entry payload in complete, correlated
+/// outcomes. A failure to prove independent payloads is not a double free.
+fn sliceCallReleaseCount(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    actual: file_cache_mod.FileCache.ActualCallSummary,
+    outcomes: []const @import("../../model/fn_summary.zig").StorageOutcome,
+    local: local_bindings.Binding,
+    field: ?[]const u8,
+) !usize {
+    var most: usize = 0;
+    for (outcomes) |outcome| {
+        var releases: usize = 0;
+        var replaced = false;
+        for (outcome.operations) |operation| {
+            if (!try sliceCallNamesLocal(cache, tree, bindings, actual, operation.path, local, field)) continue;
+            if (operation.kind == .replace) {
+                replaced = true;
+                continue;
+            }
+            if (operation.version) |version| {
+                if (version != 0) continue;
+            } else if (replaced) continue;
+            releases += 1;
+        }
+        most = @max(most, releases);
+    }
+    return most;
+}
+
+/// Match a formal release to the exact current local binding and field.
+/// Unknown aliases and different fields supply no release evidence.
+fn sliceCallNamesLocal(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    actual: file_cache_mod.FileCache.ActualCallSummary,
+    path: @import("../../model/fn_summary.zig").ParamPath,
+    local: local_bindings.Binding,
+    field: ?[]const u8,
+) !bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const argument = (try actual.callArgumentFor(cache, &buffer, path.param)) orelse return false;
+    var first = tree.firstToken(argument);
+    const last = tree.lastToken(argument);
+    if (tree.tokenTag(first) == .ampersand) first += 1;
+    if (tree.tokenTag(first) != .identifier) return false;
+    const binding = bindings.findAt(tree.tokenSlice(first), first) orelse return false;
+    if (binding.name_token != local.name_token) return false;
+    if (first == last) {
+        return if (field) |selected| std.mem.eql(u8, path.path, selected) else true;
+    }
+    return field != null and last == first + 2 and
+        tree.tokenTag(first + 1) == .period and tree.tokenTag(last) == .identifier and
+        std.mem.eql(u8, tree.tokenSlice(last), field.?) and path.path.len == 0;
+}
+
+/// A second returned owning literal is a positive owning use, not an
+/// opaque escape. A discarded or unread temporary literal proves nothing.
+fn sliceUseIsOwningLiteral(cache: *file_cache_mod.FileCache, tree: *const Ast, use: Ast.TokenIndex) !bool {
+    if (use < 3 or tree.tokenTag(use - 1) != .equal or
+        tree.tokenTag(use - 2) != .identifier or tree.tokenTag(use - 3) != .period) return false;
+    var owner = false;
+    var returned = false;
+    for (tree.nodes.items(.tag), 0..) |_, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const literal = tree.fullStructInit(&buffer, node) orelse continue;
+        if (tree.firstToken(node) > use or tree.lastToken(node) < use) continue;
+        const first = tree.firstToken(node);
+        if (first > 0 and tree.tokenTag(first - 1) == .keyword_return) returned = true;
+        for (literal.ast.fields) |value| {
+            if (tree.firstToken(value) != use) continue;
+            const dest = try bindDestination(cache, tree, node);
+            owner = try verdictOnField(cache, dest, tree.tokenSlice(use - 2)) == .owned;
+        }
+    }
+    return owner and returned;
+}
+
+fn sliceUseIsOwningStore(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    use: Ast.TokenIndex,
+) !bool {
+    if (use < 4 or tree.tokenTag(use - 1) != .equal or
+        tree.tokenTag(use - 2) != .identifier or tree.tokenTag(use - 3) != .period or
+        tree.tokenTag(use - 4) != .identifier) return false;
+    const receiver = bindings.findAt(tree.tokenSlice(use - 4), use - 4) orelse return false;
+    if (receiver.origin != .param or tree.tokenTag(receiver.rhs_first) != .asterisk) return false;
+    const owner = bindTypeRange(cache, tree, receiver.rhs_first + 1, receiver.rhs_last) orelse return false;
+    return (try verdictOnField(cache, owner, tree.tokenSlice(use - 2))) == .owned;
+}
+
+/// A runtime branch that jumps past a clear and reaches a successful
+/// return leaves the caller's original owner live beside the saved copy.
+/// Do not infer this from an unread helper or a failed disarm proof.
+fn sliceClearHasSuccessfulBypass(
+    tree: *const Ast,
+    bindings: *const local_bindings.LocalBindings,
+    body: Ast.Node.Index,
+    copy: Ast.TokenIndex,
+    clear: Ast.TokenIndex,
+) bool {
+    for (tree.nodes.items(.tag), 0..) |_, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const branch = tree.fullIf(node) orelse continue;
+        if (tree.firstToken(node) <= copy or tree.lastToken(node) >= clear or
+            tree.nodeTag(branch.ast.cond_expr) != .identifier) continue;
+        const condition_token = tree.nodeMainToken(branch.ast.cond_expr);
+        const condition = bindings.findAt(tree.tokenSlice(condition_token), condition_token) orelse continue;
+        var runtime_condition = condition.origin == .param;
+        if (condition.origin == .loop_capture) {
+            var at = condition.rhs_first;
+            while (at <= condition.rhs_last) : (at += 1) {
+                if (tree.tokenTag(at) != .identifier) continue;
+                const value = bindings.findAt(tree.tokenSlice(at), at) orelse continue;
+                if (value.origin == .param) runtime_condition = true;
+            }
+        }
+        if (!runtime_condition) continue;
+        const jump = branch.ast.then_expr;
+        const jump_tag = tree.nodeTag(jump);
+        if (jump_tag != .@"break" and jump_tag != .@"continue") continue;
+        const jump_token = tree.nodeMainToken(jump);
+        for (tree.nodes.items(.tag), 0..) |_, target_index| {
+            const target: Ast.Node.Index = @enumFromInt(target_index);
+            const first = tree.firstToken(target);
+            const last = tree.lastToken(target);
+            if (first >= copy or last <= clear or last >= tree.lastToken(body)) continue;
+            if (jump_tag == .@"break") {
+                if (jump_token + 2 >= tree.tokens.len or tree.tokenTag(jump_token + 1) != .colon or
+                    tree.tokenTag(first) != .identifier or tree.tokenTag(first + 1) != .colon or
+                    !std.mem.eql(u8, tree.tokenSlice(first), tree.tokenSlice(jump_token + 2))) continue;
+            } else {
+                // A single fixed iteration reaches the return after a
+                // continue; an unbounded loop supplies no success proof.
+                const loop = tree.fullFor(target) orelse continue;
+                if (loop.ast.inputs.len != 1) continue;
+                var array_buffer: [2]Ast.Node.Index = undefined;
+                const input = tree.fullArrayInit(&array_buffer, loop.ast.inputs[0]) orelse continue;
+                if (input.ast.elements.len != 1) continue;
+            }
+            var at = last + 1;
+            // Only a direct successful return after the target is a proof.
+            if (tree.tokenTag(at) == .semicolon) at += 1;
+            if (tree.tokenTag(at) == .keyword_return) return true;
+        }
+    }
+    return false;
+}
+
+/// A direct store into a declared global owner is positive publication
+/// evidence. Unknown calls or an address encoded in a scalar are not.
+fn sliceCallPublishesLocal(
+    cache: *file_cache_mod.FileCache,
+    caller_tree: *const Ast,
+    caller_bindings: *const local_bindings.LocalBindings,
+    actual: file_cache_mod.FileCache.ActualCallSummary,
+    local: local_bindings.Binding,
+    field: ?[]const u8,
+) !bool {
+    const declaring = (try actual.declaringCache(cache)) orelse return false;
+    const tree = actual.callee.tree;
+    const body = tokens.bodyOf(tree, actual.callee.declaration) orelse return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, actual.callee.declaration) orelse return false;
+    const bindings = (try declaring.localBindings(proto, body)).*;
+    var frames: ReachFrames = .{};
+    collectReachFrames(tree.tokens.items(.tag), tree.firstToken(body), tree.lastToken(body), &frames);
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .assign) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.firstToken(node) < tree.firstToken(body) or tree.lastToken(node) > tree.lastToken(body)) continue;
+        const pair = tree.nodeData(node).node_and_node;
+        if (tree.nodeTag(pair[0]) != .field_access or tree.nodeTag(pair[1]) != .field_access) continue;
+        const target = tree.nodeData(pair[0]).node_and_token;
+        const source = tree.nodeData(pair[1]).node_and_token;
+        if (tree.nodeTag(target[0]) != .identifier or tree.nodeTag(source[0]) != .identifier) continue;
+        const target_token = tree.nodeMainToken(target[0]);
+        const source_token = tree.nodeMainToken(source[0]);
+        if (bindings.findAt(tree.tokenSlice(target_token), target_token) != null or
+            !reachesCopy(&frames, source_token, tree.lastToken(body))) continue;
+        const source_binding = bindings.findAt(tree.tokenSlice(source_token), source_token) orelse continue;
+        if (source_binding.origin != .param) continue;
+        var parameters = proto.iterate(tree);
+        var parameter_index: u32 = 0;
+        while (parameters.next()) |parameter| : (parameter_index += 1) {
+            if (parameter.name_token != source_binding.name_token) continue;
+            if (!try sliceCallNamesLocal(cache, caller_tree, caller_bindings, actual, .{
+                .param = parameter_index,
+                .path = tree.tokenSlice(source[1]),
+            }, local, field)) break;
+            for (tree.nodes.items(.tag), 0..) |_, declaration_index| {
+                const declaration_node: Ast.Node.Index = @enumFromInt(declaration_index);
+                const declaration = tree.fullVarDecl(declaration_node) orelse continue;
+                const name_token = tree.nodeMainToken(declaration_node) + 1;
+                if (!std.mem.eql(u8, tree.tokenSlice(name_token), tree.tokenSlice(target_token)) or
+                    tokens.enclosingFnDecl(tree, name_token) != null) continue;
+                const type_expr = declaration.ast.type_node.unwrap() orelse continue;
+                const owner = bindTypeExpr(declaring, tree, type_expr) orelse continue;
+                if ((try verdictOnField(declaring, owner, tree.tokenSlice(target[1]))) == .owned) return true;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+/// Complete no-release outcomes do not say whether a callee publishes the
+/// slice. Require a void success result and certified effects on every
+/// formal and unrooted storage. A scalar result can encode an address.
+/// The whole read-only query may stop at its first write, so its other
+/// classifications are NOT complete certificates.
+fn sliceCallCannotPublish(
+    cache: *file_cache_mod.FileCache,
+    actual: file_cache_mod.FileCache.ActualCallSummary,
+) !bool {
+    const resolver = cache.zls orelse return false;
+    const frame = actual.callee.caller_frame orelse resolver.resolutionFrame();
+    var result = (try frame.typeOfNode(actual.callee.call_node)) orelse return false;
+    while (resolver.typeTag(result) == .error_union) {
+        const child = resolver.childType(result) orelse return false;
+        result = (try resolver.normalizedType(child)) orelse return false;
+    }
+    if (resolver.typeTag(result) != .void) return false;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = cache.tree.fullCall(&call_buffer, actual.callee.call_node) orelse return false;
+    const token = cache.tree.nodeMainToken(call.ast.fn_expr);
+    const context: @import("../../cache/call_summary.zig").QueryContext = .{
+        .frame = actual.callee.caller_frame,
+    };
+    const whole = (try cache.callEffectAt(token, .{ .whole = actual.callee }, context)) orelse return false;
+    if (whole == .read_only) return true;
+
+    // A finish-style scalar writer has no nested calls that might retain
+    // arguments or use collection append's weaker no-invalidation shortcut.
+    // Reuse the existing intrinsic/AST classifier; opaque syntax fails shut.
+    const declaring = (try actual.declaringCache(cache)) orelse return false;
+    const tree = actual.callee.tree;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, actual.callee.declaration) orelse return false;
+    const body = tokens.bodyOf(tree, actual.callee.declaration) orelse return false;
+    const bindings = (try declaring.localBindings(proto, body)).*;
+    var scan = @import("../../cache/call_effects.zig").Scan.init(tree, actual.callee.declaration, &bindings);
+    while (try scan.next()) |event| {
+        switch (event) {
+            .call, .write_or_unknown => return false,
+            .node, .write => {},
+        }
+    }
+    const global = (try cache.callEffectAt(token, .unrooted, context)) orelse return false;
+    if (global != .read_only) return false;
+    var parameters = proto.iterate(tree);
+    var parameter: u32 = 0;
+    while (parameters.next() != null) : (parameter += 1) {
+        // The default complete query must scan past scalar stores. A
+        // read-only-only/whole early negative answer could hide publication.
+        const effect = (try cache.callEffectAt(token, .{ .parameter = .{
+            .param = parameter,
+        } }, context)) orelse return false;
+        switch (effect) {
+            .read_only, .writes_without_invalidation => {},
+            .may_invalidate, .unknown => return false,
+        }
+    }
+    return true;
 }
 
 /// True iff this copy is already balanced by a second reference
@@ -978,7 +2118,7 @@ fn bindDestination(
     cache: *file_cache_mod.FileCache,
     tree: *const Ast,
     init: Ast.Node.Index,
-) ?DestType {
+) !?DestType {
     var buffer: [2]Ast.Node.Index = undefined;
     const literal = tree.fullStructInit(&buffer, init) orelse return null;
     if (literal.ast.type_expr.unwrap()) |type_expr| return bindTypeExpr(cache, tree, type_expr);
@@ -987,20 +2127,19 @@ fn bindDestination(
 
 /// The declaration an ANONYMOUS literal (`.{ … }`) constructs, read
 /// from what its own context says the value is: the type the enclosing
-/// function returns, or the type an annotated local is declared with.
+/// function returns, an annotated local, or a callee's argument type.
 ///
 /// The context is the only thing that names it.  Reading the SOURCE's
 /// type instead would answer the question the literal was written to
 /// ask about the wrong declaration — and would declare a borrowed view
 /// an owner whenever the two happened to differ, which is exactly the
-/// case worth getting right.  An unannotated local, an assignment to a
-/// field or through a pointer, and a literal this rule cannot place in
-/// either position all read as nothing.
+/// case worth getting right. Nested literals use their own canonical
+/// result-location type, never the outer literal's type.
 fn contextualDestination(
     cache: *file_cache_mod.FileCache,
     tree: *const Ast,
     init: Ast.Node.Index,
-) ?DestType {
+) !?DestType {
     const tags = tree.tokens.items(.tag);
     const lbrace = tree.nodeMainToken(init);
     // `.{ … }` opens with a period of its own; the token before the
@@ -1022,13 +2161,90 @@ fn contextualDestination(
         return bindTypeExpr(cache, tree, return_type);
     }
 
+    if (tags[before] == .comma or tags[before] == .l_paren)
+        return argumentDestination(cache, tree, init);
+
     // `const name : Type = .{ … }` — the annotation names the type the
     // local is declared with, which is the type the literal constructs.
     if (tags[before] != .equal or before == 0) return null;
     const name_last = before - 1;
     if (tags[name_last] != .identifier) return null;
-    const colon = annotationColonBefore(tags, name_last) orelse return null;
+    const colon = annotationColonBefore(tags, name_last) orelse
+        return expectedDestination(cache, tree, init);
     return bindTypeRange(cache, tree, colon + 1, name_last);
+}
+
+/// Only the literal occupying an actual argument can use that call's
+/// parameter context. Nested fields and chained expressions cannot inherit
+/// a type from an enclosing call. The canonical expected-type query handles
+/// argument indexes, explicit/static calls, and implicit method receivers.
+fn argumentDestination(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    init: Ast.Node.Index,
+) !?DestType {
+    const resolver = cache.zls orelse return null;
+    if (tree != cache.tree or tree != &resolver.handle.document.tree) return null;
+    const calls = try cache.getCallIndex();
+    var iterator = calls.by_callee_token.valueIterator();
+    var is_argument = false;
+    while (iterator.next()) |call_node| {
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, call_node.*) orelse continue;
+        if (std.mem.findScalar(Ast.Node.Index, call.ast.params, init) != null) {
+            is_argument = true;
+            break;
+        }
+    }
+    if (!is_argument) return null;
+    return expectedDestination(cache, tree, init);
+}
+
+/// Preserve the exact declaring document of a contextual aggregate type.
+fn expectedDestination(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    init: Ast.Node.Index,
+) !?DestType {
+    const resolver = cache.zls orelse return null;
+    if (tree != cache.tree or tree != &resolver.handle.document.tree) return null;
+    var expected = (try resolver.resolutionFrame().expectedTypeOfNode(init)) orelse return null;
+    while (resolver.typeTag(expected) == .optional)
+        expected = resolver.childType(expected) orelse return null;
+    const container = switch (expected.data) {
+        .container => |container| container,
+        else => return null,
+    };
+    // The rule's declaration model is syntactic, not an instantiated
+    // teardown model. Do not discard generic bindings when judging ownership.
+    if (container.bound_params.count() != 0 or container.bound_values.count() != 0) return null;
+    const declaring_tree = &container.scope_handle.handle.document.tree;
+    const declaration = container.scope_handle.toNode();
+    if (declaration == .root) return null;
+    const main_token = declaring_tree.nodeMainToken(declaration);
+    if (declaring_tree.tokenTag(main_token) != .keyword_struct) return null;
+    const first = main_token + 1;
+    if (declaring_tree.tokenTag(first) != .l_brace) return null;
+    const model = if (declaring_tree == tree)
+        try cache.fileModel()
+    else model: {
+        const project = cache.project orelse return null;
+        var scratch = std.heap.stackFallback(std.Io.Dir.max_path_bytes, cache.gpa);
+        const allocator = scratch.get();
+        const path = try container.scope_handle.handle.document.uri.toFsPath(allocator);
+        defer allocator.free(path);
+        break :model (try project.modelForPath(path)) orelse return null;
+    };
+    // Model and resolver must name the same immutable document, never an
+    // unrelated same-named type or a reloaded source snapshot.
+    if (model.tree != declaring_tree) return null;
+    const last = declaring_tree.lastToken(declaration);
+    for (model.types) |*info| {
+        if (info.kind == .struct_ and info.body_first == first and
+            info.body_last == last)
+            return .{ .tree = model.tree, .info = info };
+    }
+    return null;
 }
 
 /// The `:` of `const name : Type` where `name_last` is the last token
@@ -1128,14 +2344,11 @@ fn bindTypeRange(
     // model built here would answer it with whatever the analysed file
     // happens to call the name.
     if (model.tree != tree) return null;
-    // A head this file bound to an `@import` names ANOTHER file, so the
-    // leaf is that file's declaration and never this one's.  Reading the
-    // leaf out of this file's own scope first is what answered
-    // `imported.Owner` with a same-named local `Owner` that happens to
-    // borrow the pointer it was handed, and said nothing about a copy
-    // the imported owner releases.
+    // An import alias identifies another source. Resolve the whole path
+    // there before consulting local declarations, so a same-named local
+    // type cannot replace the imported owner.
     if (len > 1 and headIsImportAlias(tree, path[0])) {
-        if (cache.importedTypeAcrossImports(path[len - 1])) |resolved| {
+        if (cache.importedTypeAcrossImports(path[0..len])) |resolved| {
             return .{ .tree = resolved.model.tree, .info = resolved.info };
         }
         return null;
@@ -1143,19 +2356,9 @@ fn bindTypeRange(
     if (model.findQualifiedType(path[0..len])) |info| {
         return .{ .tree = model.tree, .info = info };
     }
-    if (len > 1) return null;
-    // A name this file does not declare may still come in through an
-    // import.  The answer carries the document it was read from, because
-    // the fields reached through it belong to THAT file's tree.
-    //
-    // Only the imports THIS file reaches are read.  The project-wide
-    // type index behind `resolvedTypeAcrossImports` answers by name over
-    // every file under the project root, so it costs a whole-project
-    // directory walk to answer a question asked once per declaration —
-    // and it can only answer it wrongly here: a head no import reaches
-    // comes back as whatever same-named type some other package declares.
-    // A head that is not reachable is charged, which is what it is.
-    if (cache.importedTypeAcrossImports(path[0])) |resolved| {
+    // An exact bound import path or bare type alias retains its declaring
+    // source, without searching unrelated leaves or the project-wide index.
+    if (cache.importedTypeAcrossImports(path[0..len])) |resolved| {
         return .{ .tree = resolved.model.tree, .info = resolved.info };
     }
     return null;
@@ -1163,11 +2366,13 @@ fn bindTypeRange(
 
 /// True iff `name` is bound to an `@import` at the top level of this
 /// file: `const imported = @import("shapes.zig");`.
+/// `tree` is the root document admitted by `check`; this helper is only
+/// called after bindTypeRange verifies model.tree == tree.
 fn headIsImportAlias(tree: *const Ast, name: []const u8) bool {
     const tags = tree.tokens.items(.tag);
-    const last: Ast.TokenIndex = @intCast(tags.len);
+    const last = tags.len;
     var t: Ast.TokenIndex = 0;
-    while (t + 5 < last) : (t += 1) {
+    while (last - t > 5) : (t += 1) {
         if (tags[t] != .keyword_const) continue;
         if (tags[t + 1] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 1), name)) continue;
@@ -1186,10 +2391,14 @@ fn verdictOnField(
     cache: *file_cache_mod.FileCache,
     dest: ?DestType,
     field_name: []const u8,
-) FieldVerdict {
+) !FieldVerdict {
     const d = dest orelse return .unknown;
     const field = d.info.findField(field_name) orelse return .unknown;
-    if (lifecycleMethodOnField(cache, d.tree, d.info, field_name)) |teardown| {
+    // A standard allocator descriptor copied by value is a capability,
+    // even when this declaration uses it to tear down other fields.
+    // A pointer to that descriptor still carries an ownership obligation.
+    if (try isBorrowedAllocatorValue(cache, d.tree, d.info, field_name)) return .borrowed;
+    if (try lifecycleMethodOnField(cache, d.tree, d.info, field_name)) |teardown| {
         // A field handed to a callee as the standard allocator BY
         // VALUE is a capability the callee borrows, not a reference
         // this declaration gives back.
@@ -1293,10 +2502,12 @@ fn lifecycleMethodOnField(
     tree: *const Ast,
     ti: *const file_model_mod.TypeInfo,
     field_name: []const u8,
-) ?Teardown {
+) !?Teardown {
+    // Imported declaration trees have their own source/index domain.
+    if (tree != cache.tree) _ = try admitSource(tree);
     for (ti.methods) |*m| {
         const receiver = m.receiver orelse continue;
-        const payload = methodReachesField(cache, tree, ti, m, receiver.name, field_name) orelse continue;
+        const payload = (try methodReachesField(cache, tree, ti, m, receiver.name, field_name)) orelse continue;
         return .{ .method = m.name, .payload = payload };
     }
     return null;
@@ -1337,7 +2548,7 @@ fn methodReachesField(
     m: *const file_model_mod.MethodInfo,
     recv: []const u8,
     field_name: []const u8,
-) ?Payload {
+) !?Payload {
     const first = m.body_first;
     const last = m.body_last;
     const tags = tree.tokens.items(.tag);
@@ -1389,7 +2600,7 @@ fn methodReachesField(
         if (!isStorageHandoffName(tree.tokenSlice(call))) continue;
         if (tags[call + 1] != .l_paren) continue;
         const close = tokens.matchParen(tags, call + 1, last) orelse continue;
-        const payload = handoffPayload(cache, tree, ti, m, h, call, close, recv, field_name);
+        const payload = try handoffPayload(cache, tree, ti, m, h, call, close, recv, field_name);
         // `self.gpa.destroy(self.f)` — the field is handed to a
         // sibling's storage handoff instead of being called on.  A
         // head that frees its own storage does not take one, an
@@ -1517,23 +2728,15 @@ fn handoffPayload(
     close: Ast.TokenIndex,
     recv: []const u8,
     field_name: []const u8,
-) Payload {
+) !Payload {
     const tags = tree.tokens.items(.tag);
     const handoff = tree.tokenSlice(call);
     const declared = headTypeRange(tree, ti, m, head, recv) orelse return .unknown;
-    // The library's own source is not in this session's reach, so the
-    // allocator is read the way it is WRITTEN: through the scopes the
-    // name is bound in, whatever wrappers the declaration puts in
-    // front of it.  A POINTER to it answers the same way the value
-    // does, because that is what the standard API is: `raw_gpa.destroy(x)`
-    // auto-derefs to the very same `Allocator` interface and frees `x`.
-    // What such a head never does is take apart the descriptor it points
-    // at, so nothing here charges the head itself — the ARGUMENT is the
-    // payload, and the descriptor stays charged wherever a real handoff
-    // of it is written.
-    if (std_type_query.isType(cache, tree, declared.first, declared.last, "mem", "Allocator", .{
-        .allow_pointer = true,
-    })) return .destroyed_argument;
+    // A genuine allocator head is the release mechanism, not the payload.
+    // Auto-deref through a pointer still frees the argument, never the
+    // descriptor. Passing that descriptor as an argument is a separate
+    // ownership question and must not receive the by-value exemption.
+    if (try isAllocatorType(cache, tree, declared, true)) return .destroyed_argument;
     // `self.node.free(self.gpa)` — the field is the value the call is
     // MADE on, and only the callee's own receiver says what such a
     // field gives back.
@@ -1550,9 +2753,10 @@ fn handoffPayload(
     // this is settled before the callee is opened — a callee this rule
     // cannot resolve has still been handed one, and charging it is what
     // named the copied allocator the reference the copy duplicates.
-    if (passed_at != null and isBorrowedAllocatorValue(cache, tree, ti, field_name))
+    if (passed_at != null and try isBorrowedAllocatorValue(cache, tree, ti, field_name))
         return .borrowed_argument;
     const owner = declaredTypeDeclAt(cache, tree, declared.first, declared.last) orelse return .unknown;
+    if (owner.tree != tree) _ = try admitSource(owner.tree);
     const method = owner.info.findMethod(handoff) orelse return .unknown;
     if (passed_at) |position| {
         // `self.registry.destroy(self.name)` — a callee that PROVES it
@@ -1632,10 +2836,43 @@ fn isBorrowedAllocatorValue(
     tree: *const Ast,
     ti: *const file_model_mod.TypeInfo,
     field_name: []const u8,
-) bool {
+) !bool {
     const field = ti.findField(field_name) orelse return false;
-    return std_type_query.isType(cache, tree, field.type_first, field.type_last, "mem", "Allocator", .{
-        .allow_pointer = false,
+    return isAllocatorType(cache, tree, .{ .first = field.type_first, .last = field.type_last }, false);
+}
+
+/// Authenticate SDK identity in the exact declaration's resolution frame.
+/// Unresolved actual identity stays unknown; actual query errors propagate.
+/// Token-only runs retain the existing lexical import proof.
+fn isAllocatorType(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    declared: TypeRange,
+    allow_pointer: bool,
+) !bool {
+    if (tree != cache.tree) {
+        // Foreign token positions belong to the declaration's document.
+        // Use its own lexical scope proof, not the caller's SDK frame or
+        // bindings. A shadowed or unresolved std alias remains unknown.
+        var declaring = file_cache_mod.FileCache.init(cache.gpa, tree);
+        defer declaring.deinit();
+        return std_type_query.isType(&declaring, tree, declared.first, declared.last, "mem", "Allocator", .{
+            .allow_pointer = allow_pointer,
+        });
+    }
+    if (cache.zls) |resolver| {
+        const node = cache.nodeForExactSpan(declared.first, declared.last) orelse return false;
+        const frame = resolver.resolutionFrame();
+        if (!allow_pointer) {
+            const actual = (try frame.typeOfNode(node)) orelse return false;
+            // Optional/pointer descriptors are owned storage, not capability
+            // values. containerOfNode auto-derefs, so check the wrapper first.
+            if (resolver.typeTag(actual) != .@"struct") return false;
+        }
+        return (try frame.isStdAllocator(node)) == true;
+    }
+    return std_type_query.isType(cache, tree, declared.first, declared.last, "mem", "Allocator", .{
+        .allow_pointer = allow_pointer,
     });
 }
 
@@ -1792,7 +3029,19 @@ fn declaredTypeDeclAt(
     // scope: its names are that file's, and a name asked for from here
     // would answer with whatever the analysed file happens to call it.
     if (model.tree != tree) return null;
-    const name = declaredTypeName(tree, first, last) orelse return null;
+    if (first > last) return null;
+    const tags = tree.tokens.items(.tag);
+    var head = first;
+    while (head <= last) : (head += 1) {
+        switch (tags[head]) {
+            .question_mark, .asterisk, .asterisk_asterisk, .keyword_const, .keyword_volatile, .keyword_allowzero => {},
+            .identifier => break,
+            else => return null,
+        }
+    }
+    if (head > last) return null;
+    if (head < last) return bindTypeRange(cache, tree, head, last);
+    const name = tree.tokenSlice(head);
     // `const Alias = Node;` names the very declaration `Node` does, and
     // the model indexes struct/union/enum/opaque declarations only — an
     // alias is not one of them, so a head written through one resolved
@@ -1802,7 +3051,7 @@ fn declaredTypeDeclAt(
     if (resolveLocalType(model, tree, name, 0)) |info| {
         return .{ .tree = model.tree, .info = info };
     }
-    const resolved = cache.importedTypeAcrossImports(name) orelse return null;
+    const resolved = cache.importedTypeAcrossImports(&.{name}) orelse return null;
     return .{ .tree = resolved.model.tree, .info = resolved.info };
 }
 
@@ -1827,11 +3076,12 @@ fn resolveLocalType(
 /// initializer is a bare declaration name.  Anything else — a struct
 /// literal, a call, a qualified path — names no single declaration and
 /// answers null.
+/// `tree` is the admitted root model, never an imported declaration.
 fn aliasTargetName(tree: *const Ast, name: []const u8) ?[]const u8 {
     const tags = tree.tokens.items(.tag);
-    const last: Ast.TokenIndex = @intCast(tags.len);
+    const last = tags.len;
     var t: Ast.TokenIndex = 0;
-    while (t + 4 < last) : (t += 1) {
+    while (last - t > 4) : (t += 1) {
         if (tags[t] != .keyword_const) continue;
         if (tags[t + 1] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 1), name)) continue;
@@ -1951,37 +3201,6 @@ fn methodBindings(
     return cache.localBindings(proto, m.body) catch null;
 }
 
-/// The declaration a type expression names: the LAST identifier of the
-/// dotted path over `[first, last]`, with leading `?` / `*` / `const` /
-/// `volatile` qualifiers stripped.  `Name`, `*Name`, `?*const Name` and
-/// `ns.Name` all answer with `Name` — the spelling `FileModel.findType`
-/// and `findTypeAcrossImports` resolve — while a slice, an array, a
-/// call or anything else in the range names no single declaration and
-/// is declined.
-fn declaredTypeName(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) ?[]const u8 {
-    if (first > last) return null;
-    const tags = tree.tokens.items(.tag);
-    var t = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .asterisk, .asterisk_asterisk, .keyword_const, .keyword_volatile, .keyword_allowzero => {},
-            .identifier => break,
-            else => return null,
-        }
-    }
-    if (t > last) return null;
-    var leaf: Ast.TokenIndex = t;
-    t += 1;
-    while (t <= last) {
-        if (tags[t] != .period) return null;
-        t += 1;
-        if (t > last or tags[t] != .identifier) return null;
-        leaf = t;
-        t += 1;
-    }
-    return tree.tokenSlice(leaf);
-}
-
 /// The `(` that opens the group the `)` at `close` closes.
 fn openingParenOf(tags: []const std.zig.Token.Tag, close: Ast.TokenIndex) ?Ast.TokenIndex {
     var depth: u32 = 0;
@@ -2088,7 +3307,7 @@ fn isLifecycleMethod(name: []const u8) bool {
 }
 
 /// True iff within `[start, end]` the SOURCE is reset to an empty value
-/// (`source_recv . source_field = { }` or `= .{ }` or `= .empty`).  This
+/// (`source_recv . source_field = { }`, `= .{ }`, `= &.{ }`, or `= .empty`). This
 /// pattern signals an ownership MOVE — the field is transferred from the
 /// source to the destination, then zeroed.  A move does not increment the
 /// refcount; both sides share the original (sole) reference, and the source
@@ -2102,6 +3321,10 @@ fn sourceIsClearedAfter(
     source_field: []const u8,
 ) bool {
     if (start + 4 > end) return false;
+    const fn_decl = tokens.enclosingFnDecl(tree, start) orelse return false;
+    const body = tokens.bodyOf(tree, fn_decl) orelse return false;
+    var frames: ReachFrames = .{};
+    collectReachFrames(tags, tree.firstToken(body), tree.lastToken(body), &frames);
     var k = start;
     while (k + 4 <= end) : (k += 1) {
         // Pattern: identifier(source_recv) . identifier(source_field) = { }
@@ -2111,6 +3334,23 @@ fn sourceIsClearedAfter(
         if (k + 2 > end or tags[k + 2] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(k + 2), source_field)) continue;
         if (k + 3 > end or tags[k + 3] != .equal) continue;
+        // A deferred reset does not execute at this copy. In particular,
+        // errdefer cannot disarm the source of a successful return.
+        if (deferredCall(tree, k)) continue;
+        // Cleanup on an earlier exit can still observe both copies.
+        // Written-after is not proof that the reset executes first.
+        const can_exit = blk: {
+            var prior = start;
+            while (prior < k) : (prior += 1) {
+                switch (tags[prior]) {
+                    .keyword_try, .keyword_return, .keyword_break, .keyword_continue => break :blk true,
+                    else => {},
+                }
+            }
+            break :blk false;
+        };
+        if (can_exit) continue;
+        if (!reachesCopy(&frames, k, start)) continue;
         // Empty init: `= {}`, `= .{}`, or `.empty`
         if (k + 4 > end) continue;
         switch (tags[k + 4]) {
@@ -2128,6 +3368,14 @@ fn sourceIsClearedAfter(
                     },
                     else => {},
                 }
+            },
+            .ampersand => {
+                // A slice reset must be exactly the address of an empty
+                // literal, not another allocated or nonempty slice.
+                if (k + 8 > end or tags[k + 5] != .period or
+                    tags[k + 6] != .l_brace or tags[k + 7] != .r_brace or
+                    tags[k + 8] != .semicolon) continue;
+                return true;
             },
             else => {},
         }
@@ -2273,10 +3521,11 @@ fn hasRefAcquireCall(
 /// so `defer source.ref.retain();` and `defer if (cond)
 /// source.ref.retain();` are one verdict and neither is decided by the
 /// token that happens to precede the receiver.
+/// Acquire checks operate only on the root copy body admitted by `check`.
 fn deferredCall(tree: *const Ast, call: Ast.TokenIndex) bool {
     if (tree.tokens.len == 0 or call == 0) return false;
     const tags = tree.tokens.items(.tag);
-    const last: Ast.TokenIndex = @intCast(tree.tokens.len - 1);
+    const last = tree.lastToken(.root);
     var k = call;
     while (k > 0) {
         k -= 1;
@@ -2737,8 +3986,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, field_tok),
-        .end = Pos.fromTokenEnd(tree, field_tok),
+        .start = try Pos.fromTokenStart(tree, field_tok),
+        .end = try Pos.fromTokenEnd(tree, field_tok),
         .message = msg,
     });
 }
@@ -2783,7 +4032,7 @@ fn reportWholeCopy(
     defer gpa.free(fix);
     const msg = try std.fmt.allocPrint(
         gpa,
-        "`{s}` is copied by value out of a by-value parameter of type `{s}` without acquiring a second reference — `{s}.{s}` hands the reference its `.{s}` field holds back on cleanup, so the copy and the parameter both give one reference back, which can double-free the shared object or SIGFPE; {s}",
+        "`{s}` is copied by value out of a by-value parameter of type `{s}` without acquiring a second reference — `{s}.{s}` releases its `.{s}` field, and the additional uses or cleanup of the handle prevent proving a single ownership handoff; overlapping cleanup can double-free the shared object or SIGFPE; {s}",
         .{ source, type_name, type_name, owned.method, owned.field, fix },
     );
     errdefer gpa.free(msg);
@@ -2791,13 +4040,191 @@ fn reportWholeCopy(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, source_tok),
-        .end = Pos.fromTokenEnd(tree, source_tok),
+        .start = try Pos.fromTokenStart(tree, source_tok),
+        .end = try Pos.fromTokenEnd(tree, source_tok),
         .message = msg,
     });
 }
 
 // ── Tests ──────────────────────────────────────────────────
+
+test "ref-counted-copy-without-dupe: by-value ownership handoffs have no implicit destructor" {
+    try testing.expectNoFire(check,
+        \\const Snapshot = struct {
+        \\    refs: *usize,
+        \\    fn release(self: *Snapshot) void { self.refs.* -= 1; }
+        \\};
+        \\const Usage = struct {
+        \\    scope: *Snapshot,
+        \\    fn deinit(self: *Usage) void { self.scope.release(); }
+        \\};
+        \\fn handoff(source: Usage) Usage { return source; }
+        \\fn record(source: Usage, sink: anytype) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    try sink.append(usage);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: successful transfers disarm all three error cleanups" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Scope = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    refs: std.ArrayList(usize) = .empty,
+        \\    fn fresh(allocator: std.mem.Allocator) Scope { return .{ .allocator = allocator }; }
+        \\    fn deinit(self: *Scope) void { self.refs.deinit(self.allocator); }
+        \\};
+        \\const Render = struct {
+        \\    scope: Scope,
+        \\    allocator: std.mem.Allocator,
+        \\    fn fresh(allocator: std.mem.Allocator) Render { return .{ .scope = Scope.fresh(allocator), .allocator = allocator }; }
+        \\    fn deinit(self: *Render) void { self.scope.deinit(); }
+        \\};
+        \\const Indirect = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    draws: std.ArrayList(usize) = .empty,
+        \\    fn fresh(allocator: std.mem.Allocator) Indirect { return .{ .allocator = allocator }; }
+        \\    fn deinit(self: *Indirect) void { self.draws.deinit(self.allocator); }
+        \\};
+        \\const Compute = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    dispatch_usages: std.ArrayList(usize) = .empty,
+        \\    fn fresh(allocator: std.mem.Allocator) Compute { return .{ .allocator = allocator }; }
+        \\    fn deinit(self: *Compute) void { self.dispatch_usages.deinit(self.allocator); }
+        \\};
+        \\fn render(source: Render, indirect: Indirect, sink: anytype) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    var metadata = indirect;
+        \\    errdefer metadata.deinit();
+        \\    try sink.validate();
+        \\    try sink.append(usage);
+        \\    usage = Render.fresh(usage.allocator);
+        \\    try sink.append(metadata);
+        \\    metadata = Indirect.fresh(metadata.allocator);
+        \\    try sink.commit();
+        \\}
+        \\fn compute(source: Compute, sink: anytype) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    try sink.append(usage);
+        \\    usage = Compute.fresh(usage.allocator);
+        \\    try sink.commit();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a later error cannot clean an already transferred handle" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Usage = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    draws: std.ArrayList(usize) = .empty,
+        \\    fn deinit(self: *Usage) void { self.draws.deinit(self.allocator); }
+        \\};
+        \\fn record(source: Usage, sink: anytype) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    try sink.append(usage);
+        \\    try sink.commit();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: unknown conditional and late resets do not disarm cleanup" {
+    const prelude =
+        \\const std = @import("std");
+        \\const Usage = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    draws: std.ArrayList(usize) = .empty,
+        \\    fn fresh(allocator: std.mem.Allocator) Usage { return .{ .allocator = allocator }; }
+        \\    fn deinit(self: *Usage) void { self.draws.deinit(self.allocator); }
+        \\};
+    ;
+    try testing.expectFires(check, R, prelude ++
+        \\fn record(source: Usage, sink: anytype, condition: bool) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    try sink.append(usage);
+        \\    if (condition) usage = Usage.fresh(usage.allocator);
+        \\    try sink.commit();
+        \\}
+    );
+    try testing.expectFires(check, R, prelude ++
+        \\fn record(source: Usage, sink: anytype) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    try sink.append(usage);
+        \\    try sink.commit();
+        \\    usage = Usage.fresh(usage.allocator);
+        \\}
+    );
+    try testing.expectFires(check, R, prelude ++
+        \\fn record(source: Usage, sink: anytype) !void {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    try sink.append(usage);
+        \\    usage = Usage.unknownReset(usage.allocator);
+        \\    try sink.commit();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: explicit source cleanup still duplicates ownership" {
+    try testing.expectFires(check, R,
+        \\const Snapshot = struct {
+        \\    refs: *usize,
+        \\    fn release(self: *Snapshot) void { self.refs.* -= 1; }
+        \\};
+        \\const Usage = struct {
+        \\    scope: *Snapshot,
+        \\    fn deinit(self: *Usage) void { self.scope.release(); }
+        \\};
+        \\fn duplicate(source: Usage) Usage {
+        \\    defer source.scope.release();
+        \\    return source;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: unconditional local cleanup cannot accompany a handoff" {
+    try testing.expectFires(check, R,
+        \\const Snapshot = struct {
+        \\    refs: *usize,
+        \\    fn release(self: *Snapshot) void { self.refs.* -= 1; }
+        \\};
+        \\const Usage = struct {
+        \\    scope: *Snapshot,
+        \\    fn deinit(self: *Usage) void { self.scope.release(); }
+        \\};
+        \\fn duplicate(source: Usage) Usage {
+        \\    var usage = source;
+        \\    defer usage.deinit();
+        \\    return usage;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: repeated error cleanup remains a double teardown" {
+    try testing.expectFires(check, R,
+        \\const Snapshot = struct {
+        \\    refs: *usize,
+        \\    fn release(self: *Snapshot) void { self.refs.* -= 1; }
+        \\};
+        \\const Usage = struct {
+        \\    scope: *Snapshot,
+        \\    fn deinit(self: *Usage) void { self.scope.release(); }
+        \\};
+        \\fn duplicate(source: Usage) !Usage {
+        \\    var usage = source;
+        \\    errdefer usage.deinit();
+        \\    errdefer usage.deinit();
+        \\    return error.Failure;
+        \\}
+    );
+}
 
 test "ref-counted-copy-without-dupe: .name = other.name fires (with lifecycle evidence)" {
     try testing.expectFires(check, R,
@@ -3424,6 +4851,7 @@ test "ref-counted-copy-without-dupe: a whole owning handle returned by value is 
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    // Copying the handle without acquiring a second reference
         \\    // means both sides decrement on drop.
         \\    return source;
@@ -3464,6 +4892,7 @@ test "ref-counted-copy-without-dupe: a whole copy that acquires its own referenc
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.ref.retain();
         \\    return source;
         \\}
@@ -3546,6 +4975,7 @@ test "ref-counted-copy-without-dupe: a whole copy of a value-typed owner is repo
         \\};
         \\
         \\pub fn copy(source: Store) Store {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -3605,6 +5035,7 @@ test "ref-counted-copy-without-dupe: a lease that writes through a borrowed hand
         \\};
         \\
         \\pub fn extend(lease: Lease) Lease {
+        \\    defer @constCast(&lease).release();
         \\    return lease;
         \\}
         \\
@@ -3680,6 +5111,7 @@ test "ref-counted-copy-without-dupe: one duplicated handle is one report, at the
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref();
         \\    const alias = source;
         \\    return alias;
         \\}
@@ -3889,6 +5321,8 @@ test "ref-counted-copy-without-dupe: a whole copy that acquires only the first-d
     // twice.  The one finding names the field left unacquired.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    source.ref.retain();
         \\    return source;
         \\}
@@ -3908,6 +5342,8 @@ test "ref-counted-copy-without-dupe: the same copy is reported whichever owning 
     // the declaration order, naming `ref` this time.
     const src = two_owners_tail_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    source.tail.retain();
         \\    return source;
         \\}
@@ -3929,6 +5365,8 @@ test "ref-counted-copy-without-dupe: a whole copy that acquires only the second-
     // still reported.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    source.tail.retain();
         \\    return source;
         \\}
@@ -3948,6 +5386,8 @@ test "ref-counted-copy-without-dupe: a whole copy that acquires neither owning f
     // same defect seen from another field, not a second defect.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    return source;
         \\}
         \\
@@ -3961,6 +5401,8 @@ test "ref-counted-copy-without-dupe: a whole copy that acquires every owning fie
     // what the two holders own.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    source.ref.retain();
         \\    source.tail.retain();
         \\    return source;
@@ -3977,6 +5419,8 @@ test "ref-counted-copy-without-dupe: acquires on another source do not balance t
     // field duplicates nothing here, so the copy stays reported.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared, alias: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    alias.ref.retain();
         \\    alias.tail.retain();
         \\    return source;
@@ -4080,6 +5524,7 @@ test "ref-counted-copy-without-dupe: an acquire on a member of the field does no
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.handle.ref.retain();
         \\    return source;
         \\}
@@ -4099,6 +5544,8 @@ test "ref-counted-copy-without-dupe: an acquire name taken as a value does not b
     // copy is still reported on the field that was not.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    const keep = source.ref.retain;
         \\    _ = keep;
         \\    source.tail.retain();
@@ -4153,6 +5600,7 @@ test "ref-counted-copy-without-dupe: a member named after the parameter does not
         \\};
         \\
         \\pub fn copy(source: Shared, wrapper: Wrapper) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    wrapper.source.?.retain();
         \\    return source;
         \\}
@@ -4171,6 +5619,7 @@ test "ref-counted-copy-without-dupe: an optional field acquired through its unwr
     // `self.f.?.release(…)`.  One per field the handle hands back.
     const src = optional_two_owners ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.ref.?.retain();
         \\    source.tail.?.retain();
         \\    return source;
@@ -4185,6 +5634,7 @@ test "ref-counted-copy-without-dupe: an unwrap acquire on one optional field lea
     // one: `ref` is still two owners after the copy.
     const src = optional_two_owners ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.tail.?.retain();
         \\    return source;
         \\}
@@ -4201,6 +5651,7 @@ test "ref-counted-copy-without-dupe: an unwrap acquire on one optional field lea
 test "ref-counted-copy-without-dupe: an unwrap acquire on another source does not balance this copy" {
     const src = optional_two_owners ++
         \\pub fn copy(source: Shared, alias: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    alias.ref.?.retain();
         \\    alias.tail.?.retain();
         \\    return source;
@@ -4220,6 +5671,7 @@ test "ref-counted-copy-without-dupe: a field acquired through a local bound from
     // it, so nothing can shadow, rebind or skip between them.
     const src = optional_two_owners ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    const r = source.ref.?;
         \\    r.retain();
         \\    const t = source.tail.?;
@@ -4236,6 +5688,7 @@ test "ref-counted-copy-without-dupe: a local bound inside a branch does not bala
     // read as one that certainly reaches the copy.
     const src = optional_two_owners ++
         \\pub fn copy(source: Shared, verbose: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    if (verbose) {
         \\        const r = source.ref.?;
         \\        r.retain();
@@ -4259,6 +5712,7 @@ test "ref-counted-copy-without-dupe: a local bound from another value does not b
     // duplicates.
     const src = optional_two_owners ++
         \\pub fn copy(source: Shared, alias: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    const r = alias.ref.?;
         \\    r.retain();
         \\    const t = alias.tail.?;
@@ -4318,6 +5772,7 @@ test "ref-counted-copy-without-dupe: an allocator passed as an argument is not a
         \\};
         \\
         \\pub fn copy(source: Handle) Handle {
+        \\    defer @constCast(&source).deinit();
         \\    source.data.?.retain();
         \\    return source;
         \\}
@@ -4365,6 +5820,7 @@ test "ref-counted-copy-without-dupe: a pointee destroyed through a sibling field
     // field into a borrowed one.
     const src = sibling_destroy_owner ++
         \\pub fn copy(source: Owner) Owner {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -4769,6 +6225,8 @@ test "ref-counted-copy-without-dupe: the reported method is the one that hands t
     // is the method a reader has to open.
     const src = two_owners_ref_first ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
+        \\    defer @constCast(&source).drop(undefined);
         \\    source.ref.retain();
         \\    return source;
         \\}
@@ -4824,6 +6282,7 @@ test "ref-counted-copy-without-dupe: a wrapper handle is balanced by an acquire 
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.doc.ref.retain();
         \\    return source;
         \\}
@@ -4880,6 +6339,7 @@ test "ref-counted-copy-without-dupe: a wrapper that also stores borrowed metadat
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.doc.ref.retain();
         \\    return source;
         \\}
@@ -4923,6 +6383,7 @@ test "ref-counted-copy-without-dupe: a nested resource of its own does not balan
         \\};
         \\
         \\pub fn copy(source: Handle) Handle {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.handle.ref.?.retain();
         \\    return source;
         \\}
@@ -4990,6 +6451,7 @@ test "ref-counted-copy-without-dupe: a whole copy reports the destroyed pointee,
     // declaration never gives back.
     const src = allocator_first_owner ++
         \\pub fn copy(source: Owner) Owner {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5018,6 +6480,7 @@ test "ref-counted-copy-without-dupe: an acquire does not balance a descriptor th
     // nothing asks for an acquire on it either.
     const src = allocator_first_owner ++
         \\pub fn copy(source: Owner) Owner {
+        \\    defer @constCast(&source).deinit();
         \\    source.name.retain();
         \\    return source;
         \\}
@@ -5079,6 +6542,7 @@ test "ref-counted-copy-without-dupe: a handle that releases through a reference 
     // the field the copy hands over as an argument.
     const src = protocol_release_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    source.name.retain();
         \\    return source;
         \\}
@@ -5126,6 +6590,7 @@ test "ref-counted-copy-without-dupe: a callee that frees its own receiver owns t
     // the finding names.
     const src = receiver_free_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5164,6 +6629,7 @@ test "ref-counted-copy-without-dupe: an allocator spelled through an alias still
         \\};
         \\
         \\pub fn copy(source: Owner) Owner {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5217,6 +6683,7 @@ test "ref-counted-copy-without-dupe: an owning receiver reached through a local 
     // copy duplicates.
     const src = aliased_receiver_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5274,6 +6741,7 @@ test "ref-counted-copy-without-dupe: an owning receiver that frees nested storag
     // holding one is not holding a second owner of anything.
     const src = nested_receiver_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5348,6 +6816,7 @@ test "ref-counted-copy-without-dupe: a whole copy whose teardown is forwarded sa
     // stays charged either way; only the reason is unread.
     const src = forwarded_free_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5514,6 +6983,7 @@ test "ref-counted-copy-without-dupe: a callee that destroys the value it is pass
     // after `name`, and stays out of it: the registry is the mechanism.
     const src = argument_payer_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5537,6 +7007,7 @@ test "ref-counted-copy-without-dupe: an acquire cannot silence a copy the callee
     // silence a real double free.
     const src = argument_payer_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    source.name.retain();
         \\    return source;
         \\}
@@ -5599,6 +7070,7 @@ test "ref-counted-copy-without-dupe: a callee that forwards the value it is pass
     // side rather than quieting the receiver by a guess.
     const src = forwarded_argument_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5711,6 +7183,7 @@ test "ref-counted-copy-without-dupe: an acquire cannot silence a copy whose forw
     // the reference this copy duplicates.
     const src = forwarded_argument_beside_freed_receiver ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    source.other_ref.retain();
         \\    return source;
         \\}
@@ -5763,6 +7236,7 @@ test "ref-counted-copy-without-dupe: a destroy through a pointer to the standard
     // side a second owner really would double free.
     const src = pointer_allocator_owner ++
         \\pub fn copy(source: Owner) Owner {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5814,6 +7288,7 @@ test "ref-counted-copy-without-dupe: a heap allocator descriptor this handle own
     // points at.
     const src = pointer_allocator_destroyed ++
         \\pub fn copy(source: Owner) Owner {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5872,6 +7347,7 @@ test "ref-counted-copy-without-dupe: a pointer to the allocator handed to a call
     // the finding names it.
     const src = pointer_allocator_argument ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5919,6 +7395,7 @@ test "ref-counted-copy-without-dupe: a callee this file does not declare keeps t
     // the one the finding names.
     const src = undeclared_callee_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -5939,6 +7416,7 @@ test "ref-counted-copy-without-dupe: an acquire cannot silence a copy whose tear
     // it as one would declare the copied pointer borrowed.
     const src = undeclared_callee_owner ++
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    source.node.retain();
         \\    return source;
         \\}
@@ -5995,6 +7473,7 @@ test "ref-counted-copy-without-dupe: a static allocator callback is not a field 
         \\}
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    return source;
         \\}
         \\
@@ -6060,6 +7539,7 @@ test "ref-counted-copy-without-dupe: an owning receiver behind an import owns th
         \\};
         \\
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
@@ -6078,13 +7558,14 @@ test "ref-counted-copy-without-dupe: an owning receiver behind an import owns th
         \\};
         \\
         \\pub fn copy(source: Holder) Holder {
+        \\    defer @constCast(&source).deinit();
         \\    return source;
         \\}
         \\
     });
     const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(directory);
-    var project = project_cache_mod.ProjectCache.init(gpa, io);
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
     defer project.deinit();
     const cases = .{ .{ "resolved.zig", "`.node`" }, .{ "unresolved.zig", "`.node`" } };
     inline for (cases) |case| {
@@ -6189,6 +7670,7 @@ test "ref-counted-copy-without-dupe: a teardown with ten derived captures is rea
     // on the floor.
     const src = many_derived_captures ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).teardown(undefined);
         \\    return source;
         \\}
         \\
@@ -6239,6 +7721,7 @@ test "ref-counted-copy-without-dupe: a name reused by a later scope is read as t
         \\};
         \\
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).teardown(undefined);
         \\    return source;
         \\}
         \\
@@ -6267,6 +7750,7 @@ test "ref-counted-copy-without-dupe: a deferred conditional acquire does not bal
     // precedes the call.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    defer if (keep) source.ref.retain();
         \\    return source;
         \\}
@@ -6285,6 +7769,7 @@ test "ref-counted-copy-without-dupe: a deferred acquire in a block does not bala
     // when the scope exits rather than before the return.
     const src = single_owner ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    defer {
         \\        source.ref.retain();
         \\    }
@@ -6301,6 +7786,7 @@ test "ref-counted-copy-without-dupe: the same acquire written where it runs does
     // so nothing is missing and nothing is reported.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    _ = keep;
         \\    source.ref.retain();
         \\    return source;
@@ -6333,6 +7819,7 @@ test "ref-counted-copy-without-dupe: an acquire inside an if does not balance th
     // parameter and the copy already agreed on.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    if (keep) source.ref.retain();
         \\    return source;
         \\}
@@ -6347,6 +7834,7 @@ test "ref-counted-copy-without-dupe: an acquire in the branch the copy is writte
     // missing — and neither arm's acquire answers for the other.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    if (keep) {
         \\        source.ref.retain();
         \\        return source;
@@ -6366,6 +7854,7 @@ test "ref-counted-copy-without-dupe: an acquire in one arm does not balance the 
     // copies without acquiring is one finding of its own.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    if (keep) {
         \\        source.ref.retain();
         \\        return source;
@@ -6388,6 +7877,7 @@ test "ref-counted-copy-without-dupe: an acquire at the top of the body reaches a
     // either copy, so neither is missing its second reference.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    source.ref.retain();
         \\    if (keep) return source;
         \\    return source;
@@ -6405,6 +7895,7 @@ test "ref-counted-copy-without-dupe: an acquire in a loop body does not balance 
     // INSIDE the loop and silence it again.
     const src = single_owner ++
         \\pub fn copy(source: Shared, count: usize) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    var i: usize = 0;
         \\    while (i < count) : (i += 1) {
         \\        source.ref.retain();
@@ -6422,6 +7913,7 @@ test "ref-counted-copy-without-dupe: a copy inside the loop body is reached by t
     // both of them are written inside.
     const src = single_owner ++
         \\pub fn copy(source: Shared, count: usize) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    var i: usize = 0;
         \\    while (i < count) : (i += 1) {
         \\        source.ref.retain();
@@ -6440,6 +7932,7 @@ test "ref-counted-copy-without-dupe: an acquire in a for body does not balance t
     // in front of it.
     const src = single_owner ++
         \\pub fn copy(source: Shared, items: []const u8) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    for (items) |byte| {
         \\        _ = byte;
         \\        source.ref.retain();
@@ -6457,6 +7950,7 @@ test "ref-counted-copy-without-dupe: an acquire in one switch prong does not bal
     // prong each is written in differs.
     const src = single_owner ++
         \\pub fn copy(source: Shared, mode: u8) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    switch (mode) {
         \\        0 => {
         \\            source.ref.retain();
@@ -6479,6 +7973,7 @@ test "ref-counted-copy-without-dupe: a copy inside the prong that retained is qu
     // is, inside one prong of the same switch, has its second reference.
     const src = single_owner ++
         \\pub fn copy(source: Shared, mode: u8) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    switch (mode) {
         \\        0 => {
         \\            source.ref.retain();
@@ -6500,6 +7995,7 @@ test "ref-counted-copy-without-dupe: an acquire in a catch payload does not bala
         \\    return 1;
         \\}
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    const n = read() catch {
         \\        source.ref.retain();
         \\        return source;
@@ -6518,6 +8014,7 @@ test "ref-counted-copy-without-dupe: an acquire in an else-if arm does not balan
     // through to the copy with nothing acquired.
     const src = single_owner ++
         \\pub fn copy(source: Shared, keep: bool, extra: bool) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    if (!keep) {
         \\        unreachable;
         \\    } else if (extra) {
@@ -6536,6 +8033,7 @@ test "ref-counted-copy-without-dupe: an acquire in a plain block still reaches t
     // as conditional would report copies this rule must leave alone.
     const src = single_owner ++
         \\pub fn copy(source: Shared) Shared {
+        \\    defer @constCast(&source).deref(undefined);
         \\    {
         \\        source.ref.retain();
         \\    }
@@ -6684,7 +8182,7 @@ test "ref-counted-copy-without-dupe: an imported owner is charged and an importe
     });
     const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(directory);
-    var project = project_cache_mod.ProjectCache.init(gpa, io);
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
     defer project.deinit();
     const cases = .{ .{ "owned.zig", @as(usize, 2) }, .{ "borrowed.zig", @as(usize, 0) } };
     inline for (cases) |case| {
@@ -6713,4 +8211,1171 @@ test "ref-counted-copy-without-dupe: an imported owner is charged and an importe
             try std.testing.expect(std.mem.indexOf(u8, problem.message, "`.slot`") != null);
         }
     }
+}
+
+test "ref-counted-copy-without-dupe: allocator capability used for a temporary free is copied by value" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Oracle = struct {
+        \\    capability: std.mem.Allocator,
+        \\    fn itemsPath(self: *Oracle) ![]u8 {
+        \\        const path = try self.capability.dupe(u8, "path");
+        \\        errdefer self.capability.free(path);
+        \\        return path;
+        \\    }
+        \\};
+        \\pub fn copy(source: Oracle) Oracle {
+        \\    return .{ .capability = source.capability };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: an optional allocator descriptor is still owned when destroyed" {
+    const src =
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    descriptor: ?*std.mem.Allocator,
+        \\    capability: std.mem.Allocator,
+        \\    fn deinit(self: *Owner) void {
+        \\        if (self.descriptor != null) self.capability.destroy(self.descriptor.?);
+        \\    }
+        \\};
+        \\pub fn copy(source: Owner) Owner { defer @constCast(&source).deinit(); return source; }
+    ;
+    var problems = try testing.runRuleTyped(std.testing.allocator, check, src);
+    defer testing.freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, problems.items[0].message, "`.descriptor`") != null);
+}
+
+test "ref-counted-copy-without-dupe: address of empty slice disarms a moved buffer" {
+    const prefix =
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    owned: []u8,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Owner) void {
+        \\        if (self.owned.len != 0) self.allocator.free(self.owned);
+        \\    }
+        \\};
+    ;
+    try testing.expectNoFire(check, prefix ++
+        \\fn move(allocator: std.mem.Allocator) !Owner {
+        \\    var expanded: Owner = .{ .owned = try allocator.alloc(u8, 4), .allocator = allocator };
+        \\    errdefer expanded.deinit();
+        \\    const pending: Owner = .{ .owned = expanded.owned, .allocator = expanded.allocator };
+        \\    expanded.owned = &.{};
+        \\    return pending;
+        \\}
+    );
+    try testing.expectFires(check, R, prefix ++
+        \\fn copy(expanded: *Owner, clear: bool) Owner {
+        \\    const pending: Owner = .{ .owned = expanded.owned, .allocator = expanded.allocator };
+        \\    if (clear) expanded.owned = &.{};
+        \\    return pending;
+        \\}
+    );
+    try testing.expectFires(check, R, prefix ++
+        \\fn copy(expanded: *Owner) Owner {
+        \\    const pending: Owner = .{ .owned = expanded.owned, .allocator = expanded.allocator };
+        \\    expanded.owned = &.{1};
+        \\    return pending;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: foreign mixed teardown preserves allocator capability identity" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\const foreign = @import("context.zig");
+        \\fn copy(old: foreign.Context) foreign.Context {
+        \\    return .{ .allocator = old.allocator };
+        \\}
+    ;
+    const foreign: [:0]const u8 =
+        \\const std = @import("std");
+        \\pub const Context = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    words: std.ArrayList(u8),
+        \\    buffer: ?[]u8,
+        \\    fn deinit(self: *Context) void {
+        \\        self.words.deinit(self.allocator);
+        \\        if (self.buffer) |bytes| self.allocator.free(bytes);
+        \\    }
+        \\};
+        \\pub const OwnedDescriptor = struct {
+        \\    allocator: *std.mem.Allocator,
+        \\    capability: std.mem.Allocator,
+        \\    fn deinit(self: *OwnedDescriptor) void { self.capability.destroy(self.allocator); }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    var foreign_tree = try Ast.parse(gpa, foreign, .zig);
+    defer foreign_tree.deinit(gpa);
+    var cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    var foreign_cache = file_cache_mod.FileCache.init(gpa, &foreign_tree);
+    defer foreign_cache.deinit();
+    const model = try foreign_cache.fileModel();
+    const context: DestType = .{ .tree = &foreign_tree, .info = model.findType("Context").? };
+    try std.testing.expect((try verdictOnField(&cache, context, "allocator")) == .borrowed);
+    const descriptor: DestType = .{ .tree = &foreign_tree, .info = model.findType("OwnedDescriptor").? };
+    const verdict = try verdictOnField(&cache, descriptor, "allocator");
+    try std.testing.expect(verdict == .owned);
+    try std.testing.expectEqual(Payload.destroyed_argument, verdict.owned);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "context.zig", .data = foreign });
+    try tmp.dir.writeFile(io, .{ .sub_path = "capability.zig", .data = source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "descriptor.zig", .data =
+        \\const foreign = @import("context.zig");
+        \\fn copy(old: foreign.OwnedDescriptor) foreign.OwnedDescriptor {
+        \\    return .{ .allocator = old.allocator, .capability = old.capability };
+        \\}
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
+    defer project.deinit();
+    const cases = .{ .{ "capability.zig", @as(usize, 0) }, .{ "descriptor.zig", @as(usize, 1) } };
+    inline for (cases) |case| {
+        const path = try std.fs.path.join(gpa, &.{ directory, case[0] });
+        defer gpa.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+        defer gpa.free(bytes);
+        const src_z = try gpa.dupeSentinel(u8, bytes, 0);
+        defer gpa.free(src_z);
+        var caller_tree = try Ast.parse(gpa, src_z, .zig);
+        defer caller_tree.deinit(gpa);
+        var caller_cache = file_cache_mod.FileCache.init(gpa, &caller_tree);
+        defer caller_cache.deinit();
+        caller_cache.setProject(&project, path);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer testing.freeProblems(gpa, &problems);
+        try check(gpa, &caller_tree, &caller_cache, &config_mod.Default, &problems);
+        try std.testing.expectEqual(case[1], problems.items.len);
+        for (problems.items) |problem| try std.testing.expectEqualStrings(R, problem.rule_id);
+    }
+}
+
+test "refcount source admission preserves count boundaries without narrowing" {
+    const max = std.math.maxInt(u32);
+    try std.testing.expectEqual(max, try admittedTokenCount(max - 1, max, max));
+    try std.testing.expectError(error.SourceTooWide, admittedTokenCount(max, 1, 1));
+    if (@bitSizeOf(usize) > 32) {
+        const beyond: usize = @as(usize, max) + 1;
+        try std.testing.expectError(error.SourceTooWide, admittedTokenCount(1, beyond, 1));
+        try std.testing.expectError(error.SourceTooWide, admittedTokenCount(1, 1, beyond));
+    }
+}
+
+const slice_handoff_prelude =
+    \\const std = @import("std");
+    \\const Buffer = struct {
+    \\    indexes: []u32,
+    \\    count: usize = 0,
+    \\    fn acquire(gpa: std.mem.Allocator) !Buffer { return .{ .indexes = try gpa.alloc(u32, 4) }; }
+    \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+    \\    fn finish(self: *Buffer) !void {
+    \\        if (self.count >= self.indexes.len) return error.Full;
+    \\        self.indexes[self.count] = 0;
+    \\    }
+    \\};
+    \\const Output = struct {
+    \\    indexes: []u32,
+    \\    count: usize = 0,
+    \\    fn deinit(self: *Output, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+    \\};
+    \\
+;
+
+test "ref-counted-copy-without-dupe: a fresh slice wrapper transfers on success only" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    try source.finish();
+        \\    return .{ .indexes = source.indexes, .count = source.count };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a temporary slice wrapper never tears down the owner's slice" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\pub fn finish(source: *Output) !void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    try temporary.finish();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: optional take removes the owning slot before the slice handoff" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\const Owner = struct {
+        \\    slot: ?Buffer,
+        \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        if (self.slot) |*slot| slot.deinit(gpa);
+        \\    }
+        \\    fn take(self: *Owner) Output {
+        \\        const source = self.slot.?;
+        \\        self.slot = null;
+        \\        return .{ .indexes = source.indexes };
+        \\    }
+        \\};
+    );
+}
+
+test "ref-counted-copy-without-dupe: unconditional source teardown overlaps slice return" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    defer source.deinit(gpa);
+        \\    return .{ .indexes = source.indexes };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: temporary slice teardown duplicates the owner" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\pub fn finish(source: *Output, gpa: std.mem.Allocator) !void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    defer temporary.deinit(gpa);
+        \\    try temporary.finish();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: error cleanup on both slice wrappers overlaps" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    var result: Output = .{ .indexes = source.indexes };
+        \\    errdefer result.deinit(gpa);
+        \\    try source.finish();
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: an optional owner kept live still duplicates its slice" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\const Owner = struct {
+        \\    slot: ?Buffer,
+        \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        if (self.slot) |*slot| slot.deinit(gpa);
+        \\    }
+        \\    fn take(self: *Owner) Output {
+        \\        const source = self.slot.?;
+        \\        return .{ .indexes = source.indexes };
+        \\    }
+        \\};
+    );
+}
+
+test "ref-counted-copy-without-dupe: opaque source calls with proved cleanup still overlap" {
+    // An unread helper alone was the old, invalid reporting oracle.
+    // The unconditional cleanup now proves the overlap independently.
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\extern fn observe(source: *Buffer) void;
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    observe(&source);
+        \\    defer source.deinit(gpa);
+        \\    return .{ .indexes = source.indexes };
+        \\}
+    );
+}
+
+/// Assert an unsafe ownership use, not the number of aliases the rule reports.
+fn expectOwnershipOverlap(src: []const u8, use: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check, src);
+    defer testing.freeProblems(gpa, &problems);
+    const first = std.mem.indexOf(u8, src, use) orelse return error.MissingOwnershipUse;
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, R) and
+            problem.start.byte >= first and problem.start.byte < first + use.len) return;
+    }
+    return error.MissingOwnershipOverlap;
+}
+
+test "ref-counted-copy-without-dupe: a second returned slice alias is not a single handoff" {
+    try expectOwnershipOverlap(slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator) !struct { first: Output, second: Output } {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    return .{
+        \\        .first = .{ .indexes = source.indexes },
+        \\        .second = .{ .indexes = source.indexes },
+        \\    };
+        \\}
+    , ".second = .{ .indexes = source.indexes }");
+}
+
+test "ref-counted-copy-without-dupe: error-only source cleanup stays disjoint from a local returned slice owner" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    const result: Output = .{ .indexes = source.indexes };
+        \\    try source.finish();
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a slice temporary method that frees cannot masquerade as finish" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    indexes: []u32,
+        \\    fn finish(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+        \\};
+        \\const Output = struct {
+        \\    indexes: []u32,
+        \\    fn deinit(self: *Output, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+        \\};
+        \\pub fn finish(source: *Output, gpa: std.mem.Allocator) void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    temporary.finish(gpa);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: opaque temporary calls with proved cleanup still overlap" {
+    // Unknown helper effects cannot establish an owning temporary.
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\extern fn observe(temporary: *Buffer) void;
+        \\pub fn finish(source: *Output, gpa: std.mem.Allocator) void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    observe(&temporary);
+        \\    defer temporary.deinit(gpa);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: conditional or restored optional slots retain slice ownership" {
+    inline for (.{
+        "if (clear) self.slot = null;",
+        "self.slot = null; self.slot = source;",
+    }) |reset| {
+        try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+            \\const Owner = struct {
+            \\    slot: ?Buffer,
+            \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+            \\        if (self.slot) |*slot| slot.deinit(gpa);
+            \\    }
+            \\    fn take(self: *Owner, clear: bool) Output {
+            \\        const source = self.slot.?;
+            \\
+        ++ reset ++
+            \\
+            \\        return .{ .indexes = source.indexes };
+            \\    }
+            \\};
+        );
+    }
+}
+
+const argument_view_prelude =
+    \\const std = @import("std");
+    \\const Data = struct {
+    \\    bytes: []u8,
+    \\    fn deinit(self: *Data, gpa: std.mem.Allocator) void { gpa.free(self.bytes); }
+    \\};
+    \\const Plan = struct {
+    \\    data: *Data,
+    \\    fn deinit(self: *Plan, gpa: std.mem.Allocator) void {
+    \\        self.data.deinit(gpa);
+    \\        gpa.destroy(self.data);
+    \\    }
+    \\};
+    \\const View = struct { data: ?*const Data = null };
+    \\
+;
+
+test "ref-counted-copy-without-dupe: anonymous borrowed view argument uses its callee parameter" {
+    try testing.expectNoFireTyped(check, argument_view_prelude ++
+        \\fn emit(gpa: std.mem.Allocator, view: View) ![]u8 {
+        \\    return gpa.dupe(u8, view.data.?.bytes);
+        \\}
+        \\pub fn borrow(gpa: std.mem.Allocator, plan: *const Plan) ![]u8 {
+        \\    return emit(gpa, .{ .data = plan.data });
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: method argument destination accounts for the implicit receiver" {
+    try testing.expectNoFireTyped(check, argument_view_prelude ++
+        \\const Emitter = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    fn emit(self: *const Emitter, marker: u32, view: View) ![]u8 {
+        \\        _ = marker;
+        \\        return self.gpa.dupe(u8, view.data.?.bytes);
+        \\    }
+        \\};
+        \\pub fn borrow(emitter: *const Emitter, plan: *const Plan) ![]u8 {
+        \\    return emitter.emit(1, .{ .data = plan.data });
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: qualified static callee does not skip its first parameter" {
+    try testing.expectNoFireTyped(check, argument_view_prelude ++
+        \\const Emitter = struct {
+        \\    fn emit(view: View, marker: u32) usize {
+        \\        _ = marker;
+        \\        return view.data.?.bytes.len;
+        \\    }
+        \\};
+        \\pub fn borrow(plan: *const Plan) usize {
+        \\    return Emitter.emit(.{ .data = plan.data }, 1);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: an owning argument destination retains its cleanup obligation" {
+    try testing.expectFiresTyped(check, R, argument_view_prelude ++
+        \\fn consume(gpa: std.mem.Allocator, owned: Plan) void {
+        \\    var value = owned;
+        \\    value.deinit(gpa);
+        \\}
+        \\pub fn copy(gpa: std.mem.Allocator, plan: *const Plan) void {
+        \\    consume(gpa, .{ .data = plan.data });
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: unresolved and untyped argument destinations stay charged" {
+    inline for (.{
+        "fn emit(view: anytype) void { _ = view; }\n",
+        "",
+    }) |callee| {
+        try testing.expectFiresTyped(check, R, argument_view_prelude ++ callee ++
+            \\pub fn copy(plan: *const Plan) void {
+            \\    emit(.{ .data = plan.data });
+            \\}
+        );
+    }
+}
+
+test "ref-counted-copy-without-dupe: a nested argument literal cannot inherit the outer view type" {
+    try testing.expectFiresTyped(check, R, argument_view_prelude ++
+        \\const Envelope = struct { nested: Plan };
+        \\fn emit(value: Envelope) void { _ = value; }
+        \\pub fn copy(plan: *const Plan) void {
+        \\    emit(.{ .nested = .{ .data = plan.data } });
+        \\}
+    );
+}
+
+const whole_handoff_owner =
+    \\const std = @import("std");
+    \\const Buffer = struct {
+    \\    bytes: []u8 = &.{},
+    \\    count: usize = 0,
+    \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.bytes); }
+    \\    fn extract(self: *Buffer) Buffer {
+    \\        const result = self.*;
+    \\        self.* = .{};
+    \\        return result;
+    \\    }
+    \\};
+;
+
+test "ref-counted-copy-without-dupe: scalar reads do not duplicate the sole local owner" {
+    try testing.expectNoFireTyped(check, whole_handoff_owner ++
+        \\pub fn consume(gpa: std.mem.Allocator, source: Buffer) usize {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return owned.count;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a structurally disarming method permits deferred cleanup" {
+    try testing.expectNoFireTyped(check, whole_handoff_owner ++
+        \\pub fn transfer(gpa: std.mem.Allocator, source: Buffer) Buffer {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return owned.extract();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: nested disarming move and in-place append retain one local owner" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Environment = struct {
+        \\    values: std.ArrayList(u8) = .empty,
+        \\    fn extract(self: *Environment) Environment { const result = self.*; self.* = .{}; return result; }
+        \\    fn deinit(self: *Environment, gpa: std.mem.Allocator) void { self.values.deinit(gpa); self.* = undefined; }
+        \\};
+        \\const Path = struct {
+        \\    env: Environment,
+        \\    fn extract(self: *Path) Path { return .{ .env = self.env.extract() }; }
+        \\    fn deinit(self: *Path, gpa: std.mem.Allocator) void { self.env.deinit(gpa); self.* = undefined; }
+        \\};
+        \\pub fn consume(gpa: std.mem.Allocator, path: Path) !void {
+        \\    var owned = path;
+        \\    defer owned.deinit(gpa);
+        \\    try owned.env.values.append(gpa, 1);
+        \\}
+        \\pub fn transfer(gpa: std.mem.Allocator, path: Path) !Path {
+        \\    var owned = path;
+        \\    errdefer owned.deinit(gpa);
+        \\    try owned.env.values.append(gpa, 1);
+        \\    return owned.extract();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: move spelling without disarming does not prove a handoff" {
+    try testing.expectFiresTyped(check, R, whole_handoff_owner ++
+        \\fn move(source: *Buffer) Buffer { return source.*; }
+        \\pub fn duplicate(gpa: std.mem.Allocator, source: Buffer) Buffer {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return move(&owned);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R, whole_handoff_owner ++
+        \\pub fn duplicate(gpa: std.mem.Allocator, source: Buffer) Buffer {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return owned.opaqueValue();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a cleared move result cannot hide overlapping parameter cleanup" {
+    try testing.expectFiresTyped(check, R, whole_handoff_owner ++
+        \\pub fn duplicate(gpa: std.mem.Allocator, source: Buffer) Buffer {
+        \\    defer @constCast(&source).deinit(gpa);
+        \\    var owned = source;
+        \\    return owned.extract();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: orelse return and later transfer have exclusive ownership" {
+    try testing.expectNoFireTyped(check, whole_handoff_owner ++
+        \\fn transform(source: Buffer) Buffer { return source; }
+        \\pub fn choose(source: Buffer, change: ?u32) Buffer {
+        \\    const node = change orelse return source;
+        \\    _ = node;
+        \\    return transform(source);
+        \\}
+    );
+    try expectOwnershipOverlap(whole_handoff_owner ++
+        \\fn transform(source: Buffer) Buffer { return source; }
+        \\pub fn choose(gpa: std.mem.Allocator, source: Buffer, change: ?u32) Buffer {
+        \\    defer @constCast(&source).deinit(gpa);
+        \\    const node = change orelse return source;
+        \\    _ = node;
+        \\    return transform(source);
+        \\}
+    , "const node = change orelse return source;");
+    try expectOwnershipOverlap(whole_handoff_owner ++
+        \\fn publish(source: Buffer) void { _ = source; }
+        \\pub fn choose(source: Buffer, change: ?u32) Buffer {
+        \\    publish(source);
+        \\    const node = change orelse return source;
+        \\    _ = node;
+        \\    return source;
+        \\}
+    , "const node = change orelse return source;");
+}
+
+test "ref-counted-copy-without-dupe: imported argument destination retains its declaring scope" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "emitter.zig", .data =
+        \\const std = @import("std");
+        \\pub const Data = struct { bytes: []u8 };
+        \\pub const View = struct { data: ?*const Data = null };
+        \\pub const Owner = struct {
+        \\    data: *Data,
+        \\    pub fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.data.bytes);
+        \\        gpa.destroy(self.data);
+        \\    }
+        \\};
+        \\pub fn emit(gpa: std.mem.Allocator, view: View) ![]u8 {
+        \\    return gpa.dupe(u8, view.data.?.bytes);
+        \\}
+        \\pub fn consume(gpa: std.mem.Allocator, owner: Owner) void {
+        \\    var value = owner;
+        \\    value.deinit(gpa);
+        \\}
+    });
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const emitter = @import("emitter.zig");
+        \\const View = struct {
+        \\    data: *emitter.Data,
+        \\    fn deinit(self: *View, gpa: std.mem.Allocator) void { gpa.destroy(self.data); }
+        \\};
+        \\const Owner = struct { data: ?*const emitter.Data };
+        \\const Plan = struct {
+        \\    data: *emitter.Data,
+        \\    fn deinit(self: *Plan, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.data.bytes);
+        \\        gpa.destroy(self.data);
+        \\    }
+        \\};
+        \\pub fn borrow(gpa: std.mem.Allocator, plan: *const Plan) ![]u8 {
+        \\    return emitter.emit(gpa, .{ .data = plan.data });
+        \\}
+        \\pub fn duplicate(gpa: std.mem.Allocator, plan: *const Plan) void {
+        \\    emitter.consume(gpa, .{ .data = plan.data });
+        \\}
+    ;
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "caller.zig" });
+    defer gpa.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "caller.zig", .data = source });
+    const type_engine = @import("type_engine");
+    var context: type_engine.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: type_engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, source);
+    defer resolver.deinit();
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
+    defer project.deinit();
+    project.type_context = &context;
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.setProject(&project, path);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer testing.freeProblems(gpa, &problems);
+    try check(gpa, tree, &cache, &config_mod.Default, &problems);
+    try std.testing.expect(problems.items.len != 0);
+    const owned_copy = std.mem.indexOf(u8, source, "emitter.consume(gpa, .{").?;
+    var line: u32 = 1;
+    for (source[0..owned_copy]) |byte| {
+        if (byte == '\n') line += 1;
+    }
+    for (problems.items) |problem| {
+        try std.testing.expectEqualStrings(R, problem.rule_id);
+        try std.testing.expectEqual(line, problem.start.line);
+        try std.testing.expect(std.mem.indexOf(u8, problem.message, "`.data`") != null);
+    }
+}
+
+test "ref-counted-copy-without-dupe: borrowed source cannot replace an owning argument destination" {
+    try testing.expectFiresTyped(check, R, argument_view_prelude ++
+        \\const ReadOnly = struct { data: *Data };
+        \\fn consume(gpa: std.mem.Allocator, owned: Plan) void {
+        \\    var value = owned;
+        \\    value.deinit(gpa);
+        \\}
+        \\pub fn copy(gpa: std.mem.Allocator, source: *const ReadOnly) void {
+        \\    consume(gpa, .{ .data = source.data });
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: nested transfer clears an optional owning field before returning it" {
+    try testing.expectNoFireTyped(check, whole_handoff_owner ++
+        \\const Path = struct {
+        \\    env: Buffer,
+        \\    state: ?*u8 = null,
+        \\    fn extract(self: *Path) Path {
+        \\        const saved = self.state;
+        \\        self.state = null;
+        \\        return .{ .env = self.env.extract(), .state = saved };
+        \\    }
+        \\    fn deinit(self: *Path, gpa: std.mem.Allocator) void {
+        \\        self.env.deinit(gpa);
+        \\        if (self.state) |state| gpa.destroy(state);
+        \\    }
+        \\};
+        \\pub fn transfer(gpa: std.mem.Allocator, source: Path) Path {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return owned.extract();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: in-place method spelling cannot hide a second free" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn append(self: *Buffer, gpa: std.mem.Allocator, value: u8) void {
+        \\        _ = value;
+        \\        gpa.free(self.bytes);
+        \\    }
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.bytes); }
+        \\};
+        \\pub fn consume(gpa: std.mem.Allocator, source: Buffer) void {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    owned.append(gpa, 1);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a move that leaves one nested owner live still fires" {
+    try expectOwnershipOverlap(whole_handoff_owner ++
+        \\const Pair = struct {
+        \\    first: Buffer,
+        \\    second: Buffer,
+        \\    fn extract(self: *Pair) Pair {
+        \\        return .{ .first = self.first.extract(), .second = self.second };
+        \\    }
+        \\    fn deinit(self: *Pair, gpa: std.mem.Allocator) void {
+        \\        self.first.deinit(gpa);
+        \\        self.second.deinit(gpa);
+        \\    }
+        \\};
+        \\pub fn transfer(gpa: std.mem.Allocator, source: Pair) Pair {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return owned.extract();
+        \\}
+    , "return .{ .first = self.first.extract(), .second = self.second };");
+}
+
+test "ref-counted-copy-without-dupe: an independent reset is not inferred from a cached default" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\var storage: [1]u8 = .{0};
+        \\const Buffer = struct {
+        \\    bytes: []u8 = &storage,
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.bytes); }
+        \\    fn extract(self: *Buffer) Buffer {
+        \\        const result = self.*;
+        \\        self.* = .{};
+        \\        return result;
+        \\    }
+        \\};
+        \\pub fn transfer(gpa: std.mem.Allocator, source: Buffer) Buffer {
+        \\    var owned = source;
+        \\    defer owned.deinit(gpa);
+        \\    return owned.extract();
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: orelse return excludes a later call assigned to a local" {
+    try testing.expectNoFireTyped(check, whole_handoff_owner ++
+        \\fn transform(source: Buffer, node: u32) Buffer { _ = node; return source; }
+        \\pub fn choose(gpa: std.mem.Allocator, source: Buffer, change: ?u32) ?Buffer {
+        \\    const node = change orelse return source;
+        \\    var outcome = transform(source, node);
+        \\    defer outcome.deinit(gpa);
+        \\    return null;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R, whole_handoff_owner ++
+        \\fn transform(source: Buffer, node: u32) Buffer { _ = node; return source; }
+        \\pub fn choose(gpa: std.mem.Allocator, source: Buffer, change: ?u32) ?Buffer {
+        \\    const node = change orelse return source;
+        \\    var first = transform(source, node);
+        \\    defer first.deinit(gpa);
+        \\    var second = transform(source, node);
+        \\    defer second.deinit(gpa);
+        \\    return null;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: an error deferred empty reset does not disarm a successful copy" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.bytes); }
+        \\};
+        \\pub fn copy(source: *Buffer) !Buffer {
+        \\    const result: Buffer = .{ .bytes = source.bytes };
+        \\    errdefer source.bytes = &.{};
+        \\    return result;
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.bytes); }
+        \\};
+        \\pub fn take(source: *Buffer) Buffer {
+        \\    const result: Buffer = .{ .bytes = source.bytes };
+        \\    source.bytes = &.{};
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: deferred value reset is not an immediate transfer" {
+    try testing.expectFires(check, R,
+        \\const Ref = struct { fn deinit(self: *Ref) void { _ = self; } };
+        \\const Owner = struct {
+        \\    ref: Ref,
+        \\    fn deinit(self: *Owner) void { self.ref.deinit(); }
+        \\};
+        \\fn copy(source: *Owner) Owner {
+        \\    const result: Owner = .{ .ref = source.ref };
+        \\    defer source.ref = .{};
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: fallible exit before empty reset retains duplicate cleanup" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8,
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Owner) void { if (self.bytes.len != 0) self.gpa.free(self.bytes); }
+        \\};
+        \\fn maybeFail(fail: bool) !void { if (fail) return error.Bad; }
+        \\pub fn copy(source: *Owner, fail: bool) !Owner {
+        \\    errdefer source.deinit();
+        \\    var result: Owner = .{ .bytes = source.bytes, .gpa = source.gpa };
+        \\    errdefer result.deinit();
+        \\    try maybeFail(fail);
+        \\    source.bytes = &.{};
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a complete no-free slice method may still publish a second owner" {
+    inline for (.{ "", "self.indexes[0] = 0;" }) |before_publish| {
+        try testing.expectFiresTyped(check, R,
+            \\const std = @import("std");
+            \\const Output = struct {
+            \\    indexes: []u32,
+            \\    fn deinit(self: *Output, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+            \\};
+            \\var published: Output = undefined;
+            \\const Buffer = struct {
+            \\    indexes: []u32,
+            \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+            \\    fn publish(self: *Buffer, fail: bool) !void {
+            \\
+        ++ before_publish ++
+            \\
+            \\        published.indexes = self.indexes;
+            \\        if (fail) return error.Bad;
+            \\    }
+            \\};
+            \\pub fn duplicate(source: *Output, fail: bool) !void {
+            \\    var temporary: Buffer = .{ .indexes = source.indexes };
+            \\    try temporary.publish(fail);
+            \\}
+        );
+    }
+}
+
+test "ref-counted-copy-without-dupe: an aliased optional owner preserves a second snapshot cleanup" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\const Owner = struct {
+        \\    slot: ?Buffer,
+        \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        if (self.slot) |*slot| slot.deinit(gpa);
+        \\    }
+        \\    fn take(self: *Owner, gpa: std.mem.Allocator) Output {
+        \\        const alias = self;
+        \\        var duplicate = alias.slot.?;
+        \\        defer duplicate.deinit(gpa);
+        \\        const source = self.slot.?;
+        \\        self.slot = null;
+        \\        return .{ .indexes = source.indexes };
+        \\    }
+        \\};
+    );
+}
+
+test "ref-counted-copy-without-dupe: one error cleanup call can release the same slice twice" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\fn releaseBoth(a: *Buffer, b: *Buffer, gpa: std.mem.Allocator) void {
+        \\    a.deinit(gpa);
+        \\    b.deinit(gpa);
+        \\}
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer releaseBoth(&source, &source, gpa);
+        \\    try source.finish();
+        \\    return .{ .indexes = source.indexes };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a deferred optional clear is not a successful take" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\const Owner = struct {
+        \\    slot: ?Buffer,
+        \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        if (self.slot) |*slot| slot.deinit(gpa);
+        \\    }
+        \\    fn take(self: *Owner) Output {
+        \\        const source = self.slot.?;
+        \\        errdefer self.slot = null;
+        \\        return .{ .indexes = source.indexes };
+        \\    }
+        \\};
+    );
+}
+
+test "ref-counted-copy-without-dupe: an error cleanup body can release its one field twice" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    indexes: []u32,
+        \\    fn acquire(gpa: std.mem.Allocator) !Buffer {
+        \\        return .{ .indexes = try gpa.alloc(u32, 4) };
+        \\    }
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.indexes);
+        \\        gpa.free(self.indexes);
+        \\    }
+        \\};
+        \\const Output = struct {
+        \\    indexes: []u32,
+        \\    fn deinit(self: *Output, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+        \\};
+        \\pub fn transfer(gpa: std.mem.Allocator, fail: bool) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    if (fail) return error.Bad;
+        \\    return .{ .indexes = source.indexes };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a read-only scalar result can encode the slice address" {
+    // A scalar result's possible address dependency is not a publication
+    // certificate. Keep this unsafe case grounded in an explicit cleanup.
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Output = struct {
+        \\    indexes: []u32,
+        \\    fn deinit(self: *Output, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+        \\};
+        \\var published_address: usize = 0;
+        \\var published: Output = undefined;
+        \\const Buffer = struct {
+        \\    indexes: []u32,
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void { gpa.free(self.indexes); }
+        \\    fn address(self: *Buffer, fail: bool) !usize {
+        \\        if (fail) return error.Bad;
+        \\        return @intFromPtr(self.indexes.ptr);
+        \\    }
+        \\};
+        \\pub fn duplicate(source: *Output, fail: bool, gpa: std.mem.Allocator) !void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    defer temporary.deinit(gpa);
+        \\    published_address = try temporary.address(fail);
+        \\    published.indexes = @as([*]u32, @ptrFromInt(published_address))[0..source.indexes.len];
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: labeled break cannot skip source disarm" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8,
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Owner) void { if (self.bytes.len != 0) self.gpa.free(self.bytes); }
+        \\};
+        \\pub fn copy(source: *Owner, skip: bool) Owner {
+        \\    var result: Owner = undefined;
+        \\    blk: {
+        \\        result = Owner{ .bytes = source.bytes, .gpa = source.gpa };
+        \\        if (skip) break :blk;
+        \\        source.bytes = &.{};
+        \\    }
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: loop continue cannot skip source disarm" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8,
+        \\    gpa: std.mem.Allocator,
+        \\    fn deinit(self: *Owner) void { if (self.bytes.len != 0) self.gpa.free(self.bytes); }
+        \\};
+        \\pub fn copy(source: *Owner, skip: bool) Owner {
+        \\    var result: Owner = undefined;
+        \\    for ([_]bool{skip}) |step| {
+        \\        result = Owner{ .bytes = source.bytes, .gpa = source.gpa };
+        \\        if (step) continue;
+        \\        source.bytes = &.{};
+        \\    }
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: unknown helper effects do not prove a fresh slice has two owners" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\extern fn observe(source: *Buffer) void;
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    observe(&source);
+        \\    try source.finish();
+        \\    return .{ .indexes = source.indexes, .count = source.count };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: unknown helper cannot hide proved unconditional slice cleanup" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\extern fn observe(source: *Buffer) void;
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    observe(&source);
+        \\    defer source.deinit(gpa);
+        \\    return .{ .indexes = source.indexes, .count = source.count };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: optional take with opaque helper effects stays silent" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\extern fn observe(owner: *Owner) void;
+        \\const Owner = struct {
+        \\    slot: ?Buffer,
+        \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        if (self.slot) |*slot| slot.deinit(gpa);
+        \\    }
+        \\    fn take(self: *Owner) Output {
+        \\        observe(self);
+        \\        const source = self.slot.?;
+        \\        self.slot = null;
+        \\        return .{ .indexes = source.indexes, .count = source.count };
+        \\    }
+        \\};
+    );
+}
+
+test "ref-counted-copy-without-dupe: optional take with proved snapshot cleanup still reports" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\extern fn observe(owner: *Owner) void;
+        \\const Owner = struct {
+        \\    slot: ?Buffer,
+        \\    fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        if (self.slot) |*slot| slot.deinit(gpa);
+        \\    }
+        \\    fn take(self: *Owner, gpa: std.mem.Allocator) Output {
+        \\        observe(self);
+        \\        var source = self.slot.?;
+        \\        self.slot = null;
+        \\        defer source.deinit(gpa);
+        \\        return .{ .indexes = source.indexes, .count = source.count };
+        \\    }
+        \\};
+    );
+}
+
+test "ref-counted-copy-without-dupe: opaque temporary helper effects do not establish a destructor" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\extern fn observe(temporary: *Buffer) void;
+        \\pub fn finish(source: *Output) void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    observe(&temporary);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: opaque temporary helper cannot hide a proved destructor" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\extern fn observe(temporary: *Buffer) void;
+        \\pub fn finish(source: *Output, gpa: std.mem.Allocator) void {
+        \\    var temporary: Buffer = .{ .indexes = source.indexes };
+        \\    observe(&temporary);
+        \\    defer temporary.deinit(gpa);
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: freeing another helper argument does not prove source ownership overlap" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\fn finish(source: *Buffer, other: []u32, gpa: std.mem.Allocator) void {
+        \\    source.count = 1;
+        \\    gpa.free(other);
+        \\}
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    const other = try gpa.alloc(u32, 2);
+        \\    finish(&source, other, gpa);
+        \\    return .{ .indexes = source.indexes, .count = source.count };
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: a later success path free proves slice ownership overlap" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    errdefer source.deinit(gpa);
+        \\    const result: Output = .{ .indexes = source.indexes, .count = source.count };
+        \\    gpa.free(source.indexes);
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: scalar slice length aliases do not own storage" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\fn size(source: *Output) usize {
+        \\    const temporary: Buffer = .{ .indexes = source.indexes };
+        \\    const length = temporary.indexes.len;
+        \\    return length;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: opaque effects cannot hide two overlapping error cleanups" {
+    try testing.expectFiresTyped(check, R, slice_handoff_prelude ++
+        \\extern fn observe(source: *Buffer) void;
+        \\pub fn transfer(gpa: std.mem.Allocator, fail: bool) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    observe(&source);
+        \\    errdefer source.deinit(gpa);
+        \\    var result: Output = .{ .indexes = source.indexes };
+        \\    errdefer result.deinit(gpa);
+        \\    if (fail) return error.Bad;
+        \\    return result;
+        \\}
+    );
+}
+
+test "ref-counted-copy-without-dupe: error cleanups in completed sibling scopes do not overlap" {
+    try testing.expectNoFireTyped(check, slice_handoff_prelude ++
+        \\pub fn transfer(gpa: std.mem.Allocator, first: bool) !Output {
+        \\    var source = try Buffer.acquire(gpa);
+        \\    if (first) {
+        \\        errdefer source.deinit(gpa);
+        \\        try source.finish();
+        \\    } else {
+        \\        errdefer source.deinit(gpa);
+        \\        try source.finish();
+        \\    }
+        \\    return .{ .indexes = source.indexes, .count = source.count };
+        \\}
+    );
 }

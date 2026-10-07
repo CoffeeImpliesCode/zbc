@@ -75,17 +75,14 @@ pub fn check(
             // case for "lazy/optional sub-state").  The
             // overwrite-without-deinit rule covers the case where
             // someone DOES assign to the field without prior cleanup.
-            if (model.fieldIsOptionalNullDefault(outer.name, field.name)) continue;
+            if (model.fieldIsOptionalNullDefault(outer.qualified_name, field.name)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, field) orelse continue;
 
-            // Trivial-deinit skip: when the inner's `deinit` (or
-            // any cleanup-named method) is a no-op `_ = self; _ =
-            // allocator;` body, dropping it never leaks anything,
-            // regardless of whether the outer calls it.  Common
-            // for trait-uniform value types that conform to the
-            // `deinit(self, allocator)` signature for API
-            // uniformity but do no real cleanup.
-            if (!mq.anyNonTrivialCleanup(tree, inner_ti)) continue;
+            // Static cleanup-named functions (for example allocator
+            // vtable callbacks taking `ctx: *anyopaque`) are not
+            // destructors for the containing type. Require a
+            // model-recognized receiver.
+            if (!anyNonTrivialReceiverCleanup(tree, inner_ti)) continue;
 
             // Refcounted-inner skip: when the inner type uses
             // `bun.ptr.RefCount(@This(), ...)` machinery, its
@@ -176,6 +173,17 @@ pub fn check(
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
+}
+
+/// True iff `ti` has a non-trivial cleanup method that is modeled
+/// as an instance method. A static `free(ctx, bytes)` callback is an
+/// allocator interface function, not a composed value destructor.
+fn anyNonTrivialReceiverCleanup(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
+    for (ti.methods) |m| {
+        if (m.receiver == null or !method_names.isCleanupMethodName(m.name)) continue;
+        if (!tokens.isTrivialBody(tree, m.body_first, m.body_last)) return true;
+    }
+    return false;
 }
 
 /// True iff some method of `outer` OTHER than `deinit_method`
@@ -454,8 +462,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = problem.Pos.fromTokenStart(tree, field_tok),
-        .end = problem.Pos.fromTokenEnd(tree, field_tok),
+        .start = try problem.Pos.fromTokenStart(tree, field_tok),
+        .end = try problem.Pos.fromTokenEnd(tree, field_tok),
         .message = msg,
     });
 }
@@ -578,6 +586,39 @@ test "embedded-view: @fieldParentPtr in non-cleanup helper suppresses — no fir
         \\    }
         \\    pub fn deinit(this: *Ctx) void {
         \\        _ = this.parent().someField;
+        \\    }
+        \\};
+    );
+}
+
+test "skript regression: allocator free callback is not a composed destructor" {
+    try testing.expectNoFire(check,
+        \\const Callback = struct {
+        \\    pub fn free(ctx: *anyopaque, bytes: []u8) void {
+        \\        if (bytes.len != 0) _ = ctx;
+        \\    }
+        \\};
+        \\const Outer = struct {
+        \\    inner: Callback,
+        \\    pub fn deinit(self: *Outer) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    );
+}
+
+test "skript regression: receiver cleanup still requires outer deinit" {
+    try testing.expectFires(check, R,
+        \\const Resource = struct {
+        \\    fd: i32 = -1,
+        \\    pub fn free(self: *Resource) void {
+        \\        self.fd = -1;
+        \\    }
+        \\};
+        \\const Outer = struct {
+        \\    inner: Resource,
+        \\    pub fn deinit(self: *Outer) void {
+        \\        _ = self;
         \\    }
         \\};
     );

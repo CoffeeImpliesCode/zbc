@@ -32,11 +32,10 @@ const LocalId = state_mod.LocalId;
 /// already-reported site re-derives its message and re-reads the whole
 /// finding list to discover it is a duplicate.
 ///
-/// Identity is the pair the old scan compared — the rule and the byte
-/// its primary span starts at — so two reports agree exactly when they
-/// name one source operation, and a second rule or a second site at
-/// the same byte is still its own finding.  [Context] carries that
-/// comparison on the rule's bytes, never on a `Problem`'s raw bytes.
+/// Ordinary reports use the rule and primary source byte. Returned stack
+/// cells also carry the physical owner's declaration byte, so distinct
+/// owners at one return remain distinct findings. Context compares rule
+/// bytes, never message text or a Problem's raw representation.
 ///
 /// The rule id in a key is BORROWED, never copied.  A report's rule id
 /// is a `comptime` parameter, so it is a string literal with static
@@ -45,7 +44,7 @@ const LocalId = state_mod.LocalId;
 /// `Problem.deinit` never frees it.  Both outlive this memo, whose
 /// lifetime ends inside the `check` call that owns the list.
 pub const Seen = struct {
-    const Key = struct { rule_id: []const u8, byte: u32 };
+    const Key = struct { rule_id: []const u8, byte: u32, owner_byte: ?u32 = null };
 
     keys: std.ArrayHashMapUnmanaged(Key, void, Context, true) = .empty,
     /// Findings the caller already held, and whether they have been
@@ -66,14 +65,16 @@ pub const Seen = struct {
     /// together, which is what the scan's `std.mem.eql` did.
     const Context = struct {
         pub fn hash(_: Context, key: Key) u32 {
-            return @truncate(std.hash.Wyhash.hash(
+            const site_hash = std.hash.Wyhash.hash(
                 std.hash_map.hashString(key.rule_id),
                 std.mem.asBytes(&key.byte),
-            ));
+            );
+            const owner: u64 = if (key.owner_byte) |byte| @as(u64, byte) + 1 else 0;
+            return @truncate(std.hash.Wyhash.hash(site_hash, std.mem.asBytes(&owner)));
         }
 
         pub fn eql(_: Context, a: Key, b: Key, _: usize) bool {
-            return a.byte == b.byte and std.mem.eql(u8, a.rule_id, b.rule_id);
+            return a.byte == b.byte and a.owner_byte == b.owner_byte and std.mem.eql(u8, a.rule_id, b.rule_id);
         }
     };
 
@@ -93,6 +94,16 @@ pub const Seen = struct {
     /// silent one: reporting without the memo would hand back the same
     /// finding once per path state.
     pub fn record(self: *Seen, gpa: std.mem.Allocator, rule_id: []const u8, byte: u32) !bool {
+        try self.adoptExisting(gpa);
+        return self.put(gpa, rule_id, byte);
+    }
+
+    fn recordOwner(self: *Seen, gpa: std.mem.Allocator, rule_id: []const u8, byte: u32, owner_byte: u32) !bool {
+        try self.adoptExisting(gpa);
+        return self.putOwner(gpa, rule_id, byte, owner_byte);
+    }
+
+    fn adoptExisting(self: *Seen, gpa: std.mem.Allocator) !void {
         // The findings [adopt] was given are folded in HERE, on the
         // first diagnostic this run actually emits.  A function that
         // reports nothing never consults the memo, so it never pays to
@@ -107,11 +118,14 @@ pub const Seen = struct {
                 for (existing) |problem| _ = try self.put(gpa, problem.rule_id, problem.start.byte);
             }
         }
-        return self.put(gpa, rule_id, byte);
     }
 
     fn put(self: *Seen, gpa: std.mem.Allocator, rule_id: []const u8, byte: u32) !bool {
-        const slot = try self.keys.getOrPut(gpa, .{ .rule_id = rule_id, .byte = byte });
+        return self.putOwner(gpa, rule_id, byte, null);
+    }
+
+    fn putOwner(self: *Seen, gpa: std.mem.Allocator, rule_id: []const u8, byte: u32, owner_byte: ?u32) !bool {
+        const slot = try self.keys.getOrPut(gpa, .{ .rule_id = rule_id, .byte = byte, .owner_byte = owner_byte });
         if (slot.found_existing) return false;
         slot.value_ptr.* = {};
         return true;
@@ -157,29 +171,274 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             .local => |local| try state.facts.assumeBoolean(ctx.gpa, local, true, !ctx.locals[@intFromEnum(local)].address_taken),
             .not_local => |local| try state.facts.assumeBoolean(ctx.gpa, local, false, !ctx.locals[@intFromEnum(local)].address_taken),
         },
+        .indexed_read => |r| try transferIndexedRead(ctx, state, r, stmt.pos, stmt.end_pos),
+        .indexed_write => |w| try transferIndexedWrite(ctx, state, w, stmt.pos),
+        .counter_step => |s| try transferCounterStep(ctx, state, s),
+        .compare_assume => |comparison| {
+            // Bounds constrain existing values, not an uncertain operand.
+            // This gate does not require scalar identity for legacy counter
+            // or header terms; fixed array lengths are constant terms.
+            if (indexIsDefined(ctx, state, comparison.lhs) and
+                indexIsDefined(ctx, state, comparison.rhs))
+            {
+                state.feasible = try state.assumeComparison(ctx.gpa, comparison);
+            }
+        },
+        .scaled_index => |certificate| {
+            _ = try @import("bounded_prefix.zig").recordScaledIndex(ctx.gpa, state, certificate);
+        },
+        .array_complete => |complete| {
+            const write: @TypeOf(@as(StmtKind, undefined).indexed_write) = .{
+                .array = complete.array,
+                .index = .{ .constant = 0 },
+                .rhs_kind = .plain,
+                .defined = true,
+                .inputs = complete.inputs,
+                .selected_inputs = complete.selected_inputs,
+            };
+            if (!storageInputsAreCovered(ctx, state, &complete.inputs) or
+                !indexedRhsIsDefined(ctx, state, write, .plain))
+            {
+                if (storageInputsMayBeUndefined(ctx, state, &complete.inputs) or
+                    indexedRhsReadsUndefined(ctx, state, write, .plain)) return;
+                try state.unknown_values.put(ctx.gpa, complete.array, {});
+            } else _ = state.unknown_values.orderedRemove(complete.array);
+            try state.markArrayComplete(ctx.gpa, complete.array);
+        },
+        .array_range_complete => |range| try transferArrayRangeComplete(ctx, state, range),
+        .array_value => |value| {
+            var may_undefined = exprMayBeUndefined(ctx, state, value.source) or
+                valueInputsMayBeUndefined(ctx, state, &value.selected_inputs);
+            for (value.inputs) |input| {
+                if (input) |local| may_undefined = may_undefined or localIsProvedUndefined(ctx, state, local);
+            }
+            var exact_copy = value.source == .copy_of and !value.whole_payload and
+                !ctx.locals[@intFromEnum(value.source.copy_of)].is_pointer and
+                localIsArray(ctx, value.source.copy_of) and arrayCopyPreservesExtent(ctx, value.target, value.source.copy_of);
+            if (exact_copy) {
+                for (value.selected_inputs) |entry| {
+                    const selected = entry orelse continue;
+                    if (selected == .local and selected.local == value.source.copy_of) continue;
+                    if (valueInputsMayBeUndefined(ctx, state, &.{selected})) exact_copy = false;
+                }
+                for (value.inputs) |entry| {
+                    const local = entry orelse continue;
+                    if (local != value.source.copy_of and localIsProvedUndefined(ctx, state, local)) exact_copy = false;
+                }
+            }
+            if (exact_copy and value.target != value.source.copy_of) {
+                state.forgetUndefinedBytes(value.target);
+                try state.copyArrayInitialization(ctx.gpa, value.target, value.source.copy_of);
+                try copyUnknownFieldValues(ctx, state, value.target, value.source.copy_of);
+                if (!may_undefined) {
+                    if (state.locals.getPtr(value.target)) |origin| if (origin.* == .undef) {
+                        origin.* = .plain;
+                    };
+                }
+            }
+            if (may_undefined) {
+                if (!exact_copy) state.forgetInitializationArray(value.target);
+                try state.may_undefined_values.put(ctx.gpa, value.target, {});
+            }
+            if (!valueInputsAreDefined(ctx, state, &value.selected_inputs, false)) {
+                try state.unknown_values.put(ctx.gpa, value.target, {});
+                return;
+            }
+            for (value.inputs) |input| {
+                const local = input orelse continue;
+                const covered_array = localIsArray(ctx, local) and arrayHasFullCoverage(ctx, state, local);
+                if (state.unknown_values.contains(local) and !covered_array) return;
+                if (state.locals.get(local)) |origin| if (origin == .undef and !covered_array) return;
+                if (!ctx.locals[@intFromEnum(local)].is_pointer and
+                    !state.fieldValueIsDefined(local, "") and !covered_array) return;
+                if (ctx.locals[@intFromEnum(local)].is_pointer) return;
+            }
+            if (value.whole_payload) {
+                const covered = switch (value.source) {
+                    .copy_of => |source| if (ctx.locals[@intFromEnum(source)].is_pointer)
+                        false
+                    else if (localIsArray(ctx, source))
+                        arrayHasFullCoverage(ctx, state, source) or
+                            (!state.locals.contains(source) and !state.unknown_values.contains(source))
+                    else
+                        !state.unknown_values.contains(source) and state.fieldValueIsDefined(source, ""),
+                    .field_copy_of => |field| blk: {
+                        if (ctx.locals[@intFromEnum(field.parent)].is_pointer) break :blk false;
+                        break :blk state.fieldValueIsDefined(field.parent, field.name);
+                    },
+                    else => false,
+                };
+                if (covered) try state.markArrayComplete(ctx.gpa, value.target);
+                return;
+            }
+            switch (value.source) {
+                .copy_of => |source| {
+                    if (localIsArray(ctx, source) and arrayCopyPreservesExtent(ctx, value.target, source)) {
+                        if (state.locals.contains(source)) {
+                            if (!exact_copy) try state.copyArrayInitialization(ctx.gpa, value.target, source);
+                        } else if (arrayInitializerComplete(ctx, state, value.target, value.source, .plain, true)) {
+                            try state.markArrayComplete(ctx.gpa, value.target);
+                        }
+                    }
+                },
+                // An opaque call result: every array it was handed must be covered.
+                .plain => if (storageInputsAreCovered(ctx, state, &value.inputs)) {
+                    try state.markArrayComplete(ctx.gpa, value.target);
+                },
+                .field_copy_of => |field| {
+                    const origin = try originOfInit(ctx, state, value.source, stmt.pos);
+                    if (origin != .undef and state.fieldArrayBaseIsDefined(field.parent, field.name)) {
+                        try state.markArrayComplete(ctx.gpa, value.target);
+                        // A whole-field default or parameter proof remains a
+                        // complete base after an exact undefined overwrite.
+                        // Carry its sparse holes, including nested slot holes.
+                        for ([_][]const state_mod.FieldKey{ state.fields.keys(), state.unknown_field_values.keys() }) |keys| {
+                            for (keys) |key| {
+                                if (key.parent != field.parent or key.name.len <= field.name.len or
+                                    !std.mem.startsWith(u8, key.name, field.name)) continue;
+                                const suffix = key.name[field.name.len..];
+                                if (suffix[0] != '[' or state.fieldValueIsDefined(key.parent, key.name)) continue;
+                                const index = literalArrayElementIndex(suffix) orelse {
+                                    state.forgetInitializationArray(value.target);
+                                    break;
+                                };
+                                if (ctx.locals[@intFromEnum(value.target)].array_extent) |extent| {
+                                    if (index >= extent) continue;
+                                }
+                                try state.setExactElement(ctx.gpa, value.target, index, false);
+                            }
+                        }
+                    }
+                    // Partially initialized source fields retain their exact
+                    // element coverage. The canonical dependency supplies no
+                    // bits; only existing source field facts supply them.
+                    if (!state.isArrayComplete(value.target)) {
+                        const extent = ctx.locals[@intFromEnum(value.target)].array_extent orelse return;
+                        for (state.fields.keys()) |key| {
+                            if (key.parent != field.parent or key.name.len <= field.name.len or
+                                !std.mem.startsWith(u8, key.name, field.name)) continue;
+                            const suffix = key.name[field.name.len..];
+                            const index = literalArrayElementIndex(suffix) orelse continue;
+                            if (suffix[suffix.len - 1] != ']' or index >= extent) continue;
+                            if (state.fieldValueIsDefined(key.parent, key.name))
+                                try state.setExactElement(ctx.gpa, value.target, index, true);
+                        }
+                    }
+                },
+                else => {},
+            }
+        },
+        .array_prefix => |prefix| {
+            const extent = ctx.locals[@intFromEnum(prefix.array)].array_extent orelse return;
+            var certified = storageInputsAreCovered(ctx, state, &prefix.inputs);
+            for (prefix.inputs) |input| {
+                const local = input orelse continue;
+                if (state.unknown_values.contains(local) and
+                    !(localIsArray(ctx, local) and arrayHasFullCoverage(ctx, state, local))) certified = false;
+            }
+            if (!certified) {
+                if (storageInputsMayBeUndefined(ctx, state, &prefix.inputs)) return;
+                try state.unknown_values.put(ctx.gpa, prefix.array, {});
+            }
+            // This certificate is emitted only on the helper's successful
+            // return of its initialized counter. The returned scalar exists;
+            // its bounds and the initialized bytes remain separate facts.
+            if (certified) _ = state.unknown_values.swapRemove(prefix.count);
+            try state.setScaledSymbolicPrefix(ctx.gpa, prefix.array, prefix.count, prefix.scale, extent);
+        },
+        .array_memset_prefix => |prefix| try transferArrayMemsetPrefix(ctx, state, prefix, stmt.pos),
         .guard_fact => |g| state.feasible = try state.facts.assumeGuard(ctx.gpa, g.guard, g.holds),
         .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos, stmt.end_pos),
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .pointer_write => |p| {
-            state.facts.forgetLocal(p.target);
-            if (state.locals.get(p.target)) |origin| {
-                if (origin == .stack) {
-                    state.facts.forgetLocal(origin.stack);
+            const writes_undefined = p.value_has_undefined_origin or
+                valueInputsMayBeUndefined(ctx, state, &p.preserve_inputs) or
+                valueInputsMayBeUndefined(ctx, state, &p.diagnostic_inputs);
+            const preserved_array: ?LocalId = if (p.preserves_complete_array) backing: {
+                var array = p.target;
+                if (p.payload_only and ctx.locals[@intFromEnum(p.target)].is_slice) {
+                    const pointer = state.fields.getContext(.{ .parent = p.target, .name = "ptr" }, .{}) orelse break :backing null;
+                    if (!scalarFieldIsDefined(ctx, state, p.target, "ptr") or pointer != .stack)
+                        break :backing null;
+                    array = pointer.stack;
                 }
-                if (origin == .undef) try state.locals.put(ctx.gpa, p.target, .plain);
+                // A descriptor is never its payload. Only existing coverage
+                // of the identified frame array can survive a defined store.
+                if (ctx.locals[@intFromEnum(array)].is_pointer or !localIsArray(ctx, array) or
+                    !arrayHasFullCoverage(ctx, state, array) or
+                    !valueInputsAreDefined(ctx, state, &p.preserve_inputs, !p.preserve_whole_payload))
+                    break :backing null;
+                break :backing array;
+            } else null;
+            try forgetAliasedValueFacts(ctx, state, p.target);
+            if (writes_undefined) try markPayloadMayBeUndefined(ctx, state, p.target);
+            if (!(p.payload_only and ctx.locals[@intFromEnum(p.target)].is_slice))
+                try invalidateFieldValueCertificates(ctx, state, p.target);
+            if (p.initializes and !writes_undefined and !ctx.locals[@intFromEnum(p.target)].is_pointer and !localIsArray(ctx, p.target))
+                state.forgetUndefinedBytes(p.target);
+            if (ctx.locals[@intFromEnum(p.target)].tracks_array_payload or tracksScalarValue(ctx, state, p.target)) {
+                if (p.initializes and !writes_undefined and !ctx.locals[@intFromEnum(p.target)].is_pointer and !localIsArray(ctx, p.target)) {
+                    _ = state.unknown_values.orderedRemove(p.target);
+                } else try state.unknown_values.put(ctx.gpa, p.target, {});
+            }
+            if (state.locals.get(p.target)) |origin| {
+                var owner = if (origin == .stack)
+                    origin.stack
+                else
+                    ctx.locals[@intFromEnum(p.target)].frame_borrow_origin;
+                if (p.payload_only and ctx.locals[@intFromEnum(p.target)].is_slice) {
+                    if (state.fields.getContext(.{ .parent = p.target, .name = "ptr" }, .{})) |pointer| {
+                        if (pointer == .stack) owner = pointer.stack;
+                    }
+                }
+                if (owner) |local| {
+                    try forgetAliasedValueFacts(ctx, state, local);
+                    if (writes_undefined) try markPayloadMayBeUndefined(ctx, state, local);
+                    try invalidateFieldValueCertificates(ctx, state, local);
+                    // Preserve field resource origins for lifetime checks, while
+                    // revoking every field's initialized-payload certificate.
+                    if (ctx.locals[@intFromEnum(local)].tracks_array_payload or tracksScalarValue(ctx, state, local)) {
+                        try state.unknown_values.put(ctx.gpa, local, {});
+                    }
+                }
+                if (p.initializes and origin == .undef and !localIsArray(ctx, p.target)) {
+                    try state.locals.put(ctx.gpa, p.target, .plain);
+                }
+            }
+            if (preserved_array) |array| {
+                // This restores only pre-existing coverage, never a hole.
+                try state.markArrayComplete(ctx.gpa, array);
+                _ = state.unknown_values.swapRemove(array);
             }
         },
         .reset_capture => |r| {
-            state.facts.forgetLocal(r.local);
-            try state.locals.put(ctx.gpa, r.local, .plain);
+            const defined = r.value_defined and if (r.value_source) |source|
+                if (localIsArray(ctx, source))
+                    arrayHasFullCoverage(ctx, state, source)
+                else if (ctx.locals[@intFromEnum(source)].is_slice) backing: {
+                    const pointer = state.fields.getContext(.{ .parent = source, .name = "ptr" }, .{}) orelse break :backing false;
+                    if (!scalarFieldIsDefined(ctx, state, source, "ptr")) break :backing false;
+                    break :backing switch (pointer) {
+                        .stack => |array| localIsArray(ctx, array) and arrayHasFullCoverage(ctx, state, array),
+                        .undef => false,
+                        else => true,
+                    };
+                } else
+                    localInputIsDefined(ctx, state, source, false)
+            else
+                true;
+            forgetLocalValueFacts(ctx, state, r.local);
+            const owner = ctx.locals[@intFromEnum(r.local)].array_element_owner;
+            try state.locals.put(ctx.gpa, r.local, if (owner) |array| .{ .stack = array } else .plain);
             // Also clear any tracked FIELD origins for this local —
             // `for (bins) |bin| ctx.allocator.free(bin.path);` frees
             // `bin.path` once per iteration; without clearing the
             // field, iter N+1 sees iter N's freed state and reports
             // a spurious double-free of `bin.path`.
             state.forgetFields(r.local);
+            if (!defined) try state.unknown_values.put(ctx.gpa, r.local, {});
         },
         .composite_escape => |c| try transferCompositeEscape(ctx, state, c, stmt.pos, stmt.end_pos),
         .field_assign => |a| try transferFieldAssign(ctx, state, a, stmt.pos),
@@ -189,8 +448,48 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
         .leak_warning => |l| try transferLeakWarning(ctx, l, stmt.pos, stmt.end_pos),
         .partial_union_write => |p| try transferPartialUnionWrite(ctx, p, stmt.pos, stmt.end_pos),
-        .lowering_gap => |g| transferGap(state, g),
+        .lowering_gap => |g| try transferGap(ctx, state, g),
     }
+}
+
+/// No input is undefined, or a frame array whose bytes are not all written.
+fn storageInputsAreCovered(ctx: Ctx, state: *const AbstractState, inputs: []const ?LocalId) bool {
+    for (inputs) |input| {
+        const local = input orelse continue;
+        const info = ctx.locals[@intFromEnum(local)];
+        const covered_array = !info.is_pointer and localIsArray(ctx, local) and
+            arrayHasFullCoverage(ctx, state, local);
+        if (state.unknown_values.contains(local) and !covered_array) return false;
+        if (localIsArray(ctx, local) and !covered_array) return false;
+        if (state.locals.get(local)) |origin| {
+            if (origin == .undef and !covered_array) return false;
+            if (origin == .stack and localIsArray(ctx, origin.stack) and
+                !arrayHasFullCoverage(ctx, state, origin.stack)) return false;
+        }
+        if (ctx.locals[@intFromEnum(local)].frame_borrow_origin) |owner| {
+            if (localIsArray(ctx, owner) and !arrayHasFullCoverage(ctx, state, owner)) return false;
+        }
+        if (info.is_slice) {
+            if (!scalarFieldIsDefined(ctx, state, local, "ptr") or
+                !scalarFieldIsDefined(ctx, state, local, "len")) return false;
+            const pointer = state.fields.getContext(.{ .parent = local, .name = "ptr" }, .{}) orelse return false;
+            if (pointer == .stack and localIsArray(ctx, pointer.stack) and
+                !arrayHasFullCoverage(ctx, state, pointer.stack)) return false;
+        }
+    }
+    return true;
+}
+
+fn storageInputsMayBeUndefined(ctx: Ctx, state: *const AbstractState, inputs: []const ?LocalId) bool {
+    for (inputs) |entry| {
+        const local = entry orelse continue;
+        if (localIsProvedUndefined(ctx, state, local)) return true;
+        if (ctx.locals[@intFromEnum(local)].is_pointer and state.fieldValueMayBeUndefined(local, "")) return true;
+        if (state.locals.get(local)) |origin| {
+            if (origin == .stack and localIsProvedUndefined(ctx, state, origin.stack)) return true;
+        }
+    }
+    return false;
 }
 
 fn booleanValue(state: *const AbstractState, value: cfg.BooleanValue) ?bool {
@@ -250,15 +549,195 @@ fn transferDecl(
     d: @TypeOf(@as(StmtKind, undefined).decl),
     pos: cfg.SrcPos,
 ) !void {
-    try bindBoolean(ctx, state, d.local, d.init_kind);
     const origin = try originOfInit(ctx, state, d.init_kind, pos);
-    try state.locals.put(ctx.gpa, d.local, scalarBindingOrigin(ctx, d.local, origin));
+    const payload_defined = if (tracksScalarValue(ctx, state, d.local))
+        scalarValueIsDefined(ctx, state, d.init_kind, d.value_defined, &d.value_inputs)
+    else if (state.integer_domains.len != 0 and ctx.locals[@intFromEnum(d.local)].tracks_array_payload)
+        d.value_defined and copiedPayloadIsDefined(state, d.init_kind, d.value_defined) and
+            valueInputsAreDefined(ctx, state, &d.value_inputs, false)
+    else
+        copiedPayloadIsDefined(state, d.init_kind, d.value_defined);
+    const array_complete = d.array_copy and arrayInitializerComplete(ctx, state, d.local, d.init_kind, origin, payload_defined);
+    const may_undefined = bindingMayBeUndefined(ctx, state, d.init_kind, &d.value_inputs);
+    forgetLocalValueFacts(ctx, state, d.local);
+    try bindBoolean(ctx, state, d.local, d.init_kind);
+    const binding_origin: Origin = if (origin == .undef and !may_undefined) .plain else origin;
+    try state.locals.put(ctx.gpa, d.local, scalarBindingOrigin(ctx, d.local, binding_origin));
+    try seedLocalValueFacts(ctx, state, d.local, d.init_kind, d.integer_value, array_complete);
+    if (d.array_copy and d.init_kind == .copy_of and localIsArray(ctx, d.local) and
+        localIsArray(ctx, d.init_kind.copy_of) and state.locals.contains(d.init_kind.copy_of) and
+        arrayCopyPreservesExtent(ctx, d.local, d.init_kind.copy_of))
+    {
+        try state.copyArrayInitialization(ctx.gpa, d.local, d.init_kind.copy_of);
+    }
     // Clear any stale field state for this local — a fresh decl
     // (e.g. `const source = ...` inside a loop body) creates a new
     // instance; prior-iteration field tracking for the same LocalId
     // is a back-edge artifact that would spuriously fire double-free
     // / UAF on the new instance.
     state.forgetFields(d.local);
+    if (may_undefined and !array_complete) try state.may_undefined_values.put(ctx.gpa, d.local, {});
+    if ((ctx.locals[@intFromEnum(d.local)].tracks_array_payload or tracksScalarValue(ctx, state, d.local)) and !payload_defined) {
+        try state.unknown_values.put(ctx.gpa, d.local, {});
+    }
+    if (d.init_kind == .copy_of and localIsArray(ctx, d.local) and state.unknown_values.contains(d.init_kind.copy_of)) {
+        try state.unknown_values.put(ctx.gpa, d.local, {});
+    }
+    if (ctx.locals[@intFromEnum(d.local)].tracks_array_payload and d.init_kind == .copy_of) {
+        try copyUnknownFieldValues(ctx, state, d.local, d.init_kind.copy_of);
+    }
+}
+
+fn seedLocalValueFacts(
+    ctx: Ctx,
+    state: *AbstractState,
+    local: LocalId,
+    kind: cfg.ExprKind,
+    integer_value: ?u64,
+    array_complete: bool,
+) !void {
+    const info = ctx.locals[@intFromEnum(local)];
+    if ((info.is_unsigned or tracksIntegerValue(state, local)) and kind == .copy_of) {
+        try state.copyCounterValue(ctx.gpa, local, kind.copy_of);
+    } else {
+        const length_value = if (kind == .field_copy_of)
+            fixedArrayLength(ctx, kind.field_copy_of.parent, kind.field_copy_of.name)
+        else
+            null;
+        const value = if (info.is_unsigned)
+            integer_value orelse length_value
+        else if (tracksIntegerValue(state, local))
+            length_value
+        else
+            null;
+        try state.setScalarValue(ctx.gpa, local, value);
+    }
+    const origin = state.locals.get(local) orelse .plain;
+    if (info.is_unsigned and origin != .undef) try state.nonnegative_locals.put(ctx.gpa, local, {});
+    if (localIsArray(ctx, local)) {
+        if (array_complete) {
+            try state.markArrayComplete(ctx.gpa, local);
+        } else if (info.array_extent != null) {
+            try state.setFixedPrefix(ctx.gpa, local, 0);
+        }
+    }
+}
+
+/// An undefined member overwrite through an element alias can corrupt any
+/// slot in its backing array. A defined member store grants no new coverage.
+fn invalidateAliasedArrayPayload(ctx: Ctx, state: *AbstractState, parent: LocalId) !void {
+    const info = ctx.locals[@intFromEnum(parent)];
+    if (!info.is_pointer) return;
+    var owner = info.frame_borrow_origin;
+    if (state.locals.get(parent)) |origin| {
+        if (origin == .stack) owner = origin.stack;
+    }
+    const array = owner orelse return;
+    if (!localIsArray(ctx, array) and !ctx.locals[@intFromEnum(array)].is_slice and
+        !ctx.locals[@intFromEnum(array)].is_pointer) return;
+    const may_undefined = state.fieldValueMayBeUndefined(parent, "");
+    try forgetAliasedValueFacts(ctx, state, array);
+    if (may_undefined) try markPayloadMayBeUndefined(ctx, state, array);
+    try invalidateFieldValueCertificates(ctx, state, array);
+    try state.unknown_values.put(ctx.gpa, array, {});
+}
+
+fn markPayloadMayBeUndefined(ctx: Ctx, state: *AbstractState, local: LocalId) !void {
+    const info = ctx.locals[@intFromEnum(local)];
+    state.forgetInitializationArray(local);
+    if (info.is_pointer and !info.is_slice) state.forgetWrittenFields(local);
+    if (info.is_slice or info.is_pointer) {
+        const key: state_mod.FieldKey = .{
+            .parent = local,
+            .name = if (info.is_slice) "[]" else "",
+        };
+        try state.bindWrittenField(ctx.gpa, key, true);
+        try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+    } else try state.may_undefined_values.put(ctx.gpa, local, {});
+    try state.unknown_values.put(ctx.gpa, local, {});
+}
+
+fn localIsArray(ctx: Ctx, local: LocalId) bool {
+    const info = ctx.locals[@intFromEnum(local)];
+    return info.is_array or info.array_extent != null;
+}
+
+fn forgetLocalValueFacts(ctx: Ctx, state: *AbstractState, local: LocalId) void {
+    state.facts.forgetLocal(local);
+    state.forgetInitializationLocal(local);
+    if (localIsArray(ctx, local)) state.forgetInitializationArray(local);
+}
+
+/// Keep byte-write witnesses when only a value certificate becomes unknown.
+fn forgetAliasedValueFacts(ctx: Ctx, state: *AbstractState, local: LocalId) !void {
+    state.facts.forgetLocal(local);
+    state.forgetInitializationLocal(local);
+    if (localIsArray(ctx, local)) try state.unknown_values.put(ctx.gpa, local, {});
+}
+
+/// Unknown writes revoke payload certificates, not physical resource origins.
+fn invalidateFieldValueCertificates(ctx: Ctx, state: *AbstractState, local: LocalId) !void {
+    const info = ctx.locals[@intFromEnum(local)];
+    if (!info.tracks_array_payload and !info.is_slice and !info.is_pointer) return;
+    for (state.fields.keys()) |key| {
+        if (key.parent == local) try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+    }
+    if (info.is_slice) {
+        try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = local, .name = "len" }, {}, .{});
+    }
+}
+
+fn literalArrayElementIndex(path: []const u8) ?u64 {
+    if (path.len < 3 or path[0] != '[') return null;
+    var end: usize = 1;
+    while (end < path.len and std.ascii.isDigit(path[end])) : (end += 1) {}
+    if (end == 1 or end >= path.len or path[end] != ']') return null;
+    return std.fmt.parseInt(u64, path[1..end], 10) catch null;
+}
+
+/// Exact slot masks only map between arrays with the same logical extent.
+/// Layout-changing casts need a later whole-payload certificate instead.
+fn arrayCopyPreservesExtent(ctx: Ctx, target: LocalId, source: LocalId) bool {
+    const target_extent = ctx.locals[@intFromEnum(target)].array_extent;
+    const source_extent = ctx.locals[@intFromEnum(source)].array_extent;
+    if (target_extent) |extent| {
+        return if (source_extent) |source_length| source_length == extent else false;
+    }
+    return source_extent == null;
+}
+
+fn arrayInitializerComplete(
+    ctx: Ctx,
+    state: *const AbstractState,
+    target: LocalId,
+    kind: ExprKind,
+    origin: Origin,
+    payload_defined: bool,
+) bool {
+    const target_extent = ctx.locals[@intFromEnum(target)].array_extent;
+    return switch (kind) {
+        .copy_of => |source| blk: {
+            if (!localIsArray(ctx, source)) break :blk false;
+            if (!arrayCopyPreservesExtent(ctx, target, source)) break :blk false;
+            if (!state.locals.contains(source)) break :blk true;
+            break :blk arrayHasFullCoverage(ctx, state, source);
+        },
+        .plain, .boolean => payload_defined and target_extent != null and origin != .undef,
+        .owned, .arena_init, .heap_alloc, .stack_ref, .borrowed_from, .composite_borrow, .undef, .field_copy_of, .unknown => false,
+    };
+}
+
+fn arrayHasFullCoverage(ctx: Ctx, state: *const AbstractState, array: LocalId) bool {
+    if (undefinedFieldBytesRemain(state, array)) return false;
+    if (state.unknown_values.contains(array)) return false;
+    return arrayHasWrittenCoverage(ctx, state, array);
+}
+
+fn arrayHasWrittenCoverage(ctx: Ctx, state: *const AbstractState, array: LocalId) bool {
+    if (ctx.locals[@intFromEnum(array)].array_extent) |extent| {
+        return state.hasInitializedPrefix(array, extent);
+    }
+    return state.isArrayComplete(array);
 }
 
 /// A binding DECLARED with a primitive scalar type cannot hold an
@@ -297,9 +776,28 @@ fn transferAssign(
     a: @TypeOf(@as(StmtKind, undefined).assign),
     pos: cfg.SrcPos,
 ) !void {
-    try bindBoolean(ctx, state, a.target, a.rhs_kind);
+    if (a.rhs_kind == .copy_of and a.rhs_kind.copy_of == a.target) return;
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
-    try state.locals.put(ctx.gpa, a.target, scalarBindingOrigin(ctx, a.target, origin));
+    const payload_defined = if (tracksScalarValue(ctx, state, a.target))
+        scalarValueIsDefined(ctx, state, a.rhs_kind, a.value_defined, &a.value_inputs)
+    else if (state.integer_domains.len != 0 and ctx.locals[@intFromEnum(a.target)].tracks_array_payload)
+        a.value_defined and copiedPayloadIsDefined(state, a.rhs_kind, a.value_defined) and
+            valueInputsAreDefined(ctx, state, &a.value_inputs, false)
+    else
+        copiedPayloadIsDefined(state, a.rhs_kind, a.value_defined);
+    const array_complete = a.array_copy and arrayInitializerComplete(ctx, state, a.target, a.rhs_kind, origin, payload_defined);
+    const may_undefined = bindingMayBeUndefined(ctx, state, a.rhs_kind, &a.value_inputs);
+    forgetLocalValueFacts(ctx, state, a.target);
+    try bindBoolean(ctx, state, a.target, a.rhs_kind);
+    const binding_origin: Origin = if (origin == .undef and !may_undefined) .plain else origin;
+    try state.locals.put(ctx.gpa, a.target, scalarBindingOrigin(ctx, a.target, binding_origin));
+    try seedLocalValueFacts(ctx, state, a.target, a.rhs_kind, a.integer_value, array_complete);
+    if (a.array_copy and a.rhs_kind == .copy_of and localIsArray(ctx, a.target) and
+        localIsArray(ctx, a.rhs_kind.copy_of) and state.locals.contains(a.rhs_kind.copy_of) and
+        arrayCopyPreservesExtent(ctx, a.target, a.rhs_kind.copy_of))
+    {
+        try state.copyArrayInitialization(ctx.gpa, a.target, a.rhs_kind.copy_of);
+    }
     // Whole-local reassignment invalidates any tracked field
     // origins for this local — the new value is independent of the
     // old.  Common cases: `&local` passed to a fn (cfg emits an
@@ -308,6 +806,16 @@ fn transferAssign(
     // x.  Stale field state would surface as use-undefined / leak
     // FPs on the new value's fields.
     state.forgetFields(a.target);
+    if (may_undefined and !array_complete) try state.may_undefined_values.put(ctx.gpa, a.target, {});
+    if ((ctx.locals[@intFromEnum(a.target)].tracks_array_payload or tracksScalarValue(ctx, state, a.target)) and !payload_defined) {
+        try state.unknown_values.put(ctx.gpa, a.target, {});
+    }
+    if (a.rhs_kind == .copy_of and localIsArray(ctx, a.target) and state.unknown_values.contains(a.rhs_kind.copy_of)) {
+        try state.unknown_values.put(ctx.gpa, a.target, {});
+    }
+    if (ctx.locals[@intFromEnum(a.target)].tracks_array_payload and a.rhs_kind == .copy_of) {
+        try copyUnknownFieldValues(ctx, state, a.target, a.rhs_kind.copy_of);
+    }
 }
 
 fn transferArenaKill(
@@ -465,7 +973,23 @@ fn transferRetValueChecks(
     // Only borrowed-shape return types can leak a borrowed origin.
     // Value-typed returns MOVE the value (and any arena it owns) to
     // the caller — that's idiomatic, not a bug.
-    const origin = try originOfInit(ctx, state, r.value_kind, pos);
+    var origin = try originOfInit(ctx, state, r.value_kind, pos);
+    const array_source: ?LocalId = switch (r.value_kind) {
+        .copy_of => |source| source,
+        else => null,
+    };
+    if (array_source) |source| {
+        if (localIsArray(ctx, source)) {
+            const complete = arrayHasWrittenCoverage(ctx, state, source);
+            if (state.locals.contains(source)) {
+                try reportUncoveredArrayUse(ctx, state, source, complete, true, pos, end_pos);
+                if (complete and origin == .undef) origin = .plain;
+            }
+        }
+    }
+    if (array_source) |source| {
+        if (origin == .undef and !localIsProvedUndefined(ctx, state, source)) origin = .plain;
+    }
 
     // Undefined-return check: not gated on return type — returning
     // garbage is wrong for value types and pointers alike.
@@ -484,19 +1008,15 @@ fn transferRetValueChecks(
         return;
     }
 
-    // Stack escape isn't gated on return type — a value-shape return
-    // can still embed a pointer to a stack local (e.g. `return .{
-    // .p = &x }`).  Unlike arenas (which can move), stack storage
-    // always dies with the frame, so any .stack origin reaching ret
-    // is wrong regardless of the outer return type.
-    if (origin == .stack and config_mod.isEnabled(ctx.config, .stack_escape)) {
-        const name = ctx.locals[@intFromEnum(origin.stack)].name;
-        if (r.is_borrowed_return_type) {
-            try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
-        } else {
-            try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+    // Physical cell loans do not resolve through the values currently stored
+    // in those cells. A complete proof replaces only the coarse stack origin.
+    if (config_mod.isEnabled(ctx.config, .stack_escape)) {
+        for (r.stack_loans.locals) |local| {
+            try reportReturnedStackCell(ctx, local, r.is_borrowed_return_type, pos, end_pos);
         }
-        return;
+        if (legacyStackCell(r.stack_loans, origin)) |local| {
+            try reportReturnedStackCell(ctx, local, r.is_borrowed_return_type, pos, end_pos);
+        }
     }
 
     // Composite-borrow returns: the embedded local is a borrow
@@ -536,15 +1056,385 @@ fn transferRetValueChecks(
     }
 }
 
+/// Canonical loans always report. An incomplete proof permits the legacy
+/// origin only for independently proved address-value chains. In particular,
+/// passing `&local` to a call does not prove its result carries that address.
+fn legacyStackCell(loans: cfg.StackLoanProof, origin: Origin) ?LocalId {
+    if (loans.complete) return null;
+    const local = switch (origin) {
+        .stack => |cell| cell,
+        else => return null,
+    };
+    if (std.mem.indexOfScalar(LocalId, loans.legacy_locals, local) == null) return null;
+    if (std.mem.indexOfScalar(LocalId, loans.locals, local) != null) return null;
+    return local;
+}
+
+fn reportReturnedStackCell(
+    ctx: Ctx,
+    local: LocalId,
+    is_borrowed_return_type: bool,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    const name = ctx.locals[@intFromEnum(local)].name;
+    if (is_borrowed_return_type) {
+        try reportWithIdentity(ctx, "stack-escape", pos, end_pos, .@"error", "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name}, null, ctx.locals[@intFromEnum(local)].decl_pos.byte);
+    } else {
+        try reportWithIdentity(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name}, null, ctx.locals[@intFromEnum(local)].decl_pos.byte);
+    }
+}
+
+fn copiedPayloadIsDefined(state: *const AbstractState, kind: ExprKind, defined: bool) bool {
+    return switch (kind) {
+        .stack_ref => true,
+        .copy_of, .borrowed_from, .composite_borrow => |source| !state.unknown_values.contains(source),
+        .field_copy_of => |field| state.fieldValueIsDefined(field.parent, field.name),
+        .undef => false,
+        else => defined,
+    };
+}
+
+fn copyUnknownFieldValues(ctx: Ctx, state: *AbstractState, target: LocalId, source: LocalId) !void {
+    if (target == source) return;
+    const count = state.unknown_field_values.count();
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const key = state.unknown_field_values.keys()[index];
+        if (key.parent == source) try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = target, .name = key.name }, {}, .{});
+    }
+    const undefined_count = state.undefined_field_values.count();
+    index = 0;
+    while (index < undefined_count) : (index += 1) {
+        const key = state.undefined_field_values.keys()[index];
+        if (key.parent == source) try state.undefined_field_values.putContext(ctx.gpa, .{ .parent = target, .name = key.name }, {}, .{});
+    }
+    const written_count = state.written_fields.count();
+    index = 0;
+    while (index < written_count) : (index += 1) {
+        const key = state.written_fields.keys()[index];
+        if (key.parent == source) try state.written_fields.putContext(ctx.gpa, .{ .parent = target, .name = key.name }, {}, .{});
+    }
+}
+
+fn fieldAssignmentIsDefined(ctx: Ctx, state: *const AbstractState, assignment: @TypeOf(@as(StmtKind, undefined).field_assign), origin: Origin) bool {
+    if (origin == .undef) return false;
+    if (assignment.reads_old_value and
+        !state.fieldValueIsDefined(assignment.parent, assignment.name)) return false;
+    if (!valueInputsAreDefined(ctx, state, &assignment.selected_inputs, false)) return false;
+    const target_info = ctx.locals[@intFromEnum(assignment.parent)];
+    if (state.integer_domains.len != 0 and target_info.is_slice and std.mem.eql(u8, assignment.name, "len")) {
+        // Every header update carries its own source certificate and evaluated
+        // bounds, including copies from a saved header scalar.
+        if (!assignment.defined) return false;
+        for (assignment.inputs) |input| {
+            const local = input orelse continue;
+            if (assignment.rhs_kind == .field_copy_of and local == assignment.rhs_kind.field_copy_of.parent) continue;
+            if (!localInputIsDefined(ctx, state, local, true)) return false;
+        }
+    }
+    switch (assignment.rhs_kind) {
+        .copy_of => |source| {
+            if (localIsArray(ctx, source)) return arrayHasFullCoverage(ctx, state, source);
+            return !state.unknown_values.contains(source);
+        },
+        .field_copy_of => |source| {
+            if (state.integer_domains.len != 0) {
+                // This flag certifies supported source shape, not the state
+                // of the enclosing object's unrelated payload.
+                if (!assignment.defined) return false;
+                for (assignment.inputs) |input| {
+                    const local = input orelse continue;
+                    if (local == source.parent) continue;
+                    if (!localInputIsDefined(ctx, state, local, false)) return false;
+                }
+            }
+            return scalarFieldIsDefined(ctx, state, source.parent, source.name);
+        },
+        else => {},
+    }
+    if (!assignment.defined) return false;
+    for (assignment.inputs) |input| {
+        const local = input orelse continue;
+        if (state.unknown_values.contains(local)) return false;
+        if (state.locals.get(local)) |value| {
+            if (value == .undef and !arrayHasFullCoverage(ctx, state, local)) return false;
+        }
+    }
+    return true;
+}
+
+/// Diagnostic question: does this store read an operand proved undefined?
+fn fieldAssignmentReadsUndefined(ctx: Ctx, state: *const AbstractState, assignment: @TypeOf(@as(StmtKind, undefined).field_assign)) bool {
+    if (bindingMayBeUndefined(ctx, state, assignment.rhs_kind, &assignment.selected_inputs)) return true;
+    if (assignment.reads_old_value and state.fieldValueMayBeUndefined(assignment.parent, assignment.name)) return true;
+    for (assignment.inputs) |input| {
+        const local = input orelse continue;
+        if (assignment.rhs_kind == .stack_ref and local == assignment.rhs_kind.stack_ref) continue;
+        if (assignment.rhs_kind == .field_copy_of and local == assignment.rhs_kind.field_copy_of.parent) continue;
+        if (localIsProvedUndefined(ctx, state, local)) return true;
+    }
+    return false;
+}
+
+fn fieldValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, parent: LocalId, path: []const u8) bool {
+    const info = ctx.locals[@intFromEnum(parent)];
+    if (std.mem.indexOf(u8, path, ".*")) |marker| {
+        const header = path[0..marker];
+        if (fieldValueMayBeUndefined(ctx, state, parent, header)) return true;
+        const pointer = state.fields.getContext(.{ .parent = parent, .name = header }, .{}) orelse return false;
+        if (pointer != .stack) return false;
+        const suffix = path[marker + 2 ..];
+        if (suffix.len == 0) return localIsProvedUndefined(ctx, state, pointer.stack);
+        return fieldValueMayBeUndefined(ctx, state, pointer.stack, if (suffix[0] == '.') suffix[1..] else suffix);
+    }
+    if (info.is_slice and std.mem.eql(u8, path, "[]")) {
+        if (localIsProvedUndefined(ctx, state, parent)) return true;
+        if (state.undefined_field_values.containsContext(.{ .parent = parent, .name = "[]" }, .{})) return true;
+        for (state.undefined_elements.keys()) |hole| if (hole.array == parent) return true;
+        if (state.fields.getContext(.{ .parent = parent, .name = "ptr" }, .{})) |pointer| {
+            if (pointer == .stack) return localIsProvedUndefined(ctx, state, pointer.stack);
+        }
+        return false;
+    }
+    if (path.len == 0 and !info.is_pointer and localIsArray(ctx, parent))
+        return localIsProvedUndefined(ctx, state, parent);
+    if (state.fieldValueMayBeUndefined(parent, path)) return true;
+    if (state.fieldBytesAreWritten(parent, path)) return false;
+    if (ctx.locals[@intFromEnum(parent)].is_pointer) {
+        const origin = state.locals.get(parent) orelse return false;
+        if (origin == .stack) {
+            if (path.len == 0 and !ctx.locals[@intFromEnum(origin.stack)].is_pointer and localIsArray(ctx, origin.stack))
+                return localIsProvedUndefined(ctx, state, origin.stack);
+            return state.fieldValueMayBeUndefined(origin.stack, path);
+        }
+    }
+    return false;
+}
+
+fn undefinedFieldBytesRemain(state: *const AbstractState, local: LocalId) bool {
+    for (state.undefined_field_values.keys()) |key| {
+        if (key.parent == local and state.fieldValueMayBeUndefined(local, key.name)) return true;
+    }
+    return false;
+}
+
+fn localIsProvedUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    if (ctx.locals[@intFromEnum(local)].is_slice)
+        return state.fieldValueMayBeUndefined(local, "ptr") or state.fieldValueMayBeUndefined(local, "len");
+    if (!ctx.locals[@intFromEnum(local)].is_pointer and undefinedFieldBytesRemain(state, local)) return true;
+    if (!ctx.locals[@intFromEnum(local)].is_pointer) {
+        if (ctx.locals[@intFromEnum(local)].runtime_fields) |fields| {
+            const complete = for (fields) |name| {
+                if (!state.fieldBytesAreWritten(local, name)) break false;
+            } else true;
+            if (complete) return false;
+        }
+    }
+    if (!ctx.locals[@intFromEnum(local)].is_pointer and
+        (state.isArrayComplete(local) or
+            (localIsArray(ctx, local) and arrayHasWrittenCoverage(ctx, state, local)))) return false;
+    if (state.may_undefined_values.contains(local)) return true;
+    if (state.locals.get(local)) |origin| if (origin == .undef) return true;
+    if (!ctx.locals[@intFromEnum(local)].is_pointer and state.fieldValueMayBeUndefined(local, "")) return true;
+    for (state.undefined_elements.keys()) |hole| if (hole.array == local) return true;
+    return false;
+}
+
+fn bindingMayBeUndefined(ctx: Ctx, state: *const AbstractState, kind: ExprKind, inputs: []const ?cfg.ValueInput) bool {
+    if (exprMayBeUndefined(ctx, state, kind)) return true;
+    const addressed_owner: ?LocalId = switch (kind) {
+        .stack_ref => |owner| owner,
+        .composite_borrow, .borrowed_from => |owner| if (!ctx.locals[@intFromEnum(owner)].is_pointer and
+            !ctx.locals[@intFromEnum(owner)].is_slice) owner else null,
+        else => null,
+    };
+    for (inputs) |entry| {
+        const input = entry orelse continue;
+        // Taking an address consumes the address and selector, not the bytes
+        // of the place. Certificate dependencies may still demand those bytes.
+        if (addressed_owner) |owner| switch (input) {
+            .local => |local| if (local == owner) continue,
+            .field => |field| if (field.parent == owner) continue,
+            .indexed => |indexed| if (indexed.array == owner) continue,
+        };
+        if (valueInputsMayBeUndefined(ctx, state, &.{input})) return true;
+    }
+    return false;
+}
+
+fn exprMayBeUndefined(ctx: Ctx, state: *const AbstractState, kind: ExprKind) bool {
+    return switch (kind) {
+        .undef => true,
+        .copy_of => |local| localIsProvedUndefined(ctx, state, local),
+        .field_copy_of => |field| fixedArrayLength(ctx, field.parent, field.name) == null and
+            fieldValueMayBeUndefined(ctx, state, field.parent, field.name),
+        else => false,
+    };
+}
+
+fn valueInputsMayBeUndefined(ctx: Ctx, state: *const AbstractState, inputs: []const ?cfg.ValueInput) bool {
+    for (inputs) |entry| switch (entry orelse continue) {
+        .local => |local| if (localIsProvedUndefined(ctx, state, local)) return true,
+        .field => |field| if (fixedArrayLength(ctx, field.parent, field.name) == null and
+            fieldValueMayBeUndefined(ctx, state, field.parent, field.name)) return true,
+        .indexed => |indexed| {
+            if (indexed.scaled) |element| {
+                if (localIsArray(ctx, indexed.array) and
+                    indexIsDefined(ctx, state, .{ .local = .{ .local = element.index } }) and
+                    state.hasInitializedScaledElement(indexed.array, element) and
+                    !undefinedFieldBytesRemain(state, indexed.array)) continue;
+            }
+            if (indexedValueMayBeUndefined(ctx, state, indexed.array, indexed.index)) return true;
+        },
+    };
+    return false;
+}
+
+fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: LocalId, index: cfg.IndexTerm) bool {
+    const info = ctx.locals[@intFromEnum(array)];
+    if (info.is_slice) {
+        if (state.fieldValueMayBeUndefined(array, "ptr") or state.fieldValueMayBeUndefined(array, "len")) return true;
+        if (!state.hasInitializedElement(array, index)) {
+            if (state.undefined_field_values.containsContext(.{ .parent = array, .name = "[]" }, .{})) return true;
+            for (state.undefined_elements.keys()) |hole| {
+                if (hole.array == array and !state.provesComparison(.{
+                    .lhs = index, .rhs = .{ .constant = hole.index }, .op = .ne,
+                })) return true;
+            }
+        }
+        const pointer = state.fields.getContext(.{ .parent = array, .name = "ptr" }, .{}) orelse return false;
+        return switch (pointer) {
+            .stack => |backing| if (state.unknown_field_values.containsContext(.{ .parent = array, .name = "ptr" }, .{}))
+                localIsProvedUndefined(ctx, state, backing)
+            else
+                indexedValueMayBeUndefined(ctx, state, backing, index),
+            .undef => true,
+            else => false,
+        };
+    }
+    if (!localIsArray(ctx, array)) {
+        if (localIsProvedUndefined(ctx, state, array)) return true;
+        if (!info.is_pointer or state.hasInitializedElement(array, index)) return false;
+        for (state.undefined_elements.keys()) |hole| {
+            if (hole.array == array and !state.provesComparison(.{
+                .lhs = index, .rhs = .{ .constant = hole.index }, .op = .ne,
+            })) return true;
+        }
+        if (state.fieldValueMayBeUndefined(array, "")) return true;
+        if (state.locals.get(array)) |origin| {
+            if (origin == .stack and origin.stack != array and localIsArray(ctx, origin.stack))
+                return indexedValueMayBeUndefined(ctx, state, origin.stack, index);
+        }
+        return false;
+    }
+    for (state.undefined_field_values.keys()) |key| {
+        if (key.parent != array or !state.fieldValueMayBeUndefined(array, key.name)) continue;
+        const slot = literalArrayElementIndex(key.name) orelse return true;
+        if (!state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = slot }, .op = .ne })) return true;
+    }
+    for (state.written_fields.keys()) |key| {
+        if (key.parent != array) continue;
+        const slot = literalArrayElementIndex(key.name) orelse continue;
+        if (state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = slot }, .op = .eq }) and
+            !state.fieldValueMayBeUndefined(array, key.name)) return false;
+    }
+    if (arrayHasWrittenCoverage(ctx, state, array)) return false;
+    if (state.hasInitializedElement(array, index)) return false;
+    for (state.undefined_elements.keys()) |hole| {
+        if (hole.array == array and !state.provesComparison(.{
+            .lhs = index, .rhs = .{ .constant = hole.index }, .op = .ne,
+        })) return true;
+    }
+    if (state.may_undefined_values.contains(array)) return true;
+    return if (state.locals.get(array)) |origin| origin == .undef else false;
+}
+
 fn transferFieldAssign(
     ctx: Ctx,
     state: *AbstractState,
     a: @TypeOf(@as(StmtKind, undefined).field_assign),
     pos: cfg.SrcPos,
 ) !void {
-    const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
+    if (a.diagnostic_only) {
+        const may_undefined = fieldAssignmentReadsUndefined(ctx, state, a);
+        const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
+        if (a.name.len == 0 and !ctx.locals[@intFromEnum(a.parent)].is_pointer) {
+            state.forgetUndefinedBytes(a.parent);
+            if (localIsArray(ctx, a.parent)) state.forgetInitializationArray(a.parent);
+            if (state.locals.getPtr(a.parent)) |origin| if (origin.* == .undef) {
+                origin.* = .plain;
+            };
+            try state.unknown_values.put(ctx.gpa, a.parent, {});
+            if (may_undefined) try state.may_undefined_values.put(ctx.gpa, a.parent, {});
+            try state.bindWrittenField(ctx.gpa, key, may_undefined);
+        } else {
+            const selected: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
+            try state.unknown_field_values.putContext(ctx.gpa, selected, {}, .{});
+            try state.bindWrittenField(ctx.gpa, selected, may_undefined);
+            if (may_undefined) {
+                try state.undefined_field_values.putContext(ctx.gpa, selected, {}, .{});
+            }
+            try invalidateAliasedArrayPayload(ctx, state, a.parent);
+        }
+        return;
+    }
+    var origin = try originOfInit(ctx, state, a.rhs_kind, pos);
+    // Retain the selected descriptor scalar at value time. A later source
+    // clobber must revoke the relation, not the already copied scalar value.
+    var copied_constant: ?u64 = null;
+    if (ctx.locals[@intFromEnum(a.parent)].is_slice and std.mem.eql(u8, a.name, "len") and a.rhs_kind == .field_copy_of) {
+        const source = a.rhs_kind.field_copy_of;
+        for (state.comparisons.items) |premise| {
+            if (premise.op != .eq) continue;
+            if (premise.lhs == .field and premise.rhs == .constant and
+                premise.lhs.field.parent == source.parent and std.mem.eql(u8, premise.lhs.field.name, source.name))
+                copied_constant = premise.rhs.constant;
+            if (premise.rhs == .field and premise.lhs == .constant and
+                premise.rhs.field.parent == source.parent and std.mem.eql(u8, premise.rhs.field.name, source.name))
+                copied_constant = premise.lhs.constant;
+        }
+    }
+    state.forgetFieldComparisons(a.parent);
     const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
+    const defined = !(a.interior_view and origin == .stack and localIsArray(ctx, origin.stack)) and
+        fieldAssignmentIsDefined(ctx, state, a, origin);
+    // An unproved store is unknown. A store computed from a proved undefined
+    // operand or old value holds undefined bytes, so later reads report.
+    const reads_undefined = fieldAssignmentReadsUndefined(ctx, state, a);
+    if (!defined and origin == .plain and reads_undefined) origin = .undef;
+    try state.bindFieldValue(ctx.gpa, key, defined);
     try state.fields.putContext(ctx.gpa, key, origin, .{});
+    try state.bindWrittenField(ctx.gpa, key, reads_undefined);
+    if (reads_undefined) try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+    if (!defined) try invalidateAliasedArrayPayload(ctx, state, a.parent);
+    // An aggregate field rebind revokes every descendant descriptor proof.
+    var fields = state.fields.iterator();
+    while (fields.next()) |entry| {
+        const descendant = entry.key_ptr.*;
+        if (descendant.parent == a.parent and descendant.name.len > a.name.len and
+            std.mem.startsWith(u8, descendant.name, a.name) and descendant.name[a.name.len] == '.')
+            try state.bindFieldValue(ctx.gpa, descendant, false);
+    }
+    if (defined) if (copied_constant) |constant| {
+        state.feasible = try state.assumeComparison(ctx.gpa, .{
+            .lhs = .{ .field = .{ .parent = a.parent, .name = a.name, .is_unsigned = true } },
+            .rhs = .{ .constant = constant },
+            .op = .eq,
+        });
+    };
+
+    if (localIsArray(ctx, a.parent) and origin == .undef) {
+        if (literalArrayElementIndex(a.name)) |index| {
+            if (ctx.locals[@intFromEnum(a.parent)].array_extent) |extent| {
+                if (index < extent) try state.setExactElement(ctx.gpa, a.parent, index, false);
+            } else {
+                try state.setExactElement(ctx.gpa, a.parent, index, false);
+            }
+        } else {
+            state.forgetInitializationArray(a.parent);
+        }
+    }
 
     // "Object owns its own arena" pattern: when the arena ITSELF is
     // stored into a field of a HEAP-allocated struct (`ptr.*.arena =
@@ -577,14 +1467,40 @@ fn transferFieldAssign(
         }
     }
 
-    // Field assignment initializes the parent (partially).  Clear
-    // the parent's .undef so `var x = undefined; x.field = val;
-    // return x;` doesn't fire spuriously — common Zig idiom.
-    if (state.locals.get(a.parent)) |parent_origin| {
-        if (parent_origin == .undef) {
-            try state.locals.put(ctx.gpa, a.parent, .plain);
-        }
+    // A field store never defines its owner or an unwritten sibling.
+    // Exact field facts permit selected reads while the whole-object origin
+    // stays undefined. Only a complete initialization certificate promotes it.
+}
+
+test "field stores define only their selected inline storage" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{.{ .name = "value", .decl_pos = pos0() }};
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const value: LId = @enumFromInt(0);
+    try state.locals.put(gpa, value, .undef);
+    try transferFieldAssign(ctx, &state, .{
+        .parent = value,
+        .name = "part.written",
+        .rhs_kind = .plain,
+        .defined = true,
+    }, pos0());
+    try testing.expect(scalarFieldIsDefined(ctx, &state, value, "part.written"));
+    try testing.expect(!scalarFieldIsDefined(ctx, &state, value, "part.missing"));
+    try transferFieldUse(ctx, &state, .{ .parent = value, .name = "part.written" }, pos0(), pos1());
+    try testing.expect(problems.items.len == 0);
+    try transferFieldUse(ctx, &state, .{ .parent = value, .name = "part.missing" }, pos0(), pos1());
+    var reported_missing = false;
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+            std.mem.indexOf(u8, problem.message, "part.missing") != null) reported_missing = true;
     }
+    try testing.expect(reported_missing);
 }
 
 fn transferFieldHeapFree(
@@ -671,9 +1587,14 @@ fn transferFieldUse(
     // `field_use` reaches exactly this: the fallback records a dead
     // field origin WITHOUT touching `state.locals[parent]`, so the two
     // coexist.)
-    if (state.locals.get(u.parent)) |parent_origin| switch (parent_origin) {
+    // `arr[i].f` on an array or slice owner: the preceding `indexed_read`
+    // owns element coverage. An undefined owner root alone does not make
+    // an initialized element undefined.
+    const element_owner = u.name.len > 0 and u.name[0] == '[' and
+        (ctx.locals[@intFromEnum(u.parent)].is_slice or localIsArray(ctx, u.parent));
+    if (state.locals.get(u.parent)) |parent_origin| if (!element_owner or parent_origin != .undef) switch (parent_origin) {
         .undef => {
-            if (config_mod.isEnabled(ctx.config, .use_undefined)) {
+            if (!u.lifetime_only and fieldValueMayBeUndefined(ctx, state, u.parent, u.name) and config_mod.isEnabled(ctx.config, .use_undefined)) {
                 const owner_name = ctx.locals[@intFromEnum(u.parent)].name;
                 try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while `{s}` is still `undefined`", .{ owner_name, pathSep(u.name), u.name, owner_name });
                 return;
@@ -695,31 +1616,34 @@ fn transferFieldUse(
         else => {},
     };
     const key: state_mod.FieldKey = .{ .parent = u.parent, .name = u.name };
-    const origin = state.fields.getContext(key, .{}) orelse return;
+    const origin = state.fields.getContext(key, .{}) orelse .plain;
     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
     switch (origin) {
         .arena, .arena_borrow => |aid| {
-            if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
-            const st = state.arenas.get(aid) orelse return;
-            if (st.state == .dead) {
-                try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}{s}{s}` borrows from an arena that was deinit'd", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
-                    .{ .site = ks, .label = "arena deinit'd here" }
-                else
-                    null);
+            if (config_mod.isEnabled(ctx.config, .arena_use_after_kill)) {
+                if (state.arenas.get(aid)) |st| if (st.state == .dead) {
+                    try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}{s}{s}` borrows from an arena that was deinit'd", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "arena deinit'd here" }
+                    else
+                        null);
+                    return;
+                };
             }
         },
         .heap => |hid| {
-            if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
-            const st = state.heaps.get(hid) orelse return;
-            if (st.state == .dead) {
-                try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` after free", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
-                    .{ .site = ks, .label = "value freed here" }
-                else
-                    null);
+            if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
+                if (state.heaps.get(hid)) |st| if (st.state == .dead) {
+                    try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` after free", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "value freed here" }
+                    else
+                        null);
+                    return;
+                };
             }
         },
         .undef => {
-            if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
+            if (u.lifetime_only or !fieldValueMayBeUndefined(ctx, state, u.parent, u.name) or
+                !config_mod.isEnabled(ctx.config, .use_undefined)) return;
             try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while still `undefined`", .{ parent_name, pathSep(u.name), u.name });
         },
         .stack => |owner_id| {
@@ -729,22 +1653,27 @@ fn transferFieldUse(
             // field route, or via struct-literal unpack of a
             // borrowed-field read), a kill of the owner invalidates
             // this read.
-            if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
-            const owner_origin = state.locals.get(owner_id) orelse return;
-            switch (owner_origin) {
-                .heap => |hid| {
-                    const st = state.heaps.get(hid) orelse return;
-                    if (st.state == .dead) {
-                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` (borrow from `{s}`) after free", .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name }, if (st.killed_at) |ks|
-                            .{ .site = ks, .label = "value freed here" }
-                        else
-                            null);
-                    }
-                },
-                else => {},
+            if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
+                if (state.locals.get(owner_id)) |owner_origin| switch (owner_origin) {
+                    .heap => |hid| {
+                        if (state.heaps.get(hid)) |st| if (st.state == .dead) {
+                            try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` (borrow from `{s}`) after free", .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name }, if (st.killed_at) |ks|
+                                .{ .site = ks, .label = "value freed here" }
+                            else
+                                null);
+                            return;
+                        };
+                    },
+                    else => {},
+                };
             }
         },
         else => {},
+    }
+    if (origin != .undef and !u.lifetime_only and !element_owner and
+        fieldValueMayBeUndefined(ctx, state, u.parent, u.name) and config_mod.isEnabled(ctx.config, .use_undefined))
+    {
+        try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` without a defined field value", .{ parent_name, pathSep(u.name), u.name });
     }
 }
 
@@ -756,6 +1685,9 @@ fn transferCompositeEscape(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
+    // ret owns canonical positive reporting. This statement only carries the
+    // residual of [legacyStackCell] to value positions inside the aggregate.
+    if (c.stack_loans.complete) return;
     // The producer is another module, so its `ExprKind` set is not this
     // function's to rely on: a variant added there has to degrade to a
     // documented no-op here, never to a build-mode-dependent panic in
@@ -769,15 +1701,14 @@ fn transferCompositeEscape(
     // and stronger: a shape nobody here has argued about reports
     // nothing, and widening it again needs that shape's own
     // reachability argument rather than origin resolution alone.
-    switch (c) {
+    switch (c.value_kind) {
         .stack_ref, .copy_of => {},
         else => return,
     }
     if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
-    const origin = try originOfInit(ctx, state, c, pos);
-    if (origin != .stack) return;
-    const name = ctx.locals[@intFromEnum(origin.stack)].name;
-    try report(ctx, "stack-escape", pos, end_pos, .@"error", "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+    const origin = try originOfInit(ctx, state, c.value_kind, pos);
+    const local = legacyStackCell(c.stack_loans, origin) orelse return;
+    try reportReturnedStackCell(ctx, local, false, pos, end_pos);
 }
 
 /// Write-through-pointer escape check.  `out.* = X` (or
@@ -885,24 +1816,35 @@ fn transferUse(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
+    if (u.from_method_call) state.forgetFieldComparisons(u.local);
     const origin = state.locals.get(u.local) orelse return;
-    // Method-call on a still-undef local: not a read of garbage,
-    // it's the conventional init pattern (`var x: T = undefined;
-    // x.decodeInternal(...);`).  Treat as a write that clears
-    // .undef → .plain, suppressing the spurious use_undefined.
-    // For .heap / .arena / .stack origins the call IS a real
-    // use — fall through to the normal liveness check.
-    if (u.from_method_call and origin == .undef) {
-        try state.locals.put(ctx.gpa, u.local, .plain);
+    // Borrowing an undefined receiver does not read its payload. Only a
+    // proven write may initialize it; a method name supplies no such proof.
+    if (u.from_method_call and !localIsArray(ctx, u.local) and !ctx.locals[@intFromEnum(u.local)].is_pointer)
+    {
+        if (origin != .undef)
+            try checkOriginAlive(ctx, state, origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
         return;
     }
-    try checkOriginAlive(ctx, state, origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
+    if (localIsArray(ctx, u.local)) {
+        const complete = arrayHasWrittenCoverage(ctx, state, u.local);
+        try reportUncoveredArrayUse(ctx, state, u.local, complete, false, pos, end_pos);
+        const read_origin = if (complete and origin == .undef) Origin.plain else origin;
+        try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
+        return;
+    }
+    const may_undefined = localIsProvedUndefined(ctx, state, u.local);
+    if (origin != .undef and may_undefined)
+        try checkOriginAlive(ctx, state, .undef, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
+    const read_origin = if (origin == .undef and !may_undefined) Origin.plain else origin;
+    try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
 }
 
 fn transferGap(
+    ctx: Ctx,
     state: *AbstractState,
     g: @TypeOf(@as(StmtKind, undefined).lowering_gap),
-) void {
+) !void {
     // A gap the builder marked `may_assign_locals = false` is a
     // statement that provably CANNOT write a local: `call-untracked`
     // carries no pointer argument, and `assign-target`'s `arr[i] = X`
@@ -911,21 +1853,673 @@ fn transferGap(
     // only thing that distinguishes the two claims — reading past it
     // made every gap a claim about locals no gap can support.
     if (!g.may_assign_locals) return;
-    state.facts.forgetAllLocals();
-    // Conservative: collapse .undef → .plain since an unknown stmt
-    // may have written through a passed pointer to initialize the
-    // local.  But PRESERVE resource origins (.heap, .arena,
-    // .arena_borrow, .stack_ref) — an unknown call can't free a
-    // tracked allocation or kill an arena unless it matches a free /
-    // arena-kill pattern (in which case cfg lowers it as the proper
-    // op, not a gap).  Without this preservation, a single
-    // `foo(args)` between `alloc(args)` and `free(args)` wipes the
-    // .heap origin and defeats double-free / use-after-free tracking
-    // for the rest of the function.
-    var it = state.locals.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* == .undef) entry.value_ptr.* = .plain;
+    for (0..ctx.locals.len) |index| {
+        const local: LocalId = @enumFromInt(index);
+        if (localIsArray(ctx, local)) {
+            // Preserve byte witnesses while revoking their value certificate.
+            // An opaque store cannot introduce a proved-undefined byte.
+            if (arrayHasWrittenCoverage(ctx, state, local) and !localIsProvedUndefined(ctx, state, local)) {
+                try state.markArrayComplete(ctx.gpa, local);
+            }
+            try state.unknown_values.put(ctx.gpa, local, {});
+        }
     }
+    for (0..ctx.locals.len) |index| {
+        const local: LocalId = @enumFromInt(index);
+        if (!ctx.locals[index].is_control_local) state.facts.forgetLocal(local);
+        state.forgetInitializationLocal(local);
+        // Exact writes and recorded holes survive opaque effects.
+    }
+    state.forgetAllComparisons();
+    // Unknown effects invalidate certificates, but cannot certify a write.
+    // Keep undefined origins until a concrete assignment initializes them.
+}
+
+fn sliceElementIsDefined(ctx: Ctx, state: *const AbstractState, slice: LocalId, index: cfg.IndexTerm) bool {
+    if (indexedValueMayBeUndefined(ctx, state, slice, index)) return false;
+    const length: cfg.IndexTerm = .{ .field = .{ .parent = slice, .name = "len", .is_unsigned = true } };
+    const pointer = state.fields.getContext(.{ .parent = slice, .name = "ptr" }, .{}) orelse return false;
+    if (!scalarFieldIsDefined(ctx, state, slice, "ptr")) return false;
+    return switch (pointer) {
+        .stack => |backing| indexIsDefined(ctx, state, index) and
+            scalarFieldIsDefined(ctx, state, slice, "len") and localIsArray(ctx, backing) and
+            !state.unknown_values.contains(backing) and
+            state.provesNonNegative(index) and state.provesLessThan(index, length) and
+            (arrayHasFullCoverage(ctx, state, backing) or state.hasInitializedElement(backing, index)),
+        .undef => false,
+        // External initialized bytes have no local holes, and a runtime bounds
+        // check is separate from payload definedness: the length certificate
+        // only matters when it selects a slot of local storage.
+        else => true,
+    };
+}
+
+fn transferIndexedRead(
+    ctx: Ctx,
+    state: *AbstractState,
+    read: @TypeOf(@as(StmtKind, undefined).indexed_read),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    const origin = state.locals.get(read.array);
+    const info = ctx.locals[@intFromEnum(read.array)];
+    if (info.is_slice) {
+        const initialized = !indexedValueMayBeUndefined(ctx, state, read.array, read.index);
+        const pointer = state.fields.getContext(.{ .parent = read.array, .name = "ptr" }, .{});
+        if (!initialized) try checkOriginAlive(ctx, state, .undef, pos, end_pos, info.name);
+        if (origin) |root| try checkOriginAlive(ctx, state, root, pos, end_pos, info.name);
+        if (pointer) |root| {
+            if (root != .undef) try checkOriginAlive(ctx, state, root, pos, end_pos, info.name);
+        }
+    } else if (localIsArray(ctx, read.array)) {
+        // Scaled byte witnesses are diagnostic coverage, not value certificates.
+        const scaled_initialized = if (read.scaled) |element|
+            indexIsDefined(ctx, state, .{ .local = .{ .local = element.index } }) and
+                state.hasInitializedScaledElement(read.array, element)
+        else
+            false;
+        const initialized = !indexedValueMayBeUndefined(ctx, state, read.array, read.index) or
+            (scaled_initialized and !undefinedFieldBytesRemain(state, read.array));
+        try reportUncoveredArrayUse(ctx, state, read.array, initialized, false, pos, end_pos);
+        if (origin) |root| {
+            const read_origin = if (initialized and root == .undef) Origin.plain else root;
+            try checkOriginAlive(ctx, state, read_origin, pos, end_pos, info.name);
+        }
+    } else if (info.is_pointer) {
+        if (indexedValueMayBeUndefined(ctx, state, read.array, read.index))
+            try checkOriginAlive(ctx, state, .undef, pos, end_pos, info.name);
+        if (origin) |root| if (root != .undef)
+            try checkOriginAlive(ctx, state, root, pos, end_pos, info.name);
+    } else if (origin) |root| {
+        try checkOriginAlive(ctx, state, root, pos, end_pos, info.name);
+    }
+    if (read.name) |name| try checkIndexedFieldOrigin(ctx, state, read.array, name, pos, end_pos);
+}
+
+fn transferIndexedWrite(
+    ctx: Ctx,
+    state: *AbstractState,
+    write: @TypeOf(@as(StmtKind, undefined).indexed_write),
+    pos: cfg.SrcPos,
+) !void {
+    // An indexed store initializes bytes, not the descriptor used to reach
+    // them. Undefined slice headers cannot be repaired by writing a slot.
+    if (ctx.locals[@intFromEnum(write.array)].is_slice) {
+        const name = ctx.locals[@intFromEnum(write.array)].name;
+        if (state.locals.get(write.array)) |origin|
+            try checkOriginAlive(ctx, state, if (origin == .undef and !localIsProvedUndefined(ctx, state, write.array)) .plain else origin, pos, pos, name);
+        // A header seeded `undefined` keeps undefined descriptor-word
+        // records while the owner itself reads as initialized.
+        for ([_][]const u8{ "ptr", "len" }) |word| {
+            const origin = state.fields.getContext(.{ .parent = write.array, .name = word }, .{}) orelse continue;
+            if (origin == .undef and state.fieldValueMayBeUndefined(write.array, word))
+                try checkOriginAlive(ctx, state, origin, pos, pos, name);
+        }
+    }
+    const rhs_origin = try originOfInit(ctx, state, write.rhs_kind, pos);
+    const reads_undefined = indexedRhsReadsUndefined(ctx, state, write, rhs_origin);
+    const info = ctx.locals[@intFromEnum(write.array)];
+    if (write.all_elements and (info.is_pointer or info.is_slice or !localIsArray(ctx, write.array))) {
+        try transferFieldAssign(ctx, state, .{
+            .parent = write.array,
+            .name = if (info.is_slice) "[]" else "",
+            .rhs_kind = if (reads_undefined) .undef else .plain,
+            .diagnostic_only = true,
+        }, pos);
+        return;
+    }
+    if (write.field_array) |path| {
+        const rhs_defined = indexedRhsIsDefined(ctx, state, write, rhs_origin);
+        state.forgetFieldComparisons(write.array);
+        if (write.name) |name| {
+            const key: state_mod.FieldKey = .{ .parent = write.array, .name = name };
+            try state.bindFieldValue(ctx.gpa, key, rhs_defined);
+            try state.fields.putContext(ctx.gpa, key, rhs_origin, .{});
+            try state.bindWrittenField(ctx.gpa, key, reads_undefined);
+            if (reads_undefined)
+                try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+        } else if (!rhs_defined) {
+            // An unplaced undefined overwrite can hit any existing slot.
+            // Revoke descendants too: a formerly complete element must not
+            // override this uncertain array ancestor. Retain lifetime origins.
+            for (state.fields.keys()) |key| {
+                if (key.parent != write.array or !std.mem.startsWith(u8, key.name, path)) continue;
+                if (key.name.len != path.len and key.name[path.len] != '[' and key.name[path.len] != '.') continue;
+                try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+            }
+            try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
+            try state.bindWrittenField(ctx.gpa, .{ .parent = write.array, .name = path }, reads_undefined);
+            if (reads_undefined)
+                try state.undefined_field_values.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
+        }
+        if (!rhs_defined) try invalidateAliasedArrayPayload(ctx, state, write.array);
+        // Defined dynamic writes preserve existing coverage, but grant none.
+        return;
+    }
+    if (write.name) |name| {
+        const key: state_mod.FieldKey = .{ .parent = write.array, .name = name };
+        try state.bindFieldValue(ctx.gpa, key, indexedRhsIsDefined(ctx, state, write, rhs_origin));
+        try state.fields.putContext(ctx.gpa, key, rhs_origin, .{});
+        try state.bindWrittenField(ctx.gpa, key, reads_undefined);
+        if (reads_undefined)
+            try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+    }
+    var rhs_defined = indexedRhsIsDefined(ctx, state, write, rhs_origin);
+    if (!rhs_defined and !reads_undefined) {
+        // Unproved is not undefined: the slot is written for use-undefined,
+        // but the array's payload certificate becomes unknown.
+        try state.unknown_values.put(ctx.gpa, write.array, {});
+        rhs_defined = true;
+    }
+    if (!rhs_defined and resolveIndex(state, write.index) == null)
+        try markPayloadMayBeUndefined(ctx, state, write.array);
+    const defined = indexIsDefined(ctx, state, write.index) and rhs_defined;
+    if (write.all_elements) {
+        if (defined) {
+            try state.markArrayComplete(ctx.gpa, write.array);
+        } else {
+            state.forgetInitializationArray(write.array);
+            if (reads_undefined) try markPayloadMayBeUndefined(ctx, state, write.array);
+        }
+        return;
+    }
+    // A defined store cannot shrink a complete array's coverage, wherever an
+    // index we cannot place lands it. The index is checked as a read elsewhere.
+    if (rhs_defined and state.baseComplete(write.array) and resolveIndex(state, write.index) == null) return;
+    const extent = ctx.locals[@intFromEnum(write.array)].array_extent orelse {
+        if (resolveIndex(state, write.index)) |index| {
+            try state.setExactElement(ctx.gpa, write.array, index, rhs_defined);
+        } else if (!rhs_defined) {
+            try markPayloadMayBeUndefined(ctx, state, write.array);
+        }
+        return;
+    };
+    const resolved = resolveIndex(state, write.index);
+    if (!rhs_defined) {
+        if (resolved) |index| {
+            if (index < extent) try state.setExactElement(ctx.gpa, write.array, index, false);
+        } else {
+            state.forgetInitializationArray(write.array);
+        }
+        return;
+    }
+    // Unsupported placement cannot create coverage. A defined overwrite also
+    // cannot remove prior prefix/sparse coverage merely because we lack a term.
+    if (!defined) return;
+    if (!state.provesIndexInBounds(write.index, extent)) return;
+
+    const prefix_before = state.fixedPrefix(write.array);
+    if (resolved) |index| {
+        try state.setExactElement(ctx.gpa, write.array, index, true);
+    }
+    try extendSymbolicPrefix(ctx, state, write.array, write.index, prefix_before, extent);
+}
+
+/// Diagnostic question: does this store write a value proved undefined?
+fn indexedRhsReadsUndefined(
+    ctx: Ctx,
+    state: *const AbstractState,
+    write: @TypeOf(@as(StmtKind, undefined).indexed_write),
+    rhs_origin: Origin,
+) bool {
+    if (rhs_origin == .undef and write.rhs_kind != .copy_of and write.rhs_kind != .field_copy_of) return true;
+    if (exprMayBeUndefined(ctx, state, write.rhs_kind)) return true;
+    for (write.inputs) |input| {
+        const local = input orelse continue;
+        if (localIsProvedUndefined(ctx, state, local)) return true;
+    }
+    return valueInputsMayBeUndefined(ctx, state, &write.selected_inputs);
+}
+
+fn transferArrayRangeComplete(
+    ctx: Ctx,
+    state: *AbstractState,
+    range: @TypeOf(@as(StmtKind, undefined).array_range_complete),
+) !void {
+    const info = ctx.locals[@intFromEnum(range.array)];
+    const extent = info.array_extent orelse {
+        state.forgetInitializationArray(range.array);
+        return;
+    };
+    if (!info.is_array or info.is_pointer or range.start > range.end or range.end > extent) {
+        state.forgetInitializationArray(range.array);
+        return;
+    }
+    if (range.start == range.end) return;
+    const write: @TypeOf(@as(StmtKind, undefined).indexed_write) = .{
+        .array = range.array,
+        .index = .{ .constant = range.start },
+        .rhs_kind = if (range.value_has_undefined_origin) .undef else .plain,
+        .defined = range.value_defined,
+        .inputs = range.inputs,
+        .selected_inputs = range.selected_inputs,
+    };
+    if (!storageInputsAreCovered(ctx, state, &range.inputs) or
+        !indexedRhsIsDefined(ctx, state, write, .plain)) {
+        if (indexedRhsReadsUndefined(ctx, state, write, .plain)) {
+            state.forgetInitializationArray(range.array);
+            try state.may_undefined_values.put(ctx.gpa, range.array, {});
+            return;
+        }
+        try state.unknown_values.put(ctx.gpa, range.array, {});
+    }
+    try state.markArrayRangeComplete(ctx.gpa, range.array, range.start, range.end);
+}
+
+fn transferArrayMemsetPrefix(
+    ctx: Ctx,
+    state: *AbstractState,
+    prefix: @TypeOf(@as(StmtKind, undefined).array_memset_prefix),
+    pos: cfg.SrcPos,
+) !void {
+    const info = ctx.locals[@intFromEnum(prefix.array)];
+    const extent = info.array_extent orelse {
+        state.forgetInitializationArray(prefix.array);
+        return;
+    };
+    if (!info.is_array or info.is_pointer or !indexIsDefined(ctx, state, prefix.count)) {
+        state.forgetInitializationArray(prefix.array);
+        return;
+    }
+    switch (prefix.count) {
+        .constant => {},
+        .local => |term| {
+            if (term.offset != 0 or !ctx.locals[@intFromEnum(term.local)].is_unsigned) {
+                state.forgetInitializationArray(prefix.array);
+                return;
+            }
+        },
+        else => {
+            state.forgetInitializationArray(prefix.array);
+            return;
+        },
+    }
+    // A successful slice bounds an existing count; it never defines that count.
+    state.feasible = try state.assumeComparison(ctx.gpa, .{
+        .lhs = prefix.count,
+        .rhs = .{ .constant = 0 },
+        .op = .ge,
+    });
+    if (!state.feasible) return;
+    state.feasible = try state.assumeComparison(ctx.gpa, .{
+        .lhs = prefix.count,
+        .rhs = .{ .constant = extent },
+        .op = .le,
+    });
+    if (!state.feasible) return;
+    const rhs_origin = try originOfInit(ctx, state, prefix.rhs_kind, pos);
+    const write: @TypeOf(@as(StmtKind, undefined).indexed_write) = .{
+        .array = prefix.array,
+        .index = prefix.count,
+        .rhs_kind = prefix.rhs_kind,
+        .defined = prefix.defined,
+        .selected_inputs = prefix.selected_inputs,
+    };
+    if (!indexedRhsIsDefined(ctx, state, write, rhs_origin) or
+        !valueInputsAreDefined(ctx, state, &prefix.selected_inputs, false))
+    {
+        if (prefix.count == .constant and prefix.count.constant == 0) return;
+        if (indexedRhsReadsUndefined(ctx, state, write, rhs_origin)) {
+            state.forgetInitializationArray(prefix.array);
+            try state.may_undefined_values.put(ctx.gpa, prefix.array, {});
+            return;
+        }
+        // Unknown stores write bytes without supplying a value certificate.
+        try state.unknown_values.put(ctx.gpa, prefix.array, {});
+    }
+    var hole_index: usize = 0;
+    while (hole_index < state.undefined_elements.count()) {
+        const hole = state.undefined_elements.keys()[hole_index];
+        if (hole.array == prefix.array and state.provesLessThan(
+            .{ .constant = hole.index },
+            prefix.count,
+        )) {
+            _ = state.undefined_elements.swapRemoveAt(hole_index);
+        } else hole_index += 1;
+    }
+    switch (prefix.count) {
+        .constant => |count| {
+            try state.setFixedPrefix(ctx.gpa, prefix.array, @max(state.fixedPrefix(prefix.array), count));
+            if (count == extent) try state.markArrayComplete(ctx.gpa, prefix.array);
+        },
+        .local => |term| {
+            if (state.symbolicPrefixOffset(prefix.array, term.local)) |offset| {
+                if (offset >= 0) return;
+            }
+            try state.setSymbolicPrefix(ctx.gpa, prefix.array, term.local, 0, extent);
+        },
+        else => unreachable,
+    }
+}
+
+fn indexedLocalInputIsDefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    if (!ctx.locals[@intFromEnum(local)].is_pointer and localIsArray(ctx, local))
+        return arrayHasFullCoverage(ctx, state, local);
+    if (state.unknown_values.contains(local)) return false;
+    if (state.locals.get(local)) |origin| if (origin == .undef) return false;
+    // Pointer values carry descriptors, not the initializedness of pointees.
+    // A copied by-value aggregate must include every tracked member instead.
+    if (!ctx.locals[@intFromEnum(local)].is_pointer and !tracksScalarValue(ctx, state, local) and
+        !state.fieldValueIsDefined(local, "")) return false;
+    return true;
+}
+
+fn indexedRhsIsDefined(
+    ctx: Ctx,
+    state: *const AbstractState,
+    write: @TypeOf(@as(StmtKind, undefined).indexed_write),
+    rhs_origin: Origin,
+) bool {
+    if (!write.defined or write.rhs_kind == .undef) return false;
+    if (rhs_origin == .undef) {
+        const source = switch (write.rhs_kind) {
+            .copy_of => |local| local,
+            else => return false,
+        };
+        if (!localIsArray(ctx, source) or !arrayHasFullCoverage(ctx, state, source)) return false;
+    }
+    for (write.inputs) |input| {
+        const local = input orelse continue;
+        if (!indexedLocalInputIsDefined(ctx, state, local)) return false;
+    }
+    for (write.selected_inputs) |entry| {
+        const input = entry orelse continue;
+        switch (input) {
+            .local => |local| {
+                if (!indexedLocalInputIsDefined(ctx, state, local)) return false;
+            },
+            .field => |field| {
+                if (!state.fieldValueIsDefined(field.parent, field.name)) return false;
+            },
+            .indexed => {
+                if (!valueInputsAreDefined(ctx, state, &.{input}, false)) return false;
+            },
+        }
+    }
+    return true;
+}
+
+fn transferCounterStep(
+    ctx: Ctx,
+    state: *AbstractState,
+    step: @TypeOf(@as(StmtKind, undefined).counter_step),
+) !void {
+    if (!ctx.locals[@intFromEnum(step.local)].is_unsigned or (step.step != 1 and step.step != -1)) {
+        forgetLocalValueFacts(ctx, state, step.local);
+        return;
+    }
+    state.facts.forgetLocal(step.local);
+    try state.stepCounter(ctx.gpa, step.local, step.step);
+    const origin = state.locals.get(step.local) orelse .plain;
+    if (origin != .undef) try state.nonnegative_locals.put(ctx.gpa, step.local, {});
+}
+
+fn tracksIntegerValue(state: *const AbstractState, local: LocalId) bool {
+    if (state.integer_domains.len == 0) return false;
+    const id = @intFromEnum(local);
+    std.debug.assert(id < state.integer_domains.len);
+    return state.integer_domains[id].kind != .unknown;
+}
+
+fn tracksScalarValue(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    return ctx.locals[@intFromEnum(local)].tracks_scalar_value or tracksIntegerValue(state, local);
+}
+
+/// A return certificate uses the same payload dependencies as element stores.
+/// No result type, resource origin, or empty opaque expression creates a value.
+pub fn returnValueIsDefined(ctx: Ctx, state: *const AbstractState, returned: cfg.StmtKind) bool {
+    const value = returned.ret;
+    return value.value_defined and !value.is_literal_undef and
+        copiedPayloadIsDefined(state, value.value_kind, true) and
+        valueInputsAreDefined(ctx, state, &value.value_inputs, false);
+}
+
+pub fn returnValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, returned: cfg.StmtKind) bool {
+    const value = returned.ret;
+    if (value.diagnostic_source) |source| return localIsProvedUndefined(ctx, state, source);
+    return value.is_literal_undef or bindingMayBeUndefined(ctx, state, value.value_kind, &value.value_inputs);
+}
+
+fn scalarValueIsDefined(
+    ctx: Ctx,
+    state: *const AbstractState,
+    kind: ExprKind,
+    defined: bool,
+    inputs: []const ?cfg.ValueInput,
+) bool {
+    // An empty context has no source type/certificate publication. Explicit
+    // scalar flags alone cannot certify a synthetic graph's value.
+    if (state.integer_domains.len == 0 or !defined) return false;
+    if (kind == .field_copy_of) {
+        return scalarFieldIsDefined(ctx, state, kind.field_copy_of.parent, kind.field_copy_of.name) and
+            scalarInputsAreDefined(ctx, state, inputs);
+    }
+    return copiedPayloadIsDefined(state, kind, defined) and scalarInputsAreDefined(ctx, state, inputs);
+}
+
+/// Fixed array length is type metadata, not a read of its element payload.
+fn fixedArrayLength(ctx: Ctx, parent: LocalId, path: []const u8) ?u64 {
+    const info = ctx.locals[@intFromEnum(parent)];
+    if (info.is_pointer or !std.mem.eql(u8, path, "len")) return null;
+    return info.array_extent;
+}
+
+fn scalarFieldIsDefined(ctx: Ctx, state: *const AbstractState, parent: LocalId, path: []const u8) bool {
+    if (fixedArrayLength(ctx, parent, path) != null) return true;
+    const info = ctx.locals[@intFromEnum(parent)];
+    if (info.is_slice and (std.mem.eql(u8, path, "len") or std.mem.eql(u8, path, "ptr"))) {
+        // Explicit certificates distinguish defined descriptor bits from
+        // the bytes behind them. A ptr certificate additionally identifies
+        // the supported zero-offset backing view, not initialized payload.
+        if (!state.fields.containsContext(.{ .parent = parent, .name = path }, .{})) return false;
+        return state.fieldValueIsDefined(parent, path);
+    }
+    // A pointer header alone never certifies storage behind it. Exact field
+    // stores do, provided the header remains defined and the field's negative
+    // or descendant certificates do not invalidate that store.
+    if (info.is_pointer) {
+        if (state.unknown_values.contains(parent)) return false;
+        if (state.locals.get(parent)) |origin| if (origin == .undef) return false;
+        if (!state.fields.containsContext(.{ .parent = parent, .name = path }, .{})) return false;
+    }
+    return state.fieldValueIsDefined(parent, path);
+}
+
+/// Evaluate computed scalar dependencies before rebinding their destination.
+/// Type endpoints can bound an existing value, but cannot create that value.
+fn scalarInputsAreDefined(ctx: Ctx, state: *const AbstractState, inputs: []const ?cfg.ValueInput) bool {
+    return valueInputsAreDefined(ctx, state, inputs, true);
+}
+
+fn localInputIsDefined(ctx: Ctx, state: *const AbstractState, local: LocalId, scalar_only: bool) bool {
+    const info = ctx.locals[@intFromEnum(local)];
+    if (!scalar_only and localIsArray(ctx, local)) {
+        // Only element coverage certifies array bytes. A header
+        // or an old whole-array undef marker does not replace it.
+        return !info.is_pointer and !state.unknown_values.contains(local) and arrayHasFullCoverage(ctx, state, local);
+    }
+    const scalar_source = state.integer_domains.len != 0 and tracksScalarValue(ctx, state, local);
+    if (!scalar_source and state.scalarValue(local) == null and
+        (scalar_only or !info.tracks_array_payload)) return false;
+    if (info.is_pointer or state.unknown_values.contains(local)) return false;
+    if (state.locals.get(local)) |origin| if (origin == .undef) return false;
+    // A defined root does not repair undefined or uncertain descendants.
+    // Scalar selectors retain their narrower field-specific certificates.
+    return scalar_only or state.fieldValueIsDefined(local, "");
+}
+
+fn valueInputsAreDefined(
+    ctx: Ctx,
+    state: *const AbstractState,
+    inputs: []const ?cfg.ValueInput,
+    scalar_only: bool,
+) bool {
+    for (inputs) |entry| {
+        const input = entry orelse continue;
+        switch (input) {
+            .local => |local| {
+                if (!localInputIsDefined(ctx, state, local, scalar_only)) return false;
+            },
+            .field => |field| {
+                if (!scalarFieldIsDefined(ctx, state, field.parent, field.name)) return false;
+            },
+            .indexed => |indexed| {
+                // Written-but-unproved slots satisfy use-undefined, not certificates.
+                if (state.unknown_values.contains(indexed.array)) return false;
+                if (indexed.modulo) |modulo| {
+                    if (!localIsArray(ctx, indexed.array) or
+                        ctx.locals[@intFromEnum(indexed.array)].is_slice) return false;
+                    const extent = ctx.locals[@intFromEnum(indexed.array)].array_extent orelse return false;
+                    if (!arrayHasFullCoverage(ctx, state, indexed.array) or
+                        !moduloIndexInBounds(ctx, state, modulo, extent)) return false;
+                    continue;
+                }
+                if (ctx.locals[@intFromEnum(indexed.array)].is_slice) {
+                    if (!sliceElementIsDefined(ctx, state, indexed.array, indexed.index)) return false;
+                    continue;
+                }
+                if (!indexIsDefined(ctx, state, indexed.index)) return false;
+                if (!localIsArray(ctx, indexed.array)) return false;
+                const extent = ctx.locals[@intFromEnum(indexed.array)].array_extent orelse return false;
+                // A complete array needs no bounds proof: a defined selection
+                // reads initialized bytes or panics before reading anything.
+                if (arrayHasFullCoverage(ctx, state, indexed.array)) continue;
+                if (!state.provesIndexInBounds(indexed.index, extent) or
+                    !state.hasInitializedElement(indexed.array, indexed.index)) return false;
+            },
+        }
+    }
+    return true;
+}
+
+/// A remainder is bounded only by its positive divisor. Its input must still
+/// exist; a type endpoint or fully written array cannot initialize that input.
+fn moduloIndexInBounds(ctx: Ctx, state: *const AbstractState, modulo: cfg.ModuloIndex, extent: u64) bool {
+    if (modulo.modulus == 0 or modulo.modulus > extent) return false;
+    const input = @intFromEnum(modulo.input);
+    if (input >= state.integer_domains.len) return false;
+    switch (state.integer_domains[input].kind) {
+        .unsigned, .unsigned_unbounded => {},
+        else => return false,
+    }
+    return indexIsDefined(ctx, state, .{ .local = .{ .local = modulo.input } });
+}
+
+fn indexIsDefined(ctx: Ctx, state: *const AbstractState, index: cfg.IndexTerm) bool {
+    return switch (index) {
+        .unknown => false,
+        .constant => true,
+        .local => |term| !state.unknown_values.contains(term.local) and
+            if (state.locals.get(term.local)) |origin| origin != .undef else true,
+        .field => |term| scalarFieldIsDefined(ctx, state, term.parent, term.name),
+    };
+}
+
+fn resolveIndex(state: *const AbstractState, index: cfg.IndexTerm) ?u64 {
+    return switch (index) {
+        .unknown, .field => null,
+        .constant => |value| value,
+        .local => |term| blk: {
+            const value = state.scalarValue(term.local) orelse break :blk null;
+            if (term.offset == 0) break :blk value;
+            if (term.offset == 1) break :blk std.math.add(u64, value, 1) catch null;
+            if (term.offset == -1) break :blk if (value == 0) null else value - 1;
+            break :blk null;
+        },
+    };
+}
+
+fn extendSymbolicPrefix(
+    ctx: Ctx,
+    state: *AbstractState,
+    array: LocalId,
+    index: cfg.IndexTerm,
+    fixed_prefix_before: u64,
+    extent: u64,
+) !void {
+    const term = switch (index) {
+        .local => |local| local,
+        else => return,
+    };
+    if (term.offset < -1 or term.offset > 1) return;
+
+    var reaches_prefix = false;
+    if (state.symbolicPrefixOffset(array, term.local)) |offset| {
+        reaches_prefix = offset == term.offset;
+    }
+    if (!reaches_prefix) {
+        if (resolveIndex(state, index)) |concrete| {
+            reaches_prefix = concrete == fixed_prefix_before;
+        }
+    }
+    if (!reaches_prefix) return;
+    const next_offset = term.offset + 1;
+    if (next_offset < -1 or next_offset > 1) return;
+    try state.setSymbolicPrefix(ctx.gpa, array, term.local, next_offset, extent);
+}
+
+fn reportUncoveredArrayUse(
+    ctx: Ctx,
+    state: *const AbstractState,
+    array: LocalId,
+    initialized: bool,
+    is_return: bool,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    if (initialized or !localIsProvedUndefined(ctx, state, array)) return;
+    const origin = state.locals.get(array) orelse return;
+    // `checkOriginAlive` emits the existing use-undefined diagnostic
+    // for an undefined root.  This path handles holes in a root whose
+    // coarse lifetime origin is otherwise plain or resource-bearing.
+    if (origin == .undef or !config_mod.isEnabled(ctx.config, .use_undefined)) return;
+    if (is_return) {
+        try report(ctx, "use-undefined", pos, end_pos, .@"error", "returning a value that is still `undefined`", .{});
+    } else {
+        try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}` while still `undefined`", .{ctx.locals[@intFromEnum(array)].name});
+    }
+}
+
+fn checkIndexedFieldOrigin(
+    ctx: Ctx,
+    state: *const AbstractState,
+    array: LocalId,
+    name: []const u8,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    if (name.len > 0 and name[0] == '[') {
+        if (std.mem.indexOfScalar(u8, name, ']')) |end| {
+            const element_name = name[0 .. end + 1];
+            if (!std.mem.eql(u8, name, element_name)) {
+                const ancestor = state.fields.getContext(.{ .parent = array, .name = element_name }, .{});
+                if (ancestor != null and ancestor.? != .undef)
+                    try checkFieldOrigin(ctx, state, array, element_name, pos, end_pos);
+            }
+        }
+    }
+    try checkFieldOrigin(ctx, state, array, name, pos, end_pos);
+}
+
+fn checkFieldOrigin(
+    ctx: Ctx,
+    state: *const AbstractState,
+    array: LocalId,
+    name: []const u8,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    const key: state_mod.FieldKey = .{ .parent = array, .name = name };
+    const origin = state.fields.getContext(key, .{}) orelse return;
+    // Name the access as written (`arr[0].ptr`), not just the field path.
+    // Display-only: an over-long name falls back to the bare path.
+    var shown_buf: [256]u8 = undefined;
+    const shown = std.fmt.bufPrint(&shown_buf, "{s}{s}{s}", .{ ctx.locals[@intFromEnum(array)].name, pathSep(name), name }) catch name;
+    const diagnostic_origin = if (fieldValueMayBeUndefined(ctx, state, array, name)) Origin.undef else
+        if (origin == .undef) Origin.plain else origin;
+    try checkOriginAlive(ctx, state, diagnostic_origin, pos, end_pos, shown);
+    if (diagnostic_origin == .undef and origin != .undef)
+        try checkOriginAlive(ctx, state, origin, pos, end_pos, shown);
 }
 
 /// Map an ExprKind (RHS classification) to the Origin it produces.
@@ -955,9 +2549,30 @@ fn originOfInit(
             });
             break :blk .{ .arena = info.id };
         },
-        .stack_ref => |src_local| .{ .stack = src_local },
+        .stack_ref => |src_local| blk: {
+            // Address formation defines a header even when payload is undefined.
+            // Resource-backed storage still carries the owner's lifetime.
+            const source = state.locals.get(src_local) orelse break :blk .{ .stack = src_local };
+            break :blk switch (source) {
+                .arena => |id| .{ .arena_borrow = id },
+                .arena_borrow, .heap => source,
+                else => .{ .stack = src_local },
+            };
+        },
         .composite_borrow => |src_local| state.locals.get(src_local) orelse .plain,
         .heap_alloc => |info| blk: {
+            if (info.allocator_source) |source| {
+                const origin = switch (source) {
+                    .local => |local| state.locals.get(local),
+                    .field => |field| state.fields.getContext(.{ .parent = field.parent, .name = field.name }, .{}),
+                    .indexed => null,
+                };
+                if (origin) |allocator| switch (allocator) {
+                    .arena => |id| break :blk .{ .arena_borrow = id },
+                    .arena_borrow => break :blk allocator,
+                    else => {},
+                };
+            }
             const mut_state: *AbstractState = @constCast(state);
             try mut_state.heaps.put(ctx.gpa, info.id, .{
                 .state = .live,
@@ -1058,6 +2673,8 @@ fn report(
     try reportWithNote(ctx, rule_id, pos, end_pos, severity, fmt, args, null);
 }
 
+const KillSiteNote = struct { site: state_mod.KillSite, label: []const u8 };
+
 fn reportWithNote(
     ctx: Ctx,
     comptime rule_id: []const u8,
@@ -1066,7 +2683,21 @@ fn reportWithNote(
     severity: Severity,
     comptime fmt: []const u8,
     args: anytype,
-    kill_site: ?struct { site: state_mod.KillSite, label: []const u8 },
+    kill_site: ?KillSiteNote,
+) !void {
+    try reportWithIdentity(ctx, rule_id, pos, end_pos, severity, fmt, args, kill_site, null);
+}
+
+fn reportWithIdentity(
+    ctx: Ctx,
+    comptime rule_id: []const u8,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+    severity: Severity,
+    comptime fmt: []const u8,
+    args: anytype,
+    kill_site: ?KillSiteNote,
+    owner_byte: ?u32,
 ) !void {
     if (!ctx.report_enabled) return;
     // One source operation can be reached through several cleanup paths,
@@ -1076,7 +2707,9 @@ fn reportWithNote(
     // insert, an old one one lookup.  The FIRST report still wins, so
     // the finding that lands — and the note it carries — is the one the
     // scan over `ctx.problems` used to keep.
-    if (!try ctx.seen.record(ctx.gpa, rule_id, pos.byte)) return;
+    if (owner_byte) |owner| {
+        if (!try ctx.seen.recordOwner(ctx.gpa, rule_id, pos.byte, owner)) return;
+    } else if (!try ctx.seen.record(ctx.gpa, rule_id, pos.byte)) return;
     const msg = try std.fmt.allocPrint(ctx.gpa, fmt, args);
     errdefer ctx.gpa.free(msg);
     const real_end: cfg.SrcPos = if (end_pos.byte > pos.byte)
@@ -1480,25 +3113,6 @@ test "transferUse: dead heap origin fires heap-use-after-free" {
     try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
 }
 
-test "transferUse: method-call on .undef clears to .plain (no fire)" {
-    const gpa = testing.allocator;
-    var state: AbstractState = .{};
-    defer state.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    defer freeProblems(gpa, &problems);
-    var seen = Seen.init();
-    defer seen.deinit(gpa);
-    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .seen = &seen, .path = "test" };
-
-    const x: LId = @enumFromInt(0);
-    try state.locals.put(gpa, x, .undef);
-
-    try transferUse(ctx, &state, .{ .local = x, .from_method_call = true }, pos0(), pos1());
-
-    try testing.expectEqual(@as(usize, 0), problems.items.len);
-    try testing.expect(state.locals.get(x).? == .plain);
-}
-
 test "transferUse: bare read of .undef fires use-undefined" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
@@ -1518,23 +3132,49 @@ test "transferUse: bare read of .undef fires use-undefined" {
     try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
 }
 
-test "transferGap: collapses .undef → .plain, preserves resource origins" {
+test "writing gaps clear source booleans but preserve internal outcomes" {
     const gpa = testing.allocator;
     var state: AbstractState = .{};
     defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "source_flag", .decl_pos = pos0() },
+        .{ .name = "control_result", .decl_pos = pos0(), .is_control_local = true },
+        .{ .name = "resource", .decl_pos = pos0() },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const source_flag: LId = @enumFromInt(0);
+    const control_result: LId = @enumFromInt(1);
+    const resource: LId = @enumFromInt(2);
+    const resource_heap = @as(HId, @enumFromInt(0));
 
-    const u: LId = @enumFromInt(0);
-    const h: LId = @enumFromInt(1);
-    const a: LId = @enumFromInt(2);
-    try state.locals.put(gpa, u, .undef);
-    try state.locals.put(gpa, h, .{ .heap = @enumFromInt(1) });
-    try state.locals.put(gpa, a, .{ .arena = @enumFromInt(1) });
+    try state.facts.bindBoolean(gpa, source_flag, true);
+    try state.facts.bindBoolean(gpa, control_result, true);
+    try state.locals.put(gpa, resource, .{ .heap = resource_heap });
+    try state.heaps.put(gpa, resource_heap, .{ .state = .dead });
+    try transferGap(ctx, &state, .{ .note = "unknown call", .may_assign_locals = true });
 
-    transferGap(&state, .{ .note = "test" });
-
-    try testing.expect(state.locals.get(u).? == .plain);
-    try testing.expect(state.locals.get(h).? == .heap);
-    try testing.expect(state.locals.get(a).? == .arena);
+    try testing.expectEqual(@as(?bool, null), state.facts.boolean(source_flag));
+    try testing.expectEqual(@as(?bool, true), state.facts.boolean(control_result));
+    try testing.expect(state.locals.get(resource).? == .heap);
+    try testing.expectEqual(.dead, state.heaps.get(resource_heap).?.state);
+    try transfer(ctx, &state, .{
+        .kind = .{ .assume = .{ .not_local = source_flag } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.feasible);
+    try transfer(ctx, &state, .{
+        .kind = .{ .assume = .{ .not_local = control_result } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(!state.feasible);
+    try testing.expect(state.locals.get(resource).? == .heap);
+    try testing.expectEqual(.dead, state.heaps.get(resource_heap).?.state);
 }
 
 test "transferRet: returning .arena from borrowed-return-type fires arena-escape" {
@@ -1582,10 +3222,110 @@ test "transferRet: returning .stack fires stack-escape" {
     try transferRet(ctx, &state, .{
         .value_kind = .{ .copy_of = y },
         .is_borrowed_return_type = true,
+        .stack_loans = .{ .legacy_locals = &.{buf} },
     }, pos0(), pos1());
 
     try testing.expect(problems.items.len >= 1);
     try testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+}
+
+test "transferRet: complete empty loans replace only the legacy stack decision" {
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |complete| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{
+            .gpa = gpa,
+            .locals = mkLocals(&.{ "alias", "cell" }),
+            .problems = &problems,
+            .seen = &seen,
+            .path = "test",
+        };
+        const alias: LId = @enumFromInt(0);
+        const cell: LId = @enumFromInt(1);
+        try state.locals.put(gpa, alias, .{ .stack = cell });
+        try transferRet(ctx, &state, .{
+            .value_kind = .{ .copy_of = alias },
+            .is_borrowed_return_type = true,
+            .stack_loans = .{ .complete = complete, .legacy_locals = &.{cell} },
+        }, pos0(), pos1());
+        try testing.expectEqual(@as(usize, if (complete) 0 else 1), problems.items.len);
+    }
+}
+
+test "transferRet: physical stack loans preserve arena and heap checks" {
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |arena| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{
+            .gpa = gpa,
+            .locals = mkLocals(&.{ "value", "cell" }),
+            .problems = &problems,
+            .seen = &seen,
+            .path = "test",
+        };
+        const value: LId = @enumFromInt(0);
+        const cell: LId = @enumFromInt(1);
+        // The cell's contents are irrelevant to an escaping physical address.
+        try state.locals.put(gpa, cell, .undef);
+        if (arena) {
+            const aid: AId = @enumFromInt(0);
+            try state.arenas.put(gpa, aid, .{ .state = .live });
+            try state.locals.put(gpa, value, .{ .arena = aid });
+        } else {
+            const hid: HId = @enumFromInt(0);
+            try state.heaps.put(gpa, hid, .{ .state = .dead });
+            try state.locals.put(gpa, value, .{ .heap = hid });
+        }
+        try transferRet(ctx, &state, .{
+            .value_kind = .{ .copy_of = value },
+            .is_borrowed_return_type = true,
+            .stack_loans = .{ .complete = arena, .locals = &.{cell} },
+        }, pos0(), pos1());
+        try testing.expectEqual(@as(usize, 2), problems.items.len);
+        try testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+        try testing.expect(std.mem.indexOf(u8, problems.items[0].message, "`cell`") != null);
+        try testing.expectEqualStrings(
+            if (arena) "arena-escape" else "heap-use-after-free",
+            problems.items[1].rule_id,
+        );
+    }
+}
+
+test "transferRet: undefined value keeps precedence over canonical stack loans" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{
+        .gpa = gpa,
+        .locals = mkLocals(&.{ "value", "cell" }),
+        .problems = &problems,
+        .seen = &seen,
+        .path = "test",
+    };
+    const value: LId = @enumFromInt(0);
+    const cell: LId = @enumFromInt(1);
+    try state.locals.put(gpa, value, .undef);
+    try transferRet(ctx, &state, .{
+        .value_kind = .{ .copy_of = value },
+        .is_borrowed_return_type = true,
+        .stack_loans = .{ .complete = true, .locals = &.{cell} },
+    }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
 }
 
 test "transferFieldHeapFree: tracks field origin as dead" {
@@ -1670,14 +3410,15 @@ test "transferCompositeEscape: an out-of-domain ExprKind is a silent no-op, not 
     // argument for from reporting an escape nobody proved: the two
     // variants the producer actually emits still fire, and these two
     // reach the same origin by a different route and stay silent.
-    try transferCompositeEscape(ctx, &state, .{ .composite_borrow = src }, pos0(), pos1());
-    try transferCompositeEscape(ctx, &state, .{ .borrowed_from = src }, pos0(), pos1());
+    const loans: cfg.StackLoanProof = .{ .legacy_locals = &.{ inner, src } };
+    try transferCompositeEscape(ctx, &state, .{ .value_kind = .{ .composite_borrow = src }, .stack_loans = loans }, pos0(), pos1());
+    try transferCompositeEscape(ctx, &state, .{ .value_kind = .{ .borrowed_from = src }, .stack_loans = loans }, pos0(), pos1());
     try testing.expectEqual(@as(usize, 0), problems.items.len);
 
     // The same source reached through the shapes the producer DOES emit
     // still reports, so the control above is about the narrowing and not
     // about `src` failing to carry a stack origin.
-    try transferCompositeEscape(ctx, &state, .{ .stack_ref = src }, pos0(), pos1());
+    try transferCompositeEscape(ctx, &state, .{ .value_kind = .{ .stack_ref = src }, .stack_loans = loans }, pos0(), pos1());
     try testing.expectEqual(@as(usize, 1), problems.items.len);
     try testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
 }
@@ -1793,65 +3534,38 @@ test "transferFieldUse: a live parent reports nothing on its own" {
     try testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "transferFieldUse: the owner prong yields the statement only to a rule it reported" {
+test "transferFieldUse: disabling undefined checks preserves dead field reports" {
     const gpa = testing.allocator;
     const without_undef: config_mod.Config = .{ .enabled = &enabled_without_use_undefined };
-    // Both arms run the IDENTICAL statement sequence — only `config`
-    // differs — so the pair answers "does this gate decide this
-    // finding?" and not "did these two fixtures happen to differ?".
-    // `heap-use-after-free` stays ON in both: the subject arm turns
-    // off `use_undefined`, an unrelated rule, and must still find it.
-    const arms = [_]struct { config: *const config_mod.Config, rule: []const u8 }{
-        .{ .config = &config_mod.Default, .rule = "use-undefined" },
-        .{ .config = &without_undef, .rule = "heap-use-after-free" },
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{
+        .gpa = gpa,
+        .locals = mkLocals(&.{"item"}),
+        .problems = &problems,
+        .seen = &seen,
+        .path = "test",
+        .config = &without_undef,
     };
-    for (arms) |arm| {
-        var state: AbstractState = .{};
-        defer state.deinit(gpa);
-        var problems: std.ArrayListUnmanaged(Problem) = .empty;
-        defer freeProblems(gpa, &problems);
-        var seen = Seen.init();
-        defer seen.deinit(gpa);
-        const ctx: Ctx = .{
-            .gpa = gpa,
-            .locals = mkLocals(&.{"item"}),
-            .problems = &problems,
-            .seen = &seen,
-            .path = "test",
-            .config = arm.config,
-        };
-        const item: LId = @enumFromInt(0);
-        const freed: HId = @enumFromInt(0);
-
-        // `var item: Item = undefined;`
-        try transferDecl(ctx, &state, .{ .local = item, .init_kind = .undef }, pos0());
-        // `gpa.free(item.buf);` — nothing has tracked this field, so
-        // the free takes `transferFieldHeapFree`'s inter-procedural
-        // FALLBACK and records it as a dead heap.  Both halves of the
-        // fixture therefore come out of the real transfers: "this
-        // field's allocation is dead" is a fact the analysis reached,
-        // not one the test wrote into the state.  The fallback touches
-        // only `state.fields`, which is what leaves the parent `.undef`
-        // and a dead field origin coexisting.
-        try transferFieldHeapFree(ctx, &state, .{
-            .parent = item,
-            .name = "buf",
-            .fallback_hid = freed,
-        }, pos0(), pos1());
-        try testing.expect(state.locals.get(item).? == .undef);
-        try testing.expect(state.heaps.get(freed).?.state == .dead);
-
-        // `sink(item.buf);`
-        try transferFieldUse(ctx, &state, .{ .parent = item, .name = "buf" }, pos0(), pos1());
-
-        // Exactly one finding either way.  Under the defaults the owner
-        // still wins the byte (`use-undefined` names the read); with
-        // `use_undefined` off the owner prong has reported nothing, so
-        // the field's own dead origin has to get its say instead of
-        // being dropped on the owner's behalf.
-        try testing.expectEqual(@as(usize, 1), problems.items.len);
-        try testing.expectEqualStrings(arm.rule, problems.items[0].rule_id);
+    const item: LId = @enumFromInt(0);
+    const freed: HId = @enumFromInt(0);
+    try transferDecl(ctx, &state, .{ .local = item, .init_kind = .undef }, pos0());
+    try transferFieldHeapFree(ctx, &state, .{
+        .parent = item,
+        .name = "buf",
+        .fallback_hid = freed,
+    }, pos0(), pos1());
+    try transferFieldUse(ctx, &state, .{ .parent = item, .name = "buf" }, pos0(), pos1());
+    var reported_dead_field = false;
+    for (problems.items) |problem| {
+        try testing.expect(!std.mem.eql(u8, problem.rule_id, "use-undefined"));
+        if (std.mem.eql(u8, problem.rule_id, "heap-use-after-free")) reported_dead_field = true;
     }
+    try testing.expect(reported_dead_field);
 }
 
 test "originOfInit: copy_of arena yields .arena_borrow" {
@@ -1933,6 +3647,16 @@ test "transfer: dispatches each StmtKind without panic" {
     const kinds = [_]Stmt{
         .{ .kind = .{ .decl = .{ .local = x, .init_kind = .plain } }, .pos = pos0(), .end_pos = pos1() },
         .{ .kind = .{ .assign = .{ .target = x, .rhs_kind = .plain } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .indexed_read = .{ .array = x, .index = .unknown } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .indexed_write = .{ .array = x, .index = .unknown, .rhs_kind = .plain } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .counter_step = .{ .local = x, .step = 1 } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .compare_assume = .{ .lhs = .{ .local = .{ .local = x } }, .rhs = .{ .constant = 0 }, .op = .eq } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .array_complete = .{ .array = x } }, .pos = pos0(), .end_pos = pos1() },
+        .{
+            .kind = .{ .array_range_complete = .{ .array = x, .start = 0, .end = 1 } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        },
         .{ .kind = .{ .pointer_write = .{ .target = x } }, .pos = pos0(), .end_pos = pos1() },
         .{ .kind = .{ .use = .{ .local = x } }, .pos = pos0(), .end_pos = pos1() },
         .{ .kind = .{ .lowering_gap = .{ .note = "smoke" } }, .pos = pos0(), .end_pos = pos1() },
@@ -1963,4 +3687,1185 @@ test "transfer: aliasable boolean reads do not retain assumptions" {
     try testing.expect(state.feasible);
     try testing.expectEqual(@as(usize, 1), problems.items.len);
     try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "indexed transfers keep exact coverage separate from array origin" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "items", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "count", .decl_pos = pos0(), .is_unsigned = true },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const items: LId = @enumFromInt(0);
+    const count: LId = @enumFromInt(1);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = items, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = count, .init_kind = .plain, .integer_value = 0 } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_write = .{
+            .array = items,
+            .index = .{ .local = .{ .local = count } },
+            .rhs_kind = .plain,
+            .defined = true,
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .counter_step = .{ .local = count, .step = 1 } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{
+            .array = items,
+            .index = .{ .local = .{ .local = count, .offset = -1 } },
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+
+    // A write to one slot must not clear the array's undefined origin.
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = items } },
+        .pos = .{ .line = 1, .column = 3, .byte = 2 },
+        .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+
+    // Explicit completion suppresses aggregate undefined without changing
+    // the underlying origin.
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_complete = .{ .array = items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(items).? == .undef);
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = items } },
+        .pos = .{ .line = 1, .column = 4, .byte = 3 },
+        .end_pos = .{ .line = 1, .column = 5, .byte = 4 },
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+
+    // An undefined overwrite must revoke the prior proof for slot zero.
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_write = .{
+            .array = items,
+            .index = .{ .constant = 0 },
+            .rhs_kind = .undef,
+            .defined = false,
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 0 } } },
+        .pos = .{ .line = 1, .column = 5, .byte = 4 },
+        .end_pos = .{ .line = 1, .column = 6, .byte = 5 },
+    });
+    try testing.expectEqual(@as(usize, 2), problems.items.len);
+}
+
+test "compact range completion joins prefixes and exact sparse suffixes" {
+    const items: LId = @enumFromInt(0);
+    const Step = struct { kind: StmtKind, prefix: u64 };
+    const cases = [_]struct { extent: u64, steps: []const Step }{
+        .{ .extent = 27, .steps = &.{
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 0 }, .rhs_kind = .plain, .defined = true } }, .prefix = 1 },
+            .{ .kind = .{ .array_range_complete = .{ .array = items, .start = 1, .end = 13 } }, .prefix = 13 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 13 }, .rhs_kind = .plain, .defined = true } }, .prefix = 14 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 14 }, .rhs_kind = .plain, .defined = true } }, .prefix = 15 },
+            .{ .kind = .{ .array_range_complete = .{ .array = items, .start = 15, .end = 25 } }, .prefix = 25 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 25 }, .rhs_kind = .plain, .defined = true } }, .prefix = 26 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 26 }, .rhs_kind = .plain, .defined = true } }, .prefix = 27 },
+        } },
+        .{ .extent = 9, .steps = &.{
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 0 }, .rhs_kind = .plain, .defined = true } }, .prefix = 1 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 1 }, .rhs_kind = .plain, .defined = true } }, .prefix = 2 },
+            .{ .kind = .{ .array_range_complete = .{ .array = items, .start = 2, .end = 8 } }, .prefix = 8 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 8 }, .rhs_kind = .plain, .defined = true } }, .prefix = 9 },
+        } },
+        // A range reaching the stored suffix consumes only existing sparse facts.
+        .{ .extent = 9, .steps = &.{
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 8 }, .rhs_kind = .plain, .defined = true } }, .prefix = 0 },
+            .{ .kind = .{ .array_range_complete = .{ .array = items, .start = 0, .end = 8 } }, .prefix = 9 },
+        } },
+        // A disconnected range cannot hide the gap or initialize a later suffix.
+        .{ .extent = 9, .steps = &.{
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 0 }, .rhs_kind = .plain, .defined = true } }, .prefix = 1 },
+            .{ .kind = .{ .array_range_complete = .{ .array = items, .start = 2, .end = 8 } }, .prefix = 1 },
+            .{ .kind = .{ .indexed_write = .{ .array = items, .index = .{ .constant = 8 }, .rhs_kind = .plain, .defined = true } }, .prefix = 1 },
+        } },
+        // The extent is metadata, not a bound on transfer work.
+        .{ .extent = std.math.maxInt(u64), .steps = &.{
+            .{ .kind = .{ .array_range_complete = .{
+                .array = items,
+                .start = 0,
+                .end = std.math.maxInt(u64),
+            } }, .prefix = std.math.maxInt(u64) },
+        } },
+    };
+    const gpa = testing.allocator;
+    for (cases) |case| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{.{
+            .name = "items",
+            .decl_pos = pos0(),
+            .is_array = true,
+            .array_extent = case.extent,
+        }};
+        const ctx: Ctx = .{
+            .gpa = gpa,
+            .locals = &locals,
+            .problems = &problems,
+            .seen = &seen,
+            .path = "test",
+        };
+        try transfer(ctx, &state, .{
+            .kind = .{ .decl = .{ .local = items, .init_kind = .undef } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        for (case.steps) |step| {
+            try transfer(ctx, &state, .{ .kind = step.kind, .pos = pos0(), .end_pos = pos1() });
+            try testing.expectEqual(step.prefix, state.fixedPrefix(items));
+            try testing.expectEqual(
+                step.prefix == case.extent,
+                state.hasInitializedPrefix(items, case.extent),
+            );
+        }
+        try testing.expect(state.locals.get(items).? == .undef);
+    }
+}
+
+test "compact range completion preserves holes outside the written range" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{.{
+        .name = "items",
+        .decl_pos = pos0(),
+        .is_array = true,
+        .array_extent = 9,
+    }};
+    const ctx: Ctx = .{
+        .gpa = gpa,
+        .locals = &locals,
+        .problems = &problems,
+        .seen = &seen,
+        .path = "test",
+    };
+    const items: LId = @enumFromInt(0);
+    try state.locals.put(gpa, items, .undef);
+    try state.markArrayComplete(gpa, items);
+    try state.setExactElement(gpa, items, 1, false);
+    try state.setExactElement(gpa, items, 4, false);
+    try state.setExactElement(gpa, items, 8, false);
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_range_complete = .{ .array = items, .start = 2, .end = 8 } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(!state.hasExactElement(items, 1));
+    try testing.expect(state.hasExactElement(items, 4));
+    try testing.expect(!state.hasExactElement(items, 8));
+    try testing.expect(!state.hasInitializedPrefix(items, 9));
+}
+
+test "compact range completion separates written bytes from strict value certificates" {
+    const gpa = testing.allocator;
+    const items: LId = @enumFromInt(0);
+    const value: LId = @enumFromInt(1);
+    for (0..7) |case| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{
+            .{ .name = "items", .decl_pos = pos0(), .is_array = true, .array_extent = 9 },
+            .{ .name = "value", .decl_pos = pos0() },
+        };
+        const ctx: Ctx = .{
+            .gpa = gpa,
+            .locals = &locals,
+            .problems = &problems,
+            .seen = &seen,
+            .path = "test",
+        };
+        try state.locals.put(gpa, items, .undef);
+        try state.markArrayComplete(gpa, items);
+        try state.locals.put(gpa, value, if (case == 0 or case == 2) .undef else .plain);
+        var range: @TypeOf(@as(StmtKind, undefined).array_range_complete) = .{
+            .array = items,
+            .start = 2,
+            .end = 8,
+        };
+        switch (case) {
+            0 => range.inputs[0] = value,
+            1 => {
+                try state.unknown_values.put(gpa, value, {});
+                range.inputs[0] = value;
+            },
+            2 => range.selected_inputs[0] = .{ .local = value },
+            3 => {
+                try state.bindFieldValue(gpa, .{ .parent = value, .name = "missing" }, false);
+                range.selected_inputs[0] = .{ .field = .{ .parent = value, .name = "missing" } };
+            },
+            4 => {
+                try state.setExactElement(gpa, items, 4, false);
+                range.selected_inputs[0] = .{
+                    .indexed = .{ .array = items, .index = .{ .constant = 4 } },
+                };
+            },
+            5 => range.value_defined = false,
+            6 => {
+                range.value_defined = false;
+                range.value_has_undefined_origin = true;
+            },
+            else => unreachable,
+        }
+        try transfer(ctx, &state, .{
+            .kind = .{ .array_range_complete = range },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expectEqual(case == 1 or case == 3 or case == 5, state.hasExactElement(items, 2));
+        try testing.expect(!arrayHasFullCoverage(ctx, &state, items));
+        try testing.expectEqual(case == 0 or case == 2 or case == 4 or case == 6, localIsProvedUndefined(ctx, &state, items));
+    }
+}
+
+test "compact range completion uses initialized dependencies without reading unrelated fields" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "items", .decl_pos = pos0(), .is_array = true, .array_extent = 9 },
+        .{ .name = "value", .decl_pos = pos0() },
+        .{ .name = "scalar", .decl_pos = pos0(), .tracks_scalar_value = true },
+        .{ .name = "source", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{
+        .gpa = gpa,
+        .locals = &locals,
+        .problems = &problems,
+        .seen = &seen,
+        .path = "test",
+    };
+    const items: LId = @enumFromInt(0);
+    const value: LId = @enumFromInt(1);
+    const scalar: LId = @enumFromInt(2);
+    const source: LId = @enumFromInt(3);
+    try state.locals.put(gpa, items, .undef);
+    try state.locals.put(gpa, value, .plain);
+    try state.locals.put(gpa, scalar, .plain);
+    try state.locals.put(gpa, source, .undef);
+    try state.bindFieldValue(gpa, .{ .parent = value, .name = "missing" }, false);
+    try state.fields.putContext(gpa, .{ .parent = value, .name = "initialized" }, .plain, .{});
+    try state.setExactElement(gpa, source, 1, true);
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_range_complete = .{
+            .array = items,
+            .start = 0,
+            .end = 8,
+            .inputs = .{ scalar, null, null, null, null, null, null, null },
+            .selected_inputs = .{
+                .{ .field = .{ .parent = value, .name = "initialized" } },
+                .{ .indexed = .{ .array = source, .index = .{ .constant = 1 } } },
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+            },
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.hasInitializedPrefix(items, 8));
+    try testing.expect(!state.hasExactElement(items, 8));
+    try testing.expect(!state.hasInitializedPrefix(items, 9));
+    try testing.expect(!state.fieldValueIsDefined(value, ""));
+}
+
+test "compact range completion requires a bounded fixed array range" {
+    const gpa = testing.allocator;
+    const items: LId = @enumFromInt(0);
+    for ([_]struct { extent: ?u64, pointer: bool, start: u64, end: u64 }{
+        .{ .extent = 9, .pointer = false, .start = 0, .end = 10 },
+        .{ .extent = 9, .pointer = false, .start = 8, .end = 2 },
+        .{ .extent = null, .pointer = false, .start = 0, .end = 9 },
+        .{ .extent = 9, .pointer = true, .start = 0, .end = 9 },
+    }) |case| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{.{
+            .name = "items",
+            .decl_pos = pos0(),
+            .is_array = true,
+            .is_pointer = case.pointer,
+            .array_extent = case.extent,
+        }};
+        const ctx: Ctx = .{
+            .gpa = gpa,
+            .locals = &locals,
+            .problems = &problems,
+            .seen = &seen,
+            .path = "test",
+        };
+        try state.locals.put(gpa, items, .undef);
+        try transfer(ctx, &state, .{
+            .kind = .{ .array_range_complete = .{
+                .array = items,
+                .start = case.start,
+                .end = case.end,
+            } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expect(!state.hasExactElement(items, 0));
+        try testing.expect(!state.hasInitializedPrefix(items, 9));
+    }
+}
+
+test "partial pointer and field writes do not initialize an array" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "pointer_items", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "field_items", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const pointer_items: LId = @enumFromInt(0);
+    const field_items: LId = @enumFromInt(1);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = pointer_items, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .pointer_write = .{ .target = pointer_items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(pointer_items).? == .undef);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = field_items, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_assign = .{ .parent = field_items, .name = "[0]", .rhs_kind = .plain } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(field_items).? == .undef);
+}
+test "undefined indexed writes revoke initialized coverage on plain arrays" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "items", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const items: LId = @enumFromInt(0);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = items, .init_kind = .plain, .value_defined = true } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_write = .{
+            .array = items,
+            .index = .{ .constant = 0 },
+            .rhs_kind = .undef,
+            .defined = false,
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 1 } } },
+        .pos = .{ .line = 1, .column = 2, .byte = 1 },
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 0 } } },
+        .pos = .{ .line = 1, .column = 3, .byte = 2 },
+        .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = items } },
+        .pos = .{ .line = 1, .column = 5, .byte = 4 },
+        .end_pos = .{ .line = 1, .column = 6, .byte = 5 },
+    });
+
+    try testing.expectEqual(@as(usize, 2), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expectEqualStrings("use-undefined", problems.items[1].rule_id);
+}
+
+test "indexed coverage holes preserve array resource origin" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "items", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const items: LId = @enumFromInt(0);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = items, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } } } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_complete = .{ .array = items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_write = .{
+            .array = items,
+            .index = .{ .constant = 0 },
+            .rhs_kind = .undef,
+            .defined = false,
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(items).? == .heap);
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 1 } } },
+        .pos = .{ .line = 1, .column = 2, .byte = 1 },
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 0 } } },
+        .pos = .{ .line = 1, .column = 3, .byte = 2 },
+        .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+}
+
+test "comparison assumptions use exact unsigned scalar values" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "count", .decl_pos = pos0(), .is_unsigned = true },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const count: LId = @enumFromInt(0);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = count, .init_kind = .plain, .integer_value = 0 } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .compare_assume = .{
+            .lhs = .{ .local = .{ .local = count } },
+            .rhs = .{ .constant = 0 },
+            .op = .gt,
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(!state.feasible);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "aliased calls invalidate only exposed coverage and preserve undefined roots" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "items", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "alias", .decl_pos = pos0() },
+        .{ .name = "undefined_arg", .decl_pos = pos0() },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const items: LId = @enumFromInt(0);
+    const alias: LId = @enumFromInt(1);
+    const undefined_arg: LId = @enumFromInt(2);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = items, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try state.locals.put(gpa, alias, .{ .stack = items });
+    try state.locals.put(gpa, undefined_arg, .undef);
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_complete = .{ .array = items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .lowering_gap = .{ .note = "call without an alias", .may_assign_locals = false } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 1 } } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .pointer_write = .{ .target = alias, .initializes = false } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(items).? == .undef);
+    try testing.expect(state.locals.get(undefined_arg).? == .undef);
+    try transfer(ctx, &state, .{
+        .kind = .{ .pointer_write = .{ .target = undefined_arg, .initializes = false } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(undefined_arg).? == .undef);
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = undefined_arg } },
+        .pos = .{ .line = 1, .column = 2, .byte = 1 },
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 1 } } },
+        .pos = .{ .line = 1, .column = 3, .byte = 2 },
+        .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expect(!valueInputsAreDefined(ctx, &state, &.{.{ .local = items }}, false));
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_complete = .{ .array = items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .lowering_gap = .{ .note = "unknown call may assign", .may_assign_locals = true } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 1 } } },
+        .pos = .{ .line = 1, .column = 5, .byte = 4 },
+        .end_pos = .{ .line = 1, .column = 6, .byte = 5 },
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "array copies inherit complete coverage from an undefined-origin source" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "decl_copy", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "assign_copy", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const source: LId = @enumFromInt(0);
+    const decl_copy: LId = @enumFromInt(1);
+    const assign_copy: LId = @enumFromInt(2);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = source, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_complete = .{ .array = source } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = decl_copy, .init_kind = .{ .copy_of = source } } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = assign_copy, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .assign = .{ .target = assign_copy, .rhs_kind = .{ .copy_of = source } } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(!localIsProvedUndefined(ctx, &state, decl_copy));
+    try testing.expect(!localIsProvedUndefined(ctx, &state, assign_copy));
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = decl_copy, .index = .{ .constant = 0 } } },
+        .pos = .{ .line = 1, .column = 2, .byte = 1 },
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = assign_copy, .index = .{ .constant = 1 } } },
+        .pos = .{ .line = 1, .column = 3, .byte = 2 },
+        .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "certified completion covers whole arrays without a numeric extent" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "items", .decl_pos = pos0(), .is_array = true },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const items: LId = @enumFromInt(0);
+
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = items, .init_kind = .undef } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_complete = .{ .array = items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = items, .index = .{ .constant = 0 } } },
+        .pos = pos1(),
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = items } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+// The source parameter has no local state, but its by-value payload is defined.
+test "untracked array copies retain computed completion for declaration and assignment" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "copy", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const source: LId = @enumFromInt(0);
+    const copy: LId = @enumFromInt(1);
+    const operations = [_]StmtKind{
+        .{ .decl = .{ .local = copy, .init_kind = .{ .copy_of = source } } },
+        .{ .assign = .{ .target = copy, .rhs_kind = .{ .copy_of = source } } },
+    };
+    for (operations) |kind| {
+        try transfer(ctx, &state, .{ .kind = kind, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{
+            .kind = .{ .indexed_read = .{ .array = copy, .index = .{ .constant = 1 } } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+
+    // A tracked source hole must replace, not inherit, the target's old proof.
+    try state.locals.put(gpa, source, .plain);
+    try state.markArrayComplete(gpa, source);
+    try state.setExactElement(gpa, source, 1, false);
+    for (operations) |kind| {
+        try transfer(ctx, &state, .{ .kind = kind, .pos = pos0(), .end_pos = pos1() });
+        try testing.expect(!state.hasInitializedElement(copy, .{ .constant = 1 }));
+        try transfer(ctx, &state, .{
+            .kind = .{ .indexed_read = .{ .array = copy, .index = .{ .constant = 1 } } },
+            .pos = pos1(),
+            .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+        });
+    }
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+}
+
+// Unknown pointee writes remove payload proof, not the alias's defined header.
+test "stack alias writes revoke aggregate field array completion" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const owner: LId = @enumFromInt(0);
+    const alias: LId = @enumFromInt(1);
+    const copy: LId = @enumFromInt(2);
+    const locals = [_]LocalInfo{
+        .{ .name = "owner", .decl_pos = pos0(), .tracks_array_payload = true },
+        .{ .name = "alias", .decl_pos = pos0(), .is_pointer = true },
+        .{ .name = "copy", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, owner, .plain);
+    try state.locals.put(gpa, alias, .{ .stack = owner });
+    const field: ExprKind = .{ .field_copy_of = .{ .parent = owner, .name = "bytes" } };
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = copy, .init_kind = field } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_value = .{ .target = copy, .source = field } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.isArrayComplete(copy));
+    try transfer(ctx, &state, .{
+        .kind = .{ .pointer_write = .{ .target = alias } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(state.locals.get(alias).? == .stack);
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = alias } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .assign = .{ .target = copy, .rhs_kind = field } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_value = .{ .target = copy, .source = field } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = copy, .index = .{ .constant = 1 } } },
+        .pos = pos1(),
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try testing.expect(!arrayHasFullCoverage(ctx, &state, copy));
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+// Address headers remain defined, while dead resource-backed storage stays dead.
+test "stack references preserve resource lifetime without inheriting undefined payload" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const owner: LId = @enumFromInt(0);
+    const alias: LId = @enumFromInt(1);
+    const locals = [_]LocalInfo{
+        .{ .name = "owner", .decl_pos = pos0() },
+        .{ .name = "alias", .decl_pos = pos0(), .is_pointer = true, .frame_borrow_origin = owner },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, owner, .undef);
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = alias, .init_kind = .{ .stack_ref = owner } } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = alias } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    const arena: AId = @enumFromInt(0);
+    try state.arenas.put(gpa, arena, .{ .state = .dead });
+    const resource_origins = [_]Origin{ .{ .arena = arena }, .{ .arena_borrow = arena } };
+    for (resource_origins) |origin| {
+        try state.locals.put(gpa, owner, origin);
+        try transfer(ctx, &state, .{
+            .kind = .{ .decl = .{ .local = alias, .init_kind = .{ .stack_ref = owner } } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expect(Origin.eql(.{ .arena_borrow = arena }, state.locals.get(alias).?));
+    }
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = alias } },
+        .pos = pos1(),
+        .end_pos = .{ .line = 1, .column = 3, .byte = 2 },
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("arena-use-after-kill", problems.items[0].rule_id);
+    const heap: state_mod.HeapId = @enumFromInt(0);
+    try state.locals.put(gpa, owner, .{ .heap = heap });
+    try state.heaps.put(gpa, heap, .{ .state = .dead });
+    try transfer(ctx, &state, .{
+        .kind = .{ .decl = .{ .local = alias, .init_kind = .{ .stack_ref = owner } } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = alias } },
+        .pos = .{ .line = 1, .column = 3, .byte = 2 },
+        .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
+    });
+    try testing.expectEqual(@as(usize, 2), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[1].rule_id);
+}
+
+test "integer domains: computed index definedness gates initialized payload reads" {
+    const gpa = testing.allocator;
+    const domains = [_]state_mod.IntegerDomain{ .{}, .{ .kind = .unsigned, .bits = 1 } };
+    const locals = [_]LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 2 },
+        .{ .name = "index", .decl_pos = pos0(), .is_unsigned = true },
+    };
+    const array: LocalId = @enumFromInt(0);
+    const index: LocalId = @enumFromInt(1);
+    for ([_]bool{ false, true }) |defined| {
+        var state: AbstractState = .{ .integer_domains = &domains };
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, array, .plain);
+        try state.markArrayComplete(gpa, array);
+        try transfer(ctx, &state, .{
+            .kind = .{ .decl = .{ .local = index, .init_kind = if (defined) .plain else .undef, .value_defined = defined } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expectEqual(defined, localInputIsDefined(ctx, &state, index, true));
+        try transfer(ctx, &state, .{
+            .kind = .{ .use = .{ .local = index } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try transfer(ctx, &state, .{
+            .kind = .{ .indexed_read = .{ .array = array, .index = .{ .local = .{ .local = index } } } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expectEqual(@as(usize, if (defined) 0 else 1), problems.items.len);
+        if (!defined) try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    }
+}
+
+test "returned stack cells retain distinct physical owners and deduplicate replay" {
+    const gpa = testing.allocator;
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "x", .decl_pos = .{ .line = 1, .column = 1, .byte = 0 } },
+        .{ .name = "y", .decl_pos = .{ .line = 2, .column = 1, .byte = 10 } },
+    };
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    for (0..2) |_| {
+        try reportReturnedStackCell(ctx, @enumFromInt(0), false, pos0(), pos1());
+        try reportReturnedStackCell(ctx, @enumFromInt(1), false, pos0(), pos1());
+    }
+    try testing.expectEqual(@as(usize, 2), problems.items.len);
+    try testing.expectEqual(@as(usize, 2), seen.keys.count());
+}
+
+test "successful prefix certificate defines its returned count without filling the tail" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 4 },
+        .{ .name = "count", .decl_pos = pos1(), .is_unsigned = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, array, .undef);
+    try state.locals.put(gpa, count, .plain);
+    try state.unknown_values.put(gpa, count, {});
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_prefix = .{ .array = array, .count = count } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try testing.expect(indexIsDefined(ctx, &state, .{ .local = .{ .local = count } }));
+    try testing.expect(try state.assumeComparison(gpa, .{ .lhs = .{ .local = .{ .local = count } }, .rhs = .{ .constant = 2 }, .op = .eq }));
+    try testing.expect(state.hasInitializedElement(array, .{ .constant = 1 }));
+    try testing.expect(!state.hasInitializedElement(array, .{ .constant = 3 }));
+}
+
+test "successful prefix source inputs reject opaque scalars without clearing the count" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const source: LocalId = @enumFromInt(2);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 4 },
+        .{ .name = "count", .decl_pos = pos1(), .is_unsigned = true },
+        .{ .name = "source", .decl_pos = pos1(), .tracks_scalar_value = true },
+    };
+    for ([_]bool{ false, true }) |opaque_source| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        try state.locals.put(gpa, array, .undef);
+        try state.locals.put(gpa, count, .plain);
+        try state.locals.put(gpa, source, .plain);
+        try state.setScalarValue(gpa, count, 2);
+        try state.unknown_values.put(gpa, count, {});
+        if (opaque_source) try state.unknown_values.put(gpa, source, {});
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        var inputs: [8]?LocalId = .{null} ** 8;
+        inputs[0] = source;
+        try transfer(ctx, &state, .{
+            .kind = .{ .array_prefix = .{ .array = array, .count = count, .inputs = inputs } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expect(state.hasInitializedElement(array, .{ .constant = 1 }));
+        try testing.expectEqual(!opaque_source, valueInputsAreDefined(ctx, &state, &.{.{
+            .indexed = .{ .array = array, .index = .{ .constant = 1 } },
+        }}, false));
+        try testing.expectEqual(opaque_source, state.unknown_values.contains(count));
+    }
+}
+
+test "indexed writes require a defined slice descriptor" {
+    const gpa = testing.allocator;
+    const slice: LocalId = @enumFromInt(0);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "slice", .decl_pos = pos0(), .is_slice = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, slice, .undef);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try transferIndexedWrite(ctx, &state, .{
+        .array = slice,
+        .index = .{ .constant = 0 },
+        .rhs_kind = .plain,
+        .defined = true,
+    }, pos0());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expect(state.locals.get(slice).? == .undef);
+    try testing.expect(!state.isArrayComplete(slice));
+}
+
+test "slice initialization separates external descriptor bounds from local coverage" {
+    const gpa = testing.allocator;
+    const slice: LocalId = @enumFromInt(0);
+    const backing: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "slice", .decl_pos = pos0(), .is_slice = true },
+        .{ .name = "backing", .decl_pos = pos1(), .is_array = true, .array_extent = 4 },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, slice, .plain);
+    try state.locals.put(gpa, backing, .undef);
+    try state.fields.putContext(gpa, .{ .parent = slice, .name = "len" }, .plain, .{});
+    try state.fields.putContext(gpa, .{ .parent = slice, .name = "ptr" }, .plain, .{});
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try testing.expect(sliceElementIsDefined(ctx, &state, slice, .{ .constant = 0 }));
+    try state.fields.putContext(gpa, .{ .parent = slice, .name = "ptr" }, .{ .stack = backing }, .{});
+    try testing.expect(!sliceElementIsDefined(ctx, &state, slice, .{ .constant = 0 }));
+    _ = try state.assumeComparison(gpa, .{
+        .lhs = .{ .field = .{ .parent = slice, .name = "len", .is_unsigned = true } },
+        .rhs = .{ .constant = 2 },
+        .op = .eq,
+    });
+    try state.setExactElement(gpa, backing, 0, true);
+    try testing.expect(sliceElementIsDefined(ctx, &state, slice, .{ .constant = 0 }));
+    try testing.expect(!sliceElementIsDefined(ctx, &state, slice, .{ .constant = 1 }));
+    try testing.expect(!sliceElementIsDefined(ctx, &state, slice, .{ .constant = 2 }));
+}
+
+test "borrowing a receiver requires a defined pointer header" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{.{ .name = "pointer", .decl_pos = pos0(), .is_pointer = true }};
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const pointer: LId = @enumFromInt(0);
+    try state.locals.put(gpa, pointer, .undef);
+    try transferUse(ctx, &state, .{ .local = pointer, .from_method_call = true }, pos0(), pos1());
+    var reported_pointer = false;
+    for (problems.items) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+            std.mem.indexOf(u8, problem.message, "pointer") != null) reported_pointer = true;
+    }
+    try testing.expect(reported_pointer);
+}
+
+test "pointer field inputs require an exact payload certificate and a defined header" {
+    const gpa = testing.allocator;
+    const pointer: LocalId = @enumFromInt(0);
+    const locals = [_]cfg.LocalInfo{.{ .name = "pointer", .decl_pos = pos0(), .is_pointer = true }};
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const key: state_mod.FieldKey = .{ .parent = pointer, .name = "a" };
+    try state.locals.put(gpa, pointer, .plain);
+    try testing.expect(!scalarFieldIsDefined(ctx, &state, pointer, "a"));
+    try state.fields.putContext(gpa, key, .plain, .{});
+    try testing.expect(scalarFieldIsDefined(ctx, &state, pointer, "a"));
+    try testing.expect(!scalarFieldIsDefined(ctx, &state, pointer, "b"));
+    try state.bindFieldValue(gpa, key, false);
+    try state.fields.putContext(gpa, key, .plain, .{});
+    try testing.expect(!scalarFieldIsDefined(ctx, &state, pointer, "a"));
+    try state.bindFieldValue(gpa, key, true);
+    try state.fields.putContext(gpa, key, .plain, .{});
+    try state.unknown_values.put(gpa, pointer, {});
+    try testing.expect(!scalarFieldIsDefined(ctx, &state, pointer, "a"));
+    _ = state.unknown_values.swapRemove(pointer);
+    try state.locals.put(gpa, pointer, .undef);
+    try testing.expect(!scalarFieldIsDefined(ctx, &state, pointer, "a"));
+}
+
+test "undefined diagnostics: unknown field writes initialize bytes without certifying values" {
+    const gpa = testing.allocator;
+    const locals = [_]LocalInfo{
+        .{ .name = "storage", .decl_pos = pos0(), .tracks_array_payload = true },
+        .{ .name = "input", .decl_pos = pos0(), .tracks_scalar_value = true },
+    };
+    const storage: LId = @enumFromInt(0);
+    const input: LId = @enumFromInt(1);
+    for ([_]bool{ false, true }) |undefined_input| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, storage, .undef);
+        try state.locals.put(gpa, input, if (undefined_input) .undef else .plain);
+        try state.unknown_values.put(gpa, input, {});
+        try transfer(ctx, &state, .{
+            .kind = .{ .field_assign = .{
+                .parent = storage,
+                .name = "index",
+                .rhs_kind = .unknown,
+                .selected_inputs = .{ .{ .local = input }, null, null, null, null, null, null, null },
+            } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expect(!state.fieldValueIsDefined(storage, "index"));
+        try testing.expectEqual(undefined_input, state.fieldValueMayBeUndefined(storage, "index"));
+        try transfer(ctx, &state, .{
+            .kind = .{ .field_use = .{ .parent = storage, .name = "index" } },
+            .pos = pos1(),
+            .end_pos = pos1(),
+        });
+        try testing.expectEqual(@as(usize, if (undefined_input) 1 else 0), problems.items.len);
+    }
 }

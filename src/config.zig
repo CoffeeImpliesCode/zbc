@@ -358,12 +358,12 @@ pub const Invariant = enum {
     /// `unreleased-refs-on-error` which is about loop-side addref
     /// without paired release.
     unreleased_factory_handle,
-    /// `<X>.<field>.len = NEW;` followed by `@memset(<X>.<field>...,
-    /// undefined);` in the same scope — the memset slices the
-    /// ALREADY-TRUNCATED items so the range is empty and the memset
-    /// is a no-op.  The freed-but-retained capacity keeps its old
-    /// bytes, defeating Zig's `undefined` use-after-shrink safety.
-    /// Catches ziglang/zig#25810 + #25832 class.
+    /// Adjacent `<X>.len = NEW;` and `@memset(<empty tail>, undefined);`
+    /// where the analysis proves NEW is strictly below the old length.
+    /// The memset slices the already-truncated items, so its range is
+    /// empty and the dropped capacity keeps its old bytes, defeating
+    /// Zig's `undefined` use-after-shrink safety.  Unproved shrinks and
+    /// growth do not fire.  Catches ziglang/zig#25810 + #25832 class.
     memset_undef_after_len_truncation,
     /// `<chain>.<publish-method>(this);` (or `(self)`) where the
     /// chain or method suggests concurrent / cross-thread dispatch
@@ -764,11 +764,6 @@ pub const Invariant = enum {
     /// `if (map.getEntry(key)) |e| { … }` or `orelse return`.
     /// Catches oven-sh/bun#14606 (H2 stream forced-unwrap after callback dispatch).
     hashmap_getentry_forced_unwrap,
-    /// `?*?T` — doubly-optional pointer type; almost always a copy-paste error
-    /// where one `?` was duplicated.  The correct form for a nullable out-param
-    /// is `?*T`; for a non-null pointer to an optional it is `*?T`.
-    /// Catches oven-sh/bun#13955 (NAPI out-param corrupted caller stack).
-    double_optional_ptr,
     /// `@alignCast(x.?)` — forced optional unwrap inside an alignment assertion;
     /// two panic sources in one expression: `.?` panics on null, `@alignCast`
     /// panics on misalignment.  Use a non-optional type or guard with `orelse`.
@@ -829,7 +824,7 @@ pub const Invariant = enum {
     clamp_wrong_direction,
 };
 
-pub const all_invariants: [113]Invariant = .{
+pub const all_invariants: [112]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -929,7 +924,6 @@ pub const all_invariants: [113]Invariant = .{
     .lessthan_uses_leq,
     .duplicate_defer_free,
     .hashmap_getentry_forced_unwrap,
-    .double_optional_ptr,
     .aligncast_on_optional_unwrap,
     .adjacent_decl_same_source_field,
     .intcast_of_negated_signed,

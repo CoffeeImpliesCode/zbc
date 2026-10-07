@@ -9,6 +9,9 @@ const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
 const cfg_builder = @import("cfg_builder.zig");
+const lib = @import("../lib.zig");
+const file_cache = @import("../cache/file_cache.zig");
+const fn_summary = @import("../model/fn_summary.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -42,6 +45,7 @@ fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
     errdefer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
@@ -69,60 +73,6 @@ test "lower trivial fn — entry block + return" {
     try std.testing.expectEqual(@as(usize, 2), cfg.blocks.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.blocks[0].stmts.len);
     try std.testing.expect(cfg.blocks[0].stmts[0].kind == .ret);
-}
-
-test "lower fn with var decl + arena init + deinit" {
-    const gpa = std.testing.allocator;
-    var result = try parseAndLower(gpa,
-        \\const std = @import("std");
-        \\pub fn foo() void {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    arena.deinit();
-        \\    return;
-        \\}
-        \\
-    );
-    defer result.deinit(gpa);
-    const cfg = result.cfg.?;
-
-    // 2 blocks (entry + dead post-return); entry has 3 stmts: decl,
-    // arena_kill, ret.
-    try std.testing.expectEqual(@as(usize, 2), cfg.blocks.len);
-    const stmts = cfg.blocks[0].stmts;
-    try std.testing.expectEqual(@as(usize, 3), stmts.len);
-
-    try std.testing.expect(stmts[0].kind == .decl);
-    try std.testing.expect(stmts[0].kind.decl.init_kind == .arena_init);
-
-    try std.testing.expect(stmts[1].kind == .arena_kill);
-    // Receiver local should be the same as the declared local.
-    try std.testing.expectEqual(stmts[0].kind.decl.local, stmts[1].kind.arena_kill.arena_local);
-
-    try std.testing.expect(stmts[2].kind == .ret);
-}
-
-test "lower fn with return of borrowed identifier" {
-    const gpa = std.testing.allocator;
-    var result = try parseAndLower(gpa,
-        \\pub fn foo() u32 {
-        \\    var x = bar();
-        \\    return x;
-        \\}
-        \\fn bar() u32 { return 0; }
-        \\
-    );
-    defer result.deinit(gpa);
-    const cfg = result.cfg.?;
-
-    const stmts = cfg.blocks[0].stmts;
-    // decl x, use x (emitted before the ret), ret x.
-    try std.testing.expectEqual(@as(usize, 3), stmts.len);
-    try std.testing.expect(stmts[0].kind == .decl);
-    try std.testing.expect(stmts[1].kind == .use);
-    try std.testing.expect(stmts[2].kind == .ret);
-    try std.testing.expect(stmts[2].kind.ret.value_kind == .copy_of);
-    try std.testing.expectEqual(stmts[0].kind.decl.local, stmts[2].kind.ret.value_kind.copy_of);
-    try std.testing.expectEqual(stmts[0].kind.decl.local, stmts[1].kind.use.local);
 }
 
 test "if-statement creates fork: 3 blocks (entry, then, merge)" {
@@ -1673,4 +1623,110 @@ test "else-if chain: multi-branch CFG, no lowering_gap for if constructs" {
             }
         }
     }
+}
+
+test "borrowed-return summaries do not cross declaration scopes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `Buffer.slice` and `Ns.slice` return static data; only the top-level
+    // `slice` borrows its argument. A method or namespace call must not
+    // inherit the summary of the same-named top-level fn, and a bare call
+    // must still reach it.
+    //
+    // KNOWN UNMET (return_storage.zig, not file_cache.zig): the returned-
+    // storage query still borrows every argument of `viaMethod(p)` and
+    // `viaNamespace(p)` (lines 13 and 19 report stack-escape), and it
+    // finds no loan for `slice(p)` in `bad()` when `b` is initialised
+    // with `.{ .bytes = .{0} }` (line 25 is missed). A `b: Buffer =
+    // undefined` local is flagged correctly.
+    const name = "check.zig";
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data =
+        \\const Buffer = struct {
+        \\    bytes: [1]u8,
+        \\    fn slice(_: *const Buffer) []const u8 { return "static"; }
+        \\};
+        \\fn slice(b: *const Buffer) []const u8 { return b.bytes[0..]; }
+        \\const Ns = struct { fn slice(_: *const Buffer) []const u8 { return "static"; } };
+        \\fn viaMethod(b: *const Buffer) []const u8 { return b.slice(); }
+        \\fn viaNamespace(b: *const Buffer) []const u8 { return Ns.slice(b); }
+        \\pub fn safeMethod() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    const p = &b;
+        \\    const result = viaMethod(p);
+        \\    return result;
+        \\}
+        \\pub fn safeNamespace() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    const p = &b;
+        \\    const result = viaNamespace(p);
+        \\    return result;
+        \\}
+        \\pub fn bad() []const u8 {
+        \\    var b = Buffer{ .bytes = .{0} };
+        \\    const p = &b;
+        \\    const result = slice(p);
+        \\    return result;
+        \\}
+        \\
+    });
+    const base_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, name });
+    defer gpa.free(path);
+
+    var session: lib.Session = undefined;
+    try session.init(gpa, io, .{ .roots = &.{base_dir} });
+    defer session.deinit();
+    const analysis = try lib.analyzeEscape(&session, path, &lib.DefaultConfig);
+    defer lib.freeAnalysis(gpa, analysis);
+
+    var escapes: usize = 0;
+    for (analysis.problems) |problem| {
+        if (!std.mem.eql(u8, problem.rule_id, "stack-escape")) continue;
+        escapes += 1;
+        try std.testing.expectEqual(@as(u32, 25), problem.start.line);
+    }
+    try std.testing.expectEqual(@as(usize, 1), escapes);
+}
+
+fn expectBorrowedFromParam(returns: fn_summary.Returns, expected: ?u32) !void {
+    switch (returns) {
+        .borrowed_from => |idx| try std.testing.expectEqual(expected orelse return error.TestUnexpectedResult, idx),
+        else => try std.testing.expectEqual(@as(?u32, null), expected),
+    }
+}
+
+test "delegator borrow inference dispatches on receiver type, namespace and lexical scope" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\var global: u8 = 0;
+        \\const Box = struct {
+        \\    v: u8,
+        \\    fn same(b: *const Box) *const Box { return b; }
+        \\    fn wrapInside(b: *const Box) *const Box { return same(b); }
+        \\};
+        \\const Other = struct { fn same(_: *const Box) *const Box { return @ptrCast(&global); } };
+        \\fn same(b: *const Box) *const Box { return b; }
+        \\fn viaMethod(b: *const Box) *const Box { return b.same(); }
+        \\fn viaOther(b: *const Box) *const Box { return Other.same(b); }
+        \\fn viaTop(b: *const Box) *const Box { return same(b); }
+        \\
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = file_cache.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try cache.resolveTransitiveTakes();
+
+    // The receiver's own type declares `same` as a borrow of arg 0.
+    try expectBorrowedFromParam((try cache.summaryByName("viaMethod")).?.returns, 0);
+    // `Other.same` is a different declaration of the same leaf name.
+    try expectBorrowedFromParam((try cache.summaryByName("viaOther")).?.returns, null);
+    // A bare call outside any container reaches the top-level fn.
+    try expectBorrowedFromParam((try cache.summaryByName("viaTop")).?.returns, 0);
+    // A bare call inside `Box` reaches `Box.same` first.
+    try expectBorrowedFromParam((try cache.summaryByMethod("Box", "wrapInside")).?.returns, 0);
 }

@@ -1,9 +1,9 @@
-//! The bounded loop-invariant prover of the numeric oracle.
+//! The bounded loop-fact prover of the numeric oracle.
 //!
 //! A loop can establish a fact about its own induction variable without any
 //! guard saying so: `while (i < n) { ... i += 1; }` proves `i <= n` on every
 //! entry, and a rule that reports a wraparound inside that body is reporting
-//! nothing.  This module answers that question, and only that one:
+//! nothing. This module proves body invariants and bounded counter exit facts:
 //!
 //!   * which scalars the loop body assigns to values the walk already knows
 //!     (`collectLoopCandidates`);
@@ -11,7 +11,9 @@
 //!     (`collectStableBoundaryReads`) — the envelope the induction is checked
 //!     against;
 //!   * whether those facts survive one pass of the body
-//!     (`verifyLoopInvariant`).
+//!     (`verifyLoopInvariant`);
+//!   * which local counters increment at most once per bounded `for` iteration
+//!     (`numericForExitFacts`).
 //!
 //! The state and the walk live in `value_range.zig` and are used here as the
 //! ONE representation of a walk: this module owns the induction, and adding a
@@ -35,7 +37,7 @@ pub const LoopKind = enum { while_, for_ };
 /// costs a proof and never takes a wrong one.
 const loop_boundary_cap: usize = 8;
 
-pub fn numericLoopInvariants(o: *Oracle, loop_node: Ast.Node.Index, st: *const State) error{OutOfMemory}!std.ArrayList(numeric_eval.Fact) {
+pub fn numericLoopInvariants(o: *Oracle, loop_node: Ast.Node.Index, st: *const State) value_range.QueryError!std.ArrayList(numeric_eval.Fact) {
     var facts: std.ArrayList(numeric_eval.Fact) = .empty;
     errdefer facts.deinit(o.gpa);
     if (o.query != .numeric_range or !o.tokenInNode(loop_node)) return facts;
@@ -62,23 +64,187 @@ pub fn numericLoopInvariants(o: *Oracle, loop_node: Ast.Node.Index, st: *const S
     for (envelope_facts.items) |*fact| fact.value = envelope;
     var proved: State = .{};
     defer proved.deinit(o.gpa);
-    if (!try verifyLoopInvariant(o, loop_node, loop, st, envelope_facts.items, &proved)) {
-        facts.clearRetainingCapacity();
-        return facts;
+    const joint_verified = try verifyLoopInvariant(o, loop_node, loop, st, envelope_facts.items, &proved);
+    var floor_state: State = .{};
+    defer floor_state.deinit(o.gpa);
+    var kept: usize = 0;
+    for (facts.items) |fact| {
+        var result = if (joint_verified) envelope else fact.value;
+        const own_kept = joint_verified and loopFactsContain(&proved, &.{fact});
+        if (own_kept) result = fact.value;
+        // A joint envelope can fail or lose a counter's positive floor:
+        // an unrelated accumulator or stable ceiling can admit zero.
+        // Verify that counter independently with the same complete body
+        // and backedge walk, without assuming the other candidates.
+        if (!own_kept and fact.value == .integer and fact.value.integer.min > 0 and
+            (!joint_verified or (result == .integer and result.integer.min < fact.value.integer.min)))
+        {
+            const floor = numeric_eval.Fact{
+                .name = fact.name,
+                .value = .{ .integer = .{
+                    .min = fact.value.integer.min,
+                    .max = if (joint_verified and result == .integer) result.integer.max else std.math.maxInt(i128),
+                } },
+            };
+            if (try verifyLoopInvariant(o, loop_node, loop, st, &.{floor}, &floor_state)) {
+                result = floor.value;
+            } else if (!joint_verified) continue;
+        } else if (!joint_verified) continue;
+        // Publish only assigned names; stable boundary reads are proof inputs.
+        facts.items[kept] = .{ .name = fact.name, .value = result };
+        kept += 1;
     }
-    // Only the ASSIGNED names are published — a boundary read is part of the
-    // proof, not a fact this loop establishes about its own state — and each is
-    // published at the tightest range the back edge actually left it in, which
-    // is its own range whenever the body kept it there and the envelope when it
-    // did not.  Publishing the envelope alone would hand downstream rules a
-    // bound as wide as `b` for a loop counter whose own range the verification
-    // just preserved.
-    for (facts.items) |*fact| {
-        const own = fact.value;
-        fact.value = envelope;
-        if (loopFactsContain(&proved, &.{ .{ .name = fact.name, .value = own } })) fact.value = own;
-    }
+    facts.shrinkRetainingCapacity(kept);
     return facts;
+}
+
+/// Exit ranges for local counters updated at most once per bounded iteration.
+/// The iterable is evaluated independently of the body. One syntactic `+= 1`
+/// outside nested loops can execute at most once per iteration, including when
+/// an `if` skips it or a break ends the loop early.
+pub fn numericForExitFacts(
+    o: *Oracle,
+    loop_node: Ast.Node.Index,
+    st: *const State,
+    evaluation: *numeric_eval.Evaluator,
+    facts: *std.ArrayList(numeric_eval.Fact),
+) error{OutOfMemory}!void {
+    if (o.query != .numeric_range or o.tokenInNode(loop_node)) return;
+    const tree = o.tree;
+    const loop = tree.fullFor(loop_node) orelse return;
+    if (loop.ast.else_expr.unwrap() != null) return;
+    var iterations: ?i128 = null;
+    for (loop.ast.inputs) |input| {
+        if (forIterationUpper(o, evaluation, input)) |upper|
+            iterations = if (iterations) |previous| @min(previous, upper) else upper;
+    }
+    const upper = iterations orelse return;
+    if (!try collectLoopCandidates(o, loop_node, st, facts)) {
+        facts.clearRetainingCapacity();
+        return;
+    }
+    if (facts.items.len == 0) return;
+    var written: [32]bool = @splat(false);
+    var targets: [32]?Ast.Node.Index = @splat(null);
+    const first = tree.firstToken(loop_node);
+    const last = tree.lastToken(loop_node);
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (node == loop_node or tree.firstToken(node) < first or tree.lastToken(node) > last) continue;
+        if (!o.spend()) {
+            facts.clearRetainingCapacity();
+            return;
+        }
+        switch (tag) {
+            // No nested repetition, shadowing, deferred effects or unknown
+            // callee writes can take part in this certificate.
+            .@"for",
+            .for_simple,
+            .@"while",
+            .while_simple,
+            .while_cont,
+            .global_var_decl,
+            .local_var_decl,
+            .simple_var_decl,
+            .aligned_var_decl,
+            .call,
+            .call_comma,
+            .call_one,
+            .call_one_comma,
+            .@"switch",
+            .switch_comma,
+            => {
+                facts.clearRetainingCapacity();
+                return;
+            },
+            .@"if", .if_simple => if (tree.fullIf(node).?.payload_token != null) {
+                facts.clearRetainingCapacity();
+                return;
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                if (!value_range.pureIntegerExpression(o, node, 0)) {
+                    facts.clearRetainingCapacity();
+                    return;
+                }
+            },
+            else => {},
+        }
+        if (!numeric_nodes.isScalarAssignTag(tag)) continue;
+        const parts = tree.nodeData(node).node_and_node;
+        const root = value_range.lhsRootIdent(o, parts[0]) orelse {
+            facts.clearRetainingCapacity();
+            return;
+        };
+        for (facts.items, 0..) |*fact, candidate| {
+            if (!std.mem.eql(u8, root, fact.name)) continue;
+            if (written[candidate] or tag != .assign_add or tree.nodeTag(parts[0]) != .identifier or
+                tree.nodeTag(parts[1]) != .number_literal or
+                (std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(parts[1])), 0) catch 0) != 1)
+                fact.value = .unknown;
+            written[candidate] = true;
+            targets[candidate] = parts[0];
+        }
+    }
+    var kept: usize = 0;
+    for (facts.items, 0..) |fact, candidate| {
+        if (!written[candidate] or fact.value != .integer or fact.value.integer.min < 0) continue;
+        if (!value_range.isLocalName(o, fact.name) or
+            o.addressed.contains(fact.name) or o.pointer_roots.contains(fact.name)) continue;
+        // A capture with the same spelling is a different binding.
+        var shadowed = false;
+        for (loop.payload_token..tree.firstToken(loop.ast.then_expr)) |token| {
+            if (tree.tokenTag(@intCast(token)) == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(@intCast(token)), fact.name)) shadowed = true;
+        }
+        if (shadowed) continue;
+        const maximum = std.math.add(i128, fact.value.integer.max, upper) catch continue;
+        const declared = evaluation.typeRange(targets[candidate] orelse continue);
+        if (declared != .integer or maximum > declared.integer.max or
+            fact.value.integer.min < declared.integer.min) continue;
+        facts.items[kept] = .{
+            .name = fact.name,
+            .value = .{ .integer = .{ .min = fact.value.integer.min, .max = maximum } },
+        };
+        kept += 1;
+    }
+    facts.shrinkRetainingCapacity(kept);
+}
+
+/// Range endpoints, slice endpoints, fixed arrays and existing length
+/// snapshots supply independent iteration bounds. Unknown extents supply none.
+fn forIterationUpper(o: *Oracle, evaluation: *numeric_eval.Evaluator, input: Ast.Node.Index) ?i128 {
+    const tree = o.tree;
+    if (tree.nodeTag(input) == .for_range) {
+        const range = tree.nodeData(input).node_and_opt_node;
+        const end = range[1].unwrap() orelse return null;
+        if (!value_range.pureIntegerExpression(o, range[0], 0) or
+            !value_range.pureIntegerExpression(o, end, 0)) return null;
+        const lower = evaluation.evaluate(range[0]);
+        const upper = evaluation.evaluate(end);
+        if (lower != .integer or upper != .integer or lower.integer.min < 0) return null;
+        return @max(0, std.math.sub(i128, upper.integer.max, lower.integer.min) catch return null);
+    }
+    const slice = tree.fullSlice(input);
+    const source = if (slice) |sl| sl.ast.sliced else input;
+    var bound: ?i128 = if (o.cache) |cache|
+        if (cache.fixedArrayLenOf(source)) |length| @as(i128, length) else null
+    else
+        null;
+    if (numeric_eval.path(tree, source)) |name| {
+        for (evaluation.len_bounds) |fact| {
+            if (std.mem.eql(u8, fact.name, name) and fact.value == .integer and fact.value.integer.max >= 0)
+                bound = if (bound) |previous| @min(previous, fact.value.integer.max) else fact.value.integer.max;
+        }
+    }
+    if (slice) |sl| {
+        if (sl.ast.end.unwrap()) |end| {
+            if (!value_range.pureIntegerExpression(o, end, 0)) return null;
+            const extent = evaluation.evaluate(end);
+            if (extent == .integer and extent.integer.max >= 0)
+                bound = if (bound) |previous| @min(previous, extent.integer.max) else extent.integer.max;
+        }
+    }
+    return bound;
 }
 
 /// Names the loop CONDITION reads as bare operands, that this loop cannot
@@ -238,7 +404,7 @@ fn verifyLoopInvariant(
     initial: *const State,
     facts: []const numeric_eval.Fact,
     proved: *State,
-) error{OutOfMemory}!bool {
+) value_range.QueryError!bool {
     var state = try initial.clone(o.gpa);
     defer state.deinit(o.gpa);
     const saved_token = o.use_token;

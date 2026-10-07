@@ -77,7 +77,9 @@ fn checkBody(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const ct = ct_ti.name;
+    // `FileModel` name-keyed lookups (`findType`, `fieldType`, ...) key on
+    // `qualified_name`; a nested owner's leaf `name` matches nothing.
+    const ct = ct_ti.qualified_name;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -107,7 +109,10 @@ fn checkBody(
             t = sc;
             continue;
         };
-        const inner_ti = model.findType(field_type) orelse {
+        // Scope-aware first: a nested owner's field may name a sibling
+        // or ancestor-scope type that `findType` (qualified-keyed) misses.
+        const inner_ti = model.resolveFieldTypeQualifiedTi(ct_ti, field_name) orelse
+            model.findType(field_type) orelse {
             t = sc;
             continue;
         };
@@ -161,11 +166,10 @@ fn checkBody(
             t = sc;
             continue;
         }
-        // Skip when RHS is a `null` / `undefined` sentinel write —
-        // canonical "clear after draining" pattern (event-loop free
-        // lists, optional resets after consumption).  The leak, if
-        // any, was already produced by the drain itself; this
-        // statement's job is just to mark the field empty.
+        // Null, undefined, and empty literals are clear sentinels.
+        // A named union tag is not cleanup: retagging to a payload-free
+        // variant can still discard an owned prior payload. Let the
+        // prior-variant and switch-arm proofs below decide that case.
         if (rhsIsNullOrUndefined(tree, t + 4, sc)) {
             t = sc;
             continue;
@@ -297,8 +301,7 @@ fn checkBody(
             break :blk null;
         };
         if (union_ti) |un| {
-            if (taggedUnionRetagIsSafeTi(tree, model, un,
-                first, t, sc, this_name, field_name, ct)) {
+            if (taggedUnionRetagIsSafeTi(tree, model, un, first, t, sc, this_name, field_name, ct)) {
                 t = sc;
                 continue;
             }
@@ -320,8 +323,7 @@ fn checkBody(
             //    explicit arms.
             // If every constrained-prior variant is non-owned,
             // the retag doesn't leak.
-            if (switchArmRetagIsSafeTi(tree, model, un, first, t,
-                this_name, field_name)) {
+            if (switchArmRetagIsSafeTi(tree, model, un, first, t, this_name, field_name)) {
                 t = sc;
                 continue;
             }
@@ -355,14 +357,17 @@ fn switchArmRetagIsSafeTi(
             return (model.unionVariantIsOwnedTi(union_ti, tag) orelse true) == false;
         },
         .else_arm => |explicit_tags| {
-            return allVariantsExceptAreNonOwnedTi(model, union_ti, explicit_tags);
+            return allVariantsExceptAreNonOwnedTi(model, union_ti, explicit_tags.names[0..explicit_tags.count]);
         },
     }
 }
 
 const SwitchArm = union(enum) {
     specific_tag: []const u8,
-    else_arm: [16][]const u8,
+    else_arm: struct {
+        names: [16][]const u8,
+        count: u32,
+    },
 };
 
 /// Walk back from `assign_tok` looking for an enclosing
@@ -508,10 +513,9 @@ fn classifySwitchArm(
     if (saw_else) {
         // `else =>`: need to walk the switch body forward to
         // collect ALL explicit-tag arms.
-        var explicit: [16][]const u8 = undefined;
-        var n_exp = collectSwitchExplicitTags(tree, s, &explicit);
-        _ = &n_exp;
-        return .{ .else_arm = explicit };
+        var explicit: [16][]const u8 = @splat("");
+        const n_exp = collectSwitchExplicitTags(tree, s, &explicit);
+        return .{ .else_arm = .{ .names = explicit, .count = n_exp } };
     }
     if (n_tags == 0) return null;
     // Specific-tag arm: use the FIRST collected tag (closest to
@@ -552,7 +556,7 @@ fn collectSwitchExplicitTags(
 fn allVariantsExceptAreNonOwnedTi(
     model: *const file_model.FileModel,
     ti: *const file_model.TypeInfo,
-    explicit_tags: [16][]const u8,
+    explicit_tags: []const []const u8,
 ) bool {
     const tree = model.tree;
     const tags = tree.tokens.items(.tag);
@@ -570,7 +574,6 @@ fn allVariantsExceptAreNonOwnedTi(
         // arm-matched variant).
         var found = false;
         for (explicit_tags) |et| {
-            if (et.len == 0) continue;
             if (std.mem.eql(u8, et, name)) {
                 found = true;
                 break;
@@ -852,7 +855,10 @@ fn priorVariantInFn(
     while (t > body_first + 4) {
         t -= 1;
         switch (tags[t]) {
-            .r_brace => { depth += 1; continue; },
+            .r_brace => {
+                depth += 1;
+                continue;
+            },
             .l_brace => {
                 depth -= 1;
                 if (depth < 0) break; // exited enclosing block — stop
@@ -1103,7 +1109,7 @@ fn priorAssertOnField(
 }
 
 /// True iff the RHS at `[start, end)` is exactly `null`, `undefined`,
-/// or `.{}` / `&.{}` / `.empty` — the canonical "clear" sentinels.
+/// or `.{}` / `&.{}`.
 fn rhsIsNullOrUndefined(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
     const tags = tree.tokens.items(.tag);
     if (start >= end) return false;
@@ -1113,7 +1119,7 @@ fn rhsIsNullOrUndefined(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenI
         const s = tree.tokenSlice(start);
         return std.mem.eql(u8, s, "null") or std.mem.eql(u8, s, "undefined");
     }
-    // `.{}` / `&.{}` / `.empty`.
+    // `.{}` / `&.{}`.
     if (start + 3 == end and
         tags[start] == .period and
         tags[start + 1] == .l_brace and
@@ -1123,10 +1129,6 @@ fn rhsIsNullOrUndefined(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenI
         tags[start + 1] == .period and
         tags[start + 2] == .l_brace and
         tags[start + 3] == .r_brace) return true;
-    if (start + 2 == end and
-        tags[start] == .period and
-        tags[start + 1] == .identifier and
-        std.mem.eql(u8, tree.tokenSlice(start + 1), "empty")) return true;
     return false;
 }
 
@@ -1322,8 +1324,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "overwrite-without-deinit",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, this_tok),
-        .end = Pos.fromTokenEnd(tree, this_tok + 2),
+        .start = try Pos.fromTokenStart(tree, this_tok),
+        .end = try Pos.fromTokenEnd(tree, this_tok + 2),
         .message = msg,
     });
 }
@@ -1683,4 +1685,196 @@ test "overwrite-without-deinit: optional field first write inside orelse block �
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "overwrite-without-deinit: differentTagElseSelection excludes the initialized explicit tag" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const State = union(enum) {
+        \\    named: Owned,
+        \\    empty,
+        \\    pub fn deinit(self: *State) void { self.* = .empty; }
+        \\};
+        \\const Owner = struct {
+        \\    state: State,
+        \\    pub fn reset(this: *Owner) void {
+        \\        switch (this.state) {
+        \\            .named => {},
+        \\            else => { this.state = .empty; },
+        \\        }
+        \\    }
+        \\};
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "overwrite-without-deinit: namedElse excludes multiple initialized explicit tags" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const State = union(enum) {
+        \\    named: Owned,
+        \\    pending: Owned,
+        \\    empty,
+        \\    pub fn deinit(self: *State) void { self.* = .empty; }
+        \\};
+        \\const Owner = struct {
+        \\    state: State,
+        \\    pub fn reset(this: *Owner) void {
+        \\        switch (this.state) {
+        \\            .named, .pending => {},
+        \\            else => { this.state = .empty; },
+        \\        }
+        \\    }
+        \\};
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "overwrite-without-deinit: namedElse without explicit tags preserves owned overwrite" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const State = union(enum) {
+        \\    named: Owned,
+        \\    empty,
+        \\    pub fn deinit(self: *State) void { self.* = .empty; }
+        \\};
+        \\const Owner = struct {
+        \\    state: State,
+        \\    pub fn reset(this: *Owner) void {
+        \\        switch (this.state) {
+        \\            else => { this.state = .empty; },
+        \\        }
+        \\    }
+        \\};
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("overwrite-without-deinit", problems.items[0].rule_id);
+}
+
+test "overwrite-without-deinit: namedElse preserves owned tags outside the explicit prefix" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const State = union(enum) {
+        \\    named: Owned,
+        \\    pending: u32,
+        \\    empty,
+        \\    pub fn deinit(self: *State) void { self.* = .empty; }
+        \\};
+        \\const Owner = struct {
+        \\    state: State,
+        \\    pub fn reset(this: *Owner) void {
+        \\        switch (this.state) {
+        \\            .pending => {},
+        \\            else => { this.state = .empty; },
+        \\        }
+        \\    }
+        \\};
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("overwrite-without-deinit", problems.items[0].rule_id);
+}
+
+test "overwrite-without-deinit: clearing an owned union still requires cleanup" {
+    try testing.expectFires(check, "overwrite-without-deinit",
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const State = union(enum) {
+        \\    active: Owned,
+        \\    vacant,
+        \\    pub fn deinit(self: *State) void { self.* = .vacant; }
+        \\};
+        \\const Owner = struct {
+        \\    state: State,
+        \\    pub fn reset(this: *Owner) void {
+        \\        switch (this.state) {
+        \\            else => { this.state = .vacant; },
+        \\        }
+        \\    }
+        \\};
+    );
+}
+
+test "overwrite-without-deinit: cleanup before clearing an owned union is safe" {
+    try testing.expectNoFire(check,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const State = union(enum) {
+        \\    active: Owned,
+        \\    empty,
+        \\    pub fn deinit(self: *State) void { self.* = .empty; }
+        \\};
+        \\const Owner = struct {
+        \\    state: State,
+        \\    pub fn reset(this: *Owner) void {
+        \\        this.state.deinit();
+        \\        this.state = .empty;
+        \\    }
+        \\};
+    );
+}
+
+test "overwrite-without-deinit: nested owner type fires like a top-level owner" {
+    // `FileModel.findType` keys on `qualified_name`, so the owner's
+    // field lookup must use `Outer.Owner`, not `Owner`.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const InnerReal = struct {
+        \\    buf: []const u8 = &.{},
+        \\    pub fn deinit(self: *InnerReal) void { self.buf = &.{}; }
+        \\};
+        \\const Outer = struct {
+        \\    pub const Owner = struct {
+        \\        inner_real: InnerReal,
+        \\        pub fn set(this: *Owner, new_inner: InnerReal) void {
+        \\            this.inner_real = new_inner;
+        \\        }
+        \\    };
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("overwrite-without-deinit", problems.items[0].rule_id);
+}
+
+test "overwrite-without-deinit: nested owner, optional null-default lazy init — no fire" {
+    try testing.expectNoFire(check,
+        \\const InnerReal = struct {
+        \\    buf: []const u8 = &.{},
+        \\    pub fn deinit(self: *InnerReal) void { self.buf = &.{}; }
+        \\};
+        \\const Outer = struct {
+        \\    pub const Owner = struct {
+        \\        inner_real: ?InnerReal = null,
+        \\        pub fn set(this: *Owner, new_inner: InnerReal) void {
+        \\            this.inner_real = new_inner;
+        \\        }
+        \\    };
+        \\};
+        \\
+    );
 }

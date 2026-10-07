@@ -70,6 +70,17 @@ than assumed:
    function's lexical local bindings before any file-scope declaration.
    A local arena does not prove that the returned bytes outlive the call,
    so that case stays diagnosed.
+   An explicit borrowed `*std.heap.ArenaAllocator` field also identifies
+   the caller-owned arena. Query snapshots can use that typed owner without
+   copying; resetting or releasing it before return still refuses the borrow.
+   The resolved type proves identity, not lifetime: uses of that arena path
+   must only obtain its allocator. A copied arena pointer, a reset or rebind,
+   or a bare capture of its owner refuses the proof even in an owner's method.
+   A whole-receiver aggregate assignment before the first allocator use is
+   allowed only when it creates that standard arena value with `.init`.
+   It must not copy an arena header or set an arena pointer. This constructs
+   the owner before the borrow exists; the same assignment after allocator
+   use refuses the proof. Other pointer captures and aliases are still checked.
    The proof charges:
 
    - the allocator-taking entry points — `append`, `appendSlice`,

@@ -20,20 +20,86 @@ first assignment:
 
 ## When this might be a false positive
 
-- **Method-call initialization.**  `var x: T = undefined;
-  x.init(...);` is the canonical Zig initialization pattern.  zbc
-  recognises method-call mutator names (`init*`, `set*`, `reset*`,
-  `deinit`, `clear*`, `open`, `load*`, `close`) and treats them as
-  writes, not reads.  If your initializer has a different name
-  shape, rename it to fit the convention.
-- **Field-by-field initialization.**  `var x: T = undefined; x.a =
-  1; x.b = 2; return x;`.  Each field assign clears the parent's
-  `.undef` state.
-- **A loop that provably wrote the whole aggregate.**  The generic
-  CFG models every loop as possibly running zero times, so a target
-  seeded `undefined` still reads as `.undef` at the end.  Five
-  narrow proofs close that gap, and each is refused rather than
-  approximated when any of its clauses fails.
+- **Pointer initialization requires source proof.** Taking an address
+  or calling a method with a mutable pointer does not prove a write.
+  zbc credits only the pointee or exact inline field paths that the
+  resolved source callee definitely writes before successful return.
+  Unwritten fields remain undefined. A boolean success result keeps its
+  store certificate on the corresponding result path; ignoring that
+  result does not initialize the failure path. Unknown externs add no
+  credit. Function and parameter names do not establish initialization.
+  A partial field store does not initialize its containing aggregate.
+  Only the written field paths can be read until a complete store is proved.
+
+  A direct pointer copy keeps the formal's identity. Reassignment or
+  escape ends that proof. A namespace type does not prove its member
+  values. Those values require defined initializers.
+- **Explicit aggregate values retain their element coverage.**
+  Array literals, `@splat`, member arithmetic and indexed inputs are
+  checked against the storage they read. Selected value branches retain
+  separate element masks. An undefined member or source element remains
+  a hole after copying it. Sentinel slices are descriptors, not fixed
+  arrays.
+- **Complete array payloads survive value copies.** Full element coverage
+  over a known array extent permits runtime-index reads. Undefined holes
+  remain errors. Immutable constant tables require a resolved declaration
+  and a fully initialized literal payload, including nested elements.
+  Every table selector must also fit its selected array extent.
+  Constant indices and bounded unsigned modulo indices can prove this.
+  An unsupported bound adds no destination initialization credit.
+  A vector copy or `@bitCast` requires complete source payload coverage.
+  A cast does not map partial element coverage across different layouts.
+  Declarations and assignments keep cast lifetime origins, but do not
+  copy their source slot masks. A valid whole-payload certificate can
+  initialize the destination after those earlier transfer steps.
+  Sentinel arrays have extra storage outside their logical extent.
+  Their logical coverage does not certify all bytes for `@bitCast`.
+  A returned array requires a body-definedness proof and covered inputs.
+  Pointer types, integer addresses and opaque extern returns prove no
+  payload initialization.
+- **Optional slice bindings retain their selected descriptor.**
+  `const view = optional_slice orelse return` retains the source pointer
+  and length on the non-null path, including fresh bindings in loops.
+  A local backing array still requires element coverage. Optional slice
+  type information does not initialize its backing storage.
+- **Defined element writes preserve prior array coverage.**
+  A defined runtime-index overwrite preserves existing coverage; it
+  does not initialize other slots. Undefined writes retain exact holes
+  when their index is known and revoke coverage when it is not known.
+  This applies to fixed arrays stored in aggregate fields as well.
+  A resolved `std.mem.swap` between two elements of the same complete
+  array also preserves coverage. An arbitrary mutable-pointer call
+  does not receive this guarantee.
+  Source-proven element helpers and optional insertion helpers can
+  preserve complete arrays when their actual inputs are defined.
+  Preservation adds no initialization credit to incomplete storage.
+  Fixed-array pointer captures retain their owner for defined stores
+  and for invalidation through opaque mutable aliases.
+- **Read-only calls preserve coverage.** A resolved
+  `std.mem.doNotOptimizeAway` does not write its input storage. Local
+  functions with the same name and unresolved mutable-pointer calls do
+  not receive this guarantee.
+- **A loop must prove the region it writes.** The generic CFG permits
+  zero iterations. Exhaustive proofs require a covering enumeration
+  and an unconditional defined store. A bounded `0..array.len` fill can
+  establish complete coverage. A runtime `0..count` fill establishes
+  only its initialized prefix; reads beyond that prefix remain errors.
+  Conditional stores, nonzero starts and interrupted loops do not
+  establish these certificates.
+  A canonical zero-seeded counter loop can fill a fixed array on its
+  normal exit. A fallible store gives no completion credit on an error
+  exit. A decrement-before-store countdown gives only its initialized
+  prefix, not the unused suffix. Each proof checks current input
+  definedness before it adds coverage.
+- **Runtime fills certify only their destination region.**
+  `@memset(array[0..count], value)` can initialize `[0,count)` when the
+  count and value are defined. A nonzero start does not initialize the
+  missing leading slots. Enum-based fills require declaration-derived
+  lengths and complete index coverage, not an enum name.
+
+Bit-reversal indexes and permutation scatters need additional relational
+proofs. A bounded index or an equal iteration count does not establish
+the required prefix or scatter coverage.
 
 ### Tiled fill — several writes per iteration
 
@@ -123,9 +189,9 @@ A read is anything the program actually evaluates, and only that.
 zbc reads `local[i]` as the contents of the element it names, so
 `var out: [4]u8 = undefined; if (out[1] == 0)` reports.  A bare
 `local[a..b]` reads nothing by itself — building a slice over the
-storage is not a read of it — and `&local`, `f(&local)` and
-`&local[i]` are address uses, which clear `.undef` when the callee
-legitimately fills through the pointer.
+storage is not a read of it. `&local` and `&local[i]` are address
+uses, not initialization. A call such as `f(&local)` clears `.undef`
+only when the resolved callee proves the required writes.
 
 A whole array counts as read when something copies out of it:
 `@memcpy(ptr[0..out.len], out[0..])` moves every element, the ones
@@ -163,8 +229,14 @@ SAVE-RESTORE.  `const saved = stack;` before the first test, then
 so everything a call did in between is undone — and the pairing
 holds across the call.
 
+The same pairing can cover a returning `catch` handler immediately
+after the establishing test. Its straight-line prefix must restore
+the saved operands before the matching test. A conditional restore,
+a changed guard, or a handler that falls through does not qualify.
+
 Refused, and still reported: a read outside the re-tested guard; a
-call that can reach through an operand with no restore after it; a
+call that can reach through an operand with no restore after it,
+including a call inside the establishing arm after its test; a
 shadowing declaration between the two tests; a `defer`/`errdefer` in
 between (its body runs at scope exit, which nothing here orders).
 

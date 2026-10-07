@@ -57,7 +57,7 @@ pub fn check(
 /// not a candidate.  A chain longer than the bound is not an answer either
 /// — raising `error.AnalysisBudgetExceeded` says the peel did not finish,
 /// where a node it never reached would quietly stand in for one it did.
-fn peel(tree: *const Ast, node: Ast.Node.Index) budget_mod.BudgetError!?Ast.Node.Index {
+fn peel(tree: *const Ast, node: Ast.Node.Index) (budget_mod.BudgetError || error{SourceTooWide})!?Ast.Node.Index {
     var result = node;
     var budget = peel_depth;
     while (budget != 0) {
@@ -82,7 +82,7 @@ fn peel(tree: *const Ast, node: Ast.Node.Index) budget_mod.BudgetError!?Ast.Node
         }
     }
     const token = tree.nodeMainToken(result);
-    const site = Pos.fromTokenStart(tree, token);
+    const site = try Pos.fromTokenStart(tree, token);
     var name: budget_mod.NameBuf = .{};
     if (tokens.enclosingFnDecl(tree, token)) |declaration| {
         var buffer: [1]Ast.Node.Index = undefined;
@@ -101,15 +101,11 @@ fn peel(tree: *const Ast, node: Ast.Node.Index) budget_mod.BudgetError!?Ast.Node
     });
 }
 
-/// Is `node` provably at least 1 at `use_token`?  A subtraction of one from
-/// an unsigned value cannot underflow exactly when that value is nonzero, and
-/// a subtraction of one from a length cannot underflow exactly when the
-/// container is non-empty — so the two spellings of the question are put to
-/// the oracle in the form it answers: `c.len` as the container `c`, anything
-/// else as the scalar its source spells.
+/// Is `node` provably at least 1 at `use_token`? Keep the complete expression,
+/// including `.len`, so the oracle can match callee postconditions to the
+/// receiver this use reads. Positivity combines two oracle channels.
 ///
-/// The scalar question has two answers to combine, and both are asked of the
-/// oracle rather than re-derived here.  `provesPositive` carries the facts the
+/// Both are asked of the oracle rather than re-derived here. `provesPositive` carries the facts the
 /// body walk recorded — a dominating `!= 0`, a loop bound, a copied depth —
 /// and it reads the SIGN of the operand, so a signed `!= 0` is correctly
 /// refused where "nonzero" alone would have accepted it.  `boundsAt` is the
@@ -125,28 +121,9 @@ fn provesPositive(
     use_token: Ast.TokenIndex,
     cache: ?*file_cache_mod.FileCache,
 ) !bool {
-    if (lenContainer(tree, node)) |container| {
-        return try value_range.provesNonempty(gpa, tree, body, container, use_token, cache);
-    }
     if (try value_range.provesPositive(gpa, tree, body, node, use_token, cache)) return true;
     const bounds = try value_range.boundsAt(gpa, tree, body, node, use_token, cache);
     return bounds == .integer and bounds.integer.min >= 1;
-}
-
-/// If `node` is `<c>.len`, the source spelling of `<c>`; else null.
-fn lenContainer(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
-    if (tree.nodeTag(node) != .field_access) return null;
-    const data = tree.nodeData(node).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "len")) return null;
-    return nodeSrc(tree, data[0]);
-}
-
-/// The source substring spanning a node.
-fn nodeSrc(tree: *const Ast, node: Ast.Node.Index) []const u8 {
-    const starts = tree.tokens.items(.start);
-    const first = tree.firstToken(node);
-    const last = tree.lastToken(node);
-    return tree.source[starts[first].. starts[last] + tree.tokenSlice(last).len];
 }
 
 fn report(
@@ -164,8 +141,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .warning,
-        .start = Pos.fromTokenStart(tree, tree.nodeMainToken(access)),
-        .end = Pos.fromTokenEnd(tree, tree.lastToken(access)),
+        .start = try Pos.fromTokenStart(tree, tree.nodeMainToken(access)),
+        .end = try Pos.fromTokenEnd(tree, tree.lastToken(access)),
         .message = message,
     });
 }
@@ -1707,6 +1684,16 @@ test "index-minus-one: an unsigned index past its start survives the short circu
     );
 }
 
+test "index-minus-one: reversed unsigned order survives the short circuit" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn previousIsSpace(input: []const u8, index: usize, start: usize) bool {
+        \\    if (start > index) return false;
+        \\    if (index == start or input[index - 1] == ' ') return true;
+        \\    return false;
+        \\}
+    );
+}
+
 test "index-minus-one: a signed index past its start is still negative (#72c4)" {
     try testing.expectFiresTyped(check, R,
         \\// The same self-excluding form on a SIGNED operand proves nothing:
@@ -1940,4 +1927,813 @@ test "index-minus-one: an unfinished cast peel returns a located refusal, not a 
     try std.testing.expectEqualStrings("deep", failure.function.slice());
     try std.testing.expect(failure.byte != 0);
     try std.testing.expect(failure.line != 0);
+}
+
+test "index-minus-one: a callee increment establishes a positive count" {
+    try testing.expectNoFireTyped(check,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State) void { self.items[self.count] = 42; self.count += 1; }
+        \\};
+        \\pub fn last(state: *State) u8 { state.emit(); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: a callee successful early return does not establish a count" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State, skip: bool) void { if (skip) return; self.count += 1; }
+        \\};
+        \\pub fn last(state: *State, skip: bool) u8 { state.emit(skip); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: a successful append helper establishes a nonempty field" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    items: std.ArrayList(u8) = .empty,
+        \\    fn emit(self: *State, allocator: std.mem.Allocator) !void { try self.items.append(allocator, 42); }
+        \\};
+        \\pub fn last(state: *State, allocator: std.mem.Allocator) !u8 {
+        \\    try state.emit(allocator);
+        \\    return state.items.items[state.items.items.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one: a caught failed append helper does not establish a field" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    items: std.ArrayList(u8) = .empty,
+        \\    fn emit(self: *State, allocator: std.mem.Allocator) !void { try self.items.append(allocator, 42); }
+        \\};
+        \\pub fn last(state: *State, allocator: std.mem.Allocator) u8 {
+        \\    state.emit(allocator) catch {};
+        \\    return state.items.items[state.items.items.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one: a loop min end remains positive after cursor advances" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn scan(input: []const u8) u8 {
+        \\    var cursor: usize = 0;
+        \\    var result: u8 = 0;
+        \\    while (cursor < input.len) {
+        \\        const block_end = @min(cursor + 16, input.len);
+        \\        cursor = block_end;
+        \\        result ^= input[block_end - 1];
+        \\    }
+        \\    return result;
+        \\}
+    );
+}
+
+test "index-minus-one: a zero-width loop min end can be zero" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn scan(input: []const u8) u8 {
+        \\    var cursor: usize = 0;
+        \\    while (cursor < input.len) {
+        \\        const block_end = @min(cursor + 0, input.len);
+        \\        cursor = block_end;
+        \\        return input[block_end - 1];
+        \\    }
+        \\    return 0;
+        \\}
+    );
+}
+
+test "index-minus-one: a comptime assertion supplies the scanner width floor" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn scan(comptime width: usize, input: []const u8) u8 {
+        \\    comptime std.debug.assert(width > 0);
+        \\    var cursor: usize = 0;
+        \\    var result: u8 = 0;
+        \\    while (cursor < input.len) {
+        \\        const block_end = @min(cursor + width, input.len);
+        \\        cursor = block_end;
+        \\        result ^= input[block_end - 1];
+        \\    }
+        \\    return result;
+        \\}
+    );
+}
+
+test "index-minus-one: an unknown callee cannot establish a positive count" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn last(state: anytype) u8 { state.emit(); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: a callee error return is not a successful zero count" {
+    try testing.expectNoFireTyped(check,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State, fail: bool) !void {
+        \\        if (fail) return error.Failed;
+        \\        self.count += 1;
+        \\    }
+        \\};
+        \\pub fn last(state: *State, fail: bool) !u8 { try state.emit(fail); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: an ignored error union leaves zero-count paths reachable" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State, fail: bool) !void {
+        \\        if (fail) return error.Failed;
+        \\        self.count += 1;
+        \\    }
+        \\};
+        \\pub fn last(state: *State, fail: bool) u8 { _ = state.emit(fail); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: successful helper ignores error-only rollback" {
+    try testing.expectNoFireTyped(check,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State, fail: bool) !void {
+        \\        self.count += 1;
+        \\        errdefer self.count = 0;
+        \\        if (fail) return error.Failed;
+        \\    }
+        \\};
+        \\pub fn last(state: *State, fail: bool) !u8 { try state.emit(fail); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: unconditional deferred reset destroys helper positivity" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State) void {
+        \\        self.count += 1;
+        \\        defer self.count = 0;
+        \\    }
+        \\};
+        \\pub fn last(state: *State) u8 { state.emit(); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: raw fallible wrapper cannot export propagated success facts" {
+    try testing.expectFiresTyped(check, R,
+        \\fn validate(fail: bool) !void { if (fail) return error.Failed; }
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State, fail: bool) !void { try validate(fail); self.count += 1; }
+        \\};
+        \\pub fn last(state: *State, fail: bool) u8 { _ = state.emit(fail); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: nested caught error rollback remains conservative" {
+    try testing.expectFiresTyped(check, R,
+        \\fn validate(fail: bool) !void { if (fail) return error.Failed; }
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn emit(self: *State, fail: bool) !void {
+        \\        self.count = 1;
+        \\        const result: anyerror!void = blk: {
+        \\            errdefer self.count = 0;
+        \\            break :blk try validate(fail);
+        \\        };
+        \\        result catch {};
+        \\    }
+        \\};
+        \\pub fn last(state: *State, fail: bool) !u8 { try state.emit(fail); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one: foreign successful append exports only universal nonempty fields" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "remote.zig",
+        .data =
+        \\const std = @import("std");
+        \\pub const State = struct {
+        \\    items: std.ArrayList(u8) = .empty,
+        \\    pub fn emit(self: *State, allocator: std.mem.Allocator, fail: bool) !void {
+        \\        try self.items.append(allocator, 42);
+        \\        errdefer _ = self.items.pop();
+        \\        if (fail) return error.Failed;
+        \\    }
+        \\    pub fn maybe(self: *State, allocator: std.mem.Allocator, skip: bool) !void {
+        \\        if (skip) return;
+        \\        try self.emit(allocator, false);
+        \\    }
+        \\};
+        ,
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    for ([_][]const u8{ "emit", "maybe" }, 0..) |method, expected| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "const std = @import(\"std\");\n" ++
+                "const State = @import(\"{s}/remote.zig\").State;\n" ++
+                "pub fn last(state: *State, allocator: std.mem.Allocator, flag: bool) !u8 {{\n" ++
+                "    try state.{s}(allocator, flag);\n" ++
+                "    return state.items.items[state.items.items.len - 1];\n" ++
+                "}}\n",
+            .{ directory, method },
+        );
+        defer gpa.free(source);
+        const engine = @import("type_engine");
+        var context: engine.TypeContext = undefined;
+        try context.init(gpa, io);
+        defer context.deinit();
+        context.store.source_policy = .{ .roots = &.{directory} };
+        const caller_path = try std.fs.path.join(gpa, &.{ directory, "caller.zig" });
+        defer gpa.free(caller_path);
+        const source_z = try gpa.dupeZ(u8, source);
+        defer gpa.free(source_z);
+        var resolver: engine.TypeResolver = undefined;
+        try resolver.init(&context, gpa, caller_path, source_z);
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        if (tree.errors.len != 0) return error.InvalidSyntax;
+        var cache = file_cache_mod.FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer testing.freeProblems(gpa, &problems);
+        try check(gpa, tree, &cache, &config_mod.Default, &problems);
+        try std.testing.expectEqual(expected, problems.items.len);
+        for (problems.items) |problem| try std.testing.expectEqualStrings(R, problem.rule_id);
+    }
+}
+
+test "index-minus-one: return operand effects precede exported callee floors" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct {
+        \\    items: [8]u8 = @splat(0),
+        \\    count: usize,
+        \\    fn reset(self: *State) void { self.count = 0; }
+        \\    fn emit(self: *State) void { self.count = 1; return self.reset(); }
+        \\};
+        \\pub fn last(state: *State) u8 { state.emit(); return state.items[state.count - 1]; }
+    );
+}
+
+test "index-minus-one Ocean effects: element stores keep independent loop indices" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn sort(ids: []u32, indices: []usize, begin: usize) void {
+        \\    for (begin..ids.len) |i| {
+        \\        const current = ids[i];
+        \\        var insertion = i;
+        \\        while (insertion > begin and ids[insertion - 1] > current) : (insertion -= 1) {
+        \\            indices[insertion] = indices[insertion - 1];
+        \\            ids[insertion] = ids[insertion - 1];
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: element stores still invalidate aliased counters" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn f(items: []u32, count: *u32, slot: usize) u32 {
+        \\    if (count.* == 0) return 0;
+        \\    items[slot] = 0;
+        \\    return items[count.* - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: same-value element store preserves pointer count" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn push(out: []u32, mapping: []u32, node: usize, count: *u32) !void {
+        \\    if (count.* == std.math.maxInt(u32)) return error.Full;
+        \\    count.* += 1;
+        \\    mapping[node] = count.*;
+        \\    out[count.* - 1] = 0;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: aliased standard expect retains nonempty success" {
+    try testing.expectNoFireTyped(check,
+        \\const testing = @import("std").testing;
+        \\pub fn last(bytes: []const u8, limit: usize) !u8 {
+        \\    try testing.expect(bytes.len >= 1);
+        \\    try testing.expect(bytes.len <= limit);
+        \\    return bytes[bytes.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: custom expect alias proves nothing" {
+    try testing.expectFiresTyped(check, R,
+        \\const testing = struct { fn expect(_: bool) !void {} };
+        \\pub fn last(bytes: []const u8) !u8 {
+        \\    try testing.expect(bytes.len >= 1);
+        \\    return bytes[bytes.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: caught standard expect proves no success fact" {
+    try testing.expectFiresTyped(check, R,
+        \\const testing = @import("std").testing;
+        \\pub fn last(bytes: []const u8) u8 {
+        \\    testing.expect(bytes.len >= 1) catch {};
+        \\    return bytes[bytes.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: unrelated errdefer keeps pointer stack guard" {
+    try testing.expectNoFireTyped(check,
+        \\const Context = struct { items: []u8 };
+        \\const Outcome = struct { fn deinit(_: *Outcome) void {} };
+        \\pub fn last(ctx: *Context) !u8 {
+        \\    if (ctx.items.len == 0) return error.Empty;
+        \\    var out: Outcome = .{};
+        \\    errdefer out.deinit();
+        \\    return ctx.items[ctx.items.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: actual cleanup mutation invalidates stack guard" {
+    try testing.expectFiresTyped(check, R,
+        \\const Context = struct {
+        \\    items: []u8,
+        \\    fn clear(self: *Context) void { self.items = self.items[0..0]; }
+        \\};
+        \\pub fn last(ctx: *Context) !u8 {
+        \\    if (ctx.items.len == 0) return error.Empty;
+        \\    ctx.clear();
+        \\    return ctx.items[ctx.items.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: positive range capture survives unrelated append" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn place(count: usize, output: *std.ArrayList(u8), allocator: std.mem.Allocator, placements: []usize) !void {
+        \\    for (1..count + 1) |raw| {
+        \\        try output.appendSlice(allocator, &.{1});
+        \\        placements[raw - 1] = output.items.len;
+        \\    }
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: zero-start range remains unsafe after append" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn place(count: usize, output: *std.ArrayList(u8), allocator: std.mem.Allocator, placements: []usize) !void {
+        \\    for (0..count) |raw| {
+        \\        try output.appendSlice(allocator, &.{1});
+        \\        placements[raw - 1] = output.items.len;
+        \\    }
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: readonly leaf clone keeps length equality" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    entries: []u8,
+        \\    limit: usize,
+        \\    fn clone(self: *const List) []u8 { return self.entries; }
+        \\};
+        \\pub fn last(list: *List) ?u8 {
+        \\    std.debug.assert(list.limit > 0);
+        \\    if (list.entries.len == list.limit) {
+        \\        const copied = list.clone();
+        \\        _ = copied;
+        \\        return list.entries[list.entries.len - 1];
+        \\    }
+        \\    return null;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: clone name does not promise length preservation" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    entries: []u8,
+        \\    limit: usize,
+        \\    fn clone(self: *List) []u8 {
+        \\        self.entries = self.entries[0..0];
+        \\        return self.entries;
+        \\    }
+        \\};
+        \\pub fn last(list: *List) ?u8 {
+        \\    std.debug.assert(list.limit > 0);
+        \\    if (list.entries.len == list.limit) {
+        \\        _ = list.clone();
+        \\        return list.entries[list.entries.len - 1];
+        \\    }
+        \\    return null;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: unaligned same-value stores retain no alias bound" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn f(items: []align(1) u32, count: *align(1) u32, slot: usize) u32 {
+        \\    if (count.* == 0) return 0;
+        \\    items[slot] = count.*;
+        \\    return items[count.* - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: distinct pointer names may alias guarded stack" {
+    try testing.expectFiresTyped(check, R,
+        \\const Context = struct {
+        \\    items: []u8,
+        \\    fn clear(self: *Context) void { self.items = self.items[0..0]; }
+        \\};
+        \\pub fn last(ctx: *Context, other: *Context) !u8 {
+        \\    if (ctx.items.len == 0) return error.Empty;
+        \\    other.clear();
+        \\    return ctx.items[ctx.items.len - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: nested readonly clone keeps guarded length" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn identity(bytes: []u8) []u8 { return bytes; }
+        \\const List = struct {
+        \\    entries: []u8,
+        \\    limit: usize,
+        \\    fn clone(self: *const List) []u8 { return identity(self.entries); }
+        \\};
+        \\pub fn last(list: *List) ?u8 {
+        \\    std.debug.assert(list.limit > 0);
+        \\    if (list.entries.len == list.limit) {
+        \\        _ = list.clone();
+        \\        return list.entries[list.entries.len - 1];
+        \\    }
+        \\    return null;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean effects: const clone with nested write remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    entries: []u8,
+        \\    limit: usize,
+        \\    fn clear(self: *List) void { self.entries = self.entries[0..0]; }
+        \\    fn clone(self: *const List) void { clear(@constCast(self)); }
+        \\};
+        \\pub fn last(list: *List) ?u8 {
+        \\    std.debug.assert(list.limit > 0);
+        \\    if (list.entries.len == list.limit) {
+        \\        list.clone();
+        \\        return list.entries[list.entries.len - 1];
+        \\    }
+        \\    return null;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Module: checked accessor result survives OR rejection" {
+    try testing.expectNoFireTyped(check,
+        \\const Key = struct { value: usize, fn index(self: Key) usize { return self.value; } };
+        \\const Module = struct { callables: []const u8 };
+        \\pub fn get(module: *const Module, key: Key) ?u8 {
+        \\    const raw_id = key.index();
+        \\    if (raw_id == 0 or raw_id > module.callables.len) return null;
+        \\    return module.callables[raw_id - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Module: upper-only accessor rejection still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const Key = struct { value: usize, fn index(self: Key) usize { return self.value; } };
+        \\const Module = struct { callables: []const u8 };
+        \\pub fn get(module: *const Module, key: Key) ?u8 {
+        \\    const raw_id = key.index();
+        \\    if (raw_id > module.callables.len) return null;
+        \\    return module.callables[raw_id - 1];
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Timing: copied union row retains ordinal rejection" {
+    try testing.expectNoFireTyped(check,
+        \\const Row = struct { ordinal: usize };
+        \\const Event = union(enum) { model: Row, other: void };
+        \\const State = struct { models: []const u8, ok: bool };
+        \\pub fn walk(state: *State, event: Event) ?u8 {
+        \\    switch (event) {
+        \\        .model => |row| {
+        \\            if (row.ordinal == 0 or row.ordinal > state.models.len) {
+        \\                state.ok = false;
+        \\                return null;
+        \\            }
+        \\            return state.models[row.ordinal - 1];
+        \\        },
+        \\        .other => return null,
+        \\    }
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Timing: copied union row without zero rejection warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const Row = struct { ordinal: usize };
+        \\const Event = union(enum) { model: Row, other: void };
+        \\const State = struct { models: []const u8, ok: bool };
+        \\pub fn walk(state: *State, event: Event) ?u8 {
+        \\    switch (event) {
+        \\        .model => |row| {
+        \\            if (row.ordinal > state.models.len) {
+        \\                state.ok = false;
+        \\                return null;
+        \\            }
+        \\            return state.models[row.ordinal - 1];
+        \\        },
+        \\        .other => return null,
+        \\    }
+        \\}
+    );
+}
+
+test "index-minus-one Ocean induction: one-based counter with independent zero sum" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn sumThree(items: [3]u8) u8 {
+        \\    var id: usize = 1;
+        \\    var sum: u8 = 0;
+        \\    while (id <= 3) : (id += 1) sum +%= items[id - 1];
+        \\    return sum;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean induction: zero-based counter still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn sumThree(items: [3]u8) u8 {
+        \\    var id: usize = 0;
+        \\    var sum: u8 = 0;
+        \\    while (id <= 3) : (id += 1) sum +%= items[id - 1];
+        \\    return sum;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean induction: body reset invalidates the counter floor" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn sumThree(items: [3]u8, reset: bool) u8 {
+        \\    var id: usize = 1;
+        \\    var sum: u8 = 0;
+        \\    while (id <= 3) : (id += 1) {
+        \\        if (reset) id = 0;
+        \\        sum +%= items[id - 1];
+        \\    }
+        \\    return sum;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean induction: wrapping backedge still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn sumThree(items: [3]u8) u8 {
+        \\    var id: usize = 1;
+        \\    var sum: u8 = 0;
+        \\    while (id <= 3) : (id +%= 1) sum +%= items[id - 1];
+        \\    return sum;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: nonempty anonymous array header" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn last() u8 {
+        \\    const entries = nonEmpty();
+        \\    return entries[entries.len - 1];
+        \\}
+        \\fn nonEmpty() []const u8 { return &.{ 7, 9 }; }
+    );
+}
+
+test "index-minus-one Ocean return: empty anonymous array header still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn last() u8 {
+        \\    const entries = empty();
+        \\    return entries[entries.len - 1];
+        \\}
+        \\fn empty() []const u8 { return &.{}; }
+    );
+}
+
+test "index-minus-one Ocean return: an empty alternate return still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn last(short: bool) u8 {
+        \\    const entries = choose(short);
+        \\    return entries[entries.len - 1];
+        \\}
+        \\fn choose(short: bool) []const u8 {
+        \\    if (short) return &.{};
+        \\    return &.{ 7, 9 };
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Memory: successful append emitter returns a positive node" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Trace = struct {
+        \\    nodes: std.ArrayList(u8),
+        \\    fn emit(self: *Trace, allocator: std.mem.Allocator) !usize {
+        \\        try self.nodes.append(allocator, 7);
+        \\        return @intCast(self.nodes.items.len);
+        \\    }
+        \\};
+        \\pub fn set(trace: *Trace, allocator: std.mem.Allocator) !void {
+        \\    const node = try trace.emit(allocator);
+        \\    trace.nodes.items[node - 1] = 9;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Memory: emitter without append still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Trace = struct {
+        \\    nodes: std.ArrayList(u8),
+        \\    fn emit(self: *Trace) !usize { return @intCast(self.nodes.items.len); }
+        \\};
+        \\pub fn set(trace: *Trace) !void {
+        \\    const node = try trace.emit();
+        \\    trace.nodes.items[node - 1] = 9;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Memory: continuing catch cannot inherit success floor" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Trace = struct {
+        \\    nodes: std.ArrayList(u8),
+        \\    fn emit(self: *Trace, allocator: std.mem.Allocator) !usize {
+        \\        try self.nodes.append(allocator, 7);
+        \\        return @intCast(self.nodes.items.len);
+        \\    }
+        \\};
+        \\pub fn set(trace: *Trace, allocator: std.mem.Allocator) void {
+        \\    const node = trace.emit(allocator) catch 0;
+        \\    trace.nodes.items[node - 1] = 9;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: selected nonempty table headers" {
+    try testing.expectNoFireTyped(check,
+        \\const Kind = enum { short, long };
+        \\pub fn last(kind: Kind) u8 {
+        \\    const entries = table(kind);
+        \\    return entries[entries.len - 1];
+        \\}
+        \\fn table(kind: Kind) []const u8 {
+        \\    return switch (kind) {
+        \\        .short => &.{7},
+        \\        .long => &.{ 7, 9 },
+        \\    };
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: selected table with an empty header still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const Kind = enum { short, long };
+        \\pub fn last(kind: Kind) u8 {
+        \\    const entries = table(kind);
+        \\    return entries[entries.len - 1];
+        \\}
+        \\fn table(kind: Kind) []const u8 {
+        \\    return switch (kind) {
+        \\        .short => &.{},
+        \\        .long => &.{ 7, 9 },
+        \\    };
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: effectful array operand cannot export a stale floor" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn last() u8 {
+        \\    const entries = choose();
+        \\    return entries[entries.len - 1];
+        \\}
+        \\var backing: [2]u8 = .{ 7, 9 };
+        \\var view: []const u8 = &backing;
+        \\fn erase() u8 { view = &.{}; return 0; }
+        \\fn choose() []const u8 {
+        \\    _ = .{erase()};
+        \\    return view;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Memory: explicit error return does not erase success floor" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Trace = struct {
+        \\    nodes: std.ArrayList(u8),
+        \\    fn emit(self: *Trace, allocator: std.mem.Allocator, fail: bool) !usize {
+        \\        if (fail) return error.Refused;
+        \\        try self.nodes.append(allocator, 7);
+        \\        return @intCast(self.nodes.items.len);
+        \\    }
+        \\};
+        \\pub fn set(trace: *Trace, allocator: std.mem.Allocator, fail: bool) !void {
+        \\    const node = try trace.emit(allocator, fail);
+        \\    trace.nodes.items[node - 1] = 9;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean Memory: zero successful return still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Trace = struct {
+        \\    nodes: std.ArrayList(u8),
+        \\    fn emit(self: *Trace, allocator: std.mem.Allocator, skip: bool) !usize {
+        \\        if (skip) return 0;
+        \\        try self.nodes.append(allocator, 7);
+        \\        return @intCast(self.nodes.items.len);
+        \\    }
+        \\};
+        \\pub fn set(trace: *Trace, allocator: std.mem.Allocator, skip: bool) !void {
+        \\    const node = try trace.emit(allocator, skip);
+        \\    trace.nodes.items[node - 1] = 9;
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: direct selected table length is positive" {
+    try testing.expectNoFireTyped(check,
+        \\const Kind = enum { short, long };
+        \\pub fn last(kind: Kind) u8 {
+        \\    return table(kind)[table(kind).len - 1];
+        \\}
+        \\fn table(kind: Kind) []const u8 {
+        \\    return switch (kind) {
+        \\        .short => &.{7},
+        \\        .long => &.{ 7, 9 },
+        \\    };
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: direct selected empty table length still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const Kind = enum { short, long };
+        \\pub fn last(kind: Kind) u8 {
+        \\    return table(kind)[table(kind).len - 1];
+        \\}
+        \\fn table(kind: Kind) []const u8 {
+        \\    return switch (kind) {
+        \\        .short => &.{},
+        \\        .long => &.{ 7, 9 },
+        \\    };
+        \\}
+    );
+}
+
+test "index-minus-one Ocean return: direct header extent snapshots pre-call arguments" {
+    try testing.expectFiresTyped(check, R,
+        \\var backing: [2]u8 = .{ 7, 9 };
+        \\pub fn last() u8 {
+        \\    var n: usize = 0;
+        \\    return backing[take(n, &n).len - 1];
+        \\}
+        \\fn take(n: usize, out: *usize) []const u8 {
+        \\    out.* = 1;
+        \\    return backing[0..n];
+        \\}
+    );
 }

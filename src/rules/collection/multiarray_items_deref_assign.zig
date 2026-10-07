@@ -30,6 +30,7 @@ const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "multiarray-items-deref-assign";
 
+/// Returns `SourceTooWide` if the source or token count exceeds the AST position domain.
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -40,12 +41,14 @@ pub fn check(
     if (!config_mod.isEnabled(config, .multiarray_items_deref_assign)) return;
     _ = cache;
 
+    if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
     const tags = tree.tokens.items(.tag);
-    if (tree.tokens.len < 12) return;
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    if (tok_count < 12) return;
+    const last_tok: Ast.TokenIndex = tok_count - 1;
 
     var t: Ast.TokenIndex = 0;
-    while (t + 6 <= last_tok) : (t += 1) {
+    while (t <= last_tok and last_tok - t >= 6) : (t += 1) {
         // Prefix: . items ( . identifier ) [
         if (tags[t] != .period) continue;
         if (tags[t + 1] != .identifier) continue;
@@ -71,7 +74,7 @@ pub fn check(
         const close_bracket = i - 1;
 
         // Suffix: ] .* =   (.* is a single period_asterisk token)
-        if (close_bracket + 2 > last_tok) continue;
+        if (last_tok - close_bracket < 2) continue;
         if (tags[close_bracket + 1] != .period_asterisk) continue;
         if (tags[close_bracket + 2] != .equal) continue;
 
@@ -96,8 +99,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, dot_tok),
-        .end = Pos.fromTokenEnd(tree, dot_tok + 1),
+        .start = try Pos.fromTokenStart(tree, dot_tok),
+        .end = try Pos.fromTokenEnd(tree, dot_tok + 1),
         .message = msg,
     });
 }

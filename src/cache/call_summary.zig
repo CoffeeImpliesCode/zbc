@@ -21,11 +21,24 @@
 //! "that is a different parameter" without the caller's own storage or a
 //! positively proved private construction in front of it.
 //!
-//! TWO QUESTIONS, ONE ENTRY.  `callEffectAt` asks about storage rooted at
-//! a formal and path of the callee, or about the storage a call reaches
-//! that NO formal of it names.  A whole-body read-only verdict is only
-//! ever the answer to the first question with the second one folded in;
-//! a consumer that cares about the caller's own buffer asks for both.
+//! EXHAUSTED ROOT DEMANDS.  A root witness demand (empty stack, the query's
+//! own 50,000-unit allowance) whose walk ran that allowance out is recorded
+//! under its memo key, its walk mode and the allowance it started with.  The
+//! same demand with no more allowance stops at once with the same labelled
+//! budget failure.  It is a refusal to answer, never an answer: completed
+//! answers are looked up first, and nested, borrowed-allowance or cut walks
+//! are never recorded.
+//!
+//! `callEffectAt` asks about parameter-rooted or unrooted storage, or selects
+//! all mutation effects with `.whole`. The whole verdict does not certify
+//! returned storage, source values, loans, or initialization.
+//! A stopped scan is not a completed witness set, but it can complete a
+//! read-only-versus-unsafe question. Independent verdict witnesses are kept
+//! separately and reused only by that same short-circuit question. Precise
+//! effects still walk to EOF; budget failures and cycle cutoffs file nothing.
+//! Empty completed all-storage sets also answer narrower questions. Within
+//! one body frame, completed acyclic origins are reused by node and depth;
+//! failed or cycle-dependent walks never become origin answers.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const file_cache = @import("file_cache.zig");
@@ -33,9 +46,11 @@ const FileCache = file_cache.FileCache;
 const fn_summary = @import("../model/fn_summary.zig");
 const LocalBindings = @import("../model/local_bindings.zig").LocalBindings;
 const tokens = @import("../ast/tokens.zig");
+
 const grow_analysis = @import("grow_analysis.zig");
 const call_effects = @import("call_effects.zig");
 const storage_alias = @import("storage_alias.zig");
+const fresh_storage = @import("fresh_storage.zig");
 const budget_mod = @import("../budget.zig");
 const resolver_mod = @import("../type_resolver.zig");
 const TypeResolver = resolver_mod.TypeResolver;
@@ -57,9 +72,13 @@ pub const Effect = enum { read_only, writes_without_invalidation, may_invalidate
 pub const ParameterSelection = struct {
     param: u32,
     path: []const u8 = "",
+    /// The caller needs only whether the answer is `.read_only`. Any other
+    /// verdict then stands for "not read-only" and its kind is unspecified.
+    /// Applies to whole-storage questions (`path == ""`).
+    read_only_only: bool = false,
 };
 
-/// The two storages one call can be asked about.
+/// Storage selected for one mutation-effect question.
 pub const EffectSelection = union(enum) {
     /// Storage the caller handed this call, named by a formal of the callee.
     parameter: ParameterSelection,
@@ -68,33 +87,41 @@ pub const EffectSelection = union(enum) {
     /// not root, or storage an unresolved callee may touch.  It is never
     /// answered by a parameter's own verdict.
     unrooted,
+    /// All formal-rooted and unrooted effects, without caller-storage projection.
+    /// `null` resolves the call normally; a supplied canonical callee borrows
+    /// its original resolver and must match `token` and the query frame.
+    /// Only `.read_only` certifies no mutation, not returned-storage safety.
+    whole: ?FileCache.ActualCallee,
 };
 
 pub const ActualCallSummary = struct {
     callee: FileCache.ActualCallee,
+    /// Declaration and return-provenance facts, without an eager cleanup walk.
+    /// Cleanup consumers request FileCache.summaryOfResolvedMethod(callee).
     summary: ?fn_summary.FnSummary,
     argument_offset: ?u1,
+    /// Identity queries do not fold effects. Use callEffectAt for a verdict.
     read_only: ?bool,
 
     /// The buffer belongs to the caller, as it does in TypeResolver.
     /// Argument mapping follows the frame the CALL was reached in, not the
     /// callee's own body frame: the bindings a caller instantiates are the
     /// ones its own arguments were resolved against.
+    /// An unsupported argument map returns `null`; source, cancellation and
+    /// resource failures propagate without becoming a missing argument.
     pub fn callArgumentFor(
         self: ActualCallSummary,
         cache: *FileCache,
-        buffer: *[1]Ast.Node.Index,
+        buffer: *[2]Ast.Node.Index,
         parameter: u32,
     ) Error!?Ast.Node.Index {
         const view = viewFor(cache, self.callee) orelse return null;
-        return view.callArgumentIn(buffer, self.callee.call_node, parameter) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => null,
-        };
+        return try view.callArgumentIn(buffer, self.callee.call_node, parameter);
     }
 
     /// The cache is immovable and owned by the canonical grow state until the
-    /// root cache's deinit. A failed open is not a body/purity observation.
+    /// root cache's deinit. The supplied caller frame selects the source
+    /// context; a failed open is not a body/purity observation.
     pub fn declaringCache(self: ActualCallSummary, cache: *FileCache) Error!?*FileCache {
         return cacheFor(cache, self.callee);
     }
@@ -144,6 +171,8 @@ const Raw = struct {
     path: u32,
     effect: Effect,
     operand: ?Ast.Node.Index = null,
+    /// Only the callee-relative suffix, not the operand's already-spelled path.
+    operand_path: u32 = root_path,
     at: ?Ast.Node.Index = null,
 };
 
@@ -181,19 +210,255 @@ const KeyContext = struct {
     }
 };
 
-/// One query's working state: the memo and cycle set that walk fills, plus
-/// the allowance it spends.  A nested query adopts its caller's counter, so
-/// one allowance still covers the complete walk; each walk's memo dies with it.
+/// How much of a root demand's answer the asker needs; part of the key of a
+/// recorded budget failure because a stopping walk and a complete walk are
+/// different walks over one declaration.
+const DemandMode = enum { complete, whole, cut, cut_advisory };
+
+fn demandMode(mode: Mode) ?DemandMode {
+    return switch (mode) {
+        .complete => .complete,
+        .whole => .whole,
+        // A parent frame makes the demand part of a stack; only a root
+        // question has none.
+        .cut => |cut| if (cut.parent != null) null else if (cut.advisory_ok) .cut_advisory else .cut,
+    };
+}
+
+/// One root demand: the complete memo key plus the walk mode.
+const ExhaustedKey = struct {
+    key: Key,
+    mode: DemandMode,
+};
+
+const ExhaustedKeyContext = struct {
+    pub fn hash(_: ExhaustedKeyContext, demand: ExhaustedKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        const key_hash = KeyContext.hash(.{}, demand.key);
+        hasher.update(std.mem.asBytes(&key_hash));
+        hasher.update(std.mem.asBytes(&demand.mode));
+        return hasher.final();
+    }
+
+    pub fn eql(_: ExhaustedKeyContext, a: ExhaustedKey, b: ExhaustedKey) bool {
+        return a.mode == b.mode and KeyContext.eql(.{}, a.key, b.key);
+    }
+};
+
+/// A root demand whose standalone walk ran its whole allowance out.  The walk
+/// is a pure function of the key, the allowance it started with and the
+/// file's completed answers, which only ever make a later walk cheaper; so a
+/// later demand of the same key with no more allowance stops the same way.
+/// Never an answer: only the failure to give one.
+const Exhausted = struct {
+    /// The allowance the exhausted walk started with.
+    budget: u32,
+    limit: budget_mod.Limit,
+    cap: u32,
+    reached: u32,
+};
+
+/// Scopes the thread's pending budget diagnostic to one walk.  `begin` sets
+/// the unclaimed record aside; `end` returns the walk's own first failure
+/// and leaves the pending record exactly as it would have been without the
+/// guard (first failure wins, an older unclaimed one first).
+pub const PendingGuard = struct {
+    saved: ?budget_mod.Diagnostic,
+
+    pub fn begin() PendingGuard {
+        return .{ .saved = budget_mod.take() };
+    }
+
+    pub fn end(self: PendingGuard) ?budget_mod.Diagnostic {
+        const own = budget_mod.take();
+        if (self.saved) |older| budget_mod.fail(older) catch {};
+        if (own) |first| budget_mod.fail(first) catch {};
+        return own;
+    }
+};
+
+/// Only source traversal omits the formal/path coordinates. Its instantiated
+/// branch proofs still belong to the complete callable graph.
+pub const SourcePlanKey = struct {
+    declaration: file_cache.DeclKey,
+    context: ?TypeResolver.ActualTypeID,
+};
+
+pub const SourcePlanKeyContext = struct {
+    fn effectKey(key: SourcePlanKey) Key {
+        return .{
+            .declaration = key.declaration,
+            .parameter = any_param,
+            .path = root_path,
+            .context = key.context,
+        };
+    }
+
+    pub fn hash(_: SourcePlanKeyContext, key: SourcePlanKey) u64 {
+        return KeyContext.hash(.{}, effectKey(key));
+    }
+
+    pub fn eql(_: SourcePlanKeyContext, a: SourcePlanKey, b: SourcePlanKey) bool {
+        return KeyContext.eql(.{}, effectKey(a), effectKey(b));
+    }
+};
+
+/// Completed ordered source evidence, not an effect answer. Every stored
+/// event is processed again for each formal/path question in a fresh Frame.
+/// Identifier uses retain declaration-token identity, including shadowing.
+pub const SourcePlan = struct {
+    events: []const call_effects.Event,
+    formal_uses: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
+
+    pub fn deinit(self: *SourcePlan, gpa: std.mem.Allocator) void {
+        gpa.free(self.events);
+        self.formal_uses.deinit(gpa);
+    }
+};
+
+/// Completed body-syntax write evidence. Name and binding-token identity
+/// distinguish shadowed variables; token-range and unresolved-write policy
+/// remain part of each live origin question, not of this immutable index.
+pub const BindingWriteIndex = struct {
+    const Write = struct { token: Ast.TokenIndex, declaration: ?Ast.TokenIndex };
+    writes: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Write)) = .empty,
+
+    pub fn deinit(self: *BindingWriteIndex, gpa: std.mem.Allocator) void {
+        var lists = self.writes.valueIterator();
+        while (lists.next()) |list| list.deinit(gpa);
+        self.writes.deinit(gpa);
+    }
+};
+
+const SourcePlanBuilder = struct {
+    events: std.ArrayListUnmanaged(call_effects.Event) = .empty,
+    formal_uses: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty,
+
+    fn deinit(self: *SourcePlanBuilder, gpa: std.mem.Allocator) void {
+        self.events.deinit(gpa);
+        self.formal_uses.deinit(gpa);
+    }
+
+    fn note(self: *SourcePlanBuilder, frame: *Frame, node: Ast.Node.Index) Error!void {
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) != .identifier) return;
+        const token = tree.nodeMainToken(node);
+        const binding = frame.currentBindings().findAt(tree.tokenSlice(token), token) orelse return;
+        if (binding.origin != .param) return;
+        const entry = try self.formal_uses.getOrPut(frame.cache.gpa, binding.name_token);
+        if (!entry.found_existing) entry.value_ptr.* = node;
+    }
+
+    fn append(self: *SourcePlanBuilder, gpa: std.mem.Allocator, event: call_effects.Event) Error!void {
+        try self.events.append(gpa, event);
+    }
+
+    /// Publication follows both Scan EOF and successful frozen witnesses.
+    /// A failed allocation leaves no entry; a recursive complete insertion
+    /// wins without replacing its owned buffers.
+    fn publish(self: *SourcePlanBuilder, cache: *FileCache, key: SourcePlanKey) Error!void {
+        const events = try self.events.toOwnedSlice(cache.gpa);
+        errdefer cache.gpa.free(events);
+        const entry = try cache.effect_source_plans.getOrPut(cache.gpa, key);
+        if (entry.found_existing) {
+            cache.gpa.free(events);
+            return;
+        }
+        entry.value_ptr.* = .{ .events = events, .formal_uses = self.formal_uses };
+        self.formal_uses = .empty;
+    }
+};
+
+/// Marks a walk with no open global key reached.
+const no_hit = std.math.maxInt(u32);
+
+/// One global reachability walk. Visit order numbers the global demands; a
+/// demand that reaches an open one (a back or cross edge) cannot be complete
+/// until that component closes, and it closes when the first-visited member
+/// finishes. Every member's answer is then the union that member folded.
+const Walk = struct {
+    const Visit = struct {
+        index: u32,
+        /// Its component has closed, so its answer is final.
+        closed: bool = false,
+    };
+    const Open = struct { key: Key, index: u32 };
+    const Partial = struct { set: []const Witness, low: u32 };
+
+    visits: std.HashMapUnmanaged(Key, Visit, KeyContext, 80) = .empty,
+    /// Visited keys whose component has not closed, in visit order.
+    open: std.ArrayListUnmanaged(Open) = .empty,
+    /// Rooted answers computed while an open key was unfinished. They are
+    /// reused only while that key stays open, and never filed in `sets`.
+    partial: std.HashMapUnmanaged(Key, Partial, KeyContext, 80) = .empty,
+    next_index: u32 = 0,
+    /// The lowest open visit index the answer being computed depends on.
+    low: u32 = no_hit,
+
+    fn deinit(self: *Walk, gpa: std.mem.Allocator) void {
+        self.visits.deinit(gpa);
+        self.open.deinit(gpa);
+        self.partial.deinit(gpa);
+    }
+
+    fn isOpen(self: *const Walk, index: u32) bool {
+        var low: usize = 0;
+        var high: usize = self.open.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const found = self.open.items[middle].index;
+            if (found == index) return true;
+            if (found < index) low = middle + 1 else high = middle;
+        }
+        return false;
+    }
+};
+
+const Scoped = struct { set: []const Witness, epoch: u32 };
+
+const Verdict = struct {
+    whole: ?[]const Witness = null,
+    cut: ?[]const Witness = null,
+};
+
+/// A scoped effect fold's memo, cycle set and allowance. Nested queries adopt
+/// their caller's counter. An enclosing ownership fold may retain completed
+/// witnesses and syntax indexes across queries until its own deferred deinit.
 pub const State = struct {
-    /// Interned dotted paths.  A memo key and a witness compare by id, and
-    /// the bytes behind one id are owned for the life of the root cache.
+    /// Interned dotted paths. A memo key and witness compare by id; their
+    /// owned bytes live until this scoped state is deinitialized.
     paths: std.StringHashMapUnmanaged(u32) = .empty,
     path_text: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Completed witness sets, one per declaration, question and identity.
     sets: std.HashMapUnmanaged(Key, []const Witness, KeyContext, 80) = .empty,
-    /// The keys on the current stack.  A set that meets itself is a cycle,
-    /// and a cycle answers unknown rather than recursing.
-    active: std.HashMapUnmanaged(Key, void, KeyContext, 80) = .empty,
+    /// Completed negative read-only verdicts, never complete witness sets.
+    /// Rooted cuts retain only an own-formal witness, so neither the caller's
+    /// actual storage nor its advisory-discharge chain shapes their reuse.
+    verdicts: std.HashMapUnmanaged(Key, Verdict, KeyContext, 80) = .empty,
+    /// Count both verdict modes, even if they share one semantic key.
+    verdict_count: usize = 0,
+    /// Completed structural type proofs, bound to the original resolver and frame.
+    address_free: fresh_storage.AddressFreeMemo = .{},
+    /// The keys on the current stack. Rooted cycles remain unknown; global
+    /// back edges are folded as graph reachability without filing partial sets.
+    active: std.HashMapUnmanaged(Key, u32, KeyContext, 80) = .empty,
+    /// Answers that depend on which keys were on the stack when they were
+    /// computed: a rooted back edge to a key above them made them unknown. A
+    /// fresh walk from another entry would not meet that edge, so they are
+    /// reused only inside the scope that computed them, never filed in `sets`.
+    scoped: std.HashMapUnmanaged(Key, Scoped, KeyContext, 80) = .empty,
+    /// Root demands whose standalone walk exhausted its whole allowance.
+    exhausted: std.HashMapUnmanaged(ExhaustedKey, Exhausted, ExhaustedKeyContext, 80) = .empty,
+    /// The shallowest stack depth a rooted back edge of the answer being
+    /// computed reached, or `no_hit`.
+    floor: u32 = no_hit,
+    /// Names the scope `scoped` entries belong to. A scope is one root query,
+    /// or one ownership fold that spans several.
+    epoch: u32 = 0,
+    scopes: u32 = 0,
+    /// A global reachability walk visits each semantic demand once and folds
+    /// strongly connected components of global demands as a unit.
+    global_walk: ?*Walk = null,
     memo: ?std.heap.ArenaAllocator = null,
     scratch: ?std.heap.ArenaAllocator = null,
     /// The ORIGINAL resolver of this root, threaded through every document a
@@ -213,11 +478,53 @@ pub const State = struct {
         self.paths.deinit(gpa);
         self.path_text.deinit(gpa);
         self.sets.deinit(gpa);
+        self.verdicts.deinit(gpa);
+        self.address_free.deinit(gpa);
         self.active.deinit(gpa);
+        self.scoped.deinit(gpa);
+        self.exhausted.deinit(gpa);
         if (self.memo) |*arena| arena.deinit();
         self.memo = null;
         if (self.scratch) |*arena| arena.deinit();
         self.scratch = null;
+    }
+
+    /// File a completed answer: reusable by every later question when it is
+    /// independent of the stack it was computed on, else for this scope only.
+    /// Filing is optional; false reports a refused table growth.
+    fn file(self: *State, gpa: std.mem.Allocator, key: Key, set: []const Witness, independent: bool) bool {
+        if (independent) {
+            self.sets.put(gpa, key, set) catch return false;
+        } else {
+            self.scoped.put(gpa, key, .{ .set = set, .epoch = self.epoch }) catch return false;
+        }
+        return true;
+    }
+
+    fn verdict(self: *const State, key: Key, mode: Mode) ?[]const Witness {
+        const known = self.verdicts.get(key) orelse return null;
+        return switch (mode) {
+            .complete => null,
+            .whole => known.whole,
+            .cut => known.cut,
+        };
+    }
+
+    fn fileVerdict(self: *State, gpa: std.mem.Allocator, key: Key, mode: Mode, set: []const Witness) Error!void {
+        const frozen = try (try self.memoAllocator(gpa)).dupe(Witness, set);
+        const result = try self.verdicts.getOrPut(gpa, key);
+        if (!result.found_existing) result.value_ptr.* = .{};
+        switch (mode) {
+            .complete => unreachable,
+            .whole => {
+                if (result.value_ptr.whole == null) self.verdict_count += 1;
+                result.value_ptr.whole = frozen;
+            },
+            .cut => {
+                if (result.value_ptr.cut == null) self.verdict_count += 1;
+                result.value_ptr.cut = frozen;
+            },
+        }
     }
 
     fn begin(
@@ -229,6 +536,8 @@ pub const State = struct {
         context: QueryContext,
     ) void {
         if (self.queries == 0) {
+            if (self.scopes == 0) self.epoch +%= 1;
+            self.floor = no_hit;
             self.steps_left = actual_query_work_limit;
             self.remaining = context.remaining;
             self.entry_tree = tree;
@@ -266,6 +575,12 @@ pub const State = struct {
     }
 
     fn failure(self: *State, limit: budget_mod.Limit, cap: u32, reached: u32) Error {
+        return self.report(limit, cap, reached);
+    }
+
+    /// Record the labelled budget failure at the position of this root
+    /// query's own entry.
+    fn report(self: *State, limit: budget_mod.Limit, cap: u32, reached: u32) Error {
         const tree = self.entry_tree.?;
         const byte = tree.tokenStart(self.entry_token);
         const position = budget_mod.lineCol(tree.source, byte);
@@ -277,8 +592,13 @@ pub const State = struct {
             }
         }
         return budget_mod.fail(.{
-            .limit = limit, .limit_value = cap, .reached = reached,
-            .byte = byte, .line = position.line, .column = position.column, .function = name,
+            .limit = limit,
+            .limit_value = cap,
+            .reached = reached,
+            .byte = byte,
+            .line = position.line,
+            .column = position.column,
+            .function = name,
         });
     }
 
@@ -287,8 +607,10 @@ pub const State = struct {
     /// per-query scratch — and BOTH containers are grown before either is
     /// written, so a failure at any point publishes nothing and leaves the
     /// table exactly as it was for the next attempt.
-    fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) error{OutOfMemory}!u32 {
+    fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) Error!u32 {
         if (self.paths.get(path)) |existing| return existing;
+        if (self.path_text.items.len > std.math.maxInt(u32))
+            return self.failure(.readonly_call_nodes, std.math.maxInt(u32), std.math.maxInt(u32));
         const owned = try (try self.memoAllocator(gpa)).dupe(u8, path);
         try self.path_text.ensureUnusedCapacity(gpa, 1);
         try self.paths.ensureUnusedCapacity(gpa, 1);
@@ -312,10 +634,36 @@ pub const State = struct {
     }
 };
 
+/// The root cache's persistent effect state. A document opened for a demand
+/// query borrows the root's grow state, which names that root.
+fn rootState(cache: *FileCache) *State {
+    const root = if (cache.grow_state) |grow| grow.owner else cache;
+    return &root.effects_state;
+}
+
+/// How many completed effect answers the file's root state holds.  A walk
+/// that leaves this unchanged filed nothing a repeat of it could reuse.
+pub fn filedAnswerCount(cache: *FileCache) usize {
+    const state = rootState(cache);
+    return state.sets.count() + state.scoped.count() + state.verdict_count;
+}
+
+/// An ownership fold that asks several root questions shares one scope of
+/// stack-dependent answers.
+pub fn openScope(cache: *FileCache) void {
+    const state = rootState(cache);
+    if (state.scopes == 0) state.epoch +%= 1;
+    state.scopes += 1;
+}
+
+pub fn closeScope(cache: *FileCache) void {
+    rootState(cache).scopes -= 1;
+}
+
 fn cacheFor(cache: *FileCache, callee: FileCache.ActualCallee) Error!?*FileCache {
     if (callee.tree == cache.tree and callee.handle.module == cache.module_id) return cache;
-    if (cache.zls == null) return null;
-    const document = grow_analysis.sourceDocument(cache, callee.handle) catch return null;
+    const resolver = if (callee.caller_frame) |frame| frame.resolver else cache.zls orelse return null;
+    const document = try grow_analysis.sourceDocument(cache, callee.handle, resolver.ctx);
     return &document.cache;
 }
 
@@ -328,7 +676,7 @@ const View = union(enum) {
 
     fn callArgumentsOf(
         self: View,
-        buffer: *[1]Ast.Node.Index,
+        buffer: *[2]Ast.Node.Index,
         node: Ast.Node.Index,
     ) !?TypeResolver.CallArguments {
         return switch (self) {
@@ -339,7 +687,7 @@ const View = union(enum) {
 
     fn callArgumentIn(
         self: View,
-        buffer: *[1]Ast.Node.Index,
+        buffer: *[2]Ast.Node.Index,
         node: Ast.Node.Index,
         parameter: usize,
     ) !?Ast.Node.Index {
@@ -367,6 +715,12 @@ const View = union(enum) {
         return switch (self) {
             .resolver => |r| try r.isEnumType(node),
             .frame => |f| try f.isEnumType(node),
+        };
+    }
+    fn isStdAllocator(self: View, node: Ast.Node.Index) !?bool {
+        return switch (self) {
+            .resolver => |r| try r.isStdAllocator(node),
+            .frame => |f| try f.isStdAllocator(node),
         };
     }
 
@@ -445,57 +799,21 @@ pub fn actualCallSummaryAt(
 ) Error!?ActualCallSummary {
     const callee = (try grow_analysis.actualCalleeOf(cache, token, frame)) orelse return null;
     var result: ActualCallSummary = .{
-        .callee = callee, .summary = null, .argument_offset = null, .read_only = null,
+        .callee = callee,
+        .summary = null,
+        .argument_offset = null,
+        .read_only = null,
     };
     const view = viewFor(cache, callee) orelse return result;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const arguments = view.callArgumentsOf(&buffer, callee.call_node) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => null,
-    };
+    var buffer: [2]Ast.Node.Index = undefined;
+    const arguments = try view.callArgumentsOf(&buffer, callee.call_node);
     if (arguments) |actual| result.argument_offset = @intFromBool(actual.receiver != null);
     // A bodyless declaration is still a canonical record: the identity and the
     // summary are read, and nothing about its effects is inferred from the
     // absence of a body.
     if (tokens.bodyOf(callee.tree, callee.declaration) == null) return result;
-    const declaring = (try cacheFor(cache, callee)) orelse return result;
-    const found = declaring.summaryOfResolvedMethod(.{
-        .tree = callee.tree, .module = callee.handle.module, .fn_decl = callee.declaration,
-    }) catch |err| return err;
-    result.summary = if (found) |s| s.* else null;
-    if (result.summary == null) return result;
-    var state_slot: State = .{};
-    defer state_slot.deinit(cache.gpa);
-    const state = &state_slot;
-    if (bodyReadOnly(cache, callee, state)) |read_only| result.read_only = read_only;
+    result.summary = try cache.summaryOfResolvedDeclaration(callee);
     return result;
-}
-
-/// The whole-body verdict, only when a demand query has already folded it.
-/// Nothing here walks a body: an identity question must not pay for an effect
-/// analysis nobody asked for, and a fold nothing asked for is not a verdict —
-/// an absent entry stays null, because "this body writes nothing" and "this
-/// body has not been looked at" are different answers.  A consumer that
-/// needs the whole-body fact asks `callEffectAt` for it.  This verdict is over
-/// EVERY formal and the unrooted storage together, so a `true` here is also
-/// the answer to `.unrooted`.
-fn bodyReadOnly(cache: *FileCache, callee: FileCache.ActualCallee, state: *State) ?bool {
-    const declaring = (cacheFor(cache, callee) catch return null) orelse return null;
-    const view = bodyView(declaring, callee, state) orelse return null;
-    const key: Key = .{
-        .declaration = .{
-            .tree = declaring.tree, .module = declaring.module_id, .declaration = callee.declaration,
-        },
-        .parameter = any_param,
-        .path = root_path,
-        .context = contextOf(view),
-    };
-    const set = state.sets.get(key) orelse return null;
-    return switch (mergeAll(set)) {
-        .read_only => true,
-        .writes_without_invalidation, .may_invalidate => false,
-        .unknown => null,
-    };
 }
 
 /// What the CALL at `token` does to the storage `selection` names.
@@ -509,24 +827,94 @@ pub fn callEffectAt(
     selection: EffectSelection,
     context: QueryContext,
 ) Error!?Effect {
-    const callee = (try grow_analysis.actualCalleeOf(cache, token, context.frame)) orelse return null;
+    const callee = switch (selection) {
+        .whole => |resolved| resolved orelse
+            (try grow_analysis.actualCalleeOf(cache, token, context.frame)) orelse return null,
+        else => (try grow_analysis.actualCalleeOf(cache, token, context.frame)) orelse return null,
+    };
+    if (selection == .whole and selection.whole != null) {
+        const index = try cache.getCallIndex();
+        if (index.by_callee_token.get(token) != callee.call_node) return .unknown;
+        if (callee.tree != &callee.handle.document.tree) return .unknown;
+        const reference = callee.reference;
+        if (reference.tree != callee.tree or reference.fn_token != callee.fn_token or
+            !reference.handle.eql(callee.handle)) return .unknown;
+        const function = switch (reference.actual_type.data) {
+            .function => |function| function,
+            else => return .unknown,
+        };
+        if (!function.handle.eql(callee.handle) or function.fn_token != callee.fn_token)
+            return .unknown;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(callee.tree, &proto_buffer, callee.declaration) orelse
+            return .unknown;
+        if (proto.ast.fn_token != callee.fn_token) return .unknown;
+        if (formalCount(callee.tree, proto) != function.parameters.len) return .unknown;
+        if (callee.caller_frame) |caller| {
+            const supplied = context.frame orelse return .unknown;
+            if (&caller.handle.document.tree != cache.tree) return .unknown;
+            if (caller.resolver != supplied.resolver or !caller.handle.eql(supplied.handle))
+                return .unknown;
+            if ((caller.actual_type == null) != (supplied.actual_type == null)) return .unknown;
+            if (caller.actual_type) |actual|
+                if (!actual.eql(supplied.actual_type.?)) return .unknown;
+            if ((caller.container_type == null) != (supplied.container_type == null))
+                return .unknown;
+            if (caller.container_type) |container|
+                if (!container.eql(supplied.container_type.?)) return .unknown;
+        } else if (context.frame != null) return .unknown;
+    }
     const declaring = (try cacheFor(cache, callee)) orelse return .unknown;
     const view = viewFor(cache, callee) orelse return .unknown;
+    // A root question reuses the file's completed answers; an enclosing
+    // query lends its own State, and a root State already mid-query belongs
+    // to that query, so an unrelated nested question gets a private one.
+    const shared: ?*State = context.effects_state orelse blk: {
+        const root = rootState(cache);
+        break :blk if (root.queries == 0) root else null;
+    };
     var state_slot: State = .{};
-    defer state_slot.deinit(cache.gpa);
-    const state = &state_slot;
-    state.begin(cache.gpa, cache.tree, token, cache.zls, context);
+    const state = shared orelse &state_slot;
+    defer if (shared == null) state_slot.deinit(cache.gpa);
+    state.begin(cache.gpa, cache.tree, token, if (context.frame) |frame| frame.resolver else cache.zls, context);
     defer state.end();
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = cache.tree.fullCall(&call_buffer, callee.call_node) orelse return .unknown;
-    var argument_buffer: [1]Ast.Node.Index = undefined;
-    const arguments = view.callArgumentsOf(&argument_buffer, callee.call_node) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .unknown,
-    } orelse return .unknown;
+    var call_buffer: [2]Ast.Node.Index = undefined;
+    const call = TypeResolver.CallOperands.full(cache.tree, &call_buffer, callee.call_node) orelse return .unknown;
+    var argument_buffer: [2]Ast.Node.Index = undefined;
+    const arguments = (try view.callArgumentsOf(&argument_buffer, callee.call_node)) orelse
+        return .unknown;
     const count = arguments.arguments.len + @intFromBool(arguments.receiver != null);
     const callee_view = bodyView(declaring, callee, state) orelse return .unknown;
+    if (selection == .whole) {
+        const function = switch (callee.reference.actual_type.data) {
+            .function => |function| function,
+            else => return .unknown,
+        };
+        if (count != function.parameters.len) return .unknown;
+    }
+    if (try allocatorFreeBuffer(cache, callee, view, callee_view, arguments, state)) |released| {
+        if (try emptyBuffer(cache, released, state, 0)) return .read_only;
+        switch (selection) {
+            .parameter => |selected| if (selected.param == 1 and selected.path.len == 0) return .may_invalidate,
+            .unrooted => {},
+            .whole => return .may_invalidate,
+        }
+    }
     switch (selection) {
+        .whole => {
+            // The existing all-formals question owns every formal and every
+            // unrooted witness. No physical actual storage needs projection.
+            const set = try collectWitnesses(
+                declaring,
+                callee.declaration,
+                any_param,
+                "",
+                callee_view,
+                state,
+                .whole,
+            );
+            return mergeAll(set);
+        },
         .unrooted => {
             // Storage no formal of this callee names cannot be projected onto
             // a caller's own storage: the caller's argument nodes and the
@@ -539,10 +927,7 @@ pub fn callEffectAt(
             if (selected.param >= count) return .unknown;
             try state.charge();
             if (selected.param == 0 and count != 0) {
-                const append = view.stdCollectionAppendOf(call.ast.fn_expr, count - 1) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => .no,
-                };
+                const append = try view.stdCollectionAppendOf(call.ast.fn_expr, count - 1);
                 // Existing SDK identity/arity query distinguishes this
                 // append's new-slot/length stores from writes poisoning
                 // existing elements.
@@ -552,15 +937,20 @@ pub fn callEffectAt(
                     .no => {},
                 }
             }
-            const set = try witnessesFor(
+            const mode: Mode = if (selected.read_only_only and selected.path.len == 0) .{
+                .cut = .{ .advisory_ok = try selectedActualKeepsAdvisory(view, callee, selected.param, state) },
+            } else .complete;
+            const set = try collectWitnesses(
                 declaring,
                 callee.declaration,
                 selected.param,
                 selected.path,
                 callee_view,
                 state,
+                mode,
             );
-            return try project(cache, state, callee, selected, set);
+            const projected = try project(cache, state, callee, selected, set, context.declaration);
+            return projected;
         },
     }
 }
@@ -641,14 +1031,31 @@ fn project(
     callee: FileCache.ActualCallee,
     selection: ParameterSelection,
     set: []const Witness,
+    caller_declaration: ?Ast.Node.Index,
 ) Error!Effect {
     const view = viewFor(cache, callee) orelse return mergeAll(set);
     var own: Effect = .read_only;
     var advisory: Effect = .read_only;
-    var selected_buffer: [1]Ast.Node.Index = undefined;
+    var selected_buffer: [2]Ast.Node.Index = undefined;
     var selected: Ast.Node.Index = undefined;
     var have_selected = false;
+    var selected_value: ?bool = null;
     for (set) |witness| {
+        if (witness.param != selection.param and selection.path.len == 0) {
+            if (selected_value == null) {
+                selected_value = false;
+                if (try view.callArgumentIn(
+                    &selected_buffer,
+                    callee.call_node,
+                    selection.param,
+                )) |argument| {
+                    selected = argument;
+                    have_selected = true;
+                    selected_value = try valueAddressFree(view, argument, state);
+                }
+            }
+            if (selected_value.?) continue;
+        }
         if (witness.param == selection.param) {
             own = merge(own, witness.effect);
             continue;
@@ -660,19 +1067,17 @@ fn project(
             continue;
         }
         try state.charge();
-        var other_buffer: [1]Ast.Node.Index = undefined;
-        const other = view.callArgumentIn(&other_buffer, callee.call_node, witness.param) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        } orelse {
+        var other_buffer: [2]Ast.Node.Index = undefined;
+        const other = (try view.callArgumentIn(&other_buffer, callee.call_node, witness.param)) orelse {
             advisory = merge(advisory, witness.effect);
             continue;
         };
         if (!have_selected) {
-            selected = view.callArgumentIn(&selected_buffer, callee.call_node, selection.param) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => null,
-            } orelse {
+            selected = (try view.callArgumentIn(
+                &selected_buffer,
+                callee.call_node,
+                selection.param,
+            )) orelse {
                 advisory = merge(advisory, witness.effect);
                 continue;
             };
@@ -691,6 +1096,8 @@ fn project(
             // is this query's own.
             .frame = callee.caller_frame,
             .remaining = state.counter(),
+            .declaration = caller_declaration,
+            .effects_state = state,
         });
         if (shares) advisory = merge(advisory, witness.effect);
     }
@@ -709,6 +1116,124 @@ fn witnessesFor(
     view: ?View,
     state: *State,
 ) Error![]const Witness {
+    return collectWitnesses(cache, declaration, parameter, path, view, state, .complete);
+}
+
+/// How much of a demand's answer the asker needs.
+const Mode = union(enum) {
+    /// Every witness, filed for reuse.
+    complete,
+    /// A whole certificate needs only one surviving negative witness to fail.
+    whole,
+    /// The asker needs only `.read_only` versus anything else about this
+    /// formal's whole storage. The first witness that must survive into the
+    /// final answer ends the walk. Its prefix is never filed as a complete
+    /// witness set; an independent own-formal verdict can be reused.
+    cut: Cut,
+
+    const Cut = struct {
+        /// The frame whose demand this is, when it asks about the very
+        /// storage that frame was asked about.
+        parent: ?*Frame = null,
+        /// A root question only: the caller's selected actual is not an
+        /// address-free value, so witnesses about other storage survive.
+        advisory_ok: bool = false,
+    };
+};
+
+/// Does the selected actual hand the callee storage other witnesses may
+/// reach? `project` drops witnesses about other storage when it is an
+/// address-free value.
+fn selectedActualKeepsAdvisory(view: View, callee: FileCache.ActualCallee, parameter: u32, state: *State) Error!bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const argument = (try view.callArgumentIn(&buffer, callee.call_node, parameter)) orelse return true;
+    return !try valueAddressFree(view, argument, state);
+}
+
+/// One witness demand.  A demand that begins a walk on an empty stack, in a
+/// query that owns its allowance, and whose identical walk already ran that
+/// whole allowance out, fails again at once instead of repeating the walk.
+///
+/// A failure is recorded only when nothing outside the key could have shaped
+/// it: the stack is empty (no active key, no open global walk, no frame
+/// above), the allowance is this query's own and not a consumer's borrowed
+/// one, no fresh-storage walk of the declaring file is open, the walk ended
+/// because the counter reached zero, and the walk filed no completed answer
+/// of its own (a repeat would otherwise be cheaper than the walk it
+/// replaces).  The recorded fact is the key, the walk mode and the allowance
+/// it started with; a completed answer is looked up first and is never
+/// replaced by it, and a walk that completes removes it.
+fn collectWitnesses(
+    cache: *FileCache,
+    declaration: Ast.Node.Index,
+    parameter: u32,
+    path: []const u8,
+    view: ?View,
+    state: *State,
+    mode: Mode,
+) Error![]const Witness {
+    const demand_mode = demandMode(mode) orelse
+        return collectWitnessesWalk(cache, declaration, parameter, path, view, state, mode);
+    if (state.queries != 1 or state.depth != 0 or state.global_walk != null or
+        state.remaining != null or cache.fresh_visiting.count() != 0)
+        return collectWitnessesWalk(cache, declaration, parameter, path, view, state, mode);
+    const gpa = cache.gpa;
+    if (state.path_text.items.len == 0) _ = try state.intern(gpa, "");
+    const demand: ExhaustedKey = .{
+        .key = .{
+            .declaration = .{ .tree = cache.tree, .module = cache.module_id, .declaration = declaration },
+            .parameter = parameter,
+            .path = try state.intern(gpa, path),
+            .context = contextOf(view),
+        },
+        .mode = demand_mode,
+    };
+    // A completed answer is never shadowed by a recorded failure.
+    if (state.sets.contains(demand.key) or state.verdict(demand.key, mode) != null)
+        return collectWitnessesWalk(cache, declaration, parameter, path, view, state, mode);
+    if (state.scoped.get(demand.key)) |scoped| {
+        if (scoped.epoch == state.epoch)
+            return collectWitnessesWalk(cache, declaration, parameter, path, view, state, mode);
+    }
+    const allowance = state.counter().*;
+    if (state.exhausted.get(demand)) |known| {
+        if (allowance <= known.budget) {
+            // Exactly what the exhausted walk left behind: no allowance.
+            state.counter().* = 0;
+            return state.report(known.limit, known.cap, known.reached);
+        }
+    }
+    const filed = state.sets.count() + state.scoped.count() + state.verdict_count;
+    const guard = PendingGuard.begin();
+    const result = collectWitnessesWalk(cache, declaration, parameter, path, view, state, mode);
+    const own = guard.end();
+    if (result) |set| {
+        _ = state.exhausted.remove(demand);
+        return set;
+    } else |err| {
+        if (err == error.AnalysisBudgetExceeded and state.counter().* == 0 and
+            state.sets.count() + state.scoped.count() + state.verdict_count == filed)
+        {
+            if (own) |first| state.exhausted.put(gpa, demand, .{
+                .budget = allowance,
+                .limit = first.limit,
+                .cap = first.limit_value,
+                .reached = first.reached,
+            }) catch {};
+        }
+        return err;
+    }
+}
+
+fn collectWitnessesWalk(
+    cache: *FileCache,
+    declaration: Ast.Node.Index,
+    parameter: u32,
+    path: []const u8,
+    view: ?View,
+    state: *State,
+    mode: Mode,
+) Error![]const Witness {
     const gpa = cache.gpa;
     if (state.path_text.items.len == 0) _ = try state.intern(gpa, "");
     const key: Key = .{
@@ -718,19 +1243,97 @@ fn witnessesFor(
         .context = contextOf(view),
     };
     try state.charge();
-    if (state.sets.get(key)) |set| return set;
-    if (state.active.contains(key)) return unknown_set;
-    if (state.depth == max_depth) return state.failure(.readonly_call_depth, max_depth, state.depth);
+    if (state.sets.get(key)) |set| {
+        return set;
+    }
+    // An independently completed all-storage proof has no witness to
+    // project or discharge. It answers every narrower demand of this exact
+    // callable, but a negative verdict or a stack-dependent set cannot.
+    if (parameter != any_param or key.path != root_path) {
+        var whole_key = key;
+        whole_key.parameter = any_param;
+        whole_key.path = root_path;
+        if (state.sets.get(whole_key)) |whole| {
+            if (whole.len == 0) return whole;
+        }
+    }
+    if (state.scoped.get(key)) |scoped| {
+        if (scoped.epoch == state.epoch) {
+            state.floor = 0;
+            return scoped.set;
+        }
+    }
+    if (state.verdict(key, mode)) |set| return set;
+    var walk_storage: Walk = .{};
+    const global_root = parameter == global_only and state.global_walk == null;
+    if (global_root) state.global_walk = &walk_storage;
+    defer if (global_root) {
+        state.global_walk = null;
+        walk_storage.deinit(gpa);
+    };
+    const walk = state.global_walk;
+    if (walk) |w| {
+        if (parameter != global_only) {
+            if (w.partial.get(key)) |partial| {
+                if (w.isOpen(partial.low)) {
+                    w.low = @min(w.low, partial.low);
+                    return partial.set;
+                }
+                // What it lacked has been completed and filed since.
+                _ = w.partial.remove(key);
+            }
+        } else if (w.visits.get(key)) |visit| {
+            // This edge's events already contribute to the enclosing root, or
+            // its completed answer could not be filed. Neither is a full
+            // answer for the frames above, so they stay unfiled.
+            w.low = @min(w.low, if (visit.closed) 0 else visit.index);
+            return &.{};
+        }
+    }
+    if (state.active.get(key)) |depth| {
+        if (parameter != global_only) {
+            // Whether this key is on the stack is a fact about the stack, so
+            // every answer that met it and sits above it is not final.
+            state.floor = @min(state.floor, depth);
+            return unknown_set;
+        }
+        if (walk) |w| w.low = 0;
+        return &.{};
+    }
+    if (state.depth == max_depth) return @as(Error![]const Witness, state.failure(.readonly_call_depth, max_depth, state.depth));
     var buffer: [1]Ast.Node.Index = undefined;
     // A body this document cannot read — an extern declaration, or a
     // prototype the closed scanner cannot decode — is a canonical record and
     // no effect at all.
-    const proto = tokens.fnProto(cache.tree, &buffer, declaration) orelse return unknown_set;
-    const body = tokens.bodyOf(cache.tree, declaration) orelse return unknown_set;
+    const proto = tokens.fnProto(cache.tree, &buffer, declaration) orelse {
+        return unknown_set;
+    };
+    const body = tokens.bodyOf(cache.tree, declaration) orelse {
+        return unknown_set;
+    };
     const formals = formalCount(cache.tree, proto);
-    if (parameter < global_only and parameter >= formals) return unknown_set;
+    if (parameter < global_only and parameter >= formals) {
+        return unknown_set;
+    }
     try state.charge();
-    try state.active.put(gpa, key, {});
+    var index: u32 = 0;
+    var stack_position: usize = 0;
+    var saved_low: u32 = no_hit;
+    if (walk) |w| {
+        saved_low = w.low;
+        w.low = no_hit;
+        if (parameter == global_only) {
+            index = w.next_index;
+            w.next_index += 1;
+            stack_position = w.open.items.len;
+            try w.visits.put(gpa, key, .{ .index = index });
+            try w.open.append(gpa, .{ .key = key, .index = index });
+        }
+    }
+    const my_depth = state.depth;
+    const saved_floor = state.floor;
+    state.floor = no_hit;
+    try state.active.put(gpa, key, my_depth);
     state.depth += 1;
     defer {
         state.depth -= 1;
@@ -743,6 +1346,7 @@ fn witnessesFor(
     _ = try cache.localBindings(proto, body);
     var frame: Frame = .{
         .cache = cache,
+        .declaration = declaration,
         .body = body,
         .proto = proto,
         .parameter = parameter,
@@ -750,30 +1354,80 @@ fn witnessesFor(
         .queried_name = if (parameter < global_only) formalNameToken(cache.tree, proto, parameter) else null,
         .view = view,
         .state = state,
+        .whole_certificate = mode == .whole,
+        .cut_mode = switch (mode) {
+            .cut => |cut| cut,
+            else => null,
+        },
     };
+    defer frame.raw_keys.deinit(gpa);
     var scan = call_effects.Scan.init(cache.tree, declaration, frame.currentBindings());
+    const source_key: SourcePlanKey = .{ .declaration = key.declaration, .context = key.context };
+    // Reentrant calls may grow the map. Its owned event/use buffers remain
+    // stable, so borrow the completed plan by value rather than getPtr.
+    const source_plan = cache.effect_source_plans.get(source_key);
+    if (source_plan) |plan| {
+        // Selection is consumed only after EOF. Collecting every formal on
+        // the cold walk also supports a first global-only question.
+        if (frame.queried_name) |formal| frame.selected = plan.formal_uses.get(formal);
+    }
+    var source_builder: SourcePlanBuilder = .{};
+    defer source_builder.deinit(gpa);
+    var source_cursor: usize = 0;
     var raw: std.ArrayListUnmanaged(Raw) = .empty;
     defer raw.deinit(gpa);
     while (true) {
-        // Resolving a callee can build another body's bindings and grow the
-        // table, so the scan's own pointer is refreshed before every step.
-        scan.bindings = frame.currentBindings();
-        const event = (try scan.next()) orelse break;
+        const event = if (source_plan) |plan| replay: {
+            if (source_cursor == plan.events.len) break;
+            const next = plan.events[source_cursor];
+            source_cursor += 1;
+            break :replay next;
+        } else scan_next: {
+            // Resolving a callee can grow the bindings table.
+            scan.bindings = frame.currentBindings();
+            break :scan_next (try scan.next()) orelse break;
+        };
         try state.charge();
+        if (source_plan == null) switch (event) {
+            .node => |node| try source_builder.note(&frame, node),
+            else => try source_builder.append(gpa, event),
+        };
         switch (event) {
-            .node => |node| frame.note(node),
+            .node => |node| {
+                frame.note(node);
+                scan.pending_children = try knownChildren(&frame, node);
+            },
             .call => |node| try callWitness(&frame, &raw, node),
             .write => |w| try writeWitness(&frame, &raw, w.node, w.target, w.value),
             .write_or_unknown => |node| try opaqueWitness(&frame, &raw, node),
+        }
+        // A prefix is never a complete witness set or syntax source plan.
+        // It can, however, finish a read-only-versus-unsafe question. Reuse
+        // only stack-independent evidence; a rooted verdict must name its
+        // own formal, not an advisory witness kept by this caller's chain.
+        if (frame.whole_negative) {
+            const negative = try frame.negativeSet();
+            const independent = state.floor == no_hit and
+                (if (walk) |w| w.low == no_hit else true);
+            const reusable = mode == .whole or
+                (if (frame.cut) |cut| parameter == global_only or cut.param == parameter else false);
+            if (independent and reusable) try state.fileVerdict(gpa, key, mode, negative);
+            if (walk) |w| w.low = @min(saved_low, w.low);
+            state.floor = @min(saved_floor, state.floor);
+            return negative;
         }
     }
     var list: std.ArrayListUnmanaged(Witness) = .empty;
     // `defer`, not `errdefer`: the success path below releases the list too,
     // once its contents have been copied into the memo arena.
     defer list.deinit(gpa);
+    const selected_value = raw.items.len != 0 and try frame.selectionAddressFree();
     for (raw.items) |entry| {
+        // A by-value address-free graph cannot alias externally reached
+        // storage. Own witnesses still describe stores into that value.
+        if (selected_value and entry.param != parameter) continue;
         if (entry.operand) |operand| {
-            if (try frame.discharged(entry.at.?, operand)) continue;
+            if (try frame.discharged(entry.at.?, operand, state.text(entry.operand_path))) continue;
         }
         try list.append(gpa, .{ .param = entry.param, .path = entry.path, .effect = entry.effect });
     }
@@ -786,18 +1440,47 @@ fn witnessesFor(
     // Copying into the arena is the same ownership move done correctly: these
     // bytes then live exactly as long as the memo that files them.
     const frozen = try (try state.memoAllocator(gpa)).dupe(Witness, list.items);
-    // Publishing the memo is a cache write, not part of the answer: a table
-    // that could not grow costs a later query one re-derivation, never the
-    // caller a fact this scan has already completed.  Every OOM on the way
-    // here — materialising the set, owning a path, growing the arena — still
-    // travels out, because nothing was completed.
-    state.sets.put(gpa, key, frozen) catch {};
+    if (source_plan == null) try source_builder.publish(cache, source_key);
+    // The owned answer is already complete. Filing it is optional: a refused
+    // table growth loses only a reuse opportunity, not its arena-owned bytes.
+    // Source reads and all allocations needed to build the set still use try.
+    const independent = state.floor >= my_depth;
+    state.floor = @min(saved_floor, state.floor);
+    if (walk) |w| {
+        const sub_low = w.low;
+        if (parameter == global_only) {
+            if (sub_low >= index) {
+                // This key is the first visited of its component: every open
+                // key above it reaches it and is reached by it, so the union
+                // this frame folded is each member's own reachability answer.
+                for (w.open.items[stack_position..]) |member| {
+                    const visit = w.visits.getPtr(member.key).?;
+                    visit.closed = true;
+                    if (!state.file(gpa, member.key, frozen, independent)) continue;
+                }
+                w.open.shrinkRetainingCapacity(stack_position);
+                w.low = saved_low;
+            } else {
+                w.low = @min(saved_low, sub_low);
+            }
+        } else if (sub_low == no_hit) {
+            _ = state.file(gpa, key, frozen, independent);
+            w.low = saved_low;
+        } else {
+            // Valid for this walk only: it is missing what an open key will
+            // contribute, and that key's component is not complete yet.
+            w.partial.put(gpa, key, .{ .set = frozen, .low = sub_low }) catch {};
+            w.low = @min(saved_low, sub_low);
+        }
+    } else {
+        _ = state.file(gpa, key, frozen, independent);
+    }
     return frozen;
 }
 
-/// The answer for a body nothing can be read out of, and for a cycle.  Both
-/// are the same statement: this analysis was shown nothing about the storage,
-/// which is precisely what is not known.
+/// A body with no readable evidence and a rooted recursive storage question
+/// remain unknown. Global cycles are handled separately as reachability over
+/// known bodies, with every unresolved edge still retaining its witness.
 const unknown_set: []const Witness = &[_]Witness{.{
     .param = unrooted_param,
     .path = root_path,
@@ -807,6 +1490,7 @@ const unknown_set: []const Witness = &[_]Witness{.{
 /// One body being scanned for one question about it.
 const Frame = struct {
     cache: *FileCache,
+    declaration: Ast.Node.Index,
     body: Ast.Node.Index,
     proto: Ast.full.FnProto,
     /// The formal being asked about, or `any_param` / `global_only`.
@@ -819,6 +1503,56 @@ const Frame = struct {
     selected: ?Ast.Node.Index = null,
     view: ?View,
     state: *State,
+    raw_keys: std.AutoHashMapUnmanaged(Raw, void) = .empty,
+    whole_certificate: bool = false,
+    cut_mode: ?Mode.Cut = null,
+    advisory_memo: ?bool = null,
+    first_use: ?Ast.Node.Index = null,
+    first_use_searched: bool = false,
+    whole_negative: bool = false,
+    cut: ?Witness = null,
+    /// Expression recursion is scoped to this actual body, context and
+    /// storage question. A back edge is unknown, not a completed memo answer.
+    origin_active: ?*const OriginVisit = null,
+    origin_cycles: u32 = 0,
+    origin_memo: std.AutoHashMapUnmanaged(OriginKey, Origin) = .empty,
+
+    /// Reuse only a fully constructed syntax index. No origin/effect answer,
+    /// failed walk, or question-specific token-range verdict is cached here.
+    fn hasRebinding(self: *Frame, name: []const u8, declaration: Ast.TokenIndex, after: Ast.TokenIndex, before: Ast.TokenIndex, unresolved_is_write: bool) Error!bool {
+        const body_key = @intFromEnum(self.body);
+        var index = self.cache.effect_binding_writes.get(body_key);
+        if (index == null) {
+            var built: BindingWriteIndex = .{};
+            defer built.deinit(self.cache.gpa);
+            const escapes = try self.cache.escapeRoots(self.body);
+            for (escapes.writes) |write| {
+                try self.state.charge();
+                if (write.declares) continue;
+                const binding = self.currentBindings().findAt(write.name, write.token);
+                const name_token: ?Ast.TokenIndex = if (binding) |assigned| assigned.name_token else null;
+                const entry = try built.writes.getOrPut(self.cache.gpa, write.name);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.cache.gpa, .{ .token = write.token, .declaration = name_token });
+            }
+            const entry = try self.cache.effect_binding_writes.getOrPut(self.cache.gpa, body_key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = built;
+                built = .{};
+            }
+            // Borrow by value: later body resolution can grow the cache map.
+            index = entry.value_ptr.*;
+        }
+        const writes = index.?.writes.get(name) orelse return false;
+        for (writes.items) |write| {
+            try self.state.charge();
+            if (write.token <= after or write.token >= before) continue;
+            if (write.declaration) |assigned| {
+                if (assigned == declaration) return true;
+            } else if (unresolved_is_write) return true;
+        }
+        return false;
+    }
 
     /// This body's bindings, taken from the cache by body key.  Reacquired at
     /// every read rather than carried in the frame, because resolving another
@@ -849,20 +1583,33 @@ const Frame = struct {
         if (binding.origin == .param and binding.name_token == formal) self.selected = node;
     }
 
+    fn selectionAddressFree(self: *Frame) Error!bool {
+        if (self.parameter >= global_only or self.path_text.len != 0) return false;
+        const view = self.view orelse return false;
+        if (self.selected) |selected| return valueAddressFree(view, selected, self.state);
+        var parameters = self.proto.iterate(self.cache.tree);
+        var index: u32 = 0;
+        while (parameters.next()) |parameter| : (index += 1) {
+            if (index != self.parameter) continue;
+            const type_node = parameter.type_expr orelse return false;
+            return valueAddressFree(view, type_node, self.state);
+        }
+        return false;
+    }
+
     /// Does this body PROVE that the storage `operand` names is not the asked
     /// one?  Only a positively proved private construction answers that; the
     /// same storage, an incoming field, a copied header, publication, an
     /// unsupported shape and a cycle all answer "may share".
-    fn discharged(self: *Frame, at: Ast.Node.Index, operand: Ast.Node.Index) Error!bool {
+    fn discharged(self: *Frame, at: Ast.Node.Index, operand: Ast.Node.Index, suffix: []const u8) Error!bool {
         if (self.parameter >= global_only) return false;
         const selected = self.selected orelse return false;
         try self.state.charge();
-        // The path is left to the alias query: it derives the operand's own
-        // chain itself, and an alias-resolved path added here would be
-        // counted twice.
-        return !try storage_alias.mayShareStorageAt(self.cache, at, .{
+        // The alias query derives the operand's own chain. A nested call's
+        // witness adds only its callee-relative suffix, never that chain twice.
+        const shares = try storage_alias.mayShareStorageAt(self.cache, at, .{
             .node = operand,
-            .path = "",
+            .path = suffix,
         }, .{
             .node = selected,
             .path = self.path_text,
@@ -872,12 +1619,97 @@ const Frame = struct {
             // edge starts a fresh one.
             .frame = frameOf(self.view),
             .remaining = self.state.counter(),
+            .declaration = self.declaration,
+            .effects_state = self.state,
         });
+        return !shares;
     }
 
     fn append(self: *Frame, raw: *std.ArrayListUnmanaged(Raw), entry: Raw) Error!void {
+        if (self.raw_keys.contains(entry)) return;
         try self.state.charge();
+        try self.raw_keys.put(self.cache.gpa, entry, {});
         try raw.append(self.cache.gpa, entry);
+        if (self.whole_certificate and entry.effect != .read_only)
+            self.whole_negative = true;
+        if (self.cut_mode != null and entry.effect != .read_only and !self.whole_negative) {
+            // The verdict is only `.read_only` versus anything else, so the
+            // first witness that must survive into the final answer decides
+            // it. A global frame filters nothing; an own, undischargeable
+            // witness always survives; an advisory one survives while no
+            // frame on the way to the root drops it.
+            const decisive = if (self.parameter >= global_only)
+                true
+            else if (entry.operand != null)
+                false
+            else if (entry.param == self.parameter)
+                true
+            else if (entry.param == unrooted_param)
+                try self.advisoryKept()
+            else
+                false;
+            if (decisive) {
+                self.whole_negative = true;
+                self.cut = .{ .param = entry.param, .path = entry.path, .effect = entry.effect };
+            }
+        }
+    }
+
+    /// Does every frame between this one and the root keep witnesses that
+    /// are not about its own formal? A frame whose formal is an address-free
+    /// value drops them, and so does a root whose actual is one. The formal's
+    /// type is read from a use of it, as the final filter reads it; a formal
+    /// the body never uses is not decided here and is not kept.
+    fn advisoryKept(self: *Frame) Error!bool {
+        if (self.advisory_memo) |kept| return kept;
+        const cut_mode = self.cut_mode orelse return false;
+        if (self.parameter >= global_only) return true;
+        var kept = if (cut_mode.parent) |parent| try parent.advisoryKept() else cut_mode.advisory_ok;
+        if (kept) {
+            if (self.view) |view| {
+                if (try self.firstFormalUse()) |use| {
+                    kept = !try valueAddressFree(view, use, self.state);
+                } else kept = false;
+            }
+        }
+        self.advisory_memo = kept;
+        return kept;
+    }
+
+    /// A node of this body that names the asked formal: the scan's own pick
+    /// when it has one, else the first such identifier in source order. Every
+    /// use of one binding has the binding's type.
+    fn firstFormalUse(self: *Frame) Error!?Ast.Node.Index {
+        if (self.selected) |node| return node;
+        if (self.first_use_searched) return self.first_use;
+        self.first_use_searched = true;
+        const formal = self.queried_name orelse return null;
+        const tree = self.cache.tree;
+        var index: u32 = @intFromEnum(self.proto.ast.proto_node) + 1;
+        const last: u32 = @intFromEnum(self.body);
+        while (index <= last) : (index += 1) {
+            try self.state.charge();
+            const node: Ast.Node.Index = @enumFromInt(index);
+            if (tree.nodeTag(node) != .identifier) continue;
+            const token = tree.nodeMainToken(node);
+            const binding = self.currentBindings().findAt(tree.tokenSlice(token), token) orelse continue;
+            if (binding.origin == .param and binding.name_token == formal) {
+                self.first_use = node;
+                return node;
+            }
+        }
+        return null;
+    }
+
+    /// What a stopped frame returns. A whole certificate has no verdict
+    /// witness; a verdict stop returns the one witness that decided it.
+    /// Neither is a complete witness set. Independent verdicts have their
+    /// own memo and are never used by a precise effect question.
+    fn negativeSet(self: *const Frame) Error![]const Witness {
+        const decided = self.cut orelse return unknown_set;
+        const set = try self.state.scratchAllocator().alloc(Witness, 1);
+        set[0] = .{ .param = decided.param, .path = decided.path, .effect = decided.effect };
+        return set;
     }
 
     fn joinPath(self: *Frame, parent: []const u8, child: []const u8) Error!u32 {
@@ -903,7 +1735,7 @@ const Frame = struct {
         operand: Ast.Node.Index,
         at: Ast.Node.Index,
     ) Error!void {
-        const verdict = self.meet(origin);
+        var verdict = self.meet(origin);
         if (verdict == .none) return;
         const owner = switch (origin) {
             .formal => |formal| formal,
@@ -912,11 +1744,22 @@ const Frame = struct {
         const param: u32 = if (owner) |formal| formal.param else unrooted_param;
         const base: []const u8 = if (owner) |formal| formal.path else "";
         const path = try self.joinPath(base, suffix);
+        // When the origin and query share a root but the actual
+        // operation path diverges, the witness is about a sibling
+        // storage cell, not the queried one. Divergent paths are
+        // treated as distinct rather than conservatively merged.
+        const path_text = self.state.text(path);
+        if (verdict == .own and self.state.path_text.items.len != 0 and path_text.len != 0) {
+            if (!pathContains(self.path_text, path_text) and !pathContains(path_text, self.path_text)) {
+                verdict = .other;
+            }
+        }
         try self.append(raw, .{
             .param = param,
             .path = path,
             .effect = severity,
             .operand = if (verdict == .own) null else operand,
+            .operand_path = if (verdict == .own) root_path else try self.state.intern(self.cache.gpa, suffix),
             .at = if (verdict == .own) null else at,
         });
     }
@@ -936,6 +1779,7 @@ const Frame = struct {
         operand: Ast.Node.Index,
         at: Ast.Node.Index,
     ) Error!void {
+        if (try mutableLocalAddressFree(self, operand)) return;
         switch (origin) {
             .formal => try self.charge(raw, origin, suffix, severity, operand, at),
             // A local's own storage is a place the callee writes, and at a
@@ -947,6 +1791,7 @@ const Frame = struct {
                 .path = root_path,
                 .effect = severity,
                 .operand = operand,
+                .operand_path = try self.state.intern(self.cache.gpa, suffix),
                 .at = at,
             }),
             .private_value => {},
@@ -1024,35 +1869,307 @@ fn combineOrigins(left: Origin, right: Origin) Origin {
     };
 }
 
-fn relate(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
-    if (depth == max_depth) return frame.state.failure(.readonly_call_depth, max_depth, depth);
+fn valueAddressFree(view: View, node: Ast.Node.Index, state: *State) Error!bool {
+    try state.charge();
+    const ty = (try view.typeOfNode(node)) orelse return false;
+    const resolution = frameOf(view) orelse view.resolverOf().resolutionFrame();
+    return state.address_free.proves(state.scratch.?.child_allocator, resolution, ty, node, state.counter());
+}
+
+/// A mutable local with no reachable addresses is a new stack value, even
+/// when its initializer copied scalar fields from a formal. Readonly objects
+/// may share static storage; pointer-bearing locals may retain caller storage.
+fn mutableLocalAddressFree(frame: *Frame, node: Ast.Node.Index) Error!bool {
+    const view = frame.view orelse return false;
+    const tree = frame.cache.tree;
+    var value = node;
+    for (0..max_depth) |_| {
+        switch (tree.nodeTag(value)) {
+            .address_of, .@"try" => value = tree.nodeData(value).node,
+            .grouped_expression => value = tree.nodeData(value).node_and_token[0],
+            else => break,
+        }
+    } else return false;
+    const root = tokens.rootIdentifier(tree, value) orelse return false;
+    const token = tree.nodeMainToken(root);
+    const binding = frame.currentBindings().findAt(tree.tokenSlice(token), token) orelse return false;
+    if (binding.is_const or binding.origin == .param or binding.origin == .loop_capture) return false;
+    return valueAddressFree(view, root, frame.state);
+}
+
+/// A branch proof is about this instantiated frame, never a helper's name.
+/// Its condition is still scanned: evaluating it may itself have effects.
+fn knownChildren(frame: *Frame, node: Ast.Node.Index) Error!?Iterator {
+    const tree = frame.cache.tree;
+    const view = frame.view orelse return null;
+    const resolution = frameOf(view) orelse view.resolverOf().resolutionFrame();
+    if (tree.fullIf(node)) |branch| {
+        if (branch.payload_token != null or branch.error_token != null) return null;
+        try frame.state.charge();
+        const condition = (try resolution.boolValueOfNode(branch.ast.cond_expr)) orelse
+            return null;
+        return .{ .array = .{
+            branch.ast.cond_expr.toOptional(),
+            if (condition) branch.ast.then_expr.toOptional() else branch.ast.else_expr,
+            .none,
+            .none,
+            .none,
+        } };
+    }
+    const branch = tree.fullSwitch(node) orelse return null;
+    var two: [2]Ast.Node.Index = undefined;
+    const condition = branch.ast.condition;
+    switch (tree.nodeTag(condition)) {
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(condition)), "@typeInfo")) return null;
+    const operands = builtinOperands(tree, condition, &two);
+    if (operands.len != 1) return null;
     try frame.state.charge();
+    const value = (try resolution.resolveValueOfNode(operands[0])) orelse return null;
+    if (!value.is_type_val) return null;
+    const ty = (try resolution.resolver.normalizedType(value)) orelse return null;
+    const tag = resolution.resolver.typeTag(ty) orelse return null;
+    var selected: ?Ast.Node.Index = null;
+    var fallback: ?Ast.Node.Index = null;
+    for (branch.ast.cases) |case_node| {
+        try frame.state.charge();
+        const case = tree.fullSwitchCase(case_node) orelse return null;
+        if (case.ast.values.len == 0) {
+            if (fallback != null) return null;
+            fallback = case_node;
+        }
+        for (case.ast.values) |case_value| {
+            try frame.state.charge();
+            if (tree.nodeTag(case_value) != .enum_literal) return null;
+            var name = tree.tokenSlice(tree.nodeMainToken(case_value));
+            if (std.mem.startsWith(u8, name, "@\"") and std.mem.endsWith(u8, name, "\""))
+                name = name[2 .. name.len - 1];
+            if (!std.mem.eql(u8, name, @tagName(tag))) continue;
+            if (selected != null) return null;
+            selected = case_node;
+        }
+    }
+    const chosen = selected orelse fallback orelse return null;
+    return .{ .array = .{
+        condition.toOptional(), chosen.toOptional(), .none, .none, .none,
+    } };
+}
+
+const OriginVisit = struct {
+    node: Ast.Node.Index,
+    previous: ?*const OriginVisit,
+};
+
+/// The binding stores only the condition's span. Recover its while by the
+/// capture token's AST identity, following only children that contain it.
+fn enclosingWhileCapture(frame: *Frame, name_token: Ast.TokenIndex) Error!?Ast.Node.Index {
+    const tree = frame.cache.tree;
+    var node = frame.body;
+    while (true) {
+        try frame.state.charge();
+        if (tree.fullWhile(node)) |loop| {
+            if (loop.error_token == name_token) return node;
+            if (loop.payload_token) |payload| {
+                if (payload + @intFromBool(tree.tokenTag(payload) == .asterisk) == name_token)
+                    return node;
+            }
+        }
+        var children = Iterator.init(tree, node);
+        var containing: ?Ast.Node.Index = null;
+        while (children.next(tree)) |child| {
+            try frame.state.charge();
+            if (tree.firstToken(child) <= name_token and name_token <= tree.lastToken(child)) {
+                containing = child;
+                break;
+            }
+        }
+        node = containing orelse return null;
+    }
+}
+
+/// Captures project the value evaluated before entering their body. Their
+/// binding names only the scrutinee; a while additionally needs its back edge.
+fn captureOrigin(frame: *Frame, rhs: Ast.Node.Index, name_token: Ast.TokenIndex, depth: u32) Error!Origin {
+    const tree = frame.cache.tree;
+    if (tree.fullWhile(rhs) == null) {
+        if (try enclosingWhileCapture(frame, name_token)) |loop_node|
+            return captureOrigin(frame, loop_node, name_token, depth);
+    }
+    if (tree.fullWhile(rhs)) |loop| {
+        if (loop.error_token == name_token) return .private_storage;
+        if (loop.payload_token) |payload| {
+            const captured = payload + @intFromBool(tree.tokenTag(payload) == .asterisk);
+            if (captured == name_token) {
+                // A cursor may be rebound on the back edge, including AFTER
+                // this use of the capture. The initial value alone cannot
+                // certify every iteration's storage.
+                // Indexing writes may build tables, so bindings below are
+                // always reacquired by body identity.
+                // Inspect every referenced binding, not just a root name:
+                // calls and projections can return a rebound argument.
+                var token = tree.firstToken(loop.ast.cond_expr);
+                while (token <= tree.lastToken(loop.ast.cond_expr)) : (token += 1) {
+                    try frame.state.charge();
+                    if (tree.tokenTag(token) != .identifier) continue;
+                    const binding = frame.currentBindings().findAt(tree.tokenSlice(token), token) orelse continue;
+                    if (try frame.hasRebinding(binding.name, binding.name_token, name_token, tree.lastToken(rhs) + 1, false))
+                        return .unrooted;
+                }
+                return relate(frame, loop.ast.cond_expr, depth);
+            }
+        }
+        return .unrooted;
+    }
+    if (tree.fullIf(rhs)) |branch| {
+        if (branch.error_token == name_token) return .private_storage;
+        if (branch.payload_token) |payload| {
+            if (payload + @intFromBool(tree.tokenTag(payload) == .asterisk) == name_token)
+                return relate(frame, branch.ast.cond_expr, depth);
+        }
+        return .unrooted;
+    }
+    if (tree.fullFor(rhs)) |loop| {
+        var token = loop.payload_token;
+        for (loop.ast.inputs) |input| {
+            if (tree.tokenTag(token) == .asterisk) token += 1;
+            if (token == name_token) {
+                if (tree.nodeTag(input) == .for_range) return .private_storage;
+                return relate(frame, input, depth);
+            }
+            token += 1;
+            if (tree.tokenTag(token) != .comma) break;
+            token += 1;
+        }
+        return .unrooted;
+    }
+    if (tree.fullSwitch(rhs)) |branch| {
+        for (branch.ast.cases) |case_node| {
+            try frame.state.charge();
+            const case = tree.fullSwitchCase(case_node) orelse return .unrooted;
+            if (case.payload_token) |payload| {
+                const captured = payload + @intFromBool(tree.tokenTag(payload) == .asterisk);
+                if (captured == name_token)
+                    return relate(frame, branch.ast.condition, depth);
+                // A second switch capture is the scalar active tag.
+                if (tree.tokenTag(captured + 1) == .comma and captured + 2 == name_token)
+                    return .private_storage;
+            }
+        }
+        return .unrooted;
+    }
+    // Some binding entries already name the scrutinee or iterable rather
+    // than its control-flow node. This expression is still at that horizon.
+    // A case entry can name only the arm; recover its enclosing switch by
+    // AST identity, never by a capture's spelling or a source excerpt.
+    if (tree.fullSwitchCase(rhs) != null) {
+        for (0..tree.nodes.len) |index| {
+            try frame.state.charge();
+            const candidate: Ast.Node.Index = @enumFromInt(index);
+            const branch = tree.fullSwitch(candidate) orelse continue;
+            for (branch.ast.cases) |case_node| {
+                if (case_node == rhs) return captureOrigin(frame, candidate, name_token, depth);
+            }
+        }
+        return .unrooted;
+    }
+    return relate(frame, rhs, depth);
+}
+
+/// Omitted defaults belong to the aggregate's declaring frame, not this
+/// caller. Until their provenance is resolved there, retain an unknown root.
+fn aggregateDefaultsOrigin(frame: *Frame, node: Ast.Node.Index, fields: []const Ast.Node.Index) Error!Origin {
+    const view = frame.view orelse return .unrooted;
+    try frame.state.charge();
+    const resolver = view.resolverOf();
+    const ty = (try view.typeOfNode(node)) orelse return .unrooted;
+    const resolution = frameOf(view) orelse resolver.resolutionFrame();
+    if (try fresh_storage.actualTypeAddressFree(resolution, ty, 0, frame.state.counter())) return .private_value;
+    const actual = (try resolver.normalizedType(ty)) orelse return .unrooted;
+    if (actual.data != .container) return .unrooted;
+    const container = actual.data.container;
+    const declaring = resolver.frameForContainer(container);
+    const tree = &container.scope_handle.handle.document.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const declaration = tree.fullContainerDecl(&buffer, container.scope_handle.toNode()) orelse return .unrooted;
+    for (declaration.ast.members) |member| {
+        try frame.state.charge();
+        const field = tree.fullContainerField(member) orelse continue;
+        if (field.ast.value_expr == .none) continue;
+        var supplied = false;
+        for (fields) |value| {
+            try frame.state.charge();
+            const first = frame.cache.tree.firstToken(value);
+            if (first < 3 or frame.cache.tree.tokenTag(first - 1) != .equal or
+                frame.cache.tree.tokenTag(first - 2) != .identifier or
+                frame.cache.tree.tokenTag(first - 3) != .period) continue;
+            if (std.mem.eql(u8, frame.cache.tree.tokenSlice(first - 2), tree.tokenSlice(field.ast.main_token))) {
+                supplied = true;
+                break;
+            }
+        }
+        if (!supplied) {
+            const type_node = field.ast.type_expr.unwrap() orelse return .unrooted;
+            const field_type = (try declaring.typeOfNode(type_node)) orelse return .unrooted;
+            if (!try fresh_storage.actualTypeAddressFree(declaring, field_type, 0, frame.state.counter()))
+                return .unrooted;
+        }
+    }
+    return .private_value;
+}
+
+const OriginKey = struct { node: Ast.Node.Index, depth: u32 };
+
+fn relate(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
+    try frame.state.charge();
+    var active = frame.origin_active;
+    while (active) |visit| : (active = visit.previous) {
+        try frame.state.charge();
+        if (visit.node == node) {
+            frame.origin_cycles += 1;
+            return .unrooted;
+        }
+    }
+    if (depth == max_depth) return @as(Error!Origin, frame.state.failure(.readonly_call_depth, max_depth, depth));
+    const key: OriginKey = .{ .node = node, .depth = depth };
+    if (frame.origin_memo.get(key)) |known| return known;
+    const visit: OriginVisit = .{ .node = node, .previous = frame.origin_active };
+    frame.origin_active = &visit;
+    defer frame.origin_active = visit.previous;
+    const cycles = frame.origin_cycles;
+    const answer = try relateWalk(frame, node, depth);
+    if (frame.origin_cycles == cycles)
+        try frame.origin_memo.put(frame.state.scratchAllocator(), key, answer);
+    return answer;
+}
+
+fn relateWalk(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
     const cache = frame.cache;
     const tree = cache.tree;
+    var static_owner_complete = true;
     if (tokens.rootIdentifier(tree, node)) |root| {
         const token = tree.nodeMainToken(root);
         if (frame.currentBindings().findAt(tree.tokenSlice(token), token)) |binding| {
+            // Static ownership follows the initial capture value. A loop's
+            // back edge must be checked before accepting that coordinate.
+            if (binding.origin == .loop_capture) static_owner_complete = false;
             if (binding.origin != .param) {
                 // The binding pointer is not held across the escape index
                 // build: resolving it can grow the table this one lives in.
                 const name = binding.name;
                 const name_token = binding.name_token;
-                const escapes = try cache.escapeRoots(frame.body);
-                for (escapes.writes) |write| {
-                    try frame.state.charge();
-                    if (write.declares or write.token <= name_token or write.token >= token) continue;
-                    if (!std.mem.eql(u8, write.name, name)) continue;
-                    const assigned = frame.currentBindings().findAt(write.name, write.token) orelse return .unrooted;
-                    if (assigned.name_token == name_token) return .unrooted;
-                }
+                if (try frame.hasRebinding(name, name_token, name_token, token, true))
+                    return .unrooted;
             }
         }
     }
-    const owner = try fn_summary.ownerOfExpr(frame.state.scratchAllocator(), tree, frame.proto,
-        frame.currentBindings(), tree.firstToken(node), tree.lastToken(node), 0);
-    switch (owner) {
-        .param => |path| return .{ .formal = path },
-        .unknown => {},
+    if (static_owner_complete) {
+        const owner = try fn_summary.ownerOfExpr(frame.state.scratchAllocator(), tree, frame.proto, frame.currentBindings(), tree.firstToken(node), tree.lastToken(node), 0);
+        switch (owner) {
+            .param => |path| return .{ .formal = path },
+            .unknown => {},
+        }
     }
     switch (tree.nodeTag(node)) {
         .identifier => {
@@ -1071,15 +2188,20 @@ fn relate(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
             // Following a name to a literal does not make the NAME valueless:
             // the local it names is still a place a call writes, so what came
             // back is this body's own storage, not a value.
-            const followed = try relate(frame, rhs, depth + 1);
+            const followed = if (binding.origin == .loop_capture)
+                try captureOrigin(frame, rhs, binding.name_token, depth + 1)
+            else
+                try relate(frame, rhs, depth + 1);
             return switch (followed) {
                 .private_value => .private_storage,
                 else => followed,
             };
         },
-        .address_of, .deref, .@"try" => return relate(frame, tree.nodeData(node).node, depth + 1),
-        .unwrap_optional, .grouped_expression =>
-            return relate(frame, tree.nodeData(node).node_and_token[0], depth + 1),
+        .address_of => return relate(frame, tree.nodeData(node).node, depth + 1),
+        .deref => return relate(frame, tree.nodeData(node).node, depth + 1),
+        .@"try" => return relate(frame, tree.nodeData(node).node, depth + 1),
+        .unwrap_optional => return relate(frame, tree.nodeData(node).node_and_token[0], depth + 1),
+        .grouped_expression => return relate(frame, tree.nodeData(node).node_and_token[0], depth + 1),
         .array_access => return relate(frame, tree.nodeData(node).node_and_node[0], depth + 1),
         .field_access => return relate(frame, tree.nodeData(node).node_and_token[0], depth + 1),
         .slice_open, .slice, .slice_sentinel => {
@@ -1087,15 +2209,42 @@ fn relate(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
             return relate(frame, slice.ast.sliced, depth + 1);
         },
         .call, .call_one, .call_comma, .call_one_comma => return resultOrigin(frame, node, depth + 1),
-        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal, .error_value =>
-            return .private_value,
+        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal, .error_value => return .private_value,
         else => {
+            // Type expressions do not carry runtime addresses, but omitted
+            // defaults can. Spelled fields alone are not a completeness proof.
+            var literal_buffer: [2]Ast.Node.Index = undefined;
+            const structure = tree.fullStructInit(&literal_buffer, node);
+            const values: ?[]const Ast.Node.Index = if (structure) |literal|
+                literal.ast.fields
+            else if (tree.fullArrayInit(&literal_buffer, node)) |literal|
+                literal.ast.elements
+            else
+                null;
+            if (values) |items| {
+                // Named aggregate literals can omit defaults declared in a
+                // different frame. Their spelled fields are not a complete
+                // provenance proof. Address-free types need no such origins.
+                var result: Origin = if (structure != null)
+                    try aggregateDefaultsOrigin(frame, node, items)
+                else
+                    .private_value;
+                if (result == .unrooted) return .unrooted;
+                for (items) |item| {
+                    result = combineOrigins(result, try relate(frame, item, depth + 1));
+                    if (result == .unrooted) return .unrooted;
+                }
+                return result;
+            }
             var children = Iterator.init(tree, node);
             var result: Origin = .private_value;
             var found = false;
             while (children.next(tree)) |child| {
                 found = true;
                 result = combineOrigins(result, try relate(frame, child, depth + 1));
+                // Unknown is absorbing: another origin cannot make this
+                // expression more precise, so do not traverse it again.
+                if (result == .unrooted) return .unrooted;
             }
             return if (found) result else .unrooted;
         },
@@ -1108,30 +2257,30 @@ fn relate(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
 /// everything.
 fn resultOrigin(frame: *Frame, node: Ast.Node.Index, depth: u32) Error!Origin {
     const cache = frame.cache;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = cache.tree.fullCall(&buffer, node) orelse return .unrooted;
-    const callee = (try grow_analysis.actualCalleeOf(cache, callCalleeToken(cache.tree, call), frameOf(frame.view))) orelse
-        return .unrooted;
-    const declaring = (try cacheFor(cache, callee)) orelse return .unrooted;
-    if (tokens.bodyOf(callee.tree, callee.declaration) == null) return .unrooted;
-    const summary = (declaring.summaryOfResolvedMethod(.{
-        .tree = callee.tree, .module = callee.handle.module, .fn_decl = callee.declaration,
-    }) catch |err| return err) orelse return .unrooted;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const call = TypeResolver.CallOperands.full(cache.tree, &buffer, node) orelse return .unrooted;
+    const actual = (try cache.actualCallSummaryAt(
+        call.queryToken(cache.tree, node),
+        frameOf(frame.view),
+    )) orelse return .unrooted;
+    const callee = actual.callee;
+    const summary = actual.summary orelse return .unrooted;
+    // Returned arguments cannot close an incomplete result summary. Keep
+    // unknown without expanding dependencies whose origins cannot change it.
+    if (!summary.result_params_complete) return .unrooted;
     const view = viewFor(cache, callee) orelse return .unrooted;
-    var arguments_buffer: [1]Ast.Node.Index = undefined;
-    const arguments = view.callArgumentsOf(&arguments_buffer, node) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .unrooted,
-    } orelse return .unrooted;
+    var arguments_buffer: [2]Ast.Node.Index = undefined;
+    const arguments = (try view.callArgumentsOf(&arguments_buffer, node)) orelse return .unrooted;
     var result: Origin = .private_value;
     const count = arguments.arguments.len + @intFromBool(arguments.receiver != null);
     for (0..count) |index| {
         const dependency = summary.returnedParamDependency(@intCast(index));
         if (dependency == false) continue;
-        const argument = argumentAt(arguments, @intCast(index)) orelse return .unrooted;
+        const argument = (try actual.callArgumentFor(cache, &arguments_buffer, @intCast(index))) orelse
+            return .unrooted;
         result = combineOrigins(result, try relate(frame, argument, depth));
+        if (result == .unrooted) return .unrooted;
     }
-    if (!summary.result_params_complete) return combineOrigins(result, .unrooted);
     return result;
 }
 
@@ -1146,8 +2295,23 @@ fn writeWitness(
     target: Ast.Node.Index,
     value: Ast.Node.Index,
 ) Error!void {
+    const tree = frame.cache.tree;
+    if (tree.nodeTag(target) == .identifier) {
+        const token = tree.nodeMainToken(target);
+        if (frame.currentBindings().findAt(tree.tokenSlice(token), token)) |binding| {
+            // Rebinding a local replaces its own slot, not any storage its
+            // old or new pointer value reaches. Indexed and dereferenced
+            // destinations still take the rooted storage path below.
+            if (binding.origin != .param) return;
+        }
+    }
+    // Classify the physical destination before following initializer value
+    // dependencies. An actual address-free mutable local owns every inline
+    // cell in its graph, even when a factory computed those cells from an
+    // incoming seed. Pointer/slice-bearing roots cannot pass this certificate.
+    if (try mutableLocalAddressFree(frame, target)) return;
     const origin = try relate(frame, target, 0);
-    var severity = storeSeverity(frame, node, target, value);
+    var severity = try storeSeverity(frame, node, target, value);
     switch (origin) {
         .formal => |owner| if (pathIsAncestor(frame.path_text, owner.path)) {
             // The store replaces an object that CONTAINS the asked storage, so
@@ -1159,7 +2323,7 @@ fn writeWitness(
     try frame.charge(raw, origin, "", severity, target, node);
 }
 
-fn storeSeverity(frame: *Frame, node: Ast.Node.Index, target: Ast.Node.Index, value: Ast.Node.Index) Effect {
+fn storeSeverity(frame: *Frame, node: Ast.Node.Index, target: Ast.Node.Index, value: Ast.Node.Index) Error!Effect {
     const tree = frame.cache.tree;
     switch (tree.nodeTag(node)) {
         // A shift can manufacture any bit pattern, which is poison wherever
@@ -1185,8 +2349,8 @@ fn storeSeverity(frame: *Frame, node: Ast.Node.Index, target: Ast.Node.Index, va
     // scalar, and the VALUE must be one this analysis cannot see poison in.
     // A composite destination is exactly what a header replaces, and an
     // unresolved one is exactly what this analysis must not guess about.
-    if (!isKnownScalarType(frame, target)) return .may_invalidate;
-    if (!valueIsNonPoisonScalar(frame, value)) return .may_invalidate;
+    if (!try isKnownScalarType(frame, target)) return .may_invalidate;
+    if (!try valueIsNonPoisonScalar(frame, value)) return .may_invalidate;
     return .writes_without_invalidation;
 }
 
@@ -1197,18 +2361,20 @@ fn storeSeverity(frame: *Frame, node: Ast.Node.Index, target: Ast.Node.Index, va
 /// generic's parameter type is the type this call really carried and never a
 /// bare generic form.  A pointer, slice, optional, struct, union, call result,
 /// and anything the engine cannot answer are all refused.
-fn isKnownScalarType(frame: *Frame, node: Ast.Node.Index) bool {
+/// Unresolved structure is refused; source, policy and resource failures
+/// abort the query so no completed witness set can contain that refusal.
+fn isKnownScalarType(frame: *Frame, node: Ast.Node.Index) Error!bool {
     const view = frame.view orelse return false;
-    if (view.isBoolType(node) catch return false) |is_bool| {
+    if (try view.isBoolType(node)) |is_bool| {
         if (is_bool) return true;
     }
-    if (view.isEnumType(node) catch return false) |is_enum| {
+    if (try view.isEnumType(node)) |is_enum| {
         if (is_enum) return true;
     }
-    if (view.intInfo(node) catch return false) |info| {
+    if (try view.intInfo(node)) |info| {
         return info.bits < @bitSizeOf(usize);
     }
-    if (view.floatBits(node) catch return false) |width| {
+    if (try view.floatBits(node)) |width| {
         return width < @bitSizeOf(usize);
     }
     return false;
@@ -1224,10 +2390,11 @@ fn isKnownScalarType(frame: *Frame, node: Ast.Node.Index) bool {
 /// cell; a struct, a union, a pointer, a slice, another aggregate, or an
 /// element this run cannot resolve is refused.  Nothing here reads a
 /// declaration spelling or names a container type.
-fn elementIsScalarElement(frame: *Frame, node: Ast.Node.Index) bool {
+/// Resolution failures propagate rather than becoming an element verdict.
+fn elementIsScalarElement(frame: *Frame, node: Ast.Node.Index) Error!bool {
     const view = frame.view orelse return false;
     const resolver = view.resolverOf();
-    var current = (view.typeOfNode(node) catch return false) orelse return false;
+    var current = (try view.typeOfNode(node)) orelse return false;
     // One optional wrapper is peeled before the pointer/array the bytes are
     // actually written through; the bound stops a malformed cycle.
     var peeled: u8 = 0;
@@ -1248,7 +2415,7 @@ fn elementIsScalarElement(frame: *Frame, node: Ast.Node.Index) bool {
         else => return false,
     } orelse return false;
     // The child is a structural instance; normalize it before it is classified.
-    const element = (resolver.normalizedType(child) catch return false) orelse return false;
+    const element = (try resolver.normalizedType(child)) orelse return false;
     return switch (resolver.typeTag(element) orelse return false) {
         .bool, .@"enum", .int, .comptime_int, .float, .comptime_float => true,
         else => false,
@@ -1261,7 +2428,7 @@ fn elementIsScalarElement(frame: *Frame, node: Ast.Node.Index) bool {
 /// scalar type that decides what it coerces into (`Row{ .bytes = undefined }`
 /// spelled `.poisoned` is refused by the destination proof, not here).  A name
 /// is one when its own type resolves to a narrow primitive.
-fn valueIsNonPoisonScalar(frame: *Frame, node: Ast.Node.Index) bool {
+fn valueIsNonPoisonScalar(frame: *Frame, node: Ast.Node.Index) Error!bool {
     const tree = frame.cache.tree;
     switch (tree.nodeTag(node)) {
         .number_literal, .char_literal, .enum_literal => return true,
@@ -1280,8 +2447,8 @@ fn opaqueWitness(frame: *Frame, raw: *std.ArrayListUnmanaged(Raw), node: Ast.Nod
     const tree = frame.cache.tree;
     var two: [2]Ast.Node.Index = undefined;
     const operands = builtinOperands(tree, node, &two);
-    if (operands.len == 0) {
-        try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
+    if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call")) {
+        try callWitness(frame, raw, node);
         return;
     }
     switch (intrinsicWrite(tree, node)) {
@@ -1299,8 +2466,13 @@ fn opaqueWitness(frame: *Frame, raw: *std.ArrayListUnmanaged(Raw), node: Ast.Nod
         // replaces what was there.
         .second => try writeIntrinsic(frame, raw, node, operands, 1, null),
         .@"opaque" => {
+            if (operands.len == 0) {
+                try frame.charge(raw, .unrooted, "", .unknown, node, node);
+                return;
+            }
             var poison = false;
-            for (operands[1..]) |operand| {
+            for (operands, 0..) |operand, index| {
+                if (index == 0) continue;
                 if (isUndefinedValue(frame, operand)) poison = true;
             }
             for (operands) |operand| {
@@ -1312,6 +2484,7 @@ fn opaqueWitness(frame: *Frame, raw: *std.ArrayListUnmanaged(Raw), node: Ast.Nod
                     operand,
                     node,
                 );
+                if (frame.whole_negative) return;
             }
         },
     }
@@ -1343,8 +2516,8 @@ fn writeIntrinsic(
     var severity: Effect = .may_invalidate;
     if (stored_value) |value_index| {
         if (value_index < operands.len and
-            valueIsNonPoisonScalar(frame, operands[value_index]) and
-            elementIsScalarElement(frame, destination)) severity = .writes_without_invalidation;
+            try valueIsNonPoisonScalar(frame, operands[value_index]) and
+            try elementIsScalarElement(frame, destination)) severity = .writes_without_invalidation;
     }
     for (operands, 0..) |operand, at| {
         if (at == index) continue;
@@ -1366,6 +2539,7 @@ const IntrinsicWrite = enum { reads_only, first, bytes, second, @"opaque" };
 fn intrinsicWrite(tree: *const Ast, node: Ast.Node.Index) IntrinsicWrite {
     const name = tree.tokenSlice(tree.nodeMainToken(node));
     const is = std.mem.eql;
+    if (is(u8, name, "@This")) return .reads_only;
     if (is(u8, name, "@atomicLoad")) return .reads_only;
     if (is(u8, name, "@atomicRmw") or is(u8, name, "@atomicStore") or
         is(u8, name, "@cmpxchgWeak") or is(u8, name, "@cmpxchgStrong")) return .second;
@@ -1396,16 +2570,125 @@ fn builtinOperands(tree: *const Ast, node: Ast.Node.Index, two: *[2]Ast.Node.Ind
     };
 }
 
-/// The token that identifies one call in the cache's own call index.
-/// `FileCache.getCallIndex` files every call under
-/// `nodeMainToken(call.ast.fn_expr)`, and `resolveActualCallee` looks a call
-/// up under exactly that key — so a container-qualified call (`map.get(key)`)
-/// is named by the token of its `.`, not by the method name at the end of the
-/// expression.  Asking under the last token instead misses every qualified
-/// call, and a miss reads as "this call resolves to nothing", which is how a
-/// method call came to be charged as unknown storage.
-fn callCalleeToken(tree: *const Ast, call: Ast.full.Call) Ast.TokenIndex {
-    return tree.nodeMainToken(call.ast.fn_expr);
+/// Only this canonical SDK declaration and its actual signature establish
+/// release semantics; a caller's method spelling is not evidence.
+fn allocatorFreeBuffer(
+    cache: *FileCache,
+    callee: FileCache.ActualCallee,
+    caller: View,
+    body: ?View,
+    arguments: TypeResolver.CallArguments,
+    state: *State,
+) Error!?Ast.Node.Index {
+    const resolver = caller.resolverOf();
+    try state.charge();
+    if (!try resolver.declaredInToolchainFile(callee.handle, "/std/mem/Allocator.zig"))
+        return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(callee.tree, &buffer, callee.declaration) orelse return null;
+    const name = proto.name_token orelse return null;
+    if (!std.mem.eql(u8, callee.tree.tokenSlice(name), "free")) return null;
+    var parameters = proto.iterate(callee.tree);
+    const allocator = parameters.next() orelse return null;
+    const memory = parameters.next() orelse return null;
+    if (parameters.next() != null) return null;
+    const generic = memory.anytype_ellipsis3 orelse return null;
+    if (callee.tree.tokenTag(generic) != .keyword_anytype) return null;
+    const allocator_type = allocator.type_expr orelse return null;
+    const released = argumentAt(arguments, 1) orelse return null;
+    const return_node = proto.ast.return_type.unwrap() orelse return null;
+    // The receiver and its erased callback are not evaluated on the SDK's
+    // zero-byte path. An explicitly typed const slice and its literal
+    // initializer prove that path without depending on generic value coercion.
+    if (callee.tree.nodeTag(return_node) == .identifier and
+        std.mem.eql(u8, callee.tree.tokenSlice(callee.tree.nodeMainToken(return_node)), "void") and
+        try declaredEmptySlice(cache, released, state))
+    {
+        for (callee.tree.rootDecls()) |root| {
+            try state.charge();
+            if (root == callee.declaration) return released;
+        }
+    }
+    const body_view = body orelse return null;
+    if (try body_view.isStdAllocator(allocator_type) != true) return null;
+    const return_type = (try body_view.typeOfNode(return_node)) orelse return null;
+    if (resolver.typeTag(return_type) != .void) return null;
+    const receiver = argumentAt(arguments, 0) orelse return null;
+    if (try caller.isStdAllocator(receiver) != true) return null;
+    const released_type = (try caller.typeOfNode(released)) orelse return null;
+    if (resolver.pointerSize(released_type) != .slice) return null;
+    return released;
+}
+
+/// A constant local may carry a statically empty slice. Mutable headers,
+/// globals and unknown values cannot establish the zero-length no-op.
+fn emptyBuffer(cache: *FileCache, node: Ast.Node.Index, state: *State, depth: u32) Error!bool {
+    if (depth == max_depth) return false;
+    try state.charge();
+    const tree = cache.tree;
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const token = tree.nodeMainToken(node);
+            const declaration = tokens.enclosingFnDecl(tree, token) orelse return false;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tokens.fnProto(tree, &buffer, declaration) orelse return false;
+            const body = tokens.bodyOf(tree, declaration) orelse return false;
+            const bindings = try cache.localBindings(proto, body);
+            const binding = bindings.findAt(tree.tokenSlice(token), token) orelse return false;
+            if (!binding.is_const or binding.origin == .param) return false;
+            const initializer = cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return false;
+            if (initializer == node) return false;
+            return emptyBuffer(cache, initializer, state, depth + 1);
+        },
+        .address_of => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const value = tree.nodeData(node).node;
+            const array_type = if (tree.fullArrayInit(&buffer, value)) |literal| blk: {
+                if (literal.ast.elements.len != 0) return false;
+                break :blk literal.ast.type_expr.unwrap() orelse return false;
+            } else if (tree.fullStructInit(&buffer, value)) |literal| blk: {
+                // The parser represents an empty typed initializer as a
+                // struct initializer, even when its type is an array.
+                if (literal.ast.fields.len != 0) return false;
+                break :blk literal.ast.type_expr.unwrap() orelse return false;
+            } else return false;
+            // A sentinel is an extra byte even when the visible slice is
+            // empty. Only a plain zero/inferred-length array proves the no-op.
+            if (tree.nodeTag(array_type) != .array_type) return false;
+            const count = tree.nodeData(array_type).node_and_node[0];
+            return (tree.nodeTag(count) == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(count)), "0")) or
+                (tree.nodeTag(count) == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(count)), "_"));
+        },
+        .grouped_expression => return emptyBuffer(cache, tree.nodeData(node).node_and_token[0], state, depth + 1),
+        else => return false,
+    }
+}
+
+/// Prove a plain slice's zero length from its own declaration and initializer.
+/// A type annotation is required: an inferred pointer-to-array is not the
+/// slice that the canonical allocator API accepts. Sentinel slices may retain
+/// a byte despite zero visible elements and are never discharged here.
+fn declaredEmptySlice(cache: *FileCache, node: Ast.Node.Index, state: *State) Error!bool {
+    try state.charge();
+    const tree = cache.tree;
+    if (tree.nodeTag(node) != .identifier) return false;
+    const token = tree.nodeMainToken(node);
+    const declaration = tokens.enclosingFnDecl(tree, token) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return false;
+    const body = tokens.bodyOf(tree, declaration) orelse return false;
+    const bindings = try cache.localBindings(proto, body);
+    const binding = bindings.findAt(tree.tokenSlice(token), token) orelse return false;
+    if (!binding.is_const or binding.origin == .param or binding.origin == .loop_capture) return false;
+    if (tree.tokenTag(binding.name_token + 1) != .colon) return false;
+    const first = binding.name_token + 2;
+    if (binding.rhs_first < 2 or binding.rhs_first - 2 < first) return false;
+    const type_node = cache.nodeForExactSpan(first, binding.rhs_first - 2) orelse return false;
+    const slice = tree.fullPtrType(type_node) orelse return false;
+    if (slice.size != .slice or slice.ast.sentinel != .none) return false;
+    return emptyBuffer(cache, node, state, 0);
 }
 
 /// What one call does, in this body's coordinates.  Every operand the call was
@@ -1414,41 +2697,54 @@ fn callCalleeToken(tree: *const Ast, call: Ast.full.Call) Ast.TokenIndex {
 /// handed anything of ours is charged on its own.
 fn callWitness(frame: *Frame, raw: *std.ArrayListUnmanaged(Raw), node: Ast.Node.Index) Error!void {
     const cache = frame.cache;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = cache.tree.fullCall(&buffer, node) orelse {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const call = TypeResolver.CallOperands.full(cache.tree, &buffer, node) orelse {
         try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
         return;
     };
-    const callee = (try grow_analysis.actualCalleeOf(cache, callCalleeToken(cache.tree, call), frameOf(frame.view))) orelse {
+    const callee = (try grow_analysis.actualCalleeOf(cache, call.queryToken(cache.tree, node), frameOf(frame.view))) orelse {
         try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
         return;
     };
-    const declaring = (try cacheFor(cache, callee)) orelse {
+    if ((try cacheFor(cache, callee)) == null) {
         try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
         return;
-    };
+    }
     const view = viewFor(cache, callee) orelse {
         try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
         return;
     };
-    var arguments_buffer: [1]Ast.Node.Index = undefined;
-    const arguments = view.callArgumentsOf(&arguments_buffer, node) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
-            return;
-        },
-    } orelse {
+    var arguments_buffer: [2]Ast.Node.Index = undefined;
+    const arguments = (try view.callArgumentsOf(&arguments_buffer, node)) orelse {
         try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
         return;
     };
+    try resolvedCallWitness(frame, raw, node, call.ast.fn_expr, callee, view, arguments);
+}
+
+fn resolvedCallWitness(
+    frame: *Frame,
+    raw: *std.ArrayListUnmanaged(Raw),
+    node: Ast.Node.Index,
+    fn_expr: Ast.Node.Index,
+    callee: FileCache.ActualCallee,
+    view: View,
+    arguments: TypeResolver.CallArguments,
+) Error!void {
+    const cache = frame.cache;
+    const declaring = (try cacheFor(cache, callee)) orelse unreachable;
     const count = arguments.arguments.len + @intFromBool(arguments.receiver != null);
     const callee_view = bodyView(declaring, callee, frame.state);
+    if (try allocatorFreeBuffer(cache, callee, view, callee_view, arguments, frame.state)) |released| {
+        // A proved empty slice executes neither poisoning nor the allocator
+        // callback. Otherwise the release is a rooted fact even when the
+        // allocator's erased vtable body cannot be resolved.
+        if (try emptyBuffer(cache, released, frame.state, 0)) return;
+        try frame.charge(raw, try relate(frame, released, 0), "", .may_invalidate, released, node);
+        if (frame.whole_negative) return;
+    }
     if (count != 0) {
-        const append = view.stdCollectionAppendOf(call.ast.fn_expr, count - 1) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => .no,
-        };
+        const append = try view.stdCollectionAppendOf(fn_expr, count - 1);
         if (append != .no) {
             const receiver = arguments.receiver orelse arguments.arguments[0];
             const severity: Effect = if (append == .infallible)
@@ -1459,9 +2755,28 @@ fn callWitness(frame: *Frame, raw: *std.ArrayListUnmanaged(Raw), node: Ast.Node.
             return;
         }
     }
+    if (frame.whole_certificate) {
+        // Ask the same no-mutation question recursively, not a truncated
+        // parameter effect. A positive answer covers every callee effect.
+        const whole = try collectWitnesses(
+            declaring,
+            callee.declaration,
+            any_param,
+            "",
+            callee_view,
+            frame.state,
+            .whole,
+        );
+        if (mergeAll(whole) == .read_only) return;
+    }
     for (0..count) |index| {
         try frame.state.charge();
         const argument = argumentAt(arguments, @intCast(index)) orelse continue;
+        if (try mutableLocalAddressFree(frame, argument)) continue;
+        // Explicit address-free arguments are values copied into the callee.
+        // An implicit receiver can instead be addressed by method coercion.
+        if ((arguments.receiver == null or index != 0) and
+            try valueAddressFree(view, argument, frame.state)) continue;
         const origin = try relate(frame, argument, 0);
         switch (origin) {
             .private_value => {
@@ -1469,29 +2784,57 @@ fn callWitness(frame: *Frame, raw: *std.ArrayListUnmanaged(Raw), node: Ast.Node.
                 // caller's, so whatever the callee does to it is its own.
                 continue;
             },
+            .formal => if (frame.parameter == global_only) continue,
             else => {},
         }
-        const sub = try witnessesFor(
+        if (frame.whole_certificate) {
+            // The child withheld its whole certificate and this actual may
+            // expose storage relevant to our root. Withhold ours too, without
+            // claiming which parameter was written or caching a partial body.
+            if (frame.meet(origin) == .none) continue;
+            try frame.append(raw, .{ .param = unrooted_param, .path = root_path, .effect = .unknown });
+            return;
+        }
+        const sub = try collectWitnesses(
             declaring,
             callee.declaration,
             @intCast(index),
             "",
             callee_view,
             frame.state,
+            // A callee's own witness about the storage this frame was asked
+            // about is a verdict witness of this frame too, so one may stop
+            // as soon as the callee finds it.
+            if (frame.cut_mode != null and frame.meet(origin) == .own)
+                .{ .cut = .{ .parent = frame } }
+            else
+                .complete,
         );
         try reexpress(frame, raw, origin, sub, arguments, node, @intCast(index));
+        if (frame.whole_negative) return;
     }
     // A known callee can reach globally aliased storage without receiving any
     // relevant operand.  That possibility is asked separately: formal flow
     // never proves nonaliasing of caller storage, and an opaque callee cannot
     // discharge it.
-    const globals = try witnessesFor(declaring, callee.declaration, global_only, "", callee_view, frame.state);
+    const globals = try collectWitnesses(
+        declaring,
+        callee.declaration,
+        global_only,
+        "",
+        callee_view,
+        frame.state,
+        // Nothing a global frame folds is filtered, and an advisory witness
+        // that survives every frame above decides the verdict by itself.
+        if (frame.cut_mode != null and try frame.advisoryKept()) .{ .cut = .{} } else .complete,
+    );
     for (globals) |witness| {
         try frame.append(raw, .{
             .param = unrooted_param,
             .path = root_path,
             .effect = witness.effect,
         });
+        if (frame.whole_negative) return;
     }
 }
 
@@ -1515,6 +2858,7 @@ fn reexpress(
 ) Error!void {
     const state = frame.state;
     for (sub) |witness| {
+        if (frame.whole_negative) return;
         try state.charge();
         if (witness.param == asked) {
             try frame.charge(raw, origin, state.text(witness.path), witness.effect, argumentAt(arguments, asked) orelse at, at);
@@ -1566,8 +2910,7 @@ fn isUndefinedValue(frame: *Frame, node: Ast.Node.Index) bool {
             return isUndefinedValue(frame, rhs);
         },
         .@"try", .address_of, .deref => return isUndefinedValue(frame, tree.nodeData(node).node),
-        .grouped_expression, .unwrap_optional =>
-            return isUndefinedValue(frame, tree.nodeData(node).node_and_token[0]),
+        .grouped_expression, .unwrap_optional => return isUndefinedValue(frame, tree.nodeData(node).node_and_token[0]),
         else => return false,
     }
 }
@@ -1651,6 +2994,549 @@ fn declarationEffect(
     return mergeRooted(set, selection.param);
 }
 
+test "sibling generic callers reuse a completed nongeneric callee effect" {
+    const source: [:0]const u8 =
+        \\const Cell = struct {
+        \\    value: u32,
+        \\    fn poison(self: *Cell) void { self.value = undefined; }
+        \\    fn forward(self: *Cell, value: anytype) void { _ = value; self.poison(); }
+        \\};
+        \\fn use(cell: *Cell) void {
+        \\    cell.forward(@as(u8, 1));
+        \\    cell.forward(@as(u64, 2));
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const tree = typed.tree();
+    const poison_token = callNamed(tree, "poison") orelse return error.TestExpectedCall;
+    var callees: [2]FileCache.ActualCallee = undefined;
+    var count: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(call.ast.fn_expr)), "forward")) continue;
+        const forward = (try grow_analysis.actualCalleeOf(cache, call.queryToken(tree, node), null)) orelse return error.TestExpectedCall;
+        const caller = typed.resolver.frameForFunction(forward.reference);
+        const callee = (try grow_analysis.actualCalleeOf(cache, poison_token, caller)) orelse return error.TestExpectedCall;
+        try std.testing.expect(count < callees.len);
+        callees[count] = callee;
+        count += 1;
+    }
+    try std.testing.expectEqual(callees.len, count);
+    var state: State = .{};
+    defer state.deinit(gpa);
+    var remaining: u32 = actual_query_work_limit;
+    state.begin(gpa, tree, poison_token, cache.zls, .{ .remaining = &remaining });
+    const first = try witnessesFor(cache, callees[0].declaration, 0, "", bodyView(cache, callees[0], &state), &state);
+    try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(first, 0));
+    try std.testing.expect(remaining < actual_query_work_limit - 1);
+    state.end();
+
+    // Same unsafe method, reached through another generic caller's frame:
+    // only the completed-answer lookup is charged, not its body.
+    remaining = 1;
+    state.begin(gpa, tree, poison_token, cache.zls, .{ .remaining = &remaining });
+    defer state.end();
+    const second = try witnessesFor(cache, callees[1].declaration, 0, "", bodyView(cache, callees[1], &state), &state);
+    try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(second, 0));
+    try std.testing.expectEqual(@as(u32, 0), remaining);
+}
+test "readonly shared aggregate origins complete without losing a pointee write" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try out.writer.writeAll("fn touch(value: anytype) void { _ = value; }\n");
+    for ([_][]const u8{ "quiet", "poison" }) |name| {
+        try out.writer.print("fn {s}(p: *u32) void {{\nconst a0 = .{{p, p}};\n", .{name});
+        for (1..13) |index|
+            try out.writer.print("const a{d} = .{{a{d}, a{d}}};\n", .{ index, index - 1, index - 1 });
+        try out.writer.writeAll("touch(a12);\n");
+        if (std.mem.eql(u8, name, "poison")) try out.writer.writeAll("p.* = undefined;\n");
+        try out.writer.writeAll("}\n");
+    }
+    const source = try gpa.dupeZ(u8, out.written());
+    defer gpa.free(source);
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const model = try typed.cache.fileModel();
+    budget_mod.clear();
+    defer budget_mod.clear();
+    for ([_][]const u8{ "quiet", "poison" }) |name| {
+        const declaration = model.findFn(name).?.fn_decl;
+        try std.testing.expectEqual(
+            if (std.mem.eql(u8, name, "quiet")) Effect.read_only else Effect.may_invalidate,
+            try declarationEffect(typed.cache, declaration, .{ .param = 0 }),
+        );
+        try std.testing.expect(budget_mod.peek() == null);
+    }
+}
+
+test "completed whole readonly bodies answer narrow demands within one lookup" {
+    const source: [:0]const u8 =
+        \\fn quiet(p: *u32, q: *u32) u32 { _ = q; return p.*; }
+        \\fn poison(p: *u32, q: *u32) void { _ = p; q.* = undefined; }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const model = try cache.fileModel();
+    const view: View = .{ .resolver = &typed.resolver };
+    var state: State = .{};
+    defer state.deinit(gpa);
+    budget_mod.clear();
+    defer budget_mod.clear();
+    const quiet = model.findFn("quiet").?.fn_decl;
+    const poison = model.findFn("poison").?.fn_decl;
+    for ([_]Ast.Node.Index{ quiet, poison }) |declaration| {
+        state.begin(gpa, cache.tree, cache.tree.nodeMainToken(declaration), cache.zls, .{});
+        _ = try collectWitnesses(cache, declaration, any_param, "", view, &state, .whole);
+        state.end();
+    }
+    var remaining: u32 = 1;
+    state.begin(gpa, cache.tree, cache.tree.nodeMainToken(quiet), cache.zls, .{ .remaining = &remaining });
+    try std.testing.expectEqual(Effect.read_only, mergeRooted(try witnessesFor(cache, quiet, 1, "", view, &state), 1));
+    state.end();
+    // A negative whole verdict says nothing about a selected formal.
+    state.begin(gpa, cache.tree, cache.tree.nodeMainToken(poison), cache.zls, .{});
+    defer state.end();
+    try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(try witnessesFor(cache, poison, 1, "", view, &state), 1));
+}
+
+test "completed readonly verdicts reuse callee bodies without hiding parameter writes" {
+    const source: [:0]const u8 =
+        \\fn peek(p: *u32, q: *u32) u32 { _ = q; return p.*; }
+        \\fn poison(p: *u32, q: *u32) void {
+        \\    _ = p.* +% p.* +% p.*;
+        \\    p.* = undefined;
+        \\    q.* = undefined;
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const model = try cache.fileModel();
+    const view: View = .{ .resolver = &typed.resolver };
+    var state: State = .{};
+    defer state.deinit(gpa);
+    budget_mod.clear();
+    defer budget_mod.clear();
+    for ([_][]const u8{ "peek", "poison" }) |name| {
+        const declaration = model.findFn(name).?.fn_decl;
+        const entry = cache.tree.nodeMainToken(declaration);
+        var remaining: u32 = 1;
+        const filed = state.verdict_count;
+        state.begin(gpa, cache.tree, entry, cache.zls, .{ .remaining = &remaining });
+        try std.testing.expectError(error.AnalysisBudgetExceeded, collectWitnesses(cache, declaration, 0, "", view, &state, .{ .cut = .{} }));
+        try std.testing.expectEqual(filed, state.verdict_count);
+        state.end();
+        budget_mod.clear();
+
+        remaining = actual_query_work_limit;
+        state.begin(gpa, cache.tree, entry, cache.zls, .{ .remaining = &remaining });
+        const first = try collectWitnesses(cache, declaration, 0, "", view, &state, .{ .cut = .{} });
+        const effect = mergeRooted(first, 0);
+        try std.testing.expectEqual(
+            if (std.mem.eql(u8, name, "peek")) Effect.read_only else Effect.may_invalidate,
+            effect,
+        );
+        try std.testing.expect(remaining < actual_query_work_limit - 1);
+        state.end();
+
+        // A new root query can afford the memo lookup, but not one body node.
+        remaining = 1;
+        state.begin(gpa, cache.tree, entry, cache.zls, .{ .remaining = &remaining });
+        const second = try collectWitnesses(cache, declaration, 0, "", view, &state, .{ .cut = .{} });
+        try std.testing.expectEqual(effect, mergeRooted(second, 0));
+        try std.testing.expectEqual(@as(u32, 0), remaining);
+        state.end();
+    }
+
+    // A verdict prefix is not a complete witness set. The precise question
+    // must still discover the second parameter's later write.
+    const poison = model.findFn("poison").?.fn_decl;
+    state.begin(gpa, cache.tree, cache.tree.nodeMainToken(poison), cache.zls, .{});
+    defer state.end();
+    const complete = try witnessesFor(cache, poison, 0, "", view, &state);
+    var saw_second = false;
+    for (complete) |witness| saw_second = saw_second or witness.param == 1;
+    try std.testing.expect(saw_second);
+}
+
+test "whole readonly verdict reuse preserves unknown and does not cache cycle cutoffs" {
+    const source: [:0]const u8 =
+        \\extern fn foreign(p: *u32) void;
+        \\fn unresolved(p: *u32) void { foreign(p); }
+        \\fn recursive(p: *u32) void { recursive(p); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const model = try cache.fileModel();
+    const view: View = .{ .resolver = &typed.resolver };
+    var state: State = .{};
+    defer state.deinit(gpa);
+    const opaque_decl = model.findFn("unresolved").?.fn_decl;
+    const entry = cache.tree.nodeMainToken(opaque_decl);
+    state.begin(gpa, cache.tree, entry, cache.zls, .{});
+    try std.testing.expectEqual(Effect.unknown, mergeAll(try collectWitnesses(cache, opaque_decl, any_param, "", view, &state, .whole)));
+    state.end();
+    var remaining: u32 = 1;
+    state.begin(gpa, cache.tree, entry, cache.zls, .{ .remaining = &remaining });
+    try std.testing.expectEqual(Effect.unknown, mergeAll(try collectWitnesses(cache, opaque_decl, any_param, "", view, &state, .whole)));
+    try std.testing.expectEqual(@as(u32, 0), remaining);
+    state.end();
+
+    const recursive = model.findFn("recursive").?.fn_decl;
+    const filed = state.verdicts.count();
+    state.begin(gpa, cache.tree, cache.tree.nodeMainToken(recursive), cache.zls, .{});
+    defer state.end();
+    try std.testing.expectEqual(Effect.unknown, mergeAll(try collectWitnesses(cache, recursive, any_param, "", view, &state, .whole)));
+    try std.testing.expectEqual(filed, state.verdicts.count());
+}
+
+test "readonly verdict memo keeps exact generic instantiations separate" {
+    const source: [:0]const u8 =
+        \\fn select(comptime poison: bool, p: *u32) void {
+        \\    if (poison) p.* = undefined;
+        \\}
+        \\fn loud(p: *u32) void { select(true, p); }
+        \\fn quiet(p: *u32) void { select(false, p); }
+        \\fn use(p: *u32) void { loud(p); quiet(p); }
+    ;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |loud_first| {
+        const typed = try Typed.init(gpa, source);
+        defer typed.deinit(gpa);
+        const loud = callNamed(typed.tree(), "loud") orelse return error.TestExpectedCall;
+        const quiet = callNamed(typed.tree(), "quiet") orelse return error.TestExpectedCall;
+        const first = if (loud_first) loud else quiet;
+        const second = if (loud_first) quiet else loud;
+        try std.testing.expectEqual(!loud_first, (try callEffectAt(typed.cache, first, .{ .whole = null }, .{})).? == .read_only);
+        try std.testing.expectEqual(loud_first, (try callEffectAt(typed.cache, second, .{ .whole = null }, .{})).? == .read_only);
+        try std.testing.expect(typed.cache.effects_state.verdict_count != 0);
+    }
+}
+
+test "global cold source plan retains qualified selections and sibling discharge" {
+    const source: [:0]const u8 =
+        \\const Pair = struct { first: u32, second: u32, third: u32 };
+        \\fn change(left: *Pair, right: *Pair) void {
+        \\    { const left: u32 = 0; _ = left; }
+        \\    const alias = left;
+        \\    { var alias = right; alias = left; _ = alias; }
+        \\    const other = right;
+        \\    alias.first += 1;
+        \\    other.first += 1;
+        \\    left.second = undefined;
+        \\    right.second = undefined;
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |global_first| {
+        const typed = try Typed.init(gpa, source);
+        defer typed.deinit(gpa);
+        const cache = typed.cache;
+        const declaration = (try cache.fileModel()).findFn("change").?.fn_decl;
+        var state: State = .{};
+        defer state.deinit(gpa);
+        state.begin(gpa, cache.tree, cache.tree.nodeMainToken(declaration), cache.zls, .{});
+        defer state.end();
+        const view: View = .{ .resolver = &typed.resolver };
+        if (global_first) _ = try witnessesFor(cache, declaration, global_only, "", view, &state);
+        for ([_]u32{ 0, 1 }) |formal| {
+            const third = try witnessesFor(cache, declaration, formal, "third", view, &state);
+            // The lifetime consumer accepts both non-invalidating classes.
+            // Ordinary local-slot writes must not pin stricter no-store
+            // precision; a lost/wrong selection still retains sibling poison.
+            try std.testing.expect(switch (mergeRooted(third, formal)) {
+                .read_only, .writes_without_invalidation => true,
+                .may_invalidate, .unknown => false,
+            });
+            const first = try witnessesFor(cache, declaration, formal, "first", view, &state);
+            try std.testing.expect(switch (mergeRooted(first, formal)) {
+                .read_only, .writes_without_invalidation => true,
+                .may_invalidate, .unknown => false,
+            });
+            const second = try witnessesFor(cache, declaration, formal, "second", view, &state);
+            try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(second, formal));
+            const root = try witnessesFor(cache, declaration, formal, "", view, &state);
+            try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(root, formal));
+        }
+    }
+}
+
+test "source replay retains opaque descendants after a global cold question" {
+    const source: [:0]const u8 =
+        \\const Cell = struct { value: u32 };
+        \\extern fn foreign(value: u32) void;
+        \\fn inspect(input: *Cell, output: *Cell) void {
+        \\    { const input = output; _ = input; }
+        \\    foreign(blk: {
+        \\        output.* = undefined;
+        \\        break :blk input.value;
+        \\    });
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |global_first| {
+        const typed = try Typed.init(gpa, source);
+        defer typed.deinit(gpa);
+        const cache = typed.cache;
+        const declaration = (try cache.fileModel()).findFn("inspect").?.fn_decl;
+        var state: State = .{};
+        defer state.deinit(gpa);
+        state.begin(gpa, cache.tree, cache.tree.nodeMainToken(declaration), cache.zls, .{});
+        defer state.end();
+        const view: View = .{ .resolver = &typed.resolver };
+        if (global_first) {
+            const globals = try witnessesFor(cache, declaration, global_only, "", view, &state);
+            try std.testing.expectEqual(Effect.unknown, mergeAll(globals));
+        }
+        const output = try witnessesFor(cache, declaration, 1, "", view, &state);
+        try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(output, 1));
+        const field = try witnessesFor(cache, declaration, 1, "value", view, &state);
+        try std.testing.expectEqual(Effect.may_invalidate, mergeRooted(field, 1));
+        const input = try witnessesFor(cache, declaration, 0, "value", view, &state);
+        try std.testing.expect(mergeRooted(input, 0) != .read_only);
+    }
+}
+
+test "source replay keeps comptime branch contexts separate in both warm orders" {
+    const source: [:0]const u8 =
+        \\const Cell = struct { value: u32 };
+        \\fn select(comptime poison: bool, cell: *Cell) void {
+        \\    if (poison) cell.value = undefined;
+        \\}
+        \\fn quiet(cell: *Cell) void { select(false, cell); }
+        \\fn loud(cell: *Cell) void { select(true, cell); }
+    ;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |loud_first| {
+        const typed = try Typed.init(gpa, source);
+        defer typed.deinit(gpa);
+        const model = try typed.cache.fileModel();
+        const quiet = model.findFn("quiet").?.fn_decl;
+        const loud = model.findFn("loud").?.fn_decl;
+        if (loud_first) {
+            try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(typed.cache, loud, .{ .param = 0 }));
+        } else {
+            try std.testing.expectEqual(Effect.read_only, try declarationEffect(typed.cache, quiet, .{ .param = 0 }));
+        }
+        try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(typed.cache, loud, .{ .param = 0, .path = "value" }));
+        try std.testing.expectEqual(Effect.read_only, try declarationEffect(typed.cache, quiet, .{ .param = 0, .path = "value" }));
+    }
+}
+
+test "an interrupted source walk retries the full poisoning body" {
+    const source: [:0]const u8 =
+        \\const Cell = struct { value: u32 };
+        \\fn poison(input: *Cell, output: *Cell) void {
+        \\    const value = input.value +% input.value +% input.value;
+        \\    _ = value;
+        \\    output.* = undefined;
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const declaration = (try cache.fileModel()).findFn("poison").?.fn_decl;
+    budget_mod.clear();
+    defer budget_mod.clear();
+    {
+        var remaining: u32 = 4;
+        var state: State = .{};
+        defer state.deinit(gpa);
+        state.begin(gpa, cache.tree, cache.tree.nodeMainToken(declaration), cache.zls, .{ .remaining = &remaining });
+        defer state.end();
+        try std.testing.expectError(error.AnalysisBudgetExceeded, witnessesFor(cache, declaration, 0, "", .{ .resolver = &typed.resolver }, &state));
+        try std.testing.expectEqual(@as(u32, 0), remaining);
+    }
+    budget_mod.clear();
+    try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(cache, declaration, .{ .param = 1 }));
+    try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(cache, declaration, .{ .param = 1, .path = "value" }));
+}
+
+/// A source whose `heavy` body alone is longer than one allowance, beside a
+/// `light` body that completes at once.
+fn exhaustingSource(gpa: std.mem.Allocator) ![:0]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try out.writer.writeAll("fn light(p: *u32) u32 { return p.*; }\n");
+    try out.writer.writeAll("fn heavy(p: *u32) u32 {\n    var a: u32 = 0;\n");
+    for (0..actual_query_work_limit / 2) |_| try out.writer.writeAll("    _ = a;\n");
+    try out.writer.writeAll("    return p.*;\n}\n");
+    try out.writer.writeAll("fn use(p: *u32) u32 { return heavy(p) + heavy(p) + light(p); }\n");
+    return gpa.dupeZ(u8, out.written());
+}
+
+test "an exhausted root demand fails again at once with the same diagnostic" {
+    const gpa = std.testing.allocator;
+    const source = try exhaustingSource(gpa);
+    defer gpa.free(source);
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const model = try cache.fileModel();
+    const heavy = model.findFn("heavy").?.fn_decl;
+    const light = model.findFn("light").?.fn_decl;
+    const view: View = .{ .resolver = cache.zls.? };
+    budget_mod.clear();
+    defer budget_mod.clear();
+    var state: State = .{};
+    defer state.deinit(gpa);
+    const entry = cache.tree.nodeMainToken(heavy);
+
+    state.begin(gpa, cache.tree, entry, cache.zls, .{});
+    try std.testing.expectError(error.AnalysisBudgetExceeded, witnessesFor(cache, heavy, 0, "", view, &state));
+    const first = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.readonly_call_nodes, first.limit);
+    try std.testing.expectEqual(@as(u32, 0), state.steps_left);
+    try std.testing.expectEqual(@as(u32, 1), state.exhausted.count());
+    state.end();
+
+    // The identical root demand stops at once, with the same label, and
+    // leaves its counter exactly where the exhausted walk left it.
+    state.begin(gpa, cache.tree, entry, cache.zls, .{});
+    try std.testing.expectError(error.AnalysisBudgetExceeded, witnessesFor(cache, heavy, 0, "", view, &state));
+    try std.testing.expectEqual(@as(u32, 0), state.steps_left);
+    const second = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first.limit, second.limit);
+    try std.testing.expectEqual(first.limit_value, second.limit_value);
+    try std.testing.expectEqual(first.reached, second.reached);
+    try std.testing.expectEqual(first.byte, second.byte);
+    try std.testing.expectEqual(first.line, second.line);
+    try std.testing.expectEqualStrings(first.function.slice(), second.function.slice());
+    try std.testing.expectEqual(@as(u32, 1), state.exhausted.count());
+    state.end();
+
+    // A different key is a different walk: another path of the same body
+    // runs its own allowance out and is recorded under its own key.
+    state.begin(gpa, cache.tree, entry, cache.zls, .{});
+    try std.testing.expectError(error.AnalysisBudgetExceeded, witnessesFor(cache, heavy, 0, "x", view, &state));
+    try std.testing.expectEqual(@as(u32, 0), state.steps_left);
+    try std.testing.expectEqual(@as(u32, 2), state.exhausted.count());
+    _ = budget_mod.take();
+    state.end();
+
+    // So is another walk mode of the same formal and path.
+    state.begin(gpa, cache.tree, entry, cache.zls, .{});
+    try std.testing.expectError(error.AnalysisBudgetExceeded, collectWitnesses(cache, heavy, 0, "", view, &state, .whole));
+    try std.testing.expectEqual(@as(u32, 0), state.steps_left);
+    try std.testing.expectEqual(@as(u32, 3), state.exhausted.count());
+    _ = budget_mod.take();
+    state.end();
+
+    // And another declaration completes normally beside the recorded ones.
+    state.begin(gpa, cache.tree, entry, cache.zls, .{});
+    try std.testing.expectEqual(Effect.read_only, mergeRooted(try witnessesFor(cache, light, 0, "", view, &state), 0));
+    try std.testing.expect(state.steps_left > actual_query_work_limit - 64);
+    try std.testing.expectEqual(@as(u32, 3), state.exhausted.count());
+    state.end();
+    try std.testing.expect(budget_mod.take() == null);
+}
+
+test "a recorded failure never replaces a completed answer and a completed walk removes it" {
+    const gpa = std.testing.allocator;
+    const source = try exhaustingSource(gpa);
+    defer gpa.free(source);
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const light = (try cache.fileModel()).findFn("light").?.fn_decl;
+    const view: View = .{ .resolver = cache.zls.? };
+    budget_mod.clear();
+    defer budget_mod.clear();
+    var state: State = .{};
+    defer state.deinit(gpa);
+    state.begin(gpa, cache.tree, cache.tree.nodeMainToken(light), cache.zls, .{});
+    defer state.end();
+    _ = try state.intern(gpa, "");
+    const demand: ExhaustedKey = .{
+        .key = .{
+            .declaration = .{ .tree = cache.tree, .module = cache.module_id, .declaration = light },
+            .parameter = 0,
+            .path = root_path,
+            .context = null,
+        },
+        .mode = .complete,
+    };
+    const stale: Exhausted = .{
+        .budget = actual_query_work_limit,
+        .limit = .readonly_call_nodes,
+        .cap = actual_query_work_limit,
+        .reached = actual_query_work_limit,
+    };
+
+    // A record whose allowance is smaller than this query's does not stop it;
+    // the walk completes, files its answer and drops the record.
+    try state.exhausted.put(gpa, demand, .{ .budget = 1, .limit = stale.limit, .cap = stale.cap, .reached = stale.reached });
+    const done = try witnessesFor(cache, light, 0, "", view, &state);
+    try std.testing.expectEqual(Effect.read_only, mergeRooted(done, 0));
+    try std.testing.expectEqual(@as(u32, 0), state.exhausted.count());
+    try std.testing.expect(state.sets.contains(demand.key));
+
+    // Even a record that would otherwise stop the demand loses to the
+    // completed answer, which is returned as filed.
+    try state.exhausted.put(gpa, demand, stale);
+    const again = try witnessesFor(cache, light, 0, "", view, &state);
+    try std.testing.expectEqual(done.ptr, again.ptr);
+    try std.testing.expect(budget_mod.take() == null);
+}
+
+test "a starved borrowed allowance is not recorded as an exhausted root demand" {
+    const gpa = std.testing.allocator;
+    const source = try exhaustingSource(gpa);
+    defer gpa.free(source);
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const heavy = (try cache.fileModel()).findFn("heavy").?.fn_decl;
+    const view: View = .{ .resolver = cache.zls.? };
+    budget_mod.clear();
+    defer budget_mod.clear();
+    var remaining: u32 = 4;
+    var state: State = .{};
+    defer state.deinit(gpa);
+    state.begin(gpa, cache.tree, cache.tree.nodeMainToken(heavy), cache.zls, .{ .remaining = &remaining });
+    defer state.end();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, witnessesFor(cache, heavy, 0, "", view, &state));
+    try std.testing.expectEqual(@as(u32, 0), remaining);
+    try std.testing.expectEqual(@as(u32, 0), state.exhausted.count());
+}
+
+test "a root effect query that exhausted its allowance fails identically on the next ask" {
+    const gpa = std.testing.allocator;
+    const source = try exhaustingSource(gpa);
+    defer gpa.free(source);
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const cache = typed.cache;
+    const token = callNamed(typed.tree(), "heavy") orelse return error.TestExpectedCall;
+    const light = callNamed(typed.tree(), "light") orelse return error.TestExpectedCall;
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{}));
+    const first = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), cache.effects_state.exhausted.count());
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{}));
+    const second = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first.limit, second.limit);
+    try std.testing.expectEqual(first.limit_value, second.limit_value);
+    try std.testing.expectEqual(first.byte, second.byte);
+    try std.testing.expectEqual(@as(u32, 1), cache.effects_state.exhausted.count());
+    // The unsafe control still fires for the other callee, which completes.
+    try std.testing.expectEqual(Effect.read_only, (try cache.callEffectAt(light, .{ .parameter = .{ .param = 0 } }, .{})).?);
+    try std.testing.expect(budget_mod.take() == null);
+}
+
 test "parameter effects distinguish a written formal from a read formal" {
     // Without a resolver nothing can prove what `input.value` holds, and a
     // store this analysis cannot TYPE is charged as a replacement rather than
@@ -1671,6 +3557,26 @@ test "parameter effects distinguish a written formal from a read formal" {
     const declaration = (try cache.fileModel()).findFn("inspect").?.fn_decl;
     try std.testing.expectEqual(Effect.read_only, try declarationEffect(&cache, declaration, .{ .param = 0 }));
     try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(&cache, declaration, .{ .param = 1 }));
+}
+
+test "opaque destructuring and assembly stores cannot certify read only" {
+    const source: [:0]const u8 =
+        \\fn destructure(p: *u32, q: *u32) void {
+        \\    p.*, q.* = .{ @as(u32, undefined), @as(u32, undefined) };
+        \\}
+        \\fn assembled(p: *u32) void {
+        \\    asm volatile ("" : : [ptr] "r" (p) : .{ .memory = true });
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    const model = try cache.fileModel();
+    try std.testing.expect((try declarationEffect(&cache, model.findFn("destructure").?.fn_decl, .{ .param = 0 })) != .read_only);
+    try std.testing.expect((try declarationEffect(&cache, model.findFn("destructure").?.fn_decl, .{ .param = 1 })) != .read_only);
+    try std.testing.expect((try declarationEffect(&cache, model.findFn("assembled").?.fn_decl, .{ .param = 0 })) != .read_only);
 }
 
 test "unknown memory intrinsic cannot certify a parameter read only" {
@@ -1695,6 +3601,7 @@ test "a memory intrinsic is charged at its destination operand" {
         \\fn bumped(cell: *Cell) void { @atomicRmw(u32, &cell.value, .Add, @as(u32, 1), .monotonic); }
         \\fn loaded(cell: *const Cell) u32 { return @atomicLoad(u32, &cell.value, .seq_cst); }
         \\fn shouted(message: []const u8) void { @panic(message); }
+        \\fn zeroOperands(bytes: []const u8) void { _ = bytes; _ = @This(); }
     ;
     const gpa = std.testing.allocator;
     const typed = try Typed.init(gpa, source);
@@ -1717,20 +3624,23 @@ test "a memory intrinsic is charged at its destination operand" {
     // A load reads and writes nothing, and a one-operand builtin has an
     // ABSENT second slot that is not a node at all.
     try std.testing.expectEqual(Effect.read_only, try at(typed, "loaded", ""));
+    // A zero-operand builtin has no operand range to slice or dereference.
+    try std.testing.expectEqual(Effect.read_only, try at(typed, "zeroOperands", ""));
     // An intrinsic this table does not know is charged at full strength.
     try std.testing.expectEqual(Effect.unknown, try at(typed, "shouted", ""));
 }
 
-/// One complete query, through whichever allocator it is handed — so the
-/// refusal point can be swept across the whole build.
-fn effectUnderFailing(
+/// Resolver, model and binding setup use the real allocator. Each call builds
+/// a fresh query State; only that demand query uses the injected allocator.
+fn effectUnderAllocator(
+    typed: *Typed,
+    declaration: Ast.Node.Index,
     gpa: std.mem.Allocator,
-    source: [:0]const u8,
-) !?Effect {
-    const typed = try Typed.init(gpa, source);
-    defer typed.deinit(gpa);
-    const declaration = (try typed.cache.fileModel()).findFn("bump").?.fn_decl;
-    return try declarationEffect(typed.cache, declaration, .{ .param = 0, .path = "first" });
+) !Effect {
+    const original = typed.cache.gpa;
+    typed.cache.gpa = gpa;
+    defer typed.cache.gpa = original;
+    return declarationEffect(typed.cache, declaration, .{ .param = 0, .path = "first" });
 }
 
 test "a completed query keeps its answer when only the memo filing runs out" {
@@ -1739,27 +3649,35 @@ test "a completed query keeps its answer when only the memo filing runs out" {
         \\fn bump(pair: *Pair) void { pair.first += 1; }
     ;
     const gpa = std.testing.allocator;
-    const expected = (try effectUnderFailing(gpa, source)) orelse return error.TestExpectedEffect;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const declaration = (try typed.cache.fileModel()).findFn("bump").?.fn_decl;
+    const expected = try declarationEffect(typed.cache, declaration, .{ .param = 0, .path = "first" });
     try std.testing.expectEqual(Effect.writes_without_invalidation, expected);
+    var counting: std.testing.FailingAllocator = .init(gpa, .{});
+    try std.testing.expectEqual(expected, try effectUnderAllocator(typed, declaration, counting.allocator()));
+    try std.testing.expect(counting.alloc_index != 0);
+    var survived_failure = false;
     var fail_index: usize = 0;
-    while (fail_index < 96) : (fail_index += 1) {
+    while (fail_index < counting.alloc_index) : (fail_index += 1) {
         var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
-        const answer = effectUnderFailing(failing.allocator(), source) catch |err| switch (err) {
-            // Refusing an allocation before the fact is complete travels out;
-            // nothing was finished, so nothing is published or returned.
-            error.OutOfMemory => continue,
+        const answer = effectUnderAllocator(typed, declaration, failing.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                continue;
+            },
             else => return err,
         };
-        // A fact this scan DID complete is returned even when the table that
-        // would have filed it could not grow.
-        try std.testing.expectEqual(expected, answer.?);
+        try std.testing.expectEqual(expected, answer);
+        survived_failure = survived_failure or failing.has_induced_failure;
     }
+    try std.testing.expect(survived_failure);
 }
 
 test "a sibling field is charged and a field no site names is not" {
     const source: [:0]const u8 =
         \\const Pair = struct { first: u32, second: u32, third: u32 };
-        \\fn bump(pair: *Pair) void { pair.first += 1; }
+        \\fn bump(pair: *Pair) void { pair.first += 1; pair.second += 1; }
     ;
     const gpa = std.testing.allocator;
     const typed = try Typed.init(gpa, source);
@@ -1769,9 +3687,8 @@ test "a sibling field is charged and a field no site names is not" {
         Effect.writes_without_invalidation,
         try declarationEffect(typed.cache, declaration, .{ .param = 0, .path = "first" }),
     );
-    // Two paths that only share a root may name the same buffer, so the
-    // sibling's store is charged against this one rather than read as proof
-    // that nothing else in the object moved.
+    // Both fields are actually written. The address-free object graph proves
+    // that the third field cannot alias either scalar destination.
     try std.testing.expectEqual(
         Effect.writes_without_invalidation,
         try declarationEffect(typed.cache, declaration, .{ .param = 0, .path = "second" }),
@@ -1780,6 +3697,22 @@ test "a sibling field is charged and a field no site names is not" {
         Effect.read_only,
         try declarationEffect(typed.cache, declaration, .{ .param = 0, .path = "third" }),
     );
+}
+
+test "sibling slice fields can carry the same backing storage" {
+    const source: [:0]const u8 =
+        \\const Pair = struct { first: []u8, second: []u8 };
+        \\fn bump(pair: *Pair) void { @memset(pair.first, undefined); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const declaration = (try typed.cache.fileModel()).findFn("bump").?.fn_decl;
+    try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(
+        typed.cache,
+        declaration,
+        .{ .param = 0, .path = "second" },
+    ));
 }
 
 test "an indexed scalar store keeps the container and an undefined one does not" {
@@ -1823,8 +3756,9 @@ test "replacing the object a field lives in invalidates that field" {
 test "an opaque write to a private construction leaves the formal alone" {
     const source: [:0]const u8 =
         \\fn wipe(bytes: []u8) void {
-        \\    const scratch = &[_]u8{0};
-        \\    @memset(scratch, 0);
+        \\    _ = bytes;
+        \\    var scratch = [_]u8{0};
+        \\    @memset(&scratch, 0);
         \\}
     ;
     const gpa = std.testing.allocator;
@@ -1883,6 +3817,7 @@ const Typed = struct {
         errdefer gpa.destroy(self.cache);
         self.cache.* = FileCache.init(gpa, self.tree());
         self.cache.setZls(&self.resolver);
+        self.cache.module_id = self.resolver.handle.module;
         return self;
     }
 
@@ -1912,6 +3847,155 @@ fn callNamed(tree: *const Ast, name: []const u8) ?Ast.TokenIndex {
     return null;
 }
 
+test "excluded actual callees fail without publishing a null memo and can be retried" {
+    // Real import admission distinguishes a failed lookup from an opaque
+    // callback. A failed lookup must not become the callback's successful null.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "remote.zig",
+        .data = "pub const Scalar = u8; pub fn read(bytes: []const u8) u8 { return bytes[0]; }",
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    const remote = try std.fs.path.join(gpa, &.{ directory, "remote.zig" });
+    defer gpa.free(remote);
+    var context: Typed.engine.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory}, .excludes = &.{remote} };
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path,
+        \\const remote = @import("remote.zig");
+        \\fn use(bytes: []const u8) u8 { return remote.read(bytes); }
+        \\fn intrinsic(bytes: []const u8) u8 { return @call(.auto, remote.read, .{bytes}); }
+        \\fn narrow(value: remote.Scalar) void { _ = value; }
+        \\fn invokeCallback(callback: *const fn ([]const u8) u8, bytes: []const u8) u8 {
+        \\    return callback(bytes);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const cache = try gpa.create(FileCache);
+    defer gpa.destroy(cache);
+    cache.* = FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const token = callNamed(tree, "read") orelse return error.TestExpectedCall;
+    try std.testing.expectError(error.SourceExcluded, actualCallSummaryAt(cache, token, null));
+    try std.testing.expect(!cache.actual_callees.contains(token));
+    const intrinsic = (try cache.fileModel()).findFn("intrinsic").?.fn_decl;
+    try std.testing.expectError(
+        error.SourceExcluded,
+        declarationEffect(cache, intrinsic, .{ .param = 0 }),
+    );
+    const narrow = (try cache.fileModel()).findFn("narrow").?.fn_decl;
+    var narrow_buffer: [1]Ast.Node.Index = undefined;
+    const narrow_proto = tokens.fnProto(tree, &narrow_buffer, narrow).?;
+    try std.testing.expectError(
+        error.SourceExcluded,
+        grow_analysis.parameterIsNonAddressScalar(cache, narrow_proto, .{ .param = 0, .path = "" }),
+    );
+    try std.testing.expectEqual(@as(u32, 0), cache.scalar_params.count());
+    context.store.source_policy = .{ .roots = &.{directory} };
+    const record = (try actualCallSummaryAt(cache, token, null)) orelse
+        return error.TestExpectedCallee;
+    try std.testing.expect(cache.actual_callees.contains(token));
+    var buffer: [2]Ast.Node.Index = undefined;
+    const argument = (try record.callArgumentFor(cache, &buffer, 0)) orelse
+        return error.TestExpectedArgument;
+    try std.testing.expectEqualStrings("bytes", tree.tokenSlice(tree.nodeMainToken(argument)));
+    try std.testing.expectEqual(
+        @as(?Ast.Node.Index, null),
+        try record.callArgumentFor(cache, &buffer, 1),
+    );
+    try std.testing.expectEqual(
+        Effect.read_only,
+        try declarationEffect(cache, intrinsic, .{ .param = 0 }),
+    );
+    try std.testing.expect(try grow_analysis.parameterIsNonAddressScalar(
+        cache,
+        narrow_proto,
+        .{ .param = 0, .path = "" },
+    ));
+    const opaque_call = callNamed(tree, "callback") orelse return error.TestExpectedCall;
+    try std.testing.expect((try actualCallSummaryAt(cache, opaque_call, null)) == null);
+    try std.testing.expect(cache.actual_callees.contains(opaque_call));
+}
+
+test "scalar effect failures publish no witness memo and can be retried" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "remote.zig",
+        .data = "pub const Scalar = u8; pub const value: u8 = 1;",
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    const remote = try std.fs.path.join(gpa, &.{ directory, "remote.zig" });
+    defer gpa.free(remote);
+    // Exercise both destination and stored-value queries for ordinary stores
+    // and byte intrinsics. Each resolver starts with an unread remote source.
+    const sources = [_][:0]const u8{
+        \\const remote = @import("remote.zig");
+        \\fn write(bytes: []remote.Scalar) void { bytes[0] = 1; }
+        ,
+        \\const remote = @import("remote.zig");
+        \\fn write(bytes: []u8) void { bytes[0] = remote.value; }
+        ,
+        \\const remote = @import("remote.zig");
+        \\fn write(bytes: []remote.Scalar) void { @memset(bytes, 1); }
+        ,
+        \\const remote = @import("remote.zig");
+        \\fn write(bytes: []u8) void { @memset(bytes, remote.value); }
+        ,
+    };
+    for (sources) |source| {
+        var context: Typed.engine.TypeContext = undefined;
+        try context.init(gpa, io);
+        defer context.deinit();
+        context.store.source_policy = .{ .roots = &.{directory}, .excludes = &.{remote} };
+        var resolver: TypeResolver = undefined;
+        try resolver.init(&context, gpa, path, source);
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        const cache = try gpa.create(FileCache);
+        defer gpa.destroy(cache);
+        cache.* = FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        cache.module_id = resolver.handle.module;
+        const declaration = (try cache.fileModel()).findFn("write").?.fn_decl;
+        var state: State = .{};
+        defer state.deinit(gpa);
+        state.begin(gpa, tree, tree.nodeMainToken(declaration), &resolver, .{});
+        defer state.end();
+        const view: View = .{ .resolver = &resolver };
+        try std.testing.expectError(
+            error.SourceExcluded,
+            witnessesFor(cache, declaration, 0, "", view, &state),
+        );
+        try std.testing.expectEqual(@as(usize, 0), state.sets.count());
+        try std.testing.expectEqual(@as(usize, 0), state.active.count());
+        try std.testing.expectEqual(@as(u32, 0), state.depth);
+        context.store.source_policy = .{ .roots = &.{directory} };
+        try std.testing.expectEqual(
+            Effect.writes_without_invalidation,
+            mergeRooted(try witnessesFor(cache, declaration, 0, "", view, &state), 0),
+        );
+        try std.testing.expectEqual(@as(usize, 1), state.sets.count());
+    }
+}
+
 test "a callee's parameter path is carried into the caller's own path" {
     const source: [:0]const u8 =
         \\const Cell = struct { value: u32, other: u32 };
@@ -1929,14 +4013,13 @@ test "a callee's parameter path is carried into the caller's own path" {
         Effect.writes_without_invalidation,
         try declarationEffect(typed.cache, use, .{ .param = 0, .path = "inner.value" }),
     );
-    // A path that only shares a root with the written one may still name the
-    // same buffer, so the callee's store is charged here rather than dropped.
+    // These scalar fields occupy different cells in an address-free graph.
     try std.testing.expectEqual(
-        Effect.writes_without_invalidation,
+        Effect.read_only,
         try declarationEffect(typed.cache, use, .{ .param = 0, .path = "inner.other" }),
     );
     try std.testing.expectEqual(
-        Effect.writes_without_invalidation,
+        Effect.read_only,
         try declarationEffect(typed.cache, use, .{ .param = 0, .path = "spare" }),
     );
     // A body that writes nothing answers read only on every path of it.
@@ -1967,12 +4050,459 @@ test "storage a callee reaches without a formal reaches the caller's question to
     try std.testing.expectEqual(Effect.unknown, (try cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{})).?);
 }
 
+test "whole mutation proof retains uncertain global and formal error branches" {
+    // A consumer may omit mutation work only when every reachable effect is read-only.
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn quiet(value: usize) usize { return value + 1; }
+        \\fn quiet_forward(value: usize) usize { return quiet(value); }
+        \\fn change_private(value: *u32) void { value.* = 1; }
+        \\fn quiet_local() void { var value: u32 = 0; change_private(&value); }
+        \\fn global(flag: bool) void { if (flag) foreign(); }
+        \\fn formal(value: *u32, fail: bool) !void {
+        \\    if (fail) { value.* = undefined; return error.Failed; }
+        \\}
+        \\fn use(value: *u32, flag: bool) !void {
+        \\    _ = quiet(1);
+        \\    _ = quiet_forward(1);
+        \\    quiet_local();
+        \\    global(flag);
+        \\    try formal(value, flag);
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    for ([_][]const u8{ "quiet", "quiet_forward", "quiet_local", "global", "formal" }) |name| {
+        const token = callNamed(typed.tree(), name) orelse return error.TestExpectedCall;
+        const actual = (try actualCallSummaryAt(typed.cache, token, null)) orelse
+            return error.TestExpectedCall;
+        const effect = (try callEffectAt(typed.cache, token, .{ .whole = actual.callee }, .{})) orelse
+            return error.TestExpectedCall;
+        try std.testing.expectEqual(std.mem.startsWith(u8, name, "quiet"), effect == .read_only);
+    }
+}
+
+test "whole negative prefix never publishes a completed body or source plan" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn change(value: *u32) void {
+        \\    value.* = 1;
+        \\    foreign();
+        \\}
+        \\fn forward(value: *u32) void { change(value); }
+        \\fn use(value: *u32) void { forward(value); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    var state: State = .{};
+    defer state.deinit(gpa);
+    const token = callNamed(typed.tree(), "forward") orelse return error.TestExpectedCall;
+    const actual = (try actualCallSummaryAt(typed.cache, token, null)) orelse
+        return error.TestExpectedCall;
+    try std.testing.expectEqual(Effect.unknown, (try callEffectAt(
+        typed.cache,
+        token,
+        .{ .whole = actual.callee },
+        .{ .effects_state = &state },
+    )).?);
+    try std.testing.expectEqual(@as(usize, 0), state.sets.count());
+    try std.testing.expectEqual(@as(usize, 0), state.active.count());
+    try std.testing.expectEqual(@as(usize, 0), typed.cache.effect_source_plans.count());
+    // The precise question must still reach the opaque call after the store.
+    try std.testing.expectEqual(Effect.unknown, (try callEffectAt(
+        typed.cache,
+        token,
+        .unrooted,
+        .{ .effects_state = &state },
+    )).?);
+    try std.testing.expect(state.sets.count() != 0);
+    try std.testing.expect(typed.cache.effect_source_plans.count() != 0);
+}
+
+test "instantiated reflection excludes impossible effects but runtime branches stay unknown" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn inspect(comptime T: type, value: T) void {
+        \\    switch (@typeInfo(T)) {
+        \\        .pointer => foreign(),
+        \\        else => { _ = value; },
+        \\    }
+        \\}
+        \\fn known(value: u32) void { inspect(u32, value); }
+        \\fn pointer(value: *u32) void { inspect(*u32, value); }
+        \\fn conditional(flag: bool) void { if (flag) foreign(); }
+        \\fn unknown(flag: bool) void { conditional(flag); }
+    ;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |pointer_first| {
+        const typed = try Typed.init(gpa, source);
+        defer typed.deinit(gpa);
+        const known = callNamed(typed.tree(), "inspect") orelse return error.TestExpectedCall;
+        const unknown = callNamed(typed.tree(), "conditional") orelse return error.TestExpectedCall;
+        const pointer = (try typed.cache.fileModel()).findFn("pointer").?.fn_decl;
+        if (pointer_first) {
+            try std.testing.expectEqual(
+                Effect.unknown,
+                try declarationEffect(typed.cache, pointer, .{ .param = 0 }),
+            );
+        }
+        try std.testing.expectEqual(
+            Effect.read_only,
+            (try typed.cache.callEffectAt(known, .unrooted, .{})).?,
+        );
+        try std.testing.expectEqual(
+            Effect.unknown,
+            try declarationEffect(typed.cache, pointer, .{ .param = 0 }),
+        );
+        try std.testing.expectEqual(
+            Effect.unknown,
+            (try typed.cache.callEffectAt(unknown, .unrooted, .{})).?,
+        );
+    }
+}
+
+test "mutable address-free scratch does not become an unrooted caller effect" {
+    const source: [:0]const u8 =
+        \\const State = struct { bits: u64 };
+        \\fn change(state: *State, next: u64) void { state.bits = next; }
+        \\fn compute(bytes: []const u8) u64 {
+        \\    var state = State{ .bits = 0 };
+        \\    change(&state, bytes[0]);
+        \\    return state.bits;
+        \\}
+        \\fn use(bytes: []const u8) u64 { return compute(bytes); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const token = callNamed(typed.tree(), "compute") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(
+        Effect.read_only,
+        (try typed.cache.callEffectAt(token, .unrooted, .{})).?,
+    );
+    try std.testing.expectEqual(
+        Effect.read_only,
+        (try typed.cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{})).?,
+    );
+}
+
+test "factory value dependencies are not the destination of private inline stores" {
+    const source: [:0]const u8 =
+        \\const State = struct {
+        \\    bits: u64, cells: [2]u64,
+        \\    fn init(seed: u64) State { return .{ .bits = seed, .cells = .{ seed, seed } }; }
+        \\};
+        \\fn compute(bytes: []const u8) u64 {
+        \\    var state = State.init(bytes.len);
+        \\    state.bits = bytes.len;
+        \\    state.cells[0] = bytes[0];
+        \\    return state.bits;
+        \\}
+        \\fn pointerFactory(state: *State) *State { return state; }
+        \\fn pointerWrite(state: *State) void {
+        \\    var borrowed = pointerFactory(state);
+        \\    borrowed.bits = undefined;
+        \\}
+        \\const Header = struct { cells: []u64 };
+        \\fn sliceFactory(cells: []u64) Header { return .{ .cells = cells }; }
+        \\fn sliceWrite(cells: []u64) void {
+        \\    var borrowed = sliceFactory(cells);
+        \\    borrowed.cells[0] = undefined;
+        \\}
+        \\fn use(bytes: []const u8) u64 { return compute(bytes); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const token = callNamed(typed.tree(), "compute") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(Effect.read_only, (try typed.cache.callEffectAt(token, .unrooted, .{})).?);
+    try std.testing.expectEqual(Effect.read_only, (try typed.cache.callEffectAt(token, .{
+        .parameter = .{ .param = 0 },
+    }, .{})).?);
+    const model = try typed.cache.fileModel();
+    for ([_][]const u8{ "pointerWrite", "sliceWrite" }) |name| {
+        try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(
+            typed.cache,
+            model.findFn(name).?.fn_decl,
+            .{ .param = 0 },
+        ));
+    }
+}
+
+test "unrooted recursion closes known bodies without caching an incomplete cycle" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn quiet(depth: u32) void { if (depth != 0) quiet(depth - 1); }
+        \\fn first(depth: u32) void { if (depth != 0) second(depth - 1); foreign(); }
+        \\fn second(depth: u32) void { if (depth != 0) first(depth - 1); }
+        \\fn use(depth: u32) void { quiet(depth); first(depth); second(depth); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const model = try typed.cache.fileModel();
+    var state: State = .{};
+    defer state.deinit(gpa);
+    state.begin(gpa, typed.tree(), 0, typed.cache.zls, .{});
+    defer state.end();
+    const view: View = .{ .resolver = typed.cache.zls.? };
+    const quiet = model.findFn("quiet").?.fn_decl;
+    const first = model.findFn("first").?.fn_decl;
+    const second = model.findFn("second").?.fn_decl;
+    try std.testing.expectEqual(
+        Effect.read_only,
+        mergeAll(try witnessesFor(typed.cache, quiet, global_only, "", view, &state)),
+    );
+    try std.testing.expectEqual(
+        Effect.unknown,
+        mergeAll(try witnessesFor(typed.cache, first, global_only, "", view, &state)),
+    );
+    try std.testing.expectEqual(
+        Effect.unknown,
+        mergeAll(try witnessesFor(typed.cache, second, global_only, "", view, &state)),
+    );
+}
+
+test "a closed global component files each member's own union" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn first(depth: u32) void { if (depth != 0) second(depth - 1); }
+        \\fn second(depth: u32) void { if (depth != 0) third(depth - 1); }
+        \\fn third(depth: u32) void { if (depth != 0) first(depth - 1); foreign(); }
+        \\fn quiet(depth: u32) void { if (depth != 0) quiet(depth - 1); }
+        \\fn use(depth: u32) void { first(depth); quiet(depth); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    var state: State = .{};
+    defer state.deinit(gpa);
+    const first = callNamed(typed.tree(), "first") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(Effect.unknown, (try callEffectAt(typed.cache, first, .unrooted, .{ .effects_state = &state })).?);
+    // One walk from the first member answers all three: the foreign call
+    // lives in the last member only, and each of them reaches it.
+    for ([_][]const u8{ "second", "third" }) |name| {
+        const token = callNamed(typed.tree(), name) orelse return error.TestExpectedCall;
+        var allowance: u32 = actual_query_work_limit;
+        try std.testing.expectEqual(Effect.unknown, (try callEffectAt(typed.cache, token, .unrooted, .{
+            .effects_state = &state,
+            .remaining = &allowance,
+        })).?);
+        try std.testing.expect(actual_query_work_limit - allowance <= 3);
+    }
+    // A body that only meets itself is a component of one.
+    const quiet = callNamed(typed.tree(), "quiet") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(Effect.read_only, (try callEffectAt(typed.cache, quiet, .unrooted, .{ .effects_state = &state })).?);
+    var again: u32 = actual_query_work_limit;
+    try std.testing.expectEqual(Effect.read_only, (try callEffectAt(typed.cache, quiet, .unrooted, .{
+        .effects_state = &state,
+        .remaining = &again,
+    })).?);
+    try std.testing.expect(actual_query_work_limit - again <= 3);
+}
+
+test "a stopped read-only-only question files nothing partial and stays exact when complete" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn deep(value: *u32) void { value.* = 1; }
+        \\fn middle(value: *u32) void { deep(value); foreign(); }
+        \\fn top(value: *u32) void { middle(value); }
+        \\fn peek(value: *u32) u32 { return value.*; }
+        \\fn use(value: *u32) void { top(value); _ = peek(value); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    var state: State = .{};
+    defer state.deinit(gpa);
+    const top = callNamed(typed.tree(), "top") orelse return error.TestExpectedCall;
+    const stopped = (try callEffectAt(typed.cache, top, .{ .parameter = .{ .param = 0, .read_only_only = true } }, .{ .effects_state = &state })).?;
+    try std.testing.expect(stopped != .read_only);
+    try std.testing.expectEqual(@as(usize, 0), state.sets.count());
+    try std.testing.expectEqual(@as(usize, 0), typed.cache.effect_source_plans.count());
+    try std.testing.expectEqual(@as(usize, 0), state.active.count());
+    // The same question asked completely keeps its exact verdict.
+    try std.testing.expectEqual(Effect.may_invalidate, (try callEffectAt(typed.cache, top, .{ .parameter = .{ .param = 0 } }, .{ .effects_state = &state })).?);
+    try std.testing.expect(state.sets.count() != 0);
+    // And a read-only callee is still certified through the stopping form.
+    const peek = callNamed(typed.tree(), "peek") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(Effect.read_only, (try callEffectAt(typed.cache, peek, .{ .parameter = .{ .param = 0, .read_only_only = true } }, .{ .effects_state = &state })).?);
+}
+
+test "advisory witnesses stop a read-only-only question only while the formal can carry them" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn address(value: *u32) void { _ = value; foreign(); }
+        \\fn scalar(value: u32) void { _ = value; foreign(); }
+        \\fn use(value: *u32) void { address(value); scalar(value.*); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const address = callNamed(typed.tree(), "address") orelse return error.TestExpectedCall;
+    const scalar = callNamed(typed.tree(), "scalar") orelse return error.TestExpectedCall;
+    for ([_]bool{ false, true }) |read_only_only| {
+        const carried = (try typed.cache.callEffectAt(address, .{ .parameter = .{ .param = 0, .read_only_only = read_only_only } }, .{})).?;
+        try std.testing.expect(carried != .read_only);
+        // A by-value scalar cannot reach the foreign call's storage.
+        const copied = (try typed.cache.callEffectAt(scalar, .{ .parameter = .{ .param = 0, .read_only_only = read_only_only } }, .{})).?;
+        try std.testing.expectEqual(Effect.read_only, copied);
+    }
+}
+
+test "a second root question reuses the file's completed answers" {
+    const source: [:0]const u8 =
+        \\fn leaf(value: *u32) u32 { return value.*; }
+        \\fn inner(value: *u32) u32 { return leaf(value) + leaf(value); }
+        \\fn outer(value: *u32) u32 { return inner(value) + inner(value); }
+        \\fn use(value: *u32) u32 { return outer(value); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const token = callNamed(typed.tree(), "outer") orelse return error.TestExpectedCall;
+    var first: u32 = actual_query_work_limit;
+    try std.testing.expectEqual(Effect.read_only, (try typed.cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{ .remaining = &first })).?);
+    var second: u32 = actual_query_work_limit;
+    try std.testing.expectEqual(Effect.read_only, (try typed.cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{ .remaining = &second })).?);
+    try std.testing.expect(second > first);
+    try std.testing.expect(actual_query_work_limit - second <= 4);
+    try std.testing.expect(typed.cache.effects_state.sets.count() != 0);
+}
+
+test "dense recursive components fold within one allowance" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const count = 14;
+    try out.writer.writeAll("extern fn foreign() void;\n");
+    for (0..count) |index| {
+        try out.writer.print(
+            "fn f{d}(p: *u32, depth: u32) void {{ if (depth != 0) {{ f{d}(p, depth - 1); f{d}(p, depth - 1); f{d}(p, depth - 1); }} if (depth == 99) foreign(); }}\n",
+            .{ index, (index + 1) % count, (index + 5) % count, (index + 9) % count },
+        );
+    }
+    try out.writer.writeAll("fn use(p: *u32) void { f0(p, 3); }\n");
+    const source = try gpa.dupeZ(u8, out.written());
+    defer gpa.free(source);
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const token = callNamed(typed.tree(), "f0") orelse return error.TestExpectedCall;
+    try std.testing.expect((try typed.cache.callEffectAt(token, .unrooted, .{})).? != .read_only);
+    try std.testing.expect((try typed.cache.callEffectAt(token, .{ .parameter = .{ .param = 0 } }, .{})).? != .read_only);
+}
+
+test "shared recursive global branches retain writes and opaque captures at each entry" {
+    const source: [:0]const u8 =
+        \\var stored: u32 = 0;
+        \\extern fn foreign() void;
+        \\fn left(depth: u32) void {
+        \\    if (depth != 0) right(depth - 1);
+        \\    stored = 1;
+        \\}
+        \\fn right(depth: u32) void {
+        \\    if (depth != 0) left(depth - 1);
+        \\}
+        \\fn opaqueLeft(depth: u32) void {
+        \\    if (depth != 0) opaqueRight(depth - 1);
+        \\    foreign();
+        \\}
+        \\fn opaqueRight(depth: u32) void {
+        \\    if (depth != 0) opaqueLeft(depth - 1);
+        \\}
+        \\fn diamond(depth: u32) void {
+        \\    left(depth); right(depth); left(depth);
+        \\    opaqueLeft(depth); opaqueRight(depth); opaqueLeft(depth);
+        \\}
+        \\fn use(depth: u32) void {
+        \\    diamond(depth); right(depth); opaqueRight(depth);
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const diamond = callNamed(typed.tree(), "diamond") orelse return error.TestExpectedCall;
+    try std.testing.expect((try typed.cache.callEffectAt(diamond, .unrooted, .{})).? != .read_only);
+    // These entries share the completed root's cache, but neither may reuse
+    // an intermediate answer that omitted its recursive sibling's events.
+    const right = callNamed(typed.tree(), "right") orelse return error.TestExpectedCall;
+    try std.testing.expect((try typed.cache.callEffectAt(right, .unrooted, .{})).? != .read_only);
+    const opaque_right = callNamed(typed.tree(), "opaqueRight") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(Effect.unknown, (try typed.cache.callEffectAt(opaque_right, .unrooted, .{})).?);
+}
+
+test "global demand retains writes through a by-value formal receiver and recursive entries" {
+    const source: [:0]const u8 =
+        \\var touched: u32 = 0;
+        \\fn touchGlobal(depth: u32) void {
+        \\    if (depth != 0) sibling(depth - 1);
+        \\    touched = undefined;
+        \\}
+        \\fn sibling(depth: u32) void {
+        \\    if (depth != 0) touchGlobal(depth - 1);
+        \\}
+        \\const Value = struct {
+        \\    n: u32,
+        \\    fn run(self: Value) void { touchGlobal(self.n); }
+        \\};
+        \\fn outer(value: Value) void { value.run(); }
+        \\fn use(value: Value) void { outer(value); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    var state: State = .{};
+    defer state.deinit(gpa);
+    // Reuse one supplied state across complete public queries. Both SCC
+    // entries must retain the write after the outer query has retired.
+    for ([_][]const u8{ "outer", "touchGlobal", "sibling", "outer" }) |name| {
+        const token = callNamed(typed.tree(), name) orelse return error.TestExpectedCall;
+        const effect = (try typed.cache.callEffectAt(token, .unrooted, .{
+            .effects_state = &state,
+        })) orelse return error.TestExpectedCall;
+        try std.testing.expectEqual(Effect.may_invalidate, effect);
+    }
+}
+
+test "global demand retains opaque reach through a by-value formal receiver and recursive entries" {
+    const source: [:0]const u8 =
+        \\extern fn foreign() void;
+        \\fn touchGlobal(depth: u32) void {
+        \\    if (depth != 0) sibling(depth - 1);
+        \\    foreign();
+        \\}
+        \\fn sibling(depth: u32) void {
+        \\    if (depth != 0) touchGlobal(depth - 1);
+        \\}
+        \\const Value = struct {
+        \\    n: u32,
+        \\    fn run(self: Value) void { touchGlobal(self.n); }
+        \\};
+        \\fn outer(value: Value) void { value.run(); }
+        \\fn use(value: Value) void { outer(value); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    var state: State = .{};
+    defer state.deinit(gpa);
+    for ([_][]const u8{ "outer", "touchGlobal", "sibling", "outer" }) |name| {
+        const token = callNamed(typed.tree(), name) orelse return error.TestExpectedCall;
+        const effect = (try typed.cache.callEffectAt(token, .unrooted, .{
+            .effects_state = &state,
+        })) orelse return error.TestExpectedCall;
+        try std.testing.expectEqual(Effect.unknown, effect);
+    }
+}
+
 test "a callee that writes another formal charges that argument, not the call" {
     const source: [:0]const u8 =
-        \\fn store(target: *u32, value: *u32) void { value.* = 0; }
+        \\fn store(target: *u32, value: *u32) void { _ = target; value.* = 0; }
         \\fn use(target: *u32) void {
-        \\    const spare = &[_]u32{0};
-        \\    store(target, spare);
+        \\    var spare: u32 = 0;
+        \\    store(target, &spare);
         \\}
     ;
     const gpa = std.testing.allocator;
@@ -1984,9 +4514,196 @@ test "a callee that writes another formal charges that argument, not the call" {
     try std.testing.expectEqual(Effect.read_only, try declarationEffect(typed.cache, declaration, .{ .param = 0 }));
 }
 
+test "call intrinsic folds its actual generic body and keeps unknown callbacks unsafe" {
+    const source: [:0]const u8 =
+        \\fn read(comptime T: type, bytes: []const T) T { return bytes[0]; }
+        \\fn write(bytes: []u8) void { @memset(bytes, undefined); }
+        \\fn readWrap(bytes: []const u8) u8 { return @call(.auto, read, .{ u8, bytes }); }
+        \\fn writeWrap(bytes: []u8) void { @call(.always_inline, write, .{bytes}); }
+        \\fn unknownWrap(callback: *const fn ([]u8) void, bytes: []u8) void {
+        \\    @call(.auto, callback, .{bytes});
+        \\}
+        \\fn use(callback: *const fn ([]u8) void, bytes: []u8) void { unknownWrap(callback, bytes); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const model = try typed.cache.fileModel();
+    const read = model.findFn("readWrap").?.fn_decl;
+    const write = model.findFn("writeWrap").?.fn_decl;
+    const unknown = model.findFn("unknownWrap").?.fn_decl;
+    try std.testing.expectEqual(
+        Effect.read_only,
+        try declarationEffect(typed.cache, read, .{ .param = 0 }),
+    );
+    try std.testing.expectEqual(
+        Effect.may_invalidate,
+        try declarationEffect(typed.cache, write, .{ .param = 0 }),
+    );
+    try std.testing.expectEqual(
+        Effect.unknown,
+        try declarationEffect(typed.cache, unknown, .{ .param = 1 }),
+    );
+    const callback_token = callNamed(typed.tree(), "unknownWrap") orelse return error.TestExpectedCall;
+    try std.testing.expectEqual(
+        Effect.unknown,
+        (try typed.cache.callEffectAt(callback_token, .unrooted, .{})).?,
+    );
+}
+
+test "call intrinsic maps explicit namespace self and keeps dynamic tuples unknown" {
+    const source: [:0]const u8 =
+        \\const Owner = struct {
+        \\    bytes: []u8,
+        \\    fn poison(self: *Owner) void { @memset(self.bytes, undefined); }
+        \\};
+        \\fn explicit(owner: *Owner) void { @call(.auto, Owner.poison, .{owner}); }
+        \\fn dynamic(owner: *Owner, args: struct { *Owner }) void { @call(.auto, Owner.poison, args); _ = owner; }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const model = try typed.cache.fileModel();
+    try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(
+        typed.cache,
+        model.findFn("explicit").?.fn_decl,
+        .{ .param = 0, .path = "bytes" },
+    ));
+    try std.testing.expectEqual(Effect.unknown, try declarationEffect(
+        typed.cache,
+        model.findFn("dynamic").?.fn_decl,
+        .{ .param = 0 },
+    ));
+    const tree = typed.tree();
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call and tag != .builtin_call_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        const token = tree.nodeMainToken(node);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "@call")) continue;
+        var scratch: [2]Ast.Node.Index = undefined;
+        if (TypeResolver.CallOperands.full(tree, &scratch, node)) |_| {
+            const actual = (try typed.cache.actualCallSummaryAt(token, null)) orelse return error.TestExpectedCallee;
+            try std.testing.expectEqual(@as(?u1, 0), actual.argument_offset);
+            try std.testing.expectEqual(Effect.may_invalidate, (try typed.cache.callEffectAt(
+                token,
+                .{ .parameter = .{ .param = 0, .path = "bytes" } },
+                .{},
+            )).?);
+            try std.testing.expectEqual(Effect.read_only, (try typed.cache.callEffectAt(token, .unrooted, .{})).?);
+        } else {
+            try std.testing.expect((try typed.cache.actualCallSummaryAt(token, null)) == null);
+        }
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "call intrinsic requires an immutable callable identity" {
+    const source: [:0]const u8 =
+        \\const Methods = struct {
+        \\    fn read(bytes: []u8) void { _ = bytes; }
+        \\    var readAlias = &read;
+        \\};
+        \\fn write(bytes: []u8) void { @memset(bytes, undefined); }
+        \\fn mutable(bytes: []u8) void {
+        \\    var callback = &Methods.read;
+        \\    callback = &write;
+        \\    @call(.auto, callback, .{bytes});
+        \\}
+        \\fn addressedAlias(bytes: []u8) void {
+        \\    var callback = &Methods.read;
+        \\    const alias = &callback;
+        \\    callback = &write;
+        \\    @call(.auto, alias.*, .{bytes});
+        \\}
+        \\fn mutableMember(bytes: []u8) void { @call(.auto, Methods.readAlias, .{bytes}); }
+        \\fn stable(bytes: []u8) void {
+        \\    const callback = &Methods.read;
+        \\    @call(.auto, callback, .{bytes});
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const model = try typed.cache.fileModel();
+    for ([_][]const u8{ "mutable", "addressedAlias", "mutableMember" }) |name| {
+        try std.testing.expectEqual(
+            Effect.unknown,
+            try declarationEffect(typed.cache, model.findFn(name).?.fn_decl, .{ .param = 0 }),
+        );
+    }
+    try std.testing.expectEqual(
+        Effect.read_only,
+        try declarationEffect(typed.cache, model.findFn("stable").?.fn_decl, .{ .param = 0 }),
+    );
+}
+
+test "zero-length no-op requires a const plain slice and an exact empty initializer" {
+    const source: [:0]const u8 =
+        \\fn use() void {
+        \\    const empty: []const u8 = &[_]u8{};
+        \\    var mutable: []const u8 = &[_]u8{};
+        \\    const sentinel: [:0]const u8 = &[_:0]u8{};
+        \\    const nonempty: []const u8 = &[_]u8{1};
+        \\    probe(empty, mutable, sentinel, nonempty);
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    var state: State = .{};
+    defer state.deinit(gpa);
+    state.begin(gpa, &tree, 0, null, .{});
+    defer state.end();
+    var found = false;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(call.ast.fn_expr)), "probe")) continue;
+        try std.testing.expectEqual(@as(usize, 4), call.ast.params.len);
+        for (call.ast.params, 0..) |argument, index| {
+            try std.testing.expectEqual(index == 0, try declaredEmptySlice(&cache, argument, &state));
+        }
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "nested effect queries cannot reset an exhausted consumer allowance" {
+    const source: [:0]const u8 =
+        \\fn peek(bytes: []const u8) u8 { return bytes[0]; }
+        \\fn use(bytes: []const u8) u8 { return peek(bytes); }
+    ;
+    const gpa = std.testing.allocator;
+    const typed = try Typed.init(gpa, source);
+    defer typed.deinit(gpa);
+    const token = callNamed(typed.tree(), "peek") orelse return error.TestExpectedCall;
+    var remaining: u32 = 0;
+    var state: State = .{};
+    defer state.deinit(gpa);
+    state.begin(gpa, typed.tree(), token, typed.cache.zls, .{ .remaining = &remaining });
+    defer state.end();
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, typed.cache.callEffectAt(
+        token,
+        .{ .parameter = .{ .param = 0 } },
+        .{
+            .remaining = &remaining,
+            .effects_state = &state,
+        },
+    ));
+    const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.readonly_call_nodes, failure.limit);
+}
+
 test "the same storage passed twice is not a disjoint pair" {
     const source: [:0]const u8 =
-        \\fn store(target: *u32, value: *u32) void { value.* = 0; }
+        \\fn store(target: *u32, value: *u32) void { _ = target; value.* = 0; }
         \\fn use(target: *u32) void { store(target, target); }
     ;
     const gpa = std.testing.allocator;
@@ -1994,40 +4711,6 @@ test "the same storage passed twice is not a disjoint pair" {
     defer typed.deinit(gpa);
     const declaration = (try typed.cache.fileModel()).findFn("use").?.fn_decl;
     try std.testing.expectEqual(Effect.may_invalidate, try declarationEffect(typed.cache, declaration, .{ .param = 0 }));
-}
-
-test "a selection path is the producer's own copy, not the caller's buffer" {
-    const source: [:0]const u8 =
-        \\const Cell = struct { value: u32, other: u32 };
-        \\fn bump(cell: *Cell) void { cell.value += 1; }
-        \\fn nothing(cell: *Cell) void { _ = cell.other; }
-    ;
-    const gpa = std.testing.allocator;
-    const typed = try Typed.init(gpa, source);
-    defer typed.deinit(gpa);
-    const model = try typed.cache.fileModel();
-    const bump = model.findFn("bump").?.fn_decl;
-    const nothing = model.findFn("nothing").?.fn_decl;
-    var owned: [5]u8 = undefined;
-    @memcpy(&owned, "value");
-    try std.testing.expectEqual(
-        Effect.writes_without_invalidation,
-        try declarationEffect(typed.cache, bump, .{ .param = 0, .path = owned[0..] }),
-    );
-    // The caller's buffer changes under the producer.  A borrowed memo key
-    // would now read as a path nobody asked about, and the entry filed under
-    // it would answer for whatever the buffer spells.
-    @memset(&owned, 'x');
-    try std.testing.expectEqual(
-        Effect.writes_without_invalidation,
-        try declarationEffect(typed.cache, bump, .{ .param = 0, .path = "value" }),
-    );
-    // A declaration that writes nothing answers read only, and it must not be
-    // answered from the entry the mutated buffer now aliases.
-    try std.testing.expectEqual(
-        Effect.read_only,
-        try declarationEffect(typed.cache, nothing, .{ .param = 0, .path = "xxxxx" }),
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2268,7 +4951,7 @@ const canonical_call_boundary = struct {
         try std.testing.expectEqual(@as(?u1, 0), via_qualified_receiver.argument_offset);
 
         // The offset is what maps a formal onto the expression it received.
-        var buffer: [1]Ast.Node.Index = undefined;
+        var buffer: [2]Ast.Node.Index = undefined;
         const implicit_receiver = (try via_receiver.callArgumentFor(fixture.cache, &buffer, 0)) orelse
             return error.ImplicitReceiverNotBound;
         try std.testing.expectEqualStrings("box", fixture.text(implicit_receiver));
@@ -2349,6 +5032,8 @@ const canonical_call_boundary = struct {
         \\    defer gpa.destroy(input);
         \\    const output = try gpa.create(Cell);
         \\    defer gpa.destroy(output);
+        \\    input.* = .{ .value = 1 };
+        \\    output.* = .{ .value = 0 };
         \\    copyOut(input, output);
         \\}
     ;
@@ -2374,7 +5059,7 @@ const canonical_call_boundary = struct {
         // the caller's two arguments to the callee's two formals.
         const record = try fixture.recordAt("copyOut", 0);
         try std.testing.expectEqual(@as(?u1, 0), record.argument_offset);
-        var buffer: [1]Ast.Node.Index = undefined;
+        var buffer: [2]Ast.Node.Index = undefined;
         const read_argument = (try record.callArgumentFor(fixture.cache, &buffer, 0)) orelse
             return error.ReadFormalNotBound;
         try std.testing.expectEqualStrings("input", fixture.text(read_argument));
@@ -2476,7 +5161,7 @@ const canonical_call_boundary = struct {
         // The query is about that buffer, not about the allocator beside it.
         const record = try fixture.recordAt("releaseAll", 0);
         try std.testing.expectEqual(@as(?u1, 0), record.argument_offset);
-        var buffer: [1]Ast.Node.Index = undefined;
+        var buffer: [2]Ast.Node.Index = undefined;
         const allocator_argument = (try record.callArgumentFor(fixture.cache, &buffer, 0)) orelse
             return error.AllocatorNotBound;
         try std.testing.expectEqualStrings("gpa", fixture.text(allocator_argument));
@@ -2501,8 +5186,8 @@ const canonical_call_boundary = struct {
         \\// A body that is not Zig at all: the implementation is the
         \\// linker's, so no store, no release and no read are visible here.
         \\fn foreignWrite(bytes: []u8) void {
-        \\    @extern(*const fn ([]u8) void, .{ .name = "foreign_write" });
-        \\    _ = bytes;
+        \\    const foreign = @extern(*const fn ([]u8) void, .{ .name = "foreign_write" });
+        \\    foreign(bytes);
         \\}
         \\
         \\fn driveForeignWrite(bytes: []u8) void {
@@ -2526,6 +5211,7 @@ const canonical_call_boundary = struct {
             Effect.unknown,
             try fixture.effectAt("foreignRelease", 0, .{ .param = 0 }),
         );
+        try std.testing.expectEqual(Effect.unknown, try fixture.unrootedAt("foreignRelease", 0));
 
         // The other shape of the same fact: the declaration HAS a body, and
         // that body is an `@extern` — a call this run must not model.
@@ -2542,10 +5228,251 @@ const canonical_call_boundary = struct {
             Effect.unknown,
             try linker.effectAt("foreignWrite", 0, .{ .param = 0 }),
         );
+        try std.testing.expectEqual(Effect.unknown, try linker.unrootedAt("foreignWrite", 0));
     }
 
-    // ── 7. A real map: one accessor provably reads, one this run cannot
-    //      finish reading, and one that writes ─────────────────────────────
+    test "SDK free releases its buffer but a project free does not" {
+        const sdk_source: [:0]const u8 =
+            \\const std = @import("std");
+            \\fn release(gpa: std.mem.Allocator, bytes: []u8) void {
+            \\    gpa.free(bytes);
+            \\}
+        ;
+        const gpa = std.testing.allocator;
+        const sdk = try Fixture.open(gpa, "canonical-sdk-release", sdk_source);
+        defer sdk.deinit();
+        try std.testing.expectEqual(Effect.may_invalidate, try sdk.effectAt("free", 0, .{ .param = 1 }));
+        // The allocator callback remains globally unresolved; recognizing
+        // its rooted release must not certify unrelated global storage.
+        try std.testing.expectEqual(Effect.unknown, try sdk.unrootedAt("free", 0));
+
+        const project_source: [:0]const u8 =
+            \\const Allocator = struct {
+            \\    fn free(_: Allocator, bytes: []u8) void { _ = bytes; }
+            \\};
+            \\fn release(bytes: []u8) void {
+            \\    const allocator: Allocator = .{};
+            \\    allocator.free(bytes);
+            \\}
+        ;
+        const project_fixture = try Fixture.open(gpa, "canonical-project-release", project_source);
+        defer project_fixture.deinit();
+        try std.testing.expectEqual(Effect.read_only, try project_fixture.effectAt("free", 0, .{ .param = 1 }));
+        try std.testing.expectEqual(Effect.read_only, try project_fixture.unrootedAt("free", 0));
+    }
+
+    test "rebinding a local cursor does not write its incoming pointee" {
+        const source: [:0]const u8 =
+            \\fn probe(bytes: []u8) void {
+            \\    var cursor = bytes.ptr;
+            \\    var remaining = bytes.len;
+            \\    while (remaining != 0) {
+            \\        _ = cursor[0];
+            \\        remaining -= 1;
+            \\        cursor = cursor + 1;
+            \\    }
+            \\}
+            \\fn poison(bytes: []u8) void {
+            \\    var cursor = bytes.ptr;
+            \\    cursor = cursor + 1;
+            \\    cursor[0] = undefined;
+            \\}
+            \\fn run(bytes: []u8) void {
+            \\    probe(bytes);
+            \\    poison(bytes);
+            \\}
+        ;
+        const gpa = std.testing.allocator;
+        const fixture = try Fixture.open(gpa, "canonical-local-cursor", source);
+        defer fixture.deinit();
+        try std.testing.expectEqual(
+            Effect.read_only,
+            try fixture.effectAt("probe", 0, .{ .param = 0 }),
+        );
+        try std.testing.expectEqual(
+            Effect.may_invalidate,
+            try fixture.effectAt("poison", 0, .{ .param = 0 }),
+        );
+    }
+
+    test "capture origins exclude loop bodies but retain captured writes and opaque reach" {
+        const source: [:0]const u8 =
+            \\const Node = struct { next: ?*Node, value: u32 };
+            \\extern fn foreign(node: *Node) void;
+            \\fn peek(node: *Node) u32 { return node.value; }
+            \\fn read(first: ?*Node) void {
+            \\    var cursor = first;
+            \\    while (cursor) |node| {
+            \\        _ = peek(node);
+            \\        cursor = node.next;
+            \\    }
+            \\}
+            \\fn poison(first: ?*Node) void {
+            \\    var cursor = first;
+            \\    while (cursor) |node| {
+            \\        node.value = undefined;
+            \\        cursor = node.next;
+            \\    }
+            \\}
+            \\fn opaqueRead(first: ?*Node) void {
+            \\    while (first) |node| { foreign(node); }
+            \\}
+            \\fn run(first: ?*Node) void {
+            \\    read(first);
+            \\    poison(first);
+            \\    opaqueRead(first);
+            \\}
+        ;
+        const fixture = try Fixture.open(std.testing.allocator, "canonical-loop-capture-origin", source);
+        defer fixture.deinit();
+        try std.testing.expectEqual(Effect.read_only, try fixture.effectAt("read", 0, .{ .param = 0 }));
+        try std.testing.expect(try fixture.effectAt("poison", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.effectAt("opaqueRead", 0, .{ .param = 0 }) != .read_only);
+    }
+
+    test "call-wrapped loop conditions retain the rebound second pointee" {
+        const source: [:0]const u8 =
+            \\fn id(value: ?*u32) ?*u32 { return value; }
+            \\fn carried(first: ?*u32, next: ?*u32) void {
+            \\    var cursor = first;
+            \\    while (id(cursor)) |node| {
+            \\        node.* = undefined;
+            \\        if (cursor == next) break;
+            \\        cursor = next;
+            \\    }
+            \\}
+            \\fn run() void {
+            \\    var a: u32 = 0;
+            \\    var b: u32 = 0;
+            \\    carried(&a, &b);
+            \\}
+        ;
+        const fixture = try Fixture.open(std.testing.allocator, "canonical-wrapped-loop-backedge", source);
+        defer fixture.deinit();
+        try std.testing.expect(try fixture.effectAt("carried", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.effectAt("carried", 0, .{ .param = 1 }) != .read_only);
+    }
+
+    test "omitted pointer defaults retain writes to shared storage" {
+        const source: [:0]const u8 =
+            \\var shared: u32 = 0;
+            \\const Holder = struct { ptr: *u32 = &shared };
+            \\fn poison(asked: *u32) void {
+            \\    _ = asked;
+            \\    const holder = Holder{};
+            \\    holder.ptr.* = undefined;
+            \\}
+            \\fn privateScalar(asked: *u32) void {
+            \\    _ = asked;
+            \\    const Scalar = struct { value: u32 = 0 };
+            \\    var holder = Scalar{};
+            \\    holder.value = undefined;
+            \\}
+            \\fn run() void { poison(&shared); privateScalar(&shared); }
+        ;
+        const fixture = try Fixture.open(std.testing.allocator, "canonical-omitted-pointer-default", source);
+        defer fixture.deinit();
+        try std.testing.expect(try fixture.effectAt("poison", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.unrootedAt("poison", 0) != .read_only);
+        try std.testing.expectEqual(Effect.read_only, try fixture.effectAt("privateScalar", 0, .{ .param = 0 }));
+        try std.testing.expectEqual(Effect.read_only, try fixture.unrootedAt("privateScalar", 0));
+    }
+
+    test "address-free omitted defaults preserve header storage origins" {
+        const source: [:0]const u8 =
+            \\const Header = struct { bytes: []u8, count: u32 = 0 };
+            \\fn poison(bytes: []u8) void {
+            \\    const header = Header{ .bytes = bytes };
+            \\    @memset(header.bytes, undefined);
+            \\}
+            \\fn scratch(asked: []u8) void {
+            \\    _ = asked;
+            \\    var cells = [_]u8{0};
+            \\    const header = Header{ .bytes = &cells };
+            \\    @memset(header.bytes, undefined);
+            \\}
+            \\fn run(bytes: []u8) void { poison(bytes); scratch(bytes); }
+        ;
+        const fixture = try Fixture.open(std.testing.allocator, "canonical-address-free-header-default", source);
+        defer fixture.deinit();
+        try std.testing.expectEqual(Effect.may_invalidate, try fixture.effectAt("poison", 0, .{ .param = 0 }));
+        try std.testing.expectEqual(Effect.read_only, try fixture.effectAt("scratch", 0, .{ .param = 0 }));
+        try std.testing.expectEqual(Effect.read_only, try fixture.unrootedAt("scratch", 0));
+    }
+
+    test "control-flow captures retain pointer loans and iteration-carried aliases" {
+        const source: [:0]const u8 =
+            \\const Choice = union(enum) { node: *u32, empty };
+            \\fn ifLoan(value: ?*u32) void {
+            \\    if (value) |node| { node.* = undefined; }
+            \\}
+            \\fn forLoan(values: []*u32) void {
+            \\    for (values, 0..) |node, index| { _ = index; node.* = undefined; }
+            \\}
+            \\fn switchLoan(value: Choice) void {
+            \\    switch (value) { .node => |node| node.* = undefined, .empty => {} }
+            \\}
+            \\fn carried(first: ?*u32, next: ?*u32) void {
+            \\    var cursor = first;
+            \\    while (cursor) |node| {
+            \\        node.* = undefined;
+            \\        cursor = next;
+            \\    }
+            \\}
+            \\fn run(value: ?*u32, values: []*u32, choice: Choice, next: ?*u32) void {
+            \\    ifLoan(value);
+            \\    forLoan(values);
+            \\    switchLoan(choice);
+            \\    carried(value, next);
+            \\}
+        ;
+        const fixture = try Fixture.open(std.testing.allocator, "canonical-capture-loans", source);
+        defer fixture.deinit();
+        try std.testing.expect(try fixture.effectAt("ifLoan", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.effectAt("forLoan", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.effectAt("switchLoan", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.effectAt("carried", 0, .{ .param = 0 }) != .read_only);
+        try std.testing.expect(try fixture.effectAt("carried", 0, .{ .param = 1 }) != .read_only);
+    }
+
+    test "reflected pointer child reaches the actual method through a generic call" {
+        const source: [:0]const u8 =
+            \\const Reader = struct {
+            \\    pub fn inspect(_: *Reader, key: *u64, comptime strategy: bool) void {
+            \\        if (strategy) _ = key.*;
+            \\    }
+            \\};
+            \\const Writer = struct {
+            \\    pub fn inspect(_: *Writer, key: *u64, comptime strategy: bool) void {
+            \\        if (strategy) key.* = 9;
+            \\    }
+            \\};
+            \\const Opaque = struct {
+            \\    pub fn inspect(_: *Opaque, key: *u64, comptime strategy: bool) void {
+            \\        if (strategy) foreign(key);
+            \\    }
+            \\};
+            \\extern fn foreign(key: *u64) void;
+            \\fn dispatch(owner: anytype, key: *u64, comptime strategy: bool) void {
+            \\    const Declaring = switch (@typeInfo(@TypeOf(owner))) {
+            \\        .pointer => |info| info.child,
+            \\        else => @TypeOf(owner),
+            \\    };
+            \\    @call(.always_inline, Declaring.inspect, .{ owner, key, strategy });
+            \\}
+            \\fn read(owner: *Reader, key: *u64) void { dispatch(owner, key, true); }
+            \\fn write(owner: *Writer, key: *u64) void { dispatch(owner, key, true); }
+            \\fn opaqueQuery(owner: *Opaque, key: *u64) void { dispatch(owner, key, true); }
+        ;
+        const gpa = std.testing.allocator;
+        const fixture = try Fixture.open(gpa, "canonical-reflected-pointer-child", source);
+        defer fixture.deinit();
+        try std.testing.expectEqual(Effect.read_only, try fixture.effectAt("dispatch", 0, .{ .param = 1 }));
+        try std.testing.expectEqual(Effect.may_invalidate, try fixture.effectAt("dispatch", 1, .{ .param = 1 }));
+        try std.testing.expect((try fixture.effectAt("dispatch", 2, .{ .param = 1 })) != .read_only);
+    }
+
+    // ── 7. A real map: read-only accessors and a mutating insert ──────────
 
     const std_map_source: [:0]const u8 =
         \\const std = @import("std");
@@ -2583,9 +5510,9 @@ const canonical_call_boundary = struct {
 
         // A lookup reads the map's storage and writes none of it.  This is
         // the SDK's own body: `get` delegating to the unmanaged form, whose
-        // `getIndex` walks metadata and asks a context to hash.  Every
-        // intrinsic on that path is a compiler directive that stores
-        // nothing, so the whole chain folds to `read_only`.
+        // `getIndex` walks metadata and asks a context to hash. Its actual
+        // `@call` reaches a bound hasher body; writes to that private hasher
+        // do not mutate the map or escape as global effects.
         try std.testing.expectEqual(
             Effect.read_only,
             try fixture.effectAt("get", 0, .{ .param = 0 }),
@@ -2676,13 +5603,6 @@ const canonical_call_boundary = struct {
             Effect.may_invalidate,
             try fixture.effectAt("getContext", 1, .{ .param = 0 }),
         );
-
-        // And the declaration is reached through the resolver, in the
-        // document and module the resolver proved — the identity case 1 pins,
-        // reached through a generic instantiation rather than a second name.
-        const record = try fixture.recordAt("getContext", 1);
-        try std.testing.expect(fixture.ast() != record.callee.tree);
-        try std.testing.expectEqual(fixture.cache.module_id, record.callee.handle.module);
     }
 
     // ── 9. Unrooted: what a call reaches that it was not handed ───────────
@@ -2693,8 +5613,18 @@ const canonical_call_boundary = struct {
         \\
         \\// Storage this file OWNS.  Not a typed scalar in some object: a
         \\// live allocation with an owner, which a release actually ends.
-        \\var held: []u8 = @constCast(&[_]u8{});
+        \\var held: []u8 = undefined;
         \\var held_allocator: std.mem.Allocator = undefined;
+        \\
+        \\fn installShared(gpa: std.mem.Allocator) !void {
+        \\    held = try gpa.alloc(u8, 1);
+        \\    held_allocator = gpa;
+        \\}
+        \\
+        \\fn releaseEmpty(gpa: std.mem.Allocator) void {
+        \\    const empty: []const u8 = &[_]u8{};
+        \\    gpa.free(empty);
+        \\}
         \\
         \\// Reaches nothing but its own formals: whatever this call does to
         \\// the caller's arguments, it does to no storage the caller did not
@@ -2728,12 +5658,18 @@ const canonical_call_boundary = struct {
         \\    rewriteLocal(self, other);
         \\}
         \\
-        \\fn driveShared() void {
+        \\fn driveShared(gpa: std.mem.Allocator) !void {
+        \\    try installShared(gpa);
         \\    releaseShared();
         \\}
         \\
-        \\fn driveSharedMarked(marker: u32) void {
+        \\fn driveSharedMarked(gpa: std.mem.Allocator, marker: u32) !void {
+        \\    try installShared(gpa);
         \\    releaseSharedMarked(marker);
+        \\}
+        \\
+        \\fn driveEmpty(gpa: std.mem.Allocator) void {
+        \\    releaseEmpty(gpa);
         \\}
     ;
 
@@ -2771,6 +5707,10 @@ const canonical_call_boundary = struct {
             Effect.read_only,
             try fixture.effectAt("releaseSharedMarked", 0, .{ .param = 0 }),
         );
+        try std.testing.expectEqual(
+            Effect.read_only,
+            try fixture.unrootedAt("releaseEmpty", 0),
+        );
     }
 
     // ── 10. One generic declaration, two instantiations, two correct answers ──
@@ -2786,8 +5726,8 @@ const canonical_call_boundary = struct {
         \\}
         \\
         \\fn driveBoth(cell: *Cell, tag: *Tag) void {
-        \\    reset(cell, .{ .value = 0 });
-        \\    reset(tag, .{ .id = 0 });
+        \\    reset(Cell, cell, .{ .value = 0 });
+        \\    reset(Tag, tag, .{ .id = 0 });
         \\}
     ;
 
@@ -2801,11 +5741,11 @@ const canonical_call_boundary = struct {
         // about ITS OWN argument — the failure being pinned is one call's
         // answer being read off the other's.
         // Not read_only for either call — each about ITS OWN argument.
-        try std.testing.expect((try fixture.effectAt("reset", 0, .{ .param = 0 })) != .read_only);
-        try std.testing.expect((try fixture.effectAt("reset", 1, .{ .param = 0 })) != .read_only);
+        try std.testing.expect((try fixture.effectAt("reset", 0, .{ .param = 1 })) != .read_only);
+        try std.testing.expect((try fixture.effectAt("reset", 1, .{ .param = 1 })) != .read_only);
 
-        // `comptime T` is not an argument, so both formals are written
-        // exactly as the call spelled them.
+        // Explicit comptime arguments retain their declared formal indices;
+        // only an implicit method receiver changes the argument offset.
         try std.testing.expectEqual(@as(?u1, 0), (try fixture.recordAt("reset", 0)).argument_offset);
         try std.testing.expectEqual(@as(?u1, 0), (try fixture.recordAt("reset", 1)).argument_offset);
 
@@ -2857,7 +5797,7 @@ const canonical_call_boundary = struct {
 
         // `runWith` is free: `callback` is formal 0 and `target` is formal 1.
         try std.testing.expectEqual(@as(?u1, 0), (try fixture.recordAt("runWith", 0)).argument_offset);
-        var buffer: [1]Ast.Node.Index = undefined;
+        var buffer: [2]Ast.Node.Index = undefined;
         const record = try fixture.recordAt("runWith", 0);
         const handed_target = (try record.callArgumentFor(fixture.cache, &buffer, 1)) orelse
             return error.TargetNotBound;

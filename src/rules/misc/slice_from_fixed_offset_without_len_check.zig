@@ -501,10 +501,10 @@ fn checkBody(
         // (Generalises the old `buf[0]`-for-offset-1 check to any offset.)
         if (offsetValue(offset_str)) |off| {
             if (provenMinLenBefore(tree, tags, first, t, buf_name) >= off) continue;
-            // Value-range oracle: `buf.len >= off` proven via a slice-length alias
-            // whose scalar has a known value (e.g. an enclosing `switch (rem_len)`
-            // arm K bounds `rem_key = b[0..rem_len]` to len K). Covers the wyhash
-            // hash-tail family `switch (rem_len) { K => rem_key[N..] }` (K >= N).
+            // Consume the shared oracle's length guards and initializer
+            // extents at this use. Runtime slice endpoints and checked return
+            // lengths require the same branch and mutation proofs as numeric
+            // indices; missing proof stays unsafe and query errors propagate.
             if (try value_range.provesMinLen(gpa, tree, body, buf_name, off, t, cache)) continue;
         }
 
@@ -876,8 +876,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, lb_tok),
-        .end = Pos.fromTokenEnd(tree, lb_tok),
+        .start = try Pos.fromTokenStart(tree, lb_tok),
+        .end = try Pos.fromTokenEnd(tree, lb_tok),
         .message = msg,
     });
 }
@@ -1159,8 +1159,8 @@ test "slice-from-fixed-offset-without-len-check: slice-typed local still fires" 
     );
 }
 
-test "slice-from-fixed-offset-without-len-check: slice derived from a fixed array still fires" {
-    try testing.expectFires(check, R,
+test "slice-from-fixed-offset-without-len-check: slice derived from a fixed array has known extent" {
+    try testing.expectNoFireTyped(check,
         \\fn f() void {
         \\    var arr: [48]u8 = undefined;
         \\    const sub = arr[0..];
@@ -1346,5 +1346,288 @@ test "slice-from-fixed-offset-without-len-check: non-comptime param with same na
         \\    return literal[1..];
         \\}
         \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: checked ELF header return lengths" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn objectSlice(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8) !void {
+        \\    if (bytes.len < 64) return error.Invalid;
+        \\    if (!std.mem.eql(u8, bytes[0..4], "\x7fELF")) return error.Invalid;
+        \\    const is_64: bool = switch (bytes[4]) {
+        \\        1 => false,
+        \\        2 => true,
+        \\        else => return error.Invalid,
+        \\    };
+        \\    if (bytes[5] != 1) return error.Invalid;
+        \\    const header = try objectSlice(bytes, 0, if (is_64) @as(usize, 64) else @as(usize, 52));
+        \\    const shoff: usize = if (is_64)
+        \\        @intCast(std.mem.readInt(u64, header[40..][0..8], .little))
+        \\    else
+        \\        std.mem.readInt(u32, header[32..][0..4], .little);
+        \\    const shentsize: usize = if (is_64)
+        \\        std.mem.readInt(u16, header[58..][0..2], .little)
+        \\    else
+        \\        std.mem.readInt(u16, header[46..][0..2], .little);
+        \\    const shnum: usize = if (is_64)
+        \\        std.mem.readInt(u16, header[60..][0..2], .little)
+        \\    else
+        \\        std.mem.readInt(u16, header[48..][0..2], .little);
+        \\    const shstrndx: usize = if (is_64)
+        \\        std.mem.readInt(u16, header[62..][0..2], .little)
+        \\    else
+        \\        std.mem.readInt(u16, header[50..][0..2], .little);
+        \\    _ = .{ shoff, shentsize, shnum, shstrndx };
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: checked ELF table entry extents" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn objectSlice(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, shoff: usize, shentsize: usize, shnum: usize, shstrndx: usize, is_64: bool) !u64 {
+        \\    const entry_size: usize = if (is_64) 64 else 40;
+        \\    if (shentsize != entry_size) return error.Invalid;
+        \\    if (shnum == 0 or shnum > 4096) return error.Invalid;
+        \\    if (shstrndx >= shnum) return error.Invalid;
+        \\    const table = try objectSlice(bytes, shoff, shnum * entry_size);
+        \\    const strings_entry = table[shstrndx * entry_size ..][0..entry_size];
+        \\    const strings_offset: usize = if (is_64)
+        \\        @intCast(std.mem.readInt(u64, strings_entry[24..][0..8], .little))
+        \\    else
+        \\        std.mem.readInt(u32, strings_entry[16..][0..4], .little);
+        \\    const strings_size: usize = if (is_64)
+        \\        @intCast(std.mem.readInt(u64, strings_entry[32..][0..8], .little))
+        \\    else
+        \\        std.mem.readInt(u32, strings_entry[20..][0..4], .little);
+        \\    _ = .{ strings_offset, strings_size };
+        \\    var section_index: usize = 0;
+        \\    while (section_index < shnum) : (section_index += 1) {
+        \\        const entry = table[section_index * entry_size ..][0..entry_size];
+        \\        const name_offset = std.mem.readInt(u32, entry[0..][0..4], .little);
+        \\        if (name_offset != 1) continue;
+        \\        if (is_64) {
+        \\            return std.mem.readInt(u64, entry[32..][0..8], .little);
+        \\        }
+        \\        return std.mem.readInt(u32, entry[20..][0..4], .little);
+        \\    }
+        \\    return error.Invalid;
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: dynamic table repro" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn read(table: []const u8, count: u16, index: u16, is_64: bool) !u64 {
+        \\    const entry_size: usize = if (is_64) 64 else 40;
+        \\    if (count == 0 or index >= count) return error.Invalid;
+        \\    if (table.len != @as(usize, count) * entry_size) return error.Invalid;
+        \\    const entry = table[@as(usize, index) * entry_size ..][0..entry_size];
+        \\    return if (is_64) std.mem.readInt(u64, entry[32..][0..8], .little)
+        \\        else std.mem.readInt(u32, entry[20..][0..4], .little);
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: checked return bound is insufficient" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn bounded(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8) ![]const u8 {
+        \\    const header = try bounded(bytes, 0, 51);
+        \\    return header[62..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: conditional return length needs matching branch" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn bounded(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, is_64: bool) ![]const u8 {
+        \\    const header = try bounded(bytes, 0, if (is_64) @as(usize, 64) else @as(usize, 52));
+        \\    return header[62..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: opposite return length branch remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn bounded(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, is_64: bool) ![]const u8 {
+        \\    const header = try bounded(bytes, 0, if (is_64) @as(usize, 52) else @as(usize, 64));
+        \\    if (is_64) return header[62..];
+        \\    return header;
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: rebound checked slice loses extent" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn bounded(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, shorter: []const u8) ![]const u8 {
+        \\    var header = try bounded(bytes, 0, 64);
+        \\    header = shorter;
+        \\    return header[62..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: mutated selector cannot correlate old extent" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn bounded(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, selector: bool) ![]const u8 {
+        \\    var is_64 = selector;
+        \\    const header = try bounded(bytes, 0, if (is_64) @as(usize, 64) else @as(usize, 52));
+        \\    is_64 = true;
+        \\    if (is_64) return header[62..];
+        \\    return header;
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: unknown helper return is not requested length" {
+    try testing.expectFiresTyped(check, R,
+        \\fn bounded(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    _ = .{ offset, len };
+        \\    return bytes;
+        \\}
+        \\pub fn read(bytes: []const u8) ![]const u8 {
+        \\    const header = try bounded(bytes, 0, 64);
+        \\    return header[62..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: helper short success return poisons extent" {
+    try testing.expectFiresTyped(check, R,
+        \\fn bounded(bytes: []const u8, len: usize, short: bool) ![]const u8 {
+        \\    if (short) return "";
+        \\    return bytes[0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, short: bool) ![]const u8 {
+        \\    const header = try bounded(bytes, 64, short);
+        \\    return header[62..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: dynamic entry insufficient extent" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn read(table: []const u8, is_64: bool) []const u8 {
+        \\    const entry_size: usize = if (is_64) 24 else 16;
+        \\    const entry = table[0..entry_size];
+        \\    return entry[32..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: dynamic entry wrong branch" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn read(table: []const u8, is_64: bool) []const u8 {
+        \\    const entry_size: usize = if (is_64) 16 else 64;
+        \\    const entry = table[0..entry_size];
+        \\    if (is_64) return entry[32..];
+        \\    return entry;
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: dynamic entry rebind invalidates extent" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn read(table: []const u8, shorter: []const u8, is_64: bool) []const u8 {
+        \\    const entry_size: usize = if (is_64) 64 else 40;
+        \\    var entry = table[0..entry_size];
+        \\    entry = shorter;
+        \\    return entry[32..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: checked header repro" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn objectSlice(bytes: []const u8, offset: usize, len: usize) ![]const u8 {
+        \\    const end = std.math.add(usize, offset, len) catch return error.Invalid;
+        \\    if (end > bytes.len) return error.Invalid;
+        \\    return bytes[offset..][0..len];
+        \\}
+        \\pub fn read(bytes: []const u8, is_64: bool) !u16 {
+        \\    if (bytes.len < 64) return error.Invalid;
+        \\    const header = try objectSlice(bytes, 0, if (is_64) @as(usize, 64) else @as(usize, 52));
+        \\    return if (is_64) std.mem.readInt(u16, header[62..][0..2], .little)
+        \\        else std.mem.readInt(u16, header[50..][0..2], .little);
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: endpoint growth does not resize old entry" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn read(table: []const u8) []const u8 {
+        \\    var entry_size: usize = 16;
+        \\    const entry = table[0..entry_size];
+        \\    entry_size = 64;
+        \\    return entry[32..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: endpoint mutation preserves existing extent" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn read(table: []const u8) []const u8 {
+        \\    var entry_size: usize = 64;
+        \\    const entry = table[0..entry_size];
+        \\    entry_size = 0;
+        \\    return entry[32..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: addressed entry header mutation loses extent" {
+    try testing.expectFiresTyped(check, R,
+        \\fn shrink(entry: *[]const u8) void {
+        \\    entry.* = "";
+        \\}
+        \\pub fn read(table: []const u8, is_64: bool) []const u8 {
+        \\    const entry_size: usize = if (is_64) 64 else 40;
+        \\    var entry = table[0..entry_size];
+        \\    shrink(&entry);
+        \\    return entry[32..];
+        \\}
     );
 }

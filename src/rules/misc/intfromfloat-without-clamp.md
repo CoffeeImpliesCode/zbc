@@ -8,7 +8,7 @@
 
 The rule checks runtime `@intFromFloat` conversions.
 It reports when the argument is not proved finite and within the destination integer's conversion range.
-The destination comes from the conversion's context, including a return type or a parameter type.
+The destination comes from the conversion's context, including a return type or a parameter type. For an optional or error-union result, the conversion produces the integer payload.
 
 NaN, infinity, and an out-of-range conversion trap in Debug and ReleaseSafe.
 In unchecked builds, the operation has undefined behavior.
@@ -54,7 +54,11 @@ Converting an integer maximum to a float can round it upward; that rounded value
 - Dominating finite comparisons, resolved arithmetic, and supported source-proved helper contracts can supply bounds.
 - Trusted standard-library clipping is checked against its declaration and actual arguments. A user helper named `clamp` has no implied contract.
 - Input masks and arithmetic can prove a finite result without any clipping call.
+- A finite bounded floating dividend with a finite positive `@mod` divisor has a nonnegative result bounded by the divisor. An unresolved divisor or a dividend that can be NaN or infinite does not supply this proof.
 - Effects are evaluated in source order. Mutation before conversion can invalidate earlier facts.
+- Private generic helpers are checked in each resolved local call frame. Conversion result locations use that frame's integer payload, including explicit error-union and optional returns. Direct type-valued inline tuple loops supply one frame per tuple element, including calls inside test declarations. A merged tuple type is not a destination proof.
+- An unresolved direct call with a different callee name does not block this census when the private helper's namespace is a `const` container literal bound by a statement in a local block and the complete file proves both the helper and namespace do not escape. Namespace-member, inline-literal, or instance-type transport can let an opaque helper reflect a method, so it also prevents this exclusion. Function aliases, unresolved references with the helper's name, and unknown reflective targets still prevent closing the census. Module-level namespaces stay conservative. This does not infer a range from an unresolved receiver or skip any concrete helper frame.
+- Finite rejection followed by truncation and destination-specific `minInt(T)` / `maxInt(T) + 1` bounds can prove a generic conversion. The upper bound must be exclusive; range comparisons alone do not reject NaN.
 - Compile-time-only expressions are not runtime conversion sites.
 - Analysis budget exhaustion is incomplete analysis, not a clean result.
 

@@ -324,8 +324,8 @@ fn explicitTypeRange(
     var t = binding.name_token + 1;
     while (t < binding.rhs_first) : (t += 1) {
         if (tags[t] != .colon) continue;
-        if (t + 1 >= binding.rhs_first) return null;
-        return .{ .first = t + 1, .last = binding.rhs_first - 1 };
+        if (t + 2 >= binding.rhs_first or tags[binding.rhs_first - 1] != .equal) return null;
+        return .{ .first = t + 1, .last = binding.rhs_first - 2 };
     }
     _ = tree;
     return null;
@@ -555,7 +555,7 @@ fn assignmentIsObservable(
 ///     release hands the bytes back, and a read that follows it still
 ///     interprets them.
 ///   - every other mention of that storage before the assignment is
-///     its own declaration, a reassignment, or a loop header.
+///     its own declaration, a reassignment, an element write, or a loop header.
 ///     Anything else could have published the slice.
 fn captureStorageIsFramePrivate(
     tree: *const Ast,
@@ -606,13 +606,30 @@ fn captureStorageIsFramePrivate(
         // allocation; the frame still owns it, and the release that
         // follows it is what the privacy proof rests on.
         if (t + 1 < assignment_tok and tags[t + 1] == .equal) continue;
+        // Initializing an element writes private storage, not a copy of
+        // its address to another owner.  Keep scanning the index and RHS:
+        // either can contain a separate mention that publishes the slice.
+        if (isIndexedStorageWrite(tags, t, assignment_tok - 1)) continue;
         return false;
     }
     return raw_free_seen;
 }
 
-/// True when the capture itself — a pointer to the element the retag
-/// corrupts — reaches a callee before the write.
+/// True only for the root of `storage[index] = …`, not an indexed read
+/// passed to a callee or copied elsewhere.  The caller still scans every
+/// token inside the index and the initializer.
+fn isIndexedStorageWrite(
+    tags: []const std.zig.Token.Tag,
+    root: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    if (root + 1 > last or tags[root + 1] != .l_bracket) return false;
+    const close = tokens.matchBracket(tags, root + 1, last) orelse return false;
+    return close < last and tags[close + 1] == .equal;
+}
+
+/// True when a call argument contains the capture itself — a pointer to
+/// the element the retag corrupts — before the write.
 ///
 /// A plain read through the capture (`if (field.kind == .ordinary)`)
 /// and a write through it (`field.byte_offset = …`) both stay inside
@@ -628,33 +645,36 @@ fn captureReachesOutsideFrame(
     assignment_tok: Ast.TokenIndex,
     capture: *const local_bindings.Binding,
 ) bool {
-    var t = body_first;
-    while (t < assignment_tok) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, assignment_tok);
-            continue;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        switch (tag) {
+            .call, .call_one, .call_comma, .call_one_comma => {},
+            else => continue,
         }
-        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), capture.name)) continue;
-        // The capture's own name token in the `for` header is the
-        // declaration this walk is about, not a use of it.
-        if (t == capture.name_token) continue;
-        if (isCallArgument(tags, t)) return true;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const paren = tree.nodeMainToken(node);
+        if (paren < body_first or paren >= assignment_tok) continue;
+        if (insideNestedFn(tags, body_first, assignment_tok, paren)) continue;
+        var call_buf: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buf, node) orelse continue;
+        for (call.ast.params) |arg| {
+            const first = tree.firstToken(arg);
+            const last = @min(tree.lastToken(arg), assignment_tok - 1);
+            var t = @max(first, capture.name_token + 1);
+            while (t <= last and t < capture.scope_close) : (t += 1) {
+                if (tags[t] == .keyword_fn) {
+                    t = skipNestedFn(tags, t, last);
+                    continue;
+                }
+                if (tags[t] == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(t), capture.name) and
+                    t > 0 and tags[t - 1] != .period)
+                {
+                    return true;
+                }
+            }
+        }
     }
     return false;
-}
-
-/// True when the path written from `head` ends in a call argument —
-/// `observe(field)`, `log(field.kind)`.  A path ending anywhere else
-/// (`field.kind == .a`, `field.kind = …`, `field.byte_offset + 1`) is
-/// read or written inside the loop body and reaches no callee.
-fn isCallArgument(tags: []const std.zig.Token.Tag, head: Ast.TokenIndex) bool {
-    const limit = tags.len;
-    var end = head;
-    while (end + 2 < limit and tags[end + 1] == .period and tags[end + 2] == .identifier) {
-        end += 2;
-    }
-    if (end + 1 >= limit) return false;
-    return tags[end + 1] == .comma or tags[end + 1] == .r_paren;
 }
 
 /// What one `defer` / `errdefer` statement does to the storage a
@@ -752,8 +772,8 @@ fn isResolvedAllocatorFree(
 ) ?Ast.TokenIndex {
     if (callee + 1 > end) return null;
     if (!std.mem.eql(u8, tree.tokenSlice(callee), "free")) return null;
-    if (tags[callee + 1] != .period) return null;
-    if (callee < 2 or tags[callee - 2] != .identifier) return null;
+    if (tags[callee + 1] != .l_paren) return null;
+    if (callee < 2 or tags[callee - 1] != .period or tags[callee - 2] != .identifier) return null;
     // `x.gpa.free(…)` — a field path is not the plain name whose
     // declared type this walk reads.
     if (callee >= 3 and tags[callee - 3] == .period) return null;
@@ -1160,8 +1180,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, try_tok),
-        .end = Pos.fromTokenEnd(tree, try_tok),
+        .start = try Pos.fromTokenStart(tree, try_tok),
+        .end = try Pos.fromTokenEnd(tree, try_tok),
         .message = msg,
     });
 }
@@ -2086,10 +2106,132 @@ test "tagged-union-payload-early-exit: reading or writing the capture in place s
         \\fn decode(gpa: std.mem.Allocator) !void {
         \\    const fields = try gpa.alloc(Field, 1);
         \\    defer gpa.free(fields);
+        \\    fields[0] = .{ .kind = .{ .bit_field = .{ .bit_offset = 0 } }, .byte_offset = 0 };
         \\    for (fields) |*field| {
         \\        if (field.kind == .ordinary) continue;
         \\        field.byte_offset = 1;
         \\        field.kind = .{ .bit_field = .{ .bit_offset = try readU16() } };
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "tagged-union-payload-early-exit: initialized private element construction stays quiet" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const FieldKind = union(enum) { ordinary, bit_field: u16 };
+        \\const Field = struct { kind: FieldKind };
+        \\fn readU16() error{EndOfStream}!u16 { return error.EndOfStream; }
+        \\fn decode(gpa: std.mem.Allocator) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    fields[0] = .{ .kind = .ordinary };
+        \\    for (fields) |*field| {
+        \\        field.kind = .{ .bit_field = try readU16() };
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "tagged-union-payload-early-exit: grouped capture reads are not call arguments" {
+    // The initial element write stays inside freshly allocated storage.
+    // On failure only the raw release runs; neither grouped read is a call.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const FieldKind = union(enum) { ordinary, bit_field: u16 };
+        \\const Field = struct { kind: FieldKind, byte_offset: u64 };
+        \\fn readU16() error{EndOfStream}!u16 { return error.EndOfStream; }
+        \\fn decode(gpa: std.mem.Allocator) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    fields[0] = .{ .kind = .ordinary, .byte_offset = 0 };
+        \\    for (fields) |*field| {
+        \\        _ = (field.kind);
+        \\        if ((field.kind) == .ordinary) field.byte_offset = 1;
+        \\        field.kind = .{ .bit_field = try readU16() };
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "tagged-union-payload-early-exit: grouped capture call arguments still publish" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const FieldKind = union(enum) { ordinary, bit_field: u16 };
+        \\const Field = struct { kind: FieldKind };
+        \\fn readU16() error{EndOfStream}!u16 { return error.EndOfStream; }
+        \\fn publish(sink: *?*Field, field: *Field) void { sink.* = field; }
+        \\fn decode(gpa: std.mem.Allocator, sink: *?*Field) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    fields[0] = .{ .kind = .ordinary };
+        \\    for (fields) |*field| {
+        \\        publish(sink, (field));
+        \\        field.kind = .{ .bit_field = try readU16() };
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "tagged-union-payload-early-exit: a grouped payload read during cleanup still observes" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const FieldKind = union(enum) { ordinary, bit_field: u16 };
+        \\const Field = struct { kind: FieldKind };
+        \\fn readU16() error{EndOfStream}!u16 { return error.EndOfStream; }
+        \\fn decode(gpa: std.mem.Allocator, sink: *u16) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    fields[0] = .{ .kind = .ordinary };
+        \\    for (fields) |*field| {
+        \\        errdefer sink.* = (field.kind.bit_field);
+        \\        field.kind = .{ .bit_field = try readU16() };
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "tagged-union-payload-early-exit: an indexed element handed to a callee still publishes" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const FieldKind = union(enum) { ordinary, bit_field: u16 };
+        \\const Field = struct { kind: FieldKind };
+        \\fn readU16() error{EndOfStream}!u16 { return error.EndOfStream; }
+        \\fn publish(sink: *?*Field, field: *Field) void { sink.* = field; }
+        \\fn decode(gpa: std.mem.Allocator, sink: *?*Field) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    fields[0] = .{ .kind = .ordinary };
+        \\    publish(sink, &fields[0]);
+        \\    for (fields) |*field| {
+        \\        field.kind = .{ .bit_field = try readU16() };
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "tagged-union-payload-early-exit: an element initializer can publish its storage" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const FieldKind = union(enum) { ordinary, bit_field: u16 };
+        \\const Field = struct { kind: FieldKind };
+        \\fn readU16() error{EndOfStream}!u16 { return error.EndOfStream; }
+        \\fn publish(sink: *[]Field, fields: []Field) Field {
+        \\    sink.* = fields;
+        \\    return .{ .kind = .ordinary };
+        \\}
+        \\fn decode(gpa: std.mem.Allocator, sink: *[]Field) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    fields[0] = publish(sink, fields);
+        \\    for (fields) |*field| {
+        \\        field.kind = .{ .bit_field = try readU16() };
         \\    }
         \\}
         \\

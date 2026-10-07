@@ -9,6 +9,8 @@
 //! What we DO model:
 //!   - `var/const NAME = INIT;` (local binding)
 //!   - `LHS = RHS;` (assignment)
+//!   - fixed-array selected reads, sparse stores, and bounded counter prefixes
+//!     (initialization coverage is independent of memory lifetime)
 //!   - call expressions (especially annotated-callee returns)
 //!   - `arena.deinit()` (arena death)
 //!   - `thread.join()` (thread join)
@@ -52,6 +54,15 @@ pub const LocalId = abstract_state.LocalId;
 /// [AbstractState.facts].  Function-scoped like every other id here.
 pub const GuardId = abstract_state.GuardId;
 
+pub const IndexTerm = abstract_state.IndexTerm;
+pub const Comparison = abstract_state.Comparison;
+
+/// Bounds for an authenticated unsigned local modulo a positive constant.
+pub const ModuloIndex = struct {
+    input: LocalId,
+    modulus: u64,
+};
+
 // ── Source position ─────────────────────────────────────────
 
 pub const SrcPos = struct {
@@ -63,17 +74,122 @@ pub const SrcPos = struct {
     column: u32,
 };
 
+pub const ValueInput = union(enum) {
+    local: LocalId,
+    field: struct { parent: LocalId, name: []const u8 },
+    indexed: struct {
+        array: LocalId,
+        index: IndexTerm,
+        modulo: ?ModuloIndex = null,
+        /// Raw scaled byte coverage is not a value certificate.
+        scaled: ?abstract_state.ScaledElement = null,
+    },
+};
+
+/// Canonical physical frame-cell loans, independent of those cells' values.
+/// `locals` always report, including integers that encode frame addresses.
+/// A complete proof is the whole stack decision. An incomplete proof permits
+/// a coarse stack origin only when `legacy_locals` independently proves that
+/// the returned expression carries that cell's address, not merely a call
+/// argument derived from it.
+pub const StackLoanProof = struct {
+    complete: bool = false,
+    locals: []const LocalId = &.{},
+    legacy_locals: []const LocalId = &.{},
+};
 // ── Statements ─────────────────────────────────────────────
 
 pub const StmtKind = union(enum) {
     /// `var/const NAME = INIT;` — local declared, bound to RHS.
-    decl: struct { local: LocalId, init_kind: ExprKind },
+    decl: struct {
+        local: LocalId,
+        init_kind: ExprKind,
+        integer_value: ?u64 = null,
+        value_defined: bool = false,
+        value_inputs: [8]?ValueInput = .{null} ** 8,
+        /// Lifetime copies may reinterpret bytes instead of copying array slots.
+        array_copy: bool = true,
+    },
 
     /// `LHS = RHS;` — overwrite local with new RHS.
-    assign: struct { target: LocalId, rhs_kind: ExprKind },
+    assign: struct {
+        target: LocalId,
+        rhs_kind: ExprKind,
+        integer_value: ?u64 = null,
+        value_defined: bool = false,
+        value_inputs: [8]?ValueInput = .{null} ** 8,
+        array_copy: bool = true,
+    },
 
     /// Require a boolean condition on this path.
     assume: BooleanValue,
+
+    /// Read selected initialization coverage, then its independent lifetime.
+    indexed_read: struct {
+        array: LocalId,
+        index: IndexTerm,
+        modulo: ?ModuloIndex = null,
+        name: ?[]const u8 = null,
+        scaled: ?abstract_state.ScaledElement = null,
+    },
+    indexed_write: struct {
+        array: LocalId,
+        index: IndexTerm,
+        rhs_kind: ExprKind,
+        /// Literal element lifetime path, borrowed from source.
+        name: ?[]const u8 = null,
+        /// Stable fixed-array field identity; dynamic indices are not keys.
+        field_array: ?[]const u8 = null,
+        /// Bounded dependencies of a value expression. Unsupported values
+        /// retain their reads but cannot establish initialized coverage.
+        inputs: [8]?LocalId = .{null} ** 8,
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
+        all_elements: bool = false,
+        defined: bool = false,
+    },
+    counter_step: struct { local: LocalId, step: i8 },
+    compare_assume: Comparison,
+    scaled_index: @import("bounded_prefix.zig").ScaledIndex,
+    /// Existing exhaustive-fill proofs commit coverage explicitly.
+    array_complete: struct {
+        array: LocalId,
+        inputs: [8]?LocalId = .{null} ** 8,
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
+    },
+    /// A natural-exit loop unconditionally wrote every slot in [start, end).
+    /// Written bytes are separate from the optional strict value certificate.
+    array_range_complete: struct {
+        array: LocalId,
+        start: u64,
+        end: u64,
+        inputs: [8]?LocalId = .{null} ** 8,
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
+        value_defined: bool = true,
+        value_has_undefined_origin: bool = false,
+    },
+    /// A canonical helper's successful return proves this count of stores.
+    /// No unknown/MAY write can emit this certificate.
+    array_prefix: struct { array: LocalId, count: LocalId, inputs: [8]?LocalId = .{null} ** 8, scale: u64 = 1 },
+    /// A successful zero-based memset initializes only its defined count.
+    /// Count and fill dependencies remain reads, never helper-return proofs.
+    array_memset_prefix: struct {
+        array: LocalId,
+        count: IndexTerm,
+        rhs_kind: ExprKind,
+        defined: bool = false,
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
+    },
+    /// A selected pointer-free array value copies actual source coverage.
+    /// Unknown sources remain uncertified even when their bytes were written.
+    array_value: struct {
+        target: LocalId,
+        source: ExprKind,
+        inputs: [8]?LocalId = .{null} ** 8,
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
+        /// Vector coercions and bit casts require the entire source payload.
+        /// Their elements are not a one-to-one initialization map.
+        whole_payload: bool = false,
+    },
 
     /// `<receiver>.deinit()` on an arena.  Marks the arena dead.
     arena_kill: struct { arena_local: LocalId },
@@ -101,7 +217,25 @@ pub const StmtKind = union(enum) {
     /// `obj.field = RHS;` — write to a struct field.  We track field
     /// origins separately from the parent local so heap allocations
     /// stored in fields can be freed and UAF-checked.
-    field_assign: struct { parent: LocalId, name: []const u8, rhs_kind: ExprKind },
+    field_assign: struct {
+        parent: LocalId,
+        name: []const u8,
+        rhs_kind: ExprKind,
+        /// Value-definedness is independent of pointer/resource lifetime.
+        defined: bool = false,
+        inputs: [8]?LocalId = .{null} ** 8,
+        /// Selected scalar RHS storage; sibling payloads are not dependencies.
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
+        /// Compound scalar stores also consume the previous selected value.
+        reads_old_value: bool = false,
+        /// The slice header's `ptr` of an offset view of another slice. Local
+        /// frame storage is addressed by index from its base, so an offset view
+        /// of it carries no element coverage; every other origin carries over.
+        interior_view: bool = false,
+        /// Replayed byte facts must not replace a resource/lifetime origin.
+        /// An empty path denotes the whole value, or a pointer's pointee.
+        diagnostic_only: bool = false,
+    },
 
     /// `g.free(obj.field)` / `g.destroy(obj.field)` — kill a field's
     /// heap allocation.
@@ -120,11 +254,19 @@ pub const StmtKind = union(enum) {
 
     /// Read of `obj.field` — fires UAF / use-of-undef checks against
     /// the field's tracked origin (separate from the parent local's).
-    field_use: struct { parent: LocalId, name: []const u8 },
+    field_use: struct {
+        parent: LocalId,
+        name: []const u8,
+        /// An inline aggregate prefix checks lifetime, not sibling payload.
+        lifetime_only: bool = false,
+    },
 
     /// Additional value-position borrow in a returned aggregate. The origin
     /// can be a direct address or a runtime alias, not an ampersand token.
-    composite_escape: ExprKind,
+    composite_escape: struct {
+        value_kind: ExprKind,
+        stack_loans: StackLoanProof = .{},
+    },
 
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
@@ -135,6 +277,14 @@ pub const StmtKind = union(enum) {
     ret: struct {
         value_kind: ExprKind,
         is_borrowed_return_type: bool,
+        stack_loans: StackLoanProof = .{},
+        /// Source-backed return definedness, consumed only by callee summaries.
+        /// These operands are the value read before the function exits.
+        value_defined: bool = false,
+        value_inputs: [8]?ValueInput = .{null} ** 8,
+        /// Snapshot of constructor bytes, used only by negative return replay.
+        /// It supplies no returned-value or lifetime certificate.
+        diagnostic_source: ?LocalId = null,
         /// `return undefined;` written literally — canonical sentinel
         /// for comptime-gated branches (e.g. `if (comptime X) return
         /// undefined;` in bindgen stubs).  The author is explicitly
@@ -150,9 +300,26 @@ pub const StmtKind = union(enum) {
     /// Write through a pointer / field of `target` (e.g.
     /// `arena.* = X;`, `obj.field = X;`).  Does NOT rebind the
     /// local — its resource identity (.heap / .arena) is unchanged.
-    /// Only clears .undef → .plain (the underlying storage was
-    /// initialized via this write).
-    pointer_write: struct { target: LocalId },
+    /// Invalidates numeric/coverage facts for possibly mutated storage.
+    /// Non-array scalar storage retains the existing out-write semantics;
+    /// an array write never initializes all its elements.
+    pointer_write: struct {
+        target: LocalId,
+        initializes: bool = true,
+        /// The write goes through an element of the slice `target`, so its
+        /// ptr/len words are unchanged. Element coverage is still revoked.
+        payload_only: bool = false,
+        /// A source-proven element mutation preserves only existing complete
+        /// coverage, and only when its actual value dependencies are defined.
+        preserves_complete_array: bool = false,
+        preserve_inputs: [8]?ValueInput = .{null} ** 8,
+        /// Byte-source dependencies used only by the diagnostic.
+        diagnostic_inputs: [2]?ValueInput = .{null} ** 2,
+        value_has_undefined_origin: bool = false,
+        /// Whole-array helpers can consume fully supplied aggregate values.
+        /// Their selected payload inputs remain subject to definedness checks.
+        preserve_whole_payload: bool = false,
+    },
     /// Write through a `*T` parameter (or pointer-typed local) to
     /// caller-visible storage — `out.* = X;` or `out.field = X;`
     /// where `out` is pointer-typed.  Mirrors the escape-style
@@ -192,15 +359,18 @@ pub const StmtKind = union(enum) {
     /// Without this, the @takes-ownership / heap_free fallback path
     /// (which now marks plain locals as .heap.dead) cascades
     /// spurious double-free reports across loop iterations.
-    reset_capture: struct { local: LocalId },
+    reset_capture: struct {
+        local: LocalId,
+        /// Iteration selects a value from this live array/slice backing.
+        value_source: ?LocalId = null,
+        value_defined: bool = true,
+    },
     use: struct {
         local: LocalId,
-        /// True when this .use was emitted by a method-call walker
-        /// pass (`x.method(...)`).  Method-call receivers on a local
-        /// whose current origin is .undef are almost certainly init
-        /// calls (you don't read garbage); transferUse clears .undef
-        /// to .plain instead of firing use_undefined.  For .heap /
-        /// .arena origins, the call still counts as a real use.
+        /// The resolved instance method takes a pointer to its receiver.
+        /// Borrowing a value place does not read that place's payload.
+        /// The receiver's pointer header and resource lifetime are still
+        /// checked. This flag never proves an initialization write.
         from_method_call: bool = false,
     },
     /// A bare `if (COND)` whose condition carries a [GuardId].  The
@@ -263,7 +433,13 @@ pub const ExprKind = union(enum) {
     /// `gpa` in `gpa.alloc(...)`) — null when the receiver isn't a
     /// known local.  Used at the matching free site to detect
     /// allocator-mismatch.
-    heap_alloc: struct { id: abstract_state.HeapId, allocator_local: ?LocalId = null },
+    heap_alloc: struct {
+        id: abstract_state.HeapId,
+        allocator_local: ?LocalId = null,
+        /// Exact caller allocator header for interprocedural replacements.
+        /// Null preserves ordinary heap-allocation behavior.
+        allocator_source: ?ValueInput = null,
+    },
     /// `&<local>` — address-of a function-local.  Produces a pointer
     /// whose lifetime is bound to that local's stack frame.
     stack_ref: LocalId,
@@ -319,12 +495,21 @@ pub const Cfg = struct {
     fn_span: struct { start: u32, end: u32 },
     /// Local-name table (name & decl position keyed by LocalId).
     locals: []LocalInfo,
+    /// Immutable LocalId type bounds. Empty means no static integer facts.
+    /// Solver states borrow this storage and must die before this graph.
+    integer_domains: []const abstract_state.IntegerDomain = &.{},
     /// Path strings referenced by `field_assign` / `field_use`
     /// statements that aren't contiguous in source — e.g. struct-
     /// literal unpacking builds "parent_prefix.field_name" from two
     /// disjoint tokens.  Most paths ARE source slices (no entry
     /// here); these own the rest.
     owned_paths: [][]u8 = &.{},
+    /// Return and composite statements borrow these arrays. Each array is
+    /// registered once, even when several statements share its proof.
+    owned_stack_loans: [][]LocalId = &.{},
+    /// Runtime member names for diagnostic byte completeness. Locals borrow
+    /// these arrays; field-name bytes borrow source or owned_paths.
+    owned_field_layouts: [][]const []const u8 = &.{},
 
     pub fn deinit(self: *Cfg, gpa: std.mem.Allocator) void {
         for (self.blocks) |b| {
@@ -333,8 +518,13 @@ pub const Cfg = struct {
         }
         gpa.free(self.blocks);
         gpa.free(self.locals);
+        gpa.free(self.integer_domains);
         for (self.owned_paths) |p| gpa.free(p);
         gpa.free(self.owned_paths);
+        for (self.owned_stack_loans) |loans| gpa.free(loans);
+        gpa.free(self.owned_stack_loans);
+        for (self.owned_field_layouts) |fields| gpa.free(fields);
+        gpa.free(self.owned_field_layouts);
     }
 };
 
@@ -347,14 +537,35 @@ pub const LocalInfo = struct {
     /// slice or pointer just produces another view of caller-owned
     /// storage, not an escape.
     is_array: bool = false,
-    /// True iff the local's declared type begins with `*` (possibly
-    /// preceded by `?` or `const`) — i.e. the local is a pointer
-    /// (typically a `*Self` parameter).  The pointee lives in the
+    array_extent: ?u64 = null,
+    is_unsigned: bool = false,
+    /// CFG-only control state has no source binding or source-visible alias.
+    /// An opaque source write cannot change its recorded branch outcome.
+    is_control_local: bool = false,
+    /// Selected data-valued projections need payload facts, not merely an
+    /// initialized pointer or descriptor. Unrelated locals do not pay for it.
+    tracks_array_payload: bool = false,
+    /// The binding's actual value type is scalar, not a metatype or an
+    /// aggregate/pointer header. Its runtime definedness uses value_inputs.
+    tracks_scalar_value: bool = false,
+    /// Known runtime struct members. Null means no layout fact. Written
+    /// UNKNOWN members can cover bytes, but never supply value certificates.
+    runtime_fields: ?[]const []const u8 = null,
+    /// Exact by-value capture of authenticated std.meta.fields(Enum).
+    /// Only its `value` member has this intrinsic scalar type certificate.
+    /// Live field definedness remains a separate transfer-state fact.
+    is_enum_field_capture: bool = false,
+    /// True for a declared pointer spelling or an actual resolved non-slice
+    /// pointer type (including aliases). Typically a `*Self` parameter.
+    /// The pointee lives in the
     /// caller, so `&local.field` for a pointer-typed local is NOT a
     /// stack-frame borrow; it's a borrow from caller-owned storage.
     /// Address-of classification gates on this to avoid spurious
     /// stack-escape on the common `return &self.field` shape.
     is_pointer: bool = false,
+    /// Actual slice descriptor type. This says nothing about its header's
+    /// initializedness or the bytes behind its pointer.
+    is_slice: bool = false,
     /// Aliases can mutate this local; do not retain boolean path facts.
     address_taken: bool = false,
     /// Coarse classification of the init expression — lets the
@@ -391,9 +602,9 @@ pub const LocalInfo = struct {
     /// result.destroy();` — destroying an interior pointer is UB
     /// under typical allocators (oven-sh/bun#30166).
     from_container: ?LocalId = null,
-    /// The frame local this one holds the ADDRESS of, when its own
-    /// initializer produced a borrow of this frame
-    /// (`const alias = &local;`).  Null for every other initializer.
+    /// The frame local addressed by a direct borrow initializer
+    /// (`const alias = &local;`) or a fixed-array pointer capture.
+    /// Null when no frame storage owner is known.
     ///
     /// `&local` is not the only way a `catch` / `orelse` fallback can
     /// hand out frame storage — naming a binding that holds it produces
@@ -403,6 +614,10 @@ pub const LocalInfo = struct {
     /// naming this local binds the local named by this field, so the
     /// stack escape the direct spelling reports is not lost.
     frame_borrow_origin: ?LocalId = null,
+    /// Immutable `for (&array) |*entry|` capture of a fixed array element.
+    /// Whole-element stores may preserve existing coverage but never fill it.
+    /// Other pointer aliases retain only their dynamic storage origin.
+    array_element_owner: ?LocalId = null,
 };
 
 pub const InitHint = enum {
@@ -419,7 +634,6 @@ pub const InitHint = enum {
     /// would never fire — buf would carry a heap id unrelated to arena.
     arena_allocator,
     heap_local,
-    noreturn_alias,
     /// Local is a TYPE ALIAS — `const X = struct {...};` /
     /// `const X = enum {...};` etc.  No runtime storage; `X.<id>`
     /// addresses a STATIC field, not a stack-frame slot.  Without

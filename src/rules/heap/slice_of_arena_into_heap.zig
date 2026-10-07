@@ -262,16 +262,16 @@ fn report(
     var notes = try gpa.alloc(problem_mod.Note, 1);
     errdefer gpa.free(notes);
     notes[0] = .{
-        .start = Pos.fromTokenStart(tree, s.name_token),
-        .end = Pos.fromTokenEnd(tree, s.name_token),
+        .start = try Pos.fromTokenStart(tree, s.name_token),
+        .end = try Pos.fromTokenEnd(tree, s.name_token),
         .label = note_label,
     };
 
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, arg_tok),
-        .end = Pos.fromTokenEnd(tree, arg_tok),
+        .start = try Pos.fromTokenStart(tree, arg_tok),
+        .end = try Pos.fromTokenEnd(tree, arg_tok),
         .message = msg,
         .notes = notes,
     });

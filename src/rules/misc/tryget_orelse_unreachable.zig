@@ -90,8 +90,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, tryget_tok),
-        .end = Pos.fromTokenEnd(tree, tryget_tok + 4),
+        .start = try Pos.fromTokenStart(tree, tryget_tok),
+        .end = try Pos.fromTokenEnd(tree, tryget_tok + 4),
         .message = msg,
     });
 }

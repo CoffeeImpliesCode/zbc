@@ -32,18 +32,19 @@
 //! Semantic suppression (the arena-backed standard list) is proved per
 //! return site: the local must be declared with the standard library's
 //! list type, every allocator that can reach its buffer must be arena
-//! backed, and the buffer must not be released or escaped first.  A
-//! proof that cannot be completed is never read as a proof — see
+//! backed, and the buffer must not be released or escaped first.
+//! A pointer parameter can also borrow an arena field of a foreign context:
+//! resolved SDK identity proves the provider, and rejecting other pointer uses
+//! prevents a reset, rebind or escape from invalidating that returned borrow.
+//! A proof that cannot be completed is never read as a proof — see
 //! `src/rules/misc/return-arraylist-items.md`.
 //!
-//!   That proof is bounded rather than merely careful.  Its declarations are
-//! indexed once per function and answered from that index, so the cost is
-//! the function's own nodes instead of the file's node count per question,
-//! and every step it spends — a declaration indexed, a lookup answered, an
-//! allocator expression resolved, a node walked — is charged against
-//! `call_summary.actual_query_work_limit`. A proof that spends its whole budget
-//! has proved nothing, and the CLI reports the bound with the work site
-//! that reached it.
+//! The bounded proof reuses scoped bindings and indexes each questioned
+//! function's AST subtree once. Repeated declaration and capture queries do
+//! not scan unrelated functions. Each node visited, lookup answered and
+//! allocator expression resolved spends the unchanged file allowance in
+//! `call_summary.actual_query_work_limit`. An exhausted proof propagates its
+//! error and reports the return that initiated it, never a partial proof.
 //!
 //! One boundary of that proof is a refusal, and it is stated here rather
 //! than left to be discovered.  When the arena reaches a private helper,
@@ -60,6 +61,10 @@
 //! resolve, and an unresolved argument is not evidence.  The same
 //! refusal answers every other caller set it cannot settle, and there is
 //! no second, looser opinion behind it.
+//!
+//! Each closed call maps the exact declared formal to its actual expression.
+//! An instance call and an unbound method call can reach the same declaration
+//! with different written argument slots; the resolver settles that mapping.
 //!
 //! A third reading answers the memoised case: a header copied out of a
 //! container the caller already owns — `if (self.memo.get(key)) |cached|
@@ -89,6 +94,7 @@ const tokens = @import("../../ast/tokens.zig");
 const budget_mod = @import("../../budget.zig");
 const std_types = @import("../../model/std_type_query.zig");
 const call_summary = @import("../../cache/call_summary.zig");
+const fresh_storage = @import("../../cache/fresh_storage.zig");
 
 const testing = @import("../../testing.zig");
 
@@ -108,13 +114,22 @@ const R = "return-arraylist-items";
 /// in, and leaving these inferred is what makes their error contract
 /// unspecified rather than merely unwritten.
 ///
-/// The two members are the two the walks already raise: `OutOfMemory`
-/// when a declaration index or a binding table is grown or built, and
-/// the budget error when a walk spends the query work `FileCache`
-/// bounds it to (`giveUp`, reached through `DeclIndex.spend`).  It is
-/// exactly that union — not `anyerror`, and not a `catch` standing in
-/// for a decision this proof has not made.
-const ProofError = budget_mod.BudgetError || error{OutOfMemory};
+/// Allocation, file-model and budget failures propagate through the proof.
+/// So do SDK lookup errors: cancellation, source exclusion and unsupported
+/// URI schemes. A failed model or index is not evidence that a declaration
+/// is absent.
+const ProofError = file_cache_mod.SummaryError;
+
+/// Levels of allocator-expression recursion one arena proof may descend: a
+/// local initialised from a local initialised from a parameter whose
+/// callers pass a local, and so on.  A chain longer than this is
+/// not an answer in either direction, so the proof raises
+/// `error.AnalysisBudgetExceeded` instead of returning a value.
+const allocator_depth_limit: u8 = 16;
+
+/// Declaration hops `reachesReceiverStorage` may follow from a handed-over
+/// value to the receiver's own storage.  Same contract as above.
+const receiver_depth_limit: u8 = 8;
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -151,30 +166,27 @@ pub fn check(
         const recv = tree.tokenSlice(return_tok + 1);
         if (std.mem.eql(u8, recv, "self") or std.mem.eql(u8, recv, "this")) continue;
 
-        // The innermost function the return is written in.  Every proof
-        // below is stated about THAT function, and finding it walks
-        // every node of the file — so it is found once and handed to
-        // each of them rather than re-derived per proof.
-        const fn_decl = tokens.enclosingFnDecl(tree, return_tok);
+        // Scope lookup uses the resolver's existing document index when present.
+        const fn_decl = if (cache.zls) |resolver|
+            try resolver.enclosingFunctionAt(return_tok)
+        else
+            tokens.enclosingFnDecl(tree, return_tok);
+        index.return_token = return_tok;
 
         // Suppress when this function proves the list's whole capacity is in
         // use — `assert(list.items.len == list.capacity)`.
         if (capacityFullyUsed(tree, fn_decl, return_tok, recv)) continue;
 
-        // Suppress only when every allocator that can grow this local list is
-        // proven to come from an actual ArenaAllocator stored by a long-lived
-        // receiver (or reached through a private, exhaustively-called helper).
-        // A std.mem.Allocator parameter, an arbitrary pointer, or an
-        // allocator-like method on another type is not evidence.
-        if (try listUsesArenaBackedAllocator(tree, cache, &index, fn_decl, return_tok, recv)) continue;
-
         if (fn_decl) |decl| {
             if (recvIsPointerParam(tree, decl, recv)) continue;
         }
 
-        // A header copied out of a memo table is a view of bytes the
-        // table still owns, not an allocation this call orphans.
+        // A capture cannot be a locally allocated header. Resolve its owner
+        // before asking an arena proof about declarations or growth sites.
         if (try returnsBorrowedContainerValue(tree, cache, &index, fn_decl, return_tok, recv)) continue;
+
+        // Unknown allocator origins still refuse this proof.
+        if (try listUsesArenaBackedAllocator(tree, cache, &index, fn_decl, return_tok, recv)) continue;
 
         try report(gpa, problems, tree, return_tok);
     }
@@ -431,43 +443,20 @@ const IndexedFn = struct {
     count: usize,
 };
 
-/// One walk over the file's nodes, keeping only those whose first token
-/// falls in the range it was opened with.
-///
-/// Node 0 is the file's root and is never a statement, so the scan
-/// starts at 1.  The range is applied to each node as it is reached
-/// rather than narrowing where the scan starts and stops, which is the
-/// whole point: a node's index and its first token do not travel
-/// together, so there is no index range that stands for a token range.
-///
-/// Nothing here relies on WHY they come apart.  Two things are needed and
-/// both are about the SOURCE, not the parser: a node's first token is
-/// where that node begins, and sibling functions' token spans cannot
-/// interleave — which is what keeps a sibling's nodes out of this
-/// question.  A NESTED function lies inside its parent's span and is
-/// reached on purpose.
+/// A range-filtered pass over an already indexed function subtree. AST node
+/// numbers need not follow token order; the subtree supplies the node set.
 const NodeScan = struct {
     tree: *const Ast,
     index: *DeclIndex,
+    nodes: []const Ast.Node.Index,
     from: Ast.TokenIndex,
     to: Ast.TokenIndex,
-    /// The next node index to inspect.  It advances BEFORE the node is
-    /// handed back, because the hand-back leaves the loop before the
-    /// loop's own increment clause could run — a cursor moved there would
-    /// never move at all, and the caller would be handed the same node
-    /// until the budget ran out.
-    cursor: usize = 1,
+    cursor: usize = 0,
 
-    fn next(self: *NodeScan) !?Ast.Node.Index {
-        while (self.cursor < self.tree.nodes.len) {
-            const node: Ast.Node.Index = @enumFromInt(self.cursor);
+    fn next(self: *NodeScan) ProofError!?Ast.Node.Index {
+        while (self.cursor < self.nodes.len) {
+            const node = self.nodes[self.cursor];
             self.cursor += 1;
-            // Charged as INSPECTED, before the filter: the walk costs
-            // every node it looks at, not every node it keeps, and a scan
-            // that spent nothing was work the cap could neither bound
-            // nor report.  The charge carries the node's own token, which
-            // is a lookup rather than a walk, so nothing further is read
-            // once the cap has been reached.
             try self.index.spend(self.tree.nodeMainToken(node));
             const node_first = self.tree.firstToken(node);
             if (node_first < self.from or node_first > self.to) continue;
@@ -495,6 +484,8 @@ const DeclIndex = struct {
     remaining: *u32,
     decls: std.ArrayListUnmanaged(IndexedDecl) = .empty,
     functions: std.ArrayListUnmanaged(IndexedFn) = .empty,
+    body_nodes: std.AutoHashMapUnmanaged(Ast.Node.Index, []const Ast.Node.Index) = .empty,
+    return_token: ?Ast.TokenIndex = null,
 
     fn init(
         gpa: std.mem.Allocator,
@@ -508,39 +499,91 @@ const DeclIndex = struct {
     fn deinit(self: *DeclIndex) void {
         self.decls.deinit(self.gpa);
         self.functions.deinit(self.gpa);
+        var bodies = self.body_nodes.valueIterator();
+        while (bodies.next()) |nodes| self.gpa.free(nodes.*);
+        self.body_nodes.deinit(self.gpa);
     }
 
-    /// The nodes whose first token falls in `[first, last]`, one at a time.
-    ///
-    /// This is a SCAN of the file's own nodes with the range applied to
-    /// each one, not a window derived from the node indices.  A node's
-    /// first tokens are NOT monotone in its index — the parser reserves
-    /// some nodes before their contents are parsed and appends others
-    /// after, so a container can be numbered either side of its own
-    /// members — and a window read off the index by bisection was
-    /// therefore never the node set asked for.  No rule about that order
-    /// is claimed here; the scan simply does not depend on one.
-    ///
-    /// Every node is charged as it is INSPECTED, before the range filter,
-    /// because what the scan costs is every node it looks at rather than
-    /// every node it keeps.  That is what keeps a walk of the whole file
-    /// inside the cap instead of running past it unremarked: the bound is
-    /// the CLI diagnostic, not a silent full scan.
+    /// Build only this function's body, once. The cache supplies scoped
+    /// bindings; the engine iterator supplies AST children, including nested
+    /// declarations. No sibling function or unrelated file node is visited.
+    fn nodesOf(self: *DeclIndex, fn_decl: Ast.Node.Index) ProofError![]const Ast.Node.Index {
+        try self.spend(self.tree.nodeMainToken(fn_decl));
+        if (self.body_nodes.get(fn_decl)) |nodes| return nodes;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return &.{};
+        const Iterator = @import("type_engine").AstIterator;
+        const Frame = union(enum) {
+            children: Iterator,
+            switch_children: struct { condition: ?Ast.Node.Index, cases: []const Ast.Node.Index },
+
+            fn next(frame: *@This(), tree: *const Ast) ?Ast.Node.Index {
+                switch (frame.*) {
+                    .children => |*children| return children.next(tree),
+                    .switch_children => |*children| {
+                        if (children.condition) |condition| {
+                            children.condition = null;
+                            return condition;
+                        }
+                        if (children.cases.len == 0) return null;
+                        const node = children.cases[0];
+                        children.cases = children.cases[1..];
+                        return node;
+                    },
+                }
+            }
+        };
+        var frames: std.ArrayListUnmanaged(Frame) = .empty;
+        defer frames.deinit(self.gpa);
+        var nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
+        defer nodes.deinit(self.gpa);
+        try frames.append(self.gpa, .{ .children = .{ .array = .{
+            body.toOptional(), .none, .none, .none, .none,
+        } } });
+        while (frames.items.len != 0) {
+            const node = frames.items[frames.items.len - 1].next(self.tree) orelse {
+                frames.items.len -= 1;
+                continue;
+            };
+            try self.spend(self.tree.nodeMainToken(node));
+            try nodes.append(self.gpa, node);
+            const frame: Frame = if (self.tree.fullSwitch(node)) |sw|
+                .{ .switch_children = .{ .condition = sw.ast.condition, .cases = sw.ast.cases } }
+            else
+                .{ .children = Iterator.init(self.tree, node) };
+            try frames.append(self.gpa, frame);
+        }
+        const owned = try nodes.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(owned);
+        try self.body_nodes.put(self.gpa, fn_decl, owned);
+        return owned;
+    }
+
     fn scanNodes(
         self: *DeclIndex,
+        fn_decl: Ast.Node.Index,
         first: Ast.TokenIndex,
         last: Ast.TokenIndex,
-    ) NodeScan {
-        return .{ .tree = self.tree, .index = self, .from = first, .to = last };
+    ) ProofError!NodeScan {
+        return .{
+            .tree = self.tree,
+            .index = self,
+            .nodes = try self.nodesOf(fn_decl),
+            .from = first,
+            .to = last,
+        };
     }
 
-    /// Charge one step, and give the file up when the cap is reached.  The
-    /// site is the one the proof was on, so the diagnostic points at the
-    /// work that ran out rather than at the file as a whole.
+    /// Charge real work, keeping the initiating return as the failure site.
     fn spend(self: *DeclIndex, token: Ast.TokenIndex) !void {
         if (self.remaining.* == 0)
-            return giveUp(self.tree, token);
+            return giveUp(self.tree, self.return_token orelse token);
         self.remaining.* -= 1;
+    }
+
+    /// The proof would have to descend past `cap` levels to answer.  The
+    /// failure is recorded at the initiating return, like `spend`.
+    fn tooDeep(self: *DeclIndex, token: Ast.TokenIndex, cap: u8) (budget_mod.BudgetError || error{SourceTooWide}) {
+        return stopAt(self.tree, self.return_token orelse token, .arena_proof_depth, cap);
     }
 
     /// The declaration of `name` that a USE written at `use_token` names,
@@ -566,7 +609,6 @@ const DeclIndex = struct {
         // buy its answer for free: everything below either reads the
         // declaration index or walks the bindings.
         try self.spend(use_token);
-        const indexed = try self.indexOf(fn_decl);
         const body = tokens.bodyOf(self.tree, fn_decl) orelse return null;
         var proto_buf: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(self.tree, &proto_buf, fn_decl) orelse return null;
@@ -580,6 +622,11 @@ const DeclIndex = struct {
         var scanned = bindings.items.len;
         while (scanned > 0) : (scanned -= 1) try self.spend(use_token);
         const binding = bindings.findAt(name, use_token) orelse return null;
+        // Parameters and payloads cannot name a locally declared list. Do not
+        // index declarations for a question that the scoped binding settles.
+        if (binding.origin == .param or binding.origin == .loop_capture) return null;
+        const name_token = binding.name_token;
+        const indexed = try self.indexOf(fn_decl);
         // The binding names the declaration; the index carries the nodes
         // that declaration was written with, keyed by the very token its
         // NAME is at.  A parameter and a loop capture bind a name without
@@ -592,7 +639,7 @@ const DeclIndex = struct {
         while (i < end) : (i += 1) {
             const entry = self.decls.items[i];
             try self.spend(entry.name_token);
-            if (entry.name_token == binding.name_token) return entry;
+            if (entry.name_token == name_token) return entry;
         }
         return null;
     }
@@ -618,7 +665,7 @@ const DeclIndex = struct {
             const body_first = self.tree.firstToken(node);
             const fn_last = self.tree.lastToken(fn_decl);
             const tags = self.tree.tokens.items(.tag);
-            var scan = self.scanNodes(body_first, fn_last);
+            var scan = try self.scanNodes(fn_decl, body_first, fn_last);
             while (try scan.next()) |candidate| {
                 switch (self.tree.nodeTag(candidate)) {
                     .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
@@ -654,11 +701,22 @@ const DeclIndex = struct {
 /// the error every bounded walk propagates.  A caller that swallows the
 /// error still knows from the record why the file was skipped.
 ///
-/// The cap is READ rather than passed.  Every walk this rule bounds spends
-/// the one allowance `call_summary.actual_query_work_limit` names, so a
-/// `cap` argument had exactly one value at every call site and stood for a
-/// second kind of walk that does not exist.
-fn giveUp(tree: *const Ast, token: Ast.TokenIndex) budget_mod.BudgetError {
+/// The cap is READ rather than passed.  Every step-counted walk this rule
+/// bounds spends the one allowance `call_summary.actual_query_work_limit`
+/// names; the depth bounds go through `DeclIndex.tooDeep`.
+fn giveUp(tree: *const Ast, token: Ast.TokenIndex) (budget_mod.BudgetError || error{SourceTooWide})!void {
+    return stopAt(tree, token, .arena_proof_steps, call_summary.actual_query_work_limit);
+}
+
+/// Shared recorder behind `giveUp` and `DeclIndex.tooDeep`: every bound is
+/// checked before it is used, so the value a tripped bound reached is the
+/// bound itself.
+fn stopAt(
+    tree: *const Ast,
+    token: Ast.TokenIndex,
+    limit: budget_mod.Limit,
+    cap: u32,
+) (budget_mod.BudgetError || error{SourceTooWide}) {
     var name: budget_mod.NameBuf = .{};
     if (tokens.enclosingFnDecl(tree, token)) |decl| {
         var buffer: [1]Ast.Node.Index = undefined;
@@ -666,11 +724,11 @@ fn giveUp(tree: *const Ast, token: Ast.TokenIndex) budget_mod.BudgetError {
             if (proto.name_token) |name_tok| name.set(tree.tokenSlice(name_tok));
         }
     }
-    const site = Pos.fromTokenStart(tree, token);
+    const site = try Pos.fromTokenStart(tree, token);
     return budget_mod.fail(.{
-        .limit = .arena_proof_steps,
-        .limit_value = call_summary.actual_query_work_limit,
-        .reached = call_summary.actual_query_work_limit,
+        .limit = limit,
+        .limit_value = cap,
+        .reached = cap,
         .byte = site.byte,
         .line = site.line,
         .column = site.column,
@@ -711,9 +769,10 @@ const ArenaProof = struct {
         const fn_last = @min(self.tree.lastToken(fn_decl), return_tok - 1);
         var growth: Growth = .none;
 
-        var scan = self.index.scanNodes(body_first, fn_last);
+        var scan = try self.index.scanNodes(fn_decl, body_first, fn_last);
         while (try scan.next()) |node| {
             switch (self.tree.nodeTag(node)) {
+                .@"asm", .asm_simple, .asm_input, .asm_output => return false,
                 .call, .call_comma, .call_one, .call_one_comma => {
                     var call_buf: [1]Ast.Node.Index = undefined;
                     const call = self.tree.fullCall(&call_buf, node) orelse continue;
@@ -845,12 +904,11 @@ const ArenaProof = struct {
     ) ProofError!bool {
         const decl = (try self.index.lookup(fn_decl, list_name, before)) orelse return false;
         if (decl.type_node.unwrap()) |type_node| {
-            return isStandardListType(
-                self.cache,
-                self.tree,
-                self.tree.firstToken(type_node),
-                self.tree.lastToken(type_node),
-            );
+            if (self.cache.zls) |resolver| {
+                try self.index.spend(self.tree.nodeMainToken(type_node));
+                return try actualStandardList(resolver, self.index, type_node);
+            }
+            return isStandardListType(self.cache, self.tree, self.tree.firstToken(type_node), self.tree.lastToken(type_node));
         }
         const init = decl.init_node.unwrap() orelse return false;
         return self.initNamesStandardList(unwrapTry(self.tree, init));
@@ -881,7 +939,7 @@ const ArenaProof = struct {
         last: Ast.TokenIndex,
         depth: u8,
     ) ProofError!bool {
-        if (first > last or depth >= 16) return false;
+        if (first > last) return false;
         // One step per allocator expression the proof resolves.  This is the
         // recursion the walk spends its budget on, so it is charged at the
         // level that recurses rather than only at the growth site that
@@ -898,6 +956,10 @@ const ArenaProof = struct {
         }
         if (try self.isArenaAllocatorCall(fn_decl, start, end)) return true;
         if (start == end and tags[start] == .identifier) {
+            // The only step that recurses by depth: a name is answered by
+            // what it was initialised from.  Cutting that short is not
+            // "unproven", it is unfinished.
+            if (depth >= allocator_depth_limit) return self.index.tooDeep(start, allocator_depth_limit);
             return try self.identifierAllocatorIsSafe(fn_decl, start, depth + 1);
         }
         if (start + 2 == end and tags[start] == .identifier and
@@ -942,14 +1004,21 @@ const ArenaProof = struct {
         const name = self.tree.tokenSlice(name_token);
         var proto_buf: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(self.tree, &proto_buf, fn_decl) orelse return false;
-        var params = proto.iterate(self.tree);
-        var position: usize = 0;
-        while (params.next()) |param| : (position += 1) {
-            const token = param.name_token orelse continue;
-            if (!std.mem.eql(u8, self.tree.tokenSlice(token), name)) continue;
-            return try self.allCallsUseArena(fn_decl, position, depth + 1);
-        }
-        if (try self.index.lookup(fn_decl, name, name_token)) |decl| {
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return false;
+        try self.index.spend(name_token);
+        const bindings = try self.cache.localBindings(proto, body);
+        for (bindings.items) |_| try self.index.spend(name_token);
+        if (bindings.findAt(name, name_token)) |binding| {
+            if (binding.origin == .param) {
+                var params = proto.iterate(self.tree);
+                var position: usize = 0;
+                while (params.next()) |param| : (position += 1) {
+                    if (param.name_token != binding.name_token) continue;
+                    return try self.allCallsUseArena(fn_decl, position, depth + 1);
+                }
+                return false;
+            }
+            const decl = (try self.index.lookup(fn_decl, name, name_token)) orelse return false;
             const init_node = decl.init_node.unwrap() orelse return false;
             return try self.allocatorExprIsSafe(
                 fn_decl,
@@ -976,10 +1045,11 @@ const ArenaProof = struct {
     /// Closure is the whole difficulty here, and it is not answered by
     /// this file.  `FileCache.closedLocalCalls` is the only answer read:
     /// it binds each reference to the DECLARATION it resolves to rather
-    /// than to the spelling of its name, it refuses the whole file when
-    /// that file writes a reflective entry point, and it memoises the set
-    /// per declaration — so a helper consulted from several growth sites
-    /// is resolved once, not once per site and per recursion level.
+    /// than to the spelling of its name, it refuses reflective escapes of
+    /// that declaration, and it memoises the set per declaration. An
+    /// unrelated function-pointer parameter call is excluded only when the
+    /// same census proves the private body cannot escape to that parameter.
+    /// A helper consulted from several growth sites is resolved once.
     ///
     /// Null refuses the site, and there is no second opinion.  No
     /// resolver, no privacy, a reference that resolves elsewhere and
@@ -998,17 +1068,18 @@ const ArenaProof = struct {
         parameter: usize,
         depth: u8,
     ) ProofError!bool {
-        if (depth >= 16 or !self.functionIsPrivate(fn_decl)) return false;
-        const calls = (self.cache.closedLocalCalls(fn_decl) catch return false) orelse
-            return false;
+        if (!self.functionIsPrivate(fn_decl)) return false;
+        const calls = (try self.cache.closedLocalCalls(fn_decl)) orelse return false;
         if (calls.len == 0) return false;
-        // One declared callee, one argument slot: read off the callee's
-        // own signature once, rather than per call.
-        const explicit_index = self.explicitArgumentIndex(fn_decl, parameter) orelse return false;
+        const resolver = self.cache.zls orelse return false;
+        const frame = resolver.resolutionFrame();
         for (calls) |node| {
-            var call_buf: [1]Ast.Node.Index = undefined;
-            const call = self.tree.fullCall(&call_buf, node) orelse return false;
-            if (explicit_index >= call.ast.params.len) return false;
+            // The actual call decides whether it supplies a receiver. A
+            // bound call and `Type.method(&receiver, ...)` share the same
+            // formal declaration but not the same written argument slots.
+            try self.index.spend(self.tree.nodeMainToken(node));
+            var call_buf: [2]Ast.Node.Index = undefined;
+            const arg = (try frame.callArgumentIn(&call_buf, node, parameter)) orelse return false;
             // The caller is what names the argument's own source — its
             // parameter, its local, its receiver — so the argument cannot
             // be read without it, and it must be the INNERMOST
@@ -1023,11 +1094,9 @@ const ArenaProof = struct {
             // function TYPE is a different scope and is not a body a
             // call is evaluated in, so the lookup skips it.  No resolver
             // means the question is open, and an open question refuses.
-            const resolver = self.cache.zls orelse return false;
             const caller = (try resolver.enclosingFunctionAt(
                 self.tree.firstToken(node),
             )) orelse return false;
-            const arg = call.ast.params[explicit_index];
             if (!(try self.allocatorExprIsSafe(
                 caller,
                 self.tree.firstToken(arg),
@@ -1083,29 +1152,6 @@ const ArenaProof = struct {
         return owner;
     }
 
-    /// The index of `parameter` among the ARGUMENTS a caller writes,
-    /// which is the parameter's own index less the receiver when the
-    /// callee is a method.  The receiver is read from the model's owner
-    /// — including the whole-file type `file_model` synthesizes, whose
-    /// methods are this file's own functions and carry their receivers
-    /// just as accurately.
-    fn explicitArgumentIndex(
-        self: *const ArenaProof,
-        fn_decl: Ast.Node.Index,
-        parameter: usize,
-    ) ?usize {
-        const owner = self.model.containingTypeOf(fn_decl) orelse return parameter;
-        var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = tokens.fnProto(self.tree, &proto_buf, fn_decl) orelse return null;
-        const name = self.tree.tokenSlice(proto.name_token orelse return null);
-        const method = owner.findMethod(name) orelse return null;
-        if (method.receiver) |_| {
-            if (parameter == 0) return null;
-            return parameter - 1;
-        }
-        return parameter;
-    }
-
     fn identifierTypeName(
         self: *const ArenaProof,
         fn_decl: Ast.Node.Index,
@@ -1132,6 +1178,10 @@ const ArenaProof = struct {
         path: *const ProofPath,
         use_token: Ast.TokenIndex,
     ) ProofError!bool {
+        // FileModel's field walk only starts from a method's own receiver.
+        // A free function can borrow a pointer to an imported/nested context
+        // too. The resolver settles both that root and the final arena field.
+        if (try self.resolvedBorrowedArenaPath(fn_decl, path, use_token)) |answer| return answer;
         if (path.len == 0) {
             // Resolve the actual local at this use, not another block's
             // declaration or a file-scope value with the same spelling.
@@ -1150,6 +1200,119 @@ const ArenaProof = struct {
         const root = self.pathRootType(fn_decl, path) orelse return false;
         const leaf = walkFieldChain(self.tree, self.model, root, path) orelse return false;
         return isArenaType(self.cache, self.tree, leaf.type_first, leaf.type_last);
+    }
+
+    fn resolvedBorrowedArenaPath(
+        self: *const ArenaProof,
+        fn_decl: Ast.Node.Index,
+        path: *const ProofPath,
+        use_token: Ast.TokenIndex,
+    ) ProofError!?bool {
+        const resolver = self.cache.zls orelse return null;
+        try self.index.spend(use_token);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(self.tree, &buffer, fn_decl) orelse return null;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return null;
+        const bindings = try self.cache.localBindings(proto, body);
+        for (bindings.items) |_| try self.index.spend(use_token);
+        const binding = bindings.findAt(path.root, use_token) orelse return null;
+        // A pointer parameter borrows storage outside this frame. A local
+        // arena or a by-value context does not prove that lifetime.
+        if (binding.origin != .param) return null;
+        const root = self.cache.nodeForExactSpan(use_token, use_token) orelse return null;
+        const root_type = (try resolver.resolutionFrame().typeOfNode(root)) orelse return null;
+        if (resolver.typeTag(root_type) != .pointer) return false;
+        const last = use_token + @as(Ast.TokenIndex, @intCast(path.len * 2));
+        const leaf = self.cache.nodeForExactSpan(use_token, last) orelse return null;
+        const actual = (try resolver.containerOfNode(leaf)) orelse return null;
+        if (!try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig")) return false;
+        // Arena identity does not prove lifetime. Every use of this exact
+        // arena path must derive its allocator, not reset/rebind it or retain
+        // an alias. Other fields on a known receiver are separate paths.
+        const foreign = path.len != 0 and self.pathRootType(fn_decl, path) == null;
+        const return_token = self.index.return_token orelse return false;
+        const body_first = self.tree.firstToken(body);
+        const body_last = self.tree.lastToken(body);
+        const end = if (return_token > body_first and return_token < body_last)
+            return_token
+        else
+            body_last;
+        var allocator_derived = false;
+        var token = body_first;
+        while (token < end) : (token += 1) {
+            try self.index.spend(token);
+            if (!tokenIsNamed(self.tree, token, path.root)) continue;
+            var matched = true;
+            for (path.segments[0..path.len], 0..) |segment, offset| {
+                const at = token + @as(Ast.TokenIndex, @intCast(offset * 2));
+                if (at + 2 >= end or self.tree.tokenTag(at + 1) != .period or
+                    !tokenIsNamed(self.tree, at + 2, segment)) matched = false;
+            }
+            if (!matched) {
+                // Constructing a fresh owned arena before its first allocator
+                // use cannot release this slice. Do not mistake the assignment
+                // target for an escaped receiver pointer.
+                if (!foreign and !allocator_derived and token < use_token and
+                    try self.freshReceiverArenaInit(fn_decl, path, token, use_token))
+                    continue;
+                if (foreign or token + 1 >= end or self.tree.tokenTag(token + 1) != .period)
+                    return false;
+                continue;
+            }
+            const at = token + @as(Ast.TokenIndex, @intCast(path.len * 2));
+            if (at + 4 >= end or self.tree.tokenTag(at + 1) != .period or
+                !tokenIsNamed(self.tree, at + 2, "allocator") or
+                self.tree.tokenTag(at + 3) != .l_paren or
+                self.tree.tokenTag(at + 4) != .r_paren) return false;
+            token = at + 4;
+            allocator_derived = true;
+        }
+        return true;
+    }
+
+    /// A whole-receiver initializer may create the arena before a callback's
+    /// allocator is recorded. Accept only a standard arena VALUE initialized
+    /// by its implicit `.init` constructor, not a pointer or a copied header.
+    fn freshReceiverArenaInit(
+        self: *const ArenaProof,
+        fn_decl: Ast.Node.Index,
+        path: *const ProofPath,
+        token: Ast.TokenIndex,
+        use_token: Ast.TokenIndex,
+    ) ProofError!bool {
+        if (path.len != 1 or token + 4 >= use_token) return false;
+        const tags = self.tree.tokens.items(.tag);
+        if (tags[token + 1] != .period_asterisk or tags[token + 2] != .equal or
+            tags[token + 3] != .period or tags[token + 4] != .l_brace)
+            return false;
+        const owner = self.pathRootType(fn_decl, path) orelse return false;
+        const field = walkFieldChain(self.tree, self.model, owner, path) orelse return false;
+        if (!std_types.isType(
+            self.cache,
+            self.tree,
+            field.type_first,
+            field.type_last,
+            "heap",
+            "ArenaAllocator",
+            .{},
+        )) return false;
+        const close = tokens.matchBrace(tags, token + 4, use_token - 1) orelse return false;
+        const node = self.cache.nodeForExactSpan(token + 3, close) orelse return false;
+        var fields: [2]Ast.Node.Index = undefined;
+        const init = self.tree.fullStructInit(&fields, node) orelse return false;
+        for (init.ast.fields) |value| {
+            const first = self.tree.firstToken(value);
+            try self.index.spend(first);
+            if (first < 3 or tags[first - 3] != .period or tags[first - 1] != .equal or
+                !tokenIsNamed(self.tree, first - 2, path.segments[0]))
+                continue;
+            var args: [1]Ast.Node.Index = undefined;
+            const call = self.tree.fullCall(&args, value) orelse return false;
+            return call.ast.params.len == 1 and
+                self.tree.nodeTag(call.ast.fn_expr) == .enum_literal and
+                tokenIsNamed(self.tree, self.tree.nodeMainToken(call.ast.fn_expr), "init");
+        }
+        return false;
     }
 
     /// `?bool`: null when `fn_decl` declares no parameter by that name —
@@ -1218,6 +1381,7 @@ const ArenaProof = struct {
         path: *const ProofPath,
     ) ?*const file_model.TypeInfo {
         const method = owner.findMethod(name) orelse return null;
+        if (method.fn_decl != fn_decl) return null;
         const receiver = method.receiver orelse return null;
         if (!receiver.is_ptr or !std.mem.eql(u8, receiver.name, path.root)) return null;
         if (!self.receiverTypeMatches(fn_decl, owner)) return null;
@@ -1251,8 +1415,8 @@ const ArenaProof = struct {
         if (pointer.size != .one) return false;
         const child = pointer.ast.child_type;
         if (std.mem.eql(u8, self.tree.getNodeSource(child), "@This()")) return true;
-        return self.tree.nodeTag(child) == .identifier and
-            std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(child)), owner.name);
+        const spelling = tokens.typeNameFromTokens(self.tree, self.tree.firstToken(child), self.tree.lastToken(child)) orelse return false;
+        return self.model.resolveTypeNameInScope(spelling, owner) == owner;
     }
 
     fn contextFieldAllocatorIsSafe(
@@ -1489,7 +1653,7 @@ fn listUsesArenaBackedAllocator(
     list_name: []const u8,
 ) ProofError!bool {
     const decl = fn_decl orelse return false;
-    const model = cache.fileModel() catch return false;
+    const model = try cache.fileModel();
     const proof = ArenaProof{ .tree = tree, .model = model, .cache = cache, .index = index };
     return proof.listUsesArena(decl, return_tok, list_name);
 }
@@ -1512,7 +1676,7 @@ fn returnsBorrowedContainerValue(
     recv: []const u8,
 ) !bool {
     const decl = fn_decl orelse return false;
-    const model = cache.fileModel() catch return false;
+    const model = try cache.fileModel();
     const borrow = ContainerBorrow{
         .tree = tree,
         .model = model,
@@ -1521,7 +1685,6 @@ fn returnsBorrowedContainerValue(
     };
     return try borrow.borrowedView(decl, return_tok, recv);
 }
-
 
 /// What the callee of one call does to storage, read from the callee's own
 /// body and from nothing else.  `rooted` is charged to the formals the call
@@ -1538,6 +1701,7 @@ const ContainerBorrow = struct {
     const Capture = struct {
         container: ProofPath,
         container_node: Ast.Node.Index,
+        lookup_node: Ast.Node.Index,
         branch_first: Ast.TokenIndex,
         branch_last: Ast.TokenIndex,
     };
@@ -1565,8 +1729,15 @@ const ContainerBorrow = struct {
         return_tok: Ast.TokenIndex,
         recv: []const u8,
     ) !bool {
-        const capture = try self.findCapture(fn_decl, return_tok, recv) orelse return false;
-        if (!self.containerStoresLists(fn_decl, &capture.container)) return false;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return false;
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(self.tree, &proto_buf, fn_decl) orelse return false;
+        const bindings = try self.cache.localBindings(proto, body);
+        for (bindings.items) |_| try self.index.spend(return_tok);
+        const binding = bindings.findAt(recv, return_tok) orelse return false;
+        if (binding.origin != .loop_capture) return false;
+        const capture = try self.findCapture(fn_decl, return_tok, recv, binding.name_token) orelse return false;
+        if (!try self.containerStoresLists(fn_decl, &capture)) return false;
         return try self.branchLeavesThemAlone(fn_decl, &capture, recv);
     }
 
@@ -1581,11 +1752,12 @@ const ContainerBorrow = struct {
         fn_decl: Ast.Node.Index,
         return_tok: Ast.TokenIndex,
         recv: []const u8,
+        name_token: Ast.TokenIndex,
     ) !?Capture {
         const fn_first = self.tree.firstToken(fn_decl);
         const fn_last = self.tree.lastToken(fn_decl);
         var best: ?Capture = null;
-        var scan = self.index.scanNodes(fn_first, fn_last);
+        var scan = try self.index.scanNodes(fn_decl, fn_first, fn_last);
         while (try scan.next()) |node| {
             const tag = self.tree.nodeTag(node);
             if (tag != .@"if" and tag != .if_simple and tag != .@"while" and
@@ -1608,6 +1780,7 @@ const ContainerBorrow = struct {
                 },
             }
             const payload_token = payload orelse continue;
+            if (payload_token != name_token) continue;
             if (!tokenIsNamed(self.tree, payload_token, recv)) continue;
             const branch_first = self.tree.firstToken(branch);
             const branch_last = self.tree.lastToken(branch);
@@ -1630,6 +1803,7 @@ const ContainerBorrow = struct {
             best = .{
                 .container = container,
                 .container_node = callee.receiver,
+                .lookup_node = cond_expr,
                 .branch_first = branch_first,
                 .branch_last = branch_last,
             };
@@ -1647,13 +1821,48 @@ const ContainerBorrow = struct {
     fn containerStoresLists(
         self: *const ContainerBorrow,
         fn_decl: Ast.Node.Index,
-        container: *const ProofPath,
-    ) bool {
+        capture: *const Capture,
+    ) !bool {
+        const container = &capture.container;
         if (container.len == 0) return false;
         const root = self.receiverRootType(fn_decl, container) orelse return false;
-        const leaf = walkFieldChain(self.tree, self.model, root, container) orelse
-            return false;
+        const leaf = walkFieldChain(self.tree, self.model, root, container) orelse return false;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return false;
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(self.tree, &proto_buf, fn_decl) orelse return false;
+        var params = proto.iterate(self.tree);
+        const receiver = params.next() orelse return false;
+        const receiver_token = receiver.name_token orelse return false;
+        const bindings = try self.cache.localBindings(proto, body);
+        for (bindings.items) |_| try self.index.spend(receiver_token);
+        const root_binding = bindings.findAt(container.root, self.tree.firstToken(capture.container_node)) orelse return false;
+        if (root_binding.origin != .param or root_binding.name_token != receiver_token) return false;
+        if (self.cache.zls) |resolver| {
+            // The actual SDK declaration settles both lookup semantics and
+            // instantiated value type. A project method named get is not proof.
+            try self.index.spend(self.tree.nodeMainToken(capture.lookup_node));
+            const reference = switch (try resolver.functionReferenceOfCall(capture.lookup_node)) {
+                .function => |reference| reference,
+                else => return false,
+            };
+            const function = reference.actual_type.data.function;
+            if (!std.mem.eql(u8, function.name orelse return false, "get")) return false;
+            if (!try sdkMapDocument(resolver, function.handle)) return false;
+            try self.index.spend(self.tree.nodeMainToken(capture.container_node));
+            const map = (try resolver.containerOfNode(capture.container_node)) orelse return false;
+            if (!try sdkMapDocument(resolver, map.scope_handle.handle)) return false;
+            try self.index.spend(self.tree.nodeMainToken(capture.lookup_node));
+            return try actualStandardList(resolver, self.index, capture.lookup_node);
+        }
         return self.mapStoresStandardList(leaf.type_first, leaf.type_last);
+    }
+
+    fn sdkMapDocument(
+        resolver: *resolver_mod.TypeResolver,
+        handle: @import("type_engine").DocumentStore.Handle,
+    ) !bool {
+        return try resolver.declaredInToolchainFile(handle, "/std/array_hash_map.zig") or
+            try resolver.declaredInToolchainFile(handle, "/std/hash_map.zig");
     }
 
     /// `std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8))`
@@ -1713,12 +1922,13 @@ const ContainerBorrow = struct {
     ) !bool {
         const fn_first = self.tree.firstToken(fn_decl);
         const fn_last = self.tree.lastToken(fn_decl);
-        var scan = self.index.scanNodes(fn_first, fn_last);
+        var scan = try self.index.scanNodes(fn_decl, fn_first, fn_last);
         while (try scan.next()) |node| {
             const first = self.tree.firstToken(node);
             const in_branch = first >= capture.branch_first and
                 first <= capture.branch_last;
             switch (self.tree.nodeTag(node)) {
+                .@"asm", .asm_simple, .asm_input, .asm_output => if (in_branch) return false,
                 .fn_decl => {
                     // A function declared in the branch can outlive it,
                     // and the capture it copied would then be the last
@@ -1737,6 +1947,7 @@ const ContainerBorrow = struct {
                 .assign => {
                     if (!in_branch) continue;
                     const lhs = self.tree.nodeData(node).node_and_node[0];
+                    if (self.reachesContainer(lhs, &capture.container)) return false;
                     if (self.tree.nodeTag(lhs) != .identifier) continue;
                     if (tokenIsNamed(self.tree, self.tree.nodeMainToken(lhs), recv)) return false;
                 },
@@ -1799,7 +2010,11 @@ const ContainerBorrow = struct {
                 reaches_receiver = true;
         }
         const callee_token = self.tree.lastToken(fn_expr);
-        const actual = try call_summary.actualCallSummaryAt(self.cache, callee_token, null);
+        const actual = try call_summary.actualCallSummaryAt(
+            self.cache,
+            fresh_storage.calleeQueryToken(self.tree, call),
+            null,
+        );
         const release: CalleeRelease = if (actual) |summary|
             try self.calleeRelease(summary.callee)
         else if (isReleaseName(self.tree.tokenSlice(callee_token)))
@@ -1919,7 +2134,6 @@ const ContainerBorrow = struct {
         node: Ast.Node.Index,
         depth: u8,
     ) !bool {
-        if (depth >= 8) return true;
         try self.index.spend(self.tree.firstToken(node));
         const first = self.tree.firstToken(node);
         const last = self.tree.lastToken(node);
@@ -1931,6 +2145,7 @@ const ContainerBorrow = struct {
             if (std.mem.eql(u8, name, capture.container.root)) return true;
             const decl = (try self.index.lookup(fn_decl, name, t)) orelse continue;
             const init = decl.init_node.unwrap() orelse continue;
+            if (depth + 1 >= receiver_depth_limit) return self.index.tooDeep(t, receiver_depth_limit);
             if (try self.reachesReceiverStorage(fn_decl, capture, init, depth + 1))
                 return true;
         }
@@ -1975,10 +2190,9 @@ fn mentionsAny(
 /// see, and a body that spells one is read on the value it was written on.
 fn isReleaseName(name: []const u8) bool {
     const names = [_][]const u8{
-        "clearAndFree", "destroy",  "deinit",          "fetchRemove",
-        "fetchRemoveGet", "free",  "rawFree",          "release",
-        "remove",       "shrinkAndFree", "shrinkAndFreePrecise",
-        "unref",
+        "clearAndFree",   "destroy",       "deinit",               "fetchRemove",
+        "fetchRemoveGet", "free",          "rawFree",              "release",
+        "remove",         "shrinkAndFree", "shrinkAndFreePrecise", "unref",
     };
     for (names) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
@@ -2473,8 +2687,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, return_tok),
-        .end = Pos.fromTokenEnd(tree, return_tok + 4),
+        .start = try Pos.fromTokenStart(tree, return_tok),
+        .end = try Pos.fromTokenEnd(tree, return_tok + 4),
         .message = msg,
     });
 }
@@ -2683,6 +2897,117 @@ test "return-arraylist-items: private call chain preserves declared arena origin
         \\    }
         \\};
         \\
+    );
+}
+
+test "return-arraylist-items: unrelated function pointer parameter cannot reach private arena helper" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn collect(memory: std.mem.Allocator) []const u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    out.append(memory, 'x') catch {};
+        \\    return out.items;
+        \\}
+        \\pub const Model = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn render(self: *Model) []const u8 {
+        \\        return collect(self.arena.allocator());
+        \\    }
+        \\};
+        \\pub fn unrelated(callback: *const fn () void) void {
+        \\    callback();
+        \\}
+    );
+}
+
+test "return-arraylist-items: function pointer parameter can reach escaped private helper" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn collect(memory: std.mem.Allocator) []const u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    out.append(memory, 'x') catch {};
+        \\    return out.items;
+        \\}
+        \\pub const Model = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn render(self: *Model) []const u8 {
+        \\        return collect(self.arena.allocator());
+        \\    }
+        \\};
+        \\fn invoke(callback: *const fn (std.mem.Allocator) []const u8, memory: std.mem.Allocator) []const u8 {
+        \\    return callback(memory);
+        \\}
+        \\pub fn heap(memory: std.mem.Allocator) []const u8 {
+        \\    return invoke(collect, memory);
+        \\}
+    );
+}
+
+test "return-arraylist-items: unrelated callback does not hide a direct heap caller" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn collect(memory: std.mem.Allocator) []const u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    out.append(memory, 'x') catch {};
+        \\    return out.items;
+        \\}
+        \\pub const Model = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn render(self: *Model) []const u8 {
+        \\        return collect(self.arena.allocator());
+        \\    }
+        \\};
+        \\pub fn heap(memory: std.mem.Allocator) []const u8 {
+        \\    return collect(memory);
+        \\}
+        \\pub fn unrelated(callback: *const fn () void) void {
+        \\    callback();
+        \\}
+    );
+}
+
+test "return-arraylist-items: bound and unbound private calls preserve the same arena formal" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Capture = struct {
+        \\    fn collect(self: *Capture, memory: std.mem.Allocator) []u8 {
+        \\        _ = self;
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        out.append(memory, 1) catch {};
+        \\        return out.items;
+        \\    }
+        \\};
+        \\const Model = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn evaluate(self: *Model) void {
+        \\        var capture: Capture = .{};
+        \\        _ = capture.collect(self.arena.allocator());
+        \\        _ = Capture.collect(&capture, self.arena.allocator());
+        \\    }
+        \\};
+    );
+}
+
+test "return-arraylist-items: arena arguments do not prove a different heap formal" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Capture = struct {
+        \\    fn collect(self: *Capture, memory: std.mem.Allocator, unused: std.mem.Allocator) []u8 {
+        \\        _ = self;
+        \\        _ = unused;
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        out.append(memory, 1) catch {};
+        \\        return out.items;
+        \\    }
+        \\};
+        \\const Model = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn evaluate(self: *Model, heap: std.mem.Allocator) void {
+        \\        var capture: Capture = .{};
+        \\        _ = capture.collect(heap, self.arena.allocator());
+        \\        _ = Capture.collect(&capture, heap, self.arena.allocator());
+        \\    }
+        \\};
     );
 }
 
@@ -4258,5 +4583,468 @@ test "return-arraylist-items: concrete SDK callback still refuses copied entry b
         \\    }
         \\};
         \\
+    );
+}
+
+test "return-arraylist-items: owner-managed membership cache borrows SDK list storage" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Wiring = struct {
+        \\    pub const NamedModuleMap = struct {
+        \\        memberships: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+        \\        pub const ModuleWiring = struct { root: []const u8 };
+        \\        pub fn deinit(self: *NamedModuleMap, gpa: std.mem.Allocator) void {
+        \\            for (self.memberships.values()) |*paths| {
+        \\                for (paths.items) |path| gpa.free(path);
+        \\                paths.deinit(gpa);
+        \\            }
+        \\            self.memberships.deinit(gpa);
+        \\        }
+        \\        pub fn membershipOf(self: *NamedModuleMap, gpa: std.mem.Allocator, identity: []const u8) ![]const []const u8 {
+        \\            if (self.memberships.get(identity)) |cached| return cached.items;
+        \\            var scratch = std.heap.ArenaAllocator.init(gpa);
+        \\            defer scratch.deinit();
+        \\            var reached: std.ArrayList([]const u8) = .empty;
+        \\            try reached.append(scratch.allocator(), identity);
+        \\            const owned = try gpa.alloc([]const u8, reached.items.len);
+        \\            errdefer gpa.free(owned);
+        \\            for (owned, reached.items) |*slot, path| slot.* = try gpa.dupe(u8, path);
+        \\            try self.memberships.put(gpa, identity, .fromOwnedSlice(owned));
+        \\            return owned;
+        \\        }
+        \\    };
+        \\};
+    );
+}
+
+test "return-arraylist-items: a membership method still reports its fresh underfilled local" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const NamedModuleMap = struct {
+        \\    memberships: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+        \\    pub fn membershipOf(self: *NamedModuleMap, gpa: std.mem.Allocator, identity: []const u8) ![]const []const u8 {
+        \\        if (self.memberships.get(identity)) |cached| return cached.items;
+        \\        var fresh = try std.ArrayList([]const u8).initCapacity(gpa, 64);
+        \\        fresh.appendAssumeCapacity(identity);
+        \\        return fresh.items;
+        \\    }
+        \\};
+    );
+}
+
+test "return-arraylist-items: unrelated large bodies do not exhaust a small local proof" {
+    const gpa = std.testing.allocator;
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "const std = @import(\"std\");\nfn unrelated() void {\n");
+    for (0..20000) |_| try source.appendSlice(gpa, "_ = 1 + 2;\n");
+    try source.appendSlice(gpa,
+        \\}
+        \\pub fn local(gpa: std.mem.Allocator) ![]u8 {
+        \\    var out = try std.ArrayList(u8).initCapacity(gpa, 64);
+        \\    out.appendAssumeCapacity(1);
+        \\    return out.items;
+        \\}
+    );
+    var problems = try testing.runRule(gpa, check, source.items);
+    defer testing.freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings(R, problems.items[0].rule_id);
+}
+
+test "return-arraylist-items: a genuinely oversized questioned body retains the work bound" {
+    const gpa = std.testing.allocator;
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa,
+        \\const std = @import("std");
+        \\pub fn oversized(gpa: std.mem.Allocator) ![]u8 {
+        \\    var out = try std.ArrayList(u8).initCapacity(gpa, 64);
+        \\
+    );
+    for (0..20000) |_| try source.appendSlice(gpa, "_ = 1 + 2;\n");
+    try source.appendSlice(gpa, "    return out.items;\n}\n");
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, testing.runRule(gpa, check, source.items));
+    const diagnostic = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.arena_proof_steps, diagnostic.limit);
+    try std.testing.expectEqual(call_summary.actual_query_work_limit, diagnostic.limit_value);
+    try std.testing.expectEqual(call_summary.actual_query_work_limit, diagnostic.reached);
+    try std.testing.expectEqualStrings("oversized", diagnostic.function.slice());
+    try std.testing.expectEqualStrings("return out.items;\n}\n", source.items[diagnostic.byte..]);
+}
+
+/// Resolve the actual SDK unmanaged-list container. Managed lists carry an
+/// allocator in their header and require a different growth proof.
+fn actualStandardList(
+    resolver: *resolver_mod.TypeResolver,
+    index: *DeclIndex,
+    node: Ast.Node.Index,
+) ProofError!bool {
+    const actual = (try resolver.containerOfNode(node)) orelse return false;
+    const handle = actual.scope_handle.handle;
+    if (!try resolver.declaredInToolchainFile(handle, "/std/array_list.zig")) return false;
+    const tree = &handle.document.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, actual.scope_handle.toNode()) orelse return false;
+    var items = false;
+    var capacity = false;
+    for (container.ast.members) |member| {
+        try index.spend(index.return_token orelse 0);
+        const field = tree.fullContainerField(member) orelse continue;
+        const name = tree.tokenSlice(field.ast.main_token);
+        if (std.mem.eql(u8, name, "allocator")) return false;
+        if (std.mem.eql(u8, name, "items")) items = true;
+        if (std.mem.eql(u8, name, "capacity")) capacity = true;
+    }
+    return items and capacity;
+}
+
+test "return-arraylist-items: unrelated large AST leaves an owner-managed SDK borrow provable" {
+    const gpa = std.testing.allocator;
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa,
+        \\const std = @import("std");
+        \\const NamedModuleMap = struct {
+        \\    memberships: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+        \\    pub fn membershipOf(self: *NamedModuleMap, identity: []const u8) []const []const u8 {
+        \\        if (self.memberships.get(identity)) |cached| return cached.items;
+        \\        return &.{};
+        \\    }
+        \\};
+        \\fn unrelated() void {
+        \\
+    );
+    for (0..20000) |_| try source.appendSlice(gpa, "_ = 1 + 2;\n");
+    try source.appendSlice(gpa, "}\n");
+    var problems = try testing.runRuleTyped(gpa, check, source.items);
+    defer testing.freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+/// A method whose list grows through an allocator reached by `hops` local
+/// aliases of the receiver's own arena.
+fn aliasChainSource(gpa: std.mem.Allocator, hops: usize) !std.ArrayListUnmanaged(u8) {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer source.deinit(gpa);
+    try source.appendSlice(gpa,
+        \\const std = @import("std");
+        \\const Context = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn render(self: *Context) []const u8 {
+        \\        const a0 = self.arena.allocator();
+        \\
+    );
+    for (1..hops + 1) |i| try source.print(gpa, "        const a{d} = a{d};\n", .{ i, i - 1 });
+    try source.print(gpa,
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        out.append(a{d}, 'x') catch {{}};
+        \\        return out.items;
+        \\    }}
+        \\}};
+        \\
+    , .{hops});
+    return source;
+}
+
+test "return-arraylist-items: a shallow allocator alias chain still proves the arena" {
+    const gpa = std.testing.allocator;
+    var source = try aliasChainSource(gpa, 3);
+    defer source.deinit(gpa);
+    try testing.expectNoFire(check, source.items);
+}
+
+test "return-arraylist-items: an allocator alias chain past the depth bound is unfinished, not unproven" {
+    const gpa = std.testing.allocator;
+    var source = try aliasChainSource(gpa, 12);
+    defer source.deinit(gpa);
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, testing.runRule(gpa, check, source.items));
+    const diagnostic = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.arena_proof_depth, diagnostic.limit);
+    try std.testing.expectEqual(@as(u32, allocator_depth_limit), diagnostic.limit_value);
+    try std.testing.expectEqualStrings("render", diagnostic.function.slice());
+}
+
+/// `levels` private helpers that each forward their allocator formal to the
+/// one below, the bottom one growing the returned list; the only caller
+/// hands the top one the receiver's own arena.
+fn privateCallChainSource(gpa: std.mem.Allocator, levels: usize) !std.ArrayListUnmanaged(u8) {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer source.deinit(gpa);
+    try source.appendSlice(gpa,
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\fn l0(memory: Allocator) []const u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    out.append(memory, 'x') catch {};
+        \\    return out.items;
+        \\}
+        \\
+    );
+    for (1..levels) |i| try source.print(
+        gpa,
+        "fn l{d}(memory: Allocator) []const u8 {{\n    return l{d}(memory);\n}}\n",
+        .{ i, i - 1 },
+    );
+    try source.print(gpa,
+        \\const Model = struct {{
+        \\    arena: std.heap.ArenaAllocator,
+        \\    fn evaluate(self: *Model) void {{
+        \\        _ = l{d}(self.arena.allocator());
+        \\    }}
+        \\}};
+        \\
+    , .{levels - 1});
+    return source;
+}
+
+test "return-arraylist-items: a short private call chain still proves the arena" {
+    const gpa = std.testing.allocator;
+    var source = try privateCallChainSource(gpa, 3);
+    defer source.deinit(gpa);
+    try testing.expectNoFireTyped(check, source.items);
+}
+
+test "return-arraylist-items: a private call chain past the depth bound is unfinished, not unproven" {
+    const gpa = std.testing.allocator;
+    var source = try privateCallChainSource(gpa, 9);
+    defer source.deinit(gpa);
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, testing.runRuleTyped(gpa, check, source.items));
+    const diagnostic = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.arena_proof_depth, diagnostic.limit);
+    try std.testing.expectEqual(@as(u32, allocator_depth_limit), diagnostic.limit_value);
+    try std.testing.expectEqualStrings("l0", diagnostic.function.slice());
+}
+
+/// A memo lookup whose branch hands a releasing helper a value reached
+/// through `hops` local copies of an empty map, none of them the receiver's.
+fn handoverChainSource(gpa: std.mem.Allocator, hops: usize) !std.ArrayListUnmanaged(u8) {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer source.deinit(gpa);
+    try source.appendSlice(gpa,
+        \\const std = @import("std");
+        \\
+        \\fn visit(
+        \\    members: std.StringArrayHashMapUnmanaged(std.ArrayList(u8)),
+        \\    gpa: std.mem.Allocator,
+        \\) void {
+        \\    for (members.values()) |*entry| gpa.free(entry.allocatedSlice());
+        \\}
+        \\
+        \\const Memo = struct {
+        \\    members: std.StringArrayHashMapUnmanaged(std.ArrayList(u8)) = .empty,
+        \\
+        \\    fn line(self: *Memo, key: []const u8, gpa: std.mem.Allocator) []const u8 {
+        \\        const d0: std.StringArrayHashMapUnmanaged(std.ArrayList(u8)) = .empty;
+        \\
+    );
+    for (1..hops + 1) |i| try source.print(gpa, "        const d{d} = d{d};\n", .{ i, i - 1 });
+    try source.print(gpa,
+        \\        if (self.members.get(key)) |cached| {{
+        \\            visit(d{d}, gpa);
+        \\            return cached.items;
+        \\        }}
+        \\        return "";
+        \\    }}
+        \\}};
+        \\
+    , .{hops});
+    return source;
+}
+
+test "return-arraylist-items: a releasing helper handed an unrelated local keeps the borrow" {
+    const gpa = std.testing.allocator;
+    var source = try handoverChainSource(gpa, 3);
+    defer source.deinit(gpa);
+    try testing.expectNoFireTyped(check, source.items);
+}
+
+test "return-arraylist-items: a handover chain past the depth bound is unfinished, not reaching" {
+    const gpa = std.testing.allocator;
+    var source = try handoverChainSource(gpa, 10);
+    defer source.deinit(gpa);
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, testing.runRuleTyped(gpa, check, source.items));
+    const diagnostic = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.arena_proof_depth, diagnostic.limit);
+    try std.testing.expectEqual(@as(u32, receiver_depth_limit), diagnostic.limit_value);
+    try std.testing.expectEqualStrings("line", diagnostic.function.slice());
+}
+
+test "return-arraylist-items: resolved foreign arena field returns a borrow" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Context = struct { storage: std.heap.ArenaAllocator };
+        \\pub fn collect(context: *Context) ![]u8 {
+        \\    const memory = context.storage.allocator();
+        \\    var writes: std.ArrayList(u8) = .empty;
+        \\    try writes.append(memory, 1);
+        \\    return writes.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: general allocator field does not prove a borrow" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Context = struct { storage: std.mem.Allocator };
+        \\pub fn collect(context: *Context) ![]u8 {
+        \\    var writes: std.ArrayList(u8) = .empty;
+        \\    try writes.append(context.storage, 1);
+        \\    return writes.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: frame local resolved arena does not prove a returned borrow" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var storage = std.heap.ArenaAllocator.init(gpa);
+        \\    defer storage.deinit();
+        \\    var writes: std.ArrayList(u8) = .empty;
+        \\    try writes.append(storage.allocator(), 1);
+        \\    return writes.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: foreign arena reset refuses the returned borrow" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Context = struct { storage: std.heap.ArenaAllocator };
+        \\pub fn collect(context: *Context) ![]u8 {
+        \\    var writes: std.ArrayList(u8) = .empty;
+        \\    try writes.append(context.storage.allocator(), 1);
+        \\    _ = context.storage.reset(.free_all);
+        \\    return writes.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: resolved general allocator local list still loses capacity" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var writes: std.ArrayList(u8) = .empty;
+        \\    try writes.append(gpa, 1);
+        \\    return writes.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: explicit borrowed arena pointer owns query snapshots" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Query = struct {
+        \\    scratch: *std.heap.ArenaAllocator,
+        \\    fn collect(self: *Query) ![]const u8 {
+        \\        var windows: std.ArrayList(u8) = .empty;
+        \\        try windows.append(self.scratch.allocator(), 1);
+        \\        return windows.items;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Query = struct {
+        \\    scratch: *std.heap.ArenaAllocator,
+        \\    fn collect(self: *Query) ![]const u8 {
+        \\        var windows: std.ArrayList(u8) = .empty;
+        \\        try windows.append(self.scratch.allocator(), 1);
+        \\        _ = self.scratch.reset(.free_all);
+        \\        return windows.items;
+        \\    }
+        \\};
+    );
+}
+
+test "return-arraylist-items: borrowed arena pointer aliases refuse lifetime credit" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Query = struct {
+        \\    scratch: *std.heap.ArenaAllocator,
+        \\    fn collect(self: *Query) ![]const u8 {
+        \\        var windows: std.ArrayList(u8) = .empty;
+        \\        try windows.append(self.scratch.allocator(), 1);
+        \\        const storage = self.scratch;
+        \\        _ = storage.reset(.free_all);
+        \\        return windows.items;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Query = struct {
+        \\    scratch: *std.heap.ArenaAllocator,
+        \\    fn collect(self: *Query) ![]const u8 {
+        \\        var windows: std.ArrayList(u8) = .empty;
+        \\        try windows.append(self.scratch.allocator(), 1);
+        \\        const alias = self;
+        \\        _ = alias.scratch.reset(.free_all);
+        \\        return windows.items;
+        \\    }
+        \\};
+    );
+}
+
+test "return-arraylist-items: fresh receiver arena initialization precedes the borrow" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    fn collect(self: *Store) ![]const u8 {
+        \\        self.* = .{ .arena = .init(std.heap.page_allocator) };
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        try out.append(self.arena.allocator(), 1);
+        \\        return out.items;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    fn collect(self: *Store) ![]const u8 {
+        \\        self.* = .{ .arena = .init(std.heap.page_allocator) };
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        try out.append(self.arena.allocator(), 1);
+        \\        self.* = .{ .arena = .init(std.heap.page_allocator) };
+        \\        return out.items;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    fn collect(self: *Store, copied: std.heap.ArenaAllocator) ![]const u8 {
+        \\        self.* = .{ .arena = copied };
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        try out.append(self.arena.allocator(), 1);
+        \\        return out.items;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Query = struct {
+        \\    scratch: *std.heap.ArenaAllocator,
+        \\    fn collect(self: *Query) ![]const u8 {
+        \\        var storage: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        \\        defer storage.deinit();
+        \\        self.* = .{ .scratch = &storage };
+        \\        var out: std.ArrayList(u8) = .empty;
+        \\        try out.append(self.scratch.allocator(), 1);
+        \\        return out.items;
+        \\    }
+        \\};
     );
 }

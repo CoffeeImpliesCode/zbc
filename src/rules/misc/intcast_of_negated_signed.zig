@@ -45,7 +45,7 @@ pub fn check(
         else
             cache.comptimeIntValueOf(operand) != null;
         if (negation_fits) {
-            if (cache.intInfoOf(node)) |destination| {
+            if (cache.coercedIntInfoOf(node) orelse cache.intInfoOf(node)) |destination| {
                 if (bounds.fitsInteger(destination.bits, destination.signed)) continue;
             }
         }
@@ -54,8 +54,8 @@ pub fn check(
         try problems.append(gpa, .{
             .rule_id = R,
             .severity = .warning,
-            .start = Pos.fromTokenStart(tree, token),
-            .end = Pos.fromTokenEnd(tree, tree.lastToken(node)),
+            .start = try Pos.fromTokenStart(tree, token),
+            .end = try Pos.fromTokenEnd(tree, tree.lastToken(node)),
             .message = message,
         });
     }
@@ -504,6 +504,161 @@ test "intcast-of-negated-signed: a return that runs its own operand exports noth
         \\    const shift = decodeExponent(bits);
         \\    if (shift >= 0) return @as(u64, @intCast(shift));
         \\    return @as(u64, @intCast(-shift));
+        \\}
+    );
+}
+
+test "intcast-of-negated-signed: a closed helper excludes minimum only through all callers" {
+    try testing.expectNoFireTyped(check,
+        \\fn magnitude(offset: isize) usize {
+        \\    if (offset >= 0) return @intCast(offset);
+        \\    return @intCast(-offset);
+        \\}
+        \\pub fn use(index: u16) usize {
+        \\    return magnitude(-@as(isize, @intCast(index)));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn magnitude(offset: isize) usize {
+        \\    if (offset >= 0) return @intCast(offset);
+        \\    return @intCast(-offset);
+        \\}
+        \\pub fn use(index: u16, offset: isize) usize {
+        \\    return magnitude(-@as(isize, @intCast(index))) + magnitude(offset);
+        \\}
+    );
+}
+
+test "intcast-of-negated-signed: closed i24 and u32 callers bound scaled negation" {
+    // Joining both callers gives [-8388608, 4294967295]. Scaling by four
+    // stays in i64; the negative branch's magnitude is at most 33554432.
+    try testing.expectNoFireTyped(check,
+        \\const Inst = packed struct(u32) { payload: u32 };
+        \\fn magnitude(offset: i64) usize {
+        \\    const delta = offset * @as(i64, @intCast(@sizeOf(Inst)));
+        \\    if (delta < 0) return @intCast(-delta);
+        \\    return @intCast(delta);
+        \\}
+        \\pub fn narrow(value: i24) usize { return magnitude(value); }
+        \\pub fn extension(value: u32) usize { return magnitude(@intCast(value)); }
+    );
+}
+
+test "intcast-of-negated-signed: a scaled signed minimum caller retains the warning" {
+    try testing.expectFiresTyped(check, R,
+        \\const Inst = packed struct(u32) { payload: u32 };
+        \\fn magnitude(offset: i64) usize {
+        \\    const delta = offset * @as(i64, @intCast(@sizeOf(Inst)));
+        \\    if (delta < 0) return @intCast(-delta);
+        \\    return @intCast(delta);
+        \\}
+        \\pub fn narrow(value: i24) usize { return magnitude(value); }
+        \\pub fn extension(value: u32) usize { return magnitude(@intCast(value)); }
+        \\pub fn minimum() usize { return magnitude(-2305843009213693952); }
+    );
+}
+
+test "intcast-of-negated-signed: public scaled helpers have an open caller domain" {
+    try testing.expectFiresTyped(check, R,
+        \\const Inst = packed struct(u32) { payload: u32 };
+        \\pub fn magnitude(offset: i64) usize {
+        \\    const delta = offset * @as(i64, @intCast(@sizeOf(Inst)));
+        \\    if (delta < 0) return @intCast(-delta);
+        \\    return @intCast(delta);
+        \\}
+        \\pub fn narrow(value: i24) usize { return magnitude(value); }
+        \\pub fn extension(value: u32) usize { return magnitude(@intCast(value)); }
+    );
+}
+
+test "intcast-of-negated-signed: escaped scaled helpers have an open caller domain" {
+    try testing.expectFiresTyped(check, R,
+        \\const Inst = packed struct(u32) { payload: u32 };
+        \\fn magnitude(offset: i64) usize {
+        \\    const delta = offset * @as(i64, @intCast(@sizeOf(Inst)));
+        \\    if (delta < 0) return @intCast(-delta);
+        \\    return @intCast(delta);
+        \\}
+        \\pub fn narrow(value: i24) usize { return magnitude(value); }
+        \\pub fn extension(value: u32) usize { return magnitude(@intCast(value)); }
+        \\pub fn callback() *const fn (i64) usize { return &magnitude; }
+    );
+}
+
+test "intcast-of-negated-signed: an opaque caller argument prevents a scaled proof" {
+    try testing.expectFiresTyped(check, R,
+        \\const Inst = packed struct(u32) { payload: u32 };
+        \\extern fn readOffset() i64;
+        \\fn magnitude(offset: i64) usize {
+        \\    const delta = offset * @as(i64, @intCast(@sizeOf(Inst)));
+        \\    if (delta < 0) return @intCast(-delta);
+        \\    return @intCast(delta);
+        \\}
+        \\pub fn narrow(value: i24) usize { return magnitude(value); }
+        \\pub fn extension(value: u32) usize { return magnitude(@intCast(value)); }
+        \\pub fn opaqueValue() usize { return magnitude(readOffset()); }
+    );
+}
+
+test "intcast-of-negated-signed: a private sign-extended immediate excludes minimum" {
+    try testing.expectNoFireTyped(check,
+        \\fn signExtend(comptime bits: u6, value: u32) i32 {
+        \\    const shift: u5 = @intCast(32 - bits);
+        \\    return @as(i32, @bitCast(value << shift)) >> shift;
+        \\}
+        \\fn immediateI(word: u32) i32 { return signExtend(12, word >> 20); }
+        \\pub fn frameSize(word: u32) ?u32 {
+        \\    const immediate = immediateI(word);
+        \\    if (immediate < 0) return @intCast(-immediate);
+        \\    return null;
+        \\}
+    );
+}
+
+test "intcast-of-negated-signed: a full-width signed immediate retains minimum" {
+    try testing.expectFiresTyped(check, R,
+        \\fn signExtend(comptime bits: u6, value: u32) i32 {
+        \\    const shift: u5 = @intCast(32 - bits);
+        \\    return @as(i32, @bitCast(value << shift)) >> shift;
+        \\}
+        \\fn immediateI(word: u32) i32 { return signExtend(32, word); }
+        \\pub fn frameSize(word: u32) ?u32 {
+        \\    const immediate = immediateI(word);
+        \\    if (immediate < 0) return @intCast(-immediate);
+        \\    return null;
+        \\}
+    );
+}
+
+test "intcast-of-negated-signed: an unbound immediate width stays conservative" {
+    try testing.expectFiresTyped(check, R,
+        \\fn signExtend(comptime bits: u6, value: u32) i32 {
+        \\    const shift: u5 = @intCast(32 - bits);
+        \\    return @as(i32, @bitCast(value << shift)) >> shift;
+        \\}
+        \\pub fn frameSize(comptime bits: u6, word: u32) ?u32 {
+        \\    const immediate = signExtend(bits, word);
+        \\    if (immediate < 0) return @intCast(-immediate);
+        \\    return null;
+        \\}
+    );
+}
+
+test "intcast-of-negated-signed: a forwarded call cannot read arguments before their effects" {
+    try testing.expectFiresTyped(check, R,
+        \\fn reset(value: *i32) i32 {
+        \\    value.* = -2147483648;
+        \\    return 0;
+        \\}
+        \\fn second(first: i32, value: i32) i32 { _ = first; return value; }
+        \\fn immediateI() i32 {
+        \\    var value: i32 = -1;
+        \\    return second(reset(&value), value);
+        \\}
+        \\pub fn frameSize() ?u32 {
+        \\    const immediate = immediateI();
+        \\    if (immediate < 0) return @intCast(-immediate);
+        \\    return null;
         \\}
     );
 }

@@ -10,6 +10,13 @@
 //! Which way a path has already read lives in [Facts], which owns those
 //! predicates' lifecycle and the rule for when two paths may still be
 //! folded together.
+//!
+//! Initialization coverage is separate from lifetime origins: sparse exact
+//! elements, fixed prefixes, bounded affine prefixes, and complete-base holes.
+//! Joins retain only common coverage. Projection keeps live comparison and
+//! array/counter dependencies, without changing predicate partition policy.
+//! Integer type endpoints are immutable CFG context, borrowed by every state.
+//! They bound values, never their definedness or the payload they index.
 
 const std = @import("std");
 
@@ -35,6 +42,83 @@ pub const BlockId = enum(u32) { _ };
 /// could have changed any of the operands.  Two `if`s reading one
 /// condition share an id; two that merely look alike do not.
 pub const GuardId = enum(u32) { _ };
+
+/// The bounded affine terms understood by initialization transfer.
+pub const IndexTerm = union(enum) {
+    unknown,
+    constant: u64,
+    local: struct { local: LocalId, offset: i8 = 0 },
+    field: struct { parent: LocalId, name: []const u8, offset: i8 = 0, is_unsigned: bool = false },
+};
+
+/// A selected element in a contiguous group of `scale` values per lane.
+pub const ScaledElement = struct { index: LocalId, scale: u64, offset: u64 = 0 };
+
+/// Immutable binding type context. The CFG owns rows; states only borrow them.
+pub const IntegerDomain = struct {
+    kind: enum(u8) { unknown, unsigned_unbounded, unsigned, signed, signed_unbounded } = .unknown,
+    bits: u8 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(IntegerDomain) == 2);
+    std.debug.assert(@alignOf(IntegerDomain) == 1);
+}
+
+pub const Comparison = struct {
+    lhs: IndexTerm,
+    rhs: IndexTerm,
+    op: enum { eq, ne, lt, le, gt, ge },
+};
+
+const ElementKey = struct { array: LocalId, index: u64 };
+const PrefixKey = struct { array: LocalId, counter: LocalId };
+/// Bounded prefixes also constrain the counter. Capped prefixes cover
+/// [0, min(max(counter + offset, 0), extent)) without constraining it.
+const SymbolicPrefix = struct { offset: i8, extent: u64, capped: bool = false, scale: u64 = 1 };
+const TermBounds = struct {
+    lower: ?i128 = null,
+    upper: ?i128 = null,
+
+    fn valid(self: TermBounds) bool {
+        const lower = self.lower orelse return true;
+        const upper = self.upper orelse return true;
+        return lower <= upper;
+    }
+
+    fn raiseLower(self: *TermBounds, endpoint: i128) void {
+        self.lower = if (self.lower) |old| @max(old, endpoint) else endpoint;
+    }
+
+    fn lowerUpper(self: *TermBounds, endpoint: i128) void {
+        self.upper = if (self.upper) |old| @min(old, endpoint) else endpoint;
+    }
+
+    fn intersect(self: *TermBounds, other: TermBounds) void {
+        if (other.lower) |lower| self.raiseLower(lower);
+        if (other.upper) |upper| self.lowerUpper(upper);
+    }
+
+    fn offset(self: TermBounds, amount: i8) TermBounds {
+        return .{
+            .lower = if (self.lower) |lower| std.math.add(i128, lower, amount) catch null else null,
+            .upper = if (self.upper) |upper| std.math.add(i128, upper, amount) catch null else null,
+        };
+    }
+};
+
+const integer_endpoints = blk: {
+    var unsigned: [65]TermBounds = undefined;
+    var signed: [65]TermBounds = undefined;
+    for (0..65) |bits| {
+        unsigned[bits] = .{ .lower = 0, .upper = (@as(i128, 1) << @intCast(bits)) - 1 };
+        signed[bits] = if (bits == 0)
+            .{ .lower = 0, .upper = 0 }
+        else
+            .{ .lower = -(@as(i128, 1) << @intCast(bits - 1)), .upper = (@as(i128, 1) << @intCast(bits - 1)) - 1 };
+    }
+    break :blk .{ .unsigned = unsigned, .signed = signed };
+};
 
 // ── Origin ─────────────────────────────────────────────────
 
@@ -384,6 +468,8 @@ fn intersectPredicates(comptime Map: type, self_map: *Map, other: *const Map) bo
 
 pub const AbstractState = struct {
     feasible: bool = true,
+    /// Borrowed immutable LocalId table, shared by every state in this CFG.
+    integer_domains: []const IntegerDomain = &.{},
     /// Which way this path has already been shown to read — see [Facts],
     /// which owns the maps, their lifecycle and the merge rule over them.
     facts: Facts = .{},
@@ -402,6 +488,16 @@ pub const AbstractState = struct {
     /// name); lets `s.buf = alloc(); free(s.buf); use(s.buf);` catch
     /// UAF.  Name slices borrow from source — caller keeps it alive.
     fields: std.ArrayHashMapUnmanaged(FieldKey, Origin, FieldKey.Context, true) = .empty,
+    /// Defined descriptor bits do not prove initialized array payloads.
+    /// Only writes that lack a definite value need a sparse negative entry.
+    unknown_field_values: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
+    /// Sparse uncertainty for scalar values and selected aggregate payloads.
+    unknown_values: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
+    /// Diagnostic taint, separate from missing value certificates.
+    may_undefined_values: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
+    undefined_field_values: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
+    /// Byte-write witnesses, independent of value/resource certificates.
+    written_fields: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
     /// `*T` out-parameter writes that carried a heap origin.  Keyed
     /// by the out-param local; value is the HeapId of the most
     /// recently written value.  Checked at function exit
@@ -412,13 +508,36 @@ pub const AbstractState = struct {
     /// and consumer.
     out_param_writes: std.AutoArrayHashMapUnmanaged(LocalId, HeapId) = .empty,
 
+    /// Flat sparse keys own no nested allocations and never scale with array extent.
+    exact_elements: std.AutoArrayHashMapUnmanaged(ElementKey, void) = .empty,
+    undefined_elements: std.AutoArrayHashMapUnmanaged(ElementKey, void) = .empty,
+    complete_arrays: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
+    fixed_prefixes: std.AutoArrayHashMapUnmanaged(LocalId, u64) = .empty,
+    symbolic_prefixes: std.AutoArrayHashMapUnmanaged(PrefixKey, SymbolicPrefix) = .empty,
+    scalar_values: std.AutoArrayHashMapUnmanaged(LocalId, u64) = .empty,
+    nonnegative_locals: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
+    comparisons: std.ArrayListUnmanaged(Comparison) = .empty,
+
     pub fn deinit(self: *AbstractState, gpa: std.mem.Allocator) void {
         self.locals.deinit(gpa);
         self.arenas.deinit(gpa);
         self.heaps.deinit(gpa);
         self.fields.deinit(gpa);
+        self.unknown_field_values.deinit(gpa);
+        self.unknown_values.deinit(gpa);
+        self.may_undefined_values.deinit(gpa);
+        self.undefined_field_values.deinit(gpa);
+        self.written_fields.deinit(gpa);
         self.out_param_writes.deinit(gpa);
         self.facts.deinit(gpa);
+        self.exact_elements.deinit(gpa);
+        self.undefined_elements.deinit(gpa);
+        self.complete_arrays.deinit(gpa);
+        self.fixed_prefixes.deinit(gpa);
+        self.symbolic_prefixes.deinit(gpa);
+        self.scalar_values.deinit(gpa);
+        self.nonnegative_locals.deinit(gpa);
+        self.comparisons.deinit(gpa);
     }
 
     /// Forget every field record belonging to `parent`.
@@ -431,6 +550,21 @@ pub const AbstractState = struct {
     /// artifact that fires double-free / UAF on a value no longer there.
     pub fn forgetFields(self: *AbstractState, parent: LocalId) void {
         retainWhere(&self.fields, parent, fieldNotOwnedBy);
+        retainWhere(&self.unknown_field_values, parent, fieldNotOwnedBy);
+        _ = self.unknown_values.swapRemove(parent);
+        _ = self.may_undefined_values.swapRemove(parent);
+        retainWhere(&self.undefined_field_values, parent, fieldNotOwnedBy);
+        retainWhere(&self.written_fields, parent, fieldNotOwnedBy);
+    }
+
+    /// A whole-location write removes prior undefined bytes, not certificates
+    /// or resource identities retained for the other rules.
+    pub fn forgetUndefinedBytes(self: *AbstractState, parent: LocalId) void {
+        _ = self.may_undefined_values.swapRemove(parent);
+        retainWhere(&self.undefined_field_values, parent, fieldNotOwnedBy);
+        for (self.fields.keys(), self.fields.values()) |key, *origin| {
+            if (key.parent == parent and origin.* == .undef) origin.* = .plain;
+        }
     }
 
     pub fn clone(self: *const AbstractState, gpa: std.mem.Allocator) !AbstractState {
@@ -445,12 +579,28 @@ pub const AbstractState = struct {
     /// sufficient, no allocator call is made for that map.
     pub fn cloneFrom(self: *AbstractState, src: *const AbstractState, gpa: std.mem.Allocator) !void {
         self.feasible = src.feasible;
+        self.integer_domains = src.integer_domains;
         try copyMap(@TypeOf(self.locals), &self.locals, &src.locals, gpa);
         try copyMap(@TypeOf(self.arenas), &self.arenas, &src.arenas, gpa);
         try copyMap(@TypeOf(self.heaps), &self.heaps, &src.heaps, gpa);
         try copyMap(@TypeOf(self.fields), &self.fields, &src.fields, gpa);
+        try copyMap(@TypeOf(self.unknown_field_values), &self.unknown_field_values, &src.unknown_field_values, gpa);
+        try copyMap(@TypeOf(self.unknown_values), &self.unknown_values, &src.unknown_values, gpa);
+        try copyMap(@TypeOf(self.may_undefined_values), &self.may_undefined_values, &src.may_undefined_values, gpa);
+        try copyMap(@TypeOf(self.undefined_field_values), &self.undefined_field_values, &src.undefined_field_values, gpa);
+        try copyMap(@TypeOf(self.written_fields), &self.written_fields, &src.written_fields, gpa);
         try copyMap(@TypeOf(self.out_param_writes), &self.out_param_writes, &src.out_param_writes, gpa);
         try self.facts.cloneFrom(&src.facts, gpa);
+        try copyMap(@TypeOf(self.exact_elements), &self.exact_elements, &src.exact_elements, gpa);
+        try copyMap(@TypeOf(self.undefined_elements), &self.undefined_elements, &src.undefined_elements, gpa);
+        try copyMap(@TypeOf(self.complete_arrays), &self.complete_arrays, &src.complete_arrays, gpa);
+        try copyMap(@TypeOf(self.fixed_prefixes), &self.fixed_prefixes, &src.fixed_prefixes, gpa);
+        try copyMap(@TypeOf(self.symbolic_prefixes), &self.symbolic_prefixes, &src.symbolic_prefixes, gpa);
+        try copyMap(@TypeOf(self.scalar_values), &self.scalar_values, &src.scalar_values, gpa);
+        try copyMap(@TypeOf(self.nonnegative_locals), &self.nonnegative_locals, &src.nonnegative_locals, gpa);
+        try self.comparisons.ensureTotalCapacity(gpa, src.comparisons.items.len);
+        self.comparisons.clearRetainingCapacity();
+        self.comparisons.appendSliceAssumeCapacity(src.comparisons.items);
     }
 
     /// Drop every fact the target block can no longer observe, so two
@@ -493,10 +643,19 @@ pub const AbstractState = struct {
         // Widen `keep` to the owners of the `.stack` origins that survive
         // it; see this function's doc for why that edge is sound.
         var grew = true;
-        while (grew) grew = retainStackOwners(self, keep);
+        while (grew) {
+            grew = retainStackOwners(self, keep);
+            grew = self.retainInitializationDependencies(keep) or grew;
+        }
 
         retainWhere(&self.locals, keep, isRetained);
         retainWhere(&self.fields, keep, fieldParentIsRetained);
+        retainWhere(&self.unknown_field_values, keep, fieldParentIsRetained);
+        retainWhere(&self.unknown_values, keep, isRetained);
+        retainWhere(&self.may_undefined_values, keep, isRetained);
+        retainWhere(&self.undefined_field_values, keep, fieldParentIsRetained);
+        retainWhere(&self.written_fields, keep, fieldParentIsRetained);
+        self.projectInitialization(keep);
 
         // An allocation record is only observable while something still
         // names it: a surviving origin, or an out-param write a `return`
@@ -539,7 +698,13 @@ pub const AbstractState = struct {
     ) bool {
         for (self.locals.keys()) |local| if (!isRetained(keep, local)) return false;
         for (self.fields.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.unknown_field_values.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.unknown_values.keys()) |local| if (!isRetained(keep, local)) return false;
+        for (self.may_undefined_values.keys()) |local| if (!isRetained(keep, local)) return false;
+        for (self.undefined_field_values.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.written_fields.keys()) |key| if (!isRetained(keep, key.parent)) return false;
         for (self.out_param_writes.keys()) |out| if (!isRetained(live_out_params, out)) return false;
+        if (!self.initializationProjectionIsIdentity(keep)) return false;
         // A handful of allocation records against a handful of origins:
         // cheaper than copying the whole map to find out the same thing.
         for (self.heaps.keys()) |heap| if (!self.namesAllocation(.{ .heap = heap })) return false;
@@ -662,7 +827,1064 @@ pub const AbstractState = struct {
         }
         return true;
     }
+
+    pub fn baseComplete(self: *const AbstractState, array: LocalId) bool {
+        return self.complete_arrays.contains(array);
+    }
+
+    pub fn isArrayComplete(self: *const AbstractState, array: LocalId) bool {
+        if (!self.baseComplete(array)) return false;
+        for (self.undefined_elements.keys()) |key| if (key.array == array) return false;
+        return true;
+    }
+
+    /// Copy the physical initialized-element mask, not a counter alias.
+    pub fn copyArrayInitialization(self: *AbstractState, gpa: std.mem.Allocator, target: LocalId, source: LocalId) !void {
+        if (target == source) return;
+        self.forgetInitializationArray(target);
+        if (self.baseComplete(source)) try self.complete_arrays.put(gpa, target, {});
+        if (self.fixed_prefixes.get(source)) |prefix| try self.fixed_prefixes.put(gpa, target, prefix);
+        const exact_count = self.exact_elements.count();
+        var index: usize = 0;
+        while (index < exact_count) : (index += 1) {
+            const key = self.exact_elements.keys()[index];
+            if (key.array == source) try self.exact_elements.put(gpa, .{ .array = target, .index = key.index }, {});
+        }
+        const hole_count = self.undefined_elements.count();
+        index = 0;
+        while (index < hole_count) : (index += 1) {
+            const key = self.undefined_elements.keys()[index];
+            if (key.array == source) try self.undefined_elements.put(gpa, .{ .array = target, .index = key.index }, {});
+        }
+        const prefix_count = self.symbolic_prefixes.count();
+        index = 0;
+        while (index < prefix_count) : (index += 1) {
+            const key = self.symbolic_prefixes.keys()[index];
+            const prefix = self.symbolic_prefixes.values()[index];
+            if (key.array == source) try self.symbolic_prefixes.put(gpa, .{ .array = target, .counter = key.counter }, prefix);
+        }
+    }
+
+    pub fn fieldValueIsDefined(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
+        return self.fieldValueIsDefinedWithLimit(parent, path, self.unknown_field_values.count(), false, true);
+    }
+
+    /// Unknown payloads do not report. Only reached undefined bytes do.
+    pub fn fieldValueMayBeUndefined(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
+        const repaired_prefix = self.writtenFieldPrefix(parent, path);
+        for (self.undefined_field_values.keys()) |key| {
+            if (key.parent != parent) continue;
+            if (fieldPathPrefix(key.name, path)) {
+                if (repaired_prefix == null or repaired_prefix.? < key.name.len) return true;
+            } else if (fieldPathPrefix(path, key.name)) {
+                const repair = self.writtenFieldPrefix(parent, key.name);
+                if (repair == null or repair.? < key.name.len) return true;
+            }
+        }
+        if (repaired_prefix == null) {
+            if (self.may_undefined_values.contains(parent)) return true;
+            if (self.locals.get(parent)) |origin| if (origin == .undef) return true;
+        }
+        for (self.fields.keys(), self.fields.values()) |key, origin| {
+            if (key.parent != parent or origin != .undef) continue;
+            if (fieldPathPrefix(key.name, path) and repaired_prefix == null) return true;
+            if (fieldPathPrefix(path, key.name) and self.writtenFieldPrefix(parent, key.name) == null) return true;
+        }
+        return false;
+    }
+
+    pub fn fieldBytesAreWritten(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
+        return self.writtenFieldPrefix(parent, path) != null and !self.fieldValueMayBeUndefined(parent, path);
+    }
+
+    fn writtenFieldPrefix(self: *const AbstractState, parent: LocalId, path: []const u8) ?usize {
+        var prefix: ?usize = null;
+        for (self.written_fields.keys()) |key| {
+            if (key.parent != parent or !fieldPathPrefix(key.name, path)) continue;
+            if (prefix == null or key.name.len > prefix.?) prefix = key.name.len;
+        }
+        return prefix;
+    }
+
+    pub fn bindWrittenField(self: *AbstractState, gpa: std.mem.Allocator, key: FieldKey, may_undefined: bool) !void {
+        var index: usize = 0;
+        while (index < self.written_fields.count()) {
+            const old = self.written_fields.keys()[index];
+            if (old.parent == key.parent and fieldPathPrefix(key.name, old.name)) {
+                _ = self.written_fields.swapRemoveAt(index);
+            } else index += 1;
+        }
+        index = 0;
+        while (index < self.undefined_field_values.count()) {
+            const old = self.undefined_field_values.keys()[index];
+            if (old.parent == key.parent and fieldPathPrefix(key.name, old.name)) {
+                _ = self.undefined_field_values.swapRemoveAt(index);
+            } else index += 1;
+        }
+        if (!may_undefined) try self.written_fields.putContext(gpa, key, {}, .{});
+    }
+
+    pub fn forgetWrittenFields(self: *AbstractState, parent: LocalId) void {
+        retainWhere(&self.written_fields, parent, fieldNotOwnedBy);
+    }
+
+    /// Array copies apply sparse element holes separately from the base proof.
+    pub fn fieldArrayBaseIsDefined(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
+        return self.fieldValueIsDefinedWithLimit(parent, path, self.unknown_field_values.count(), true, true);
+    }
+
+    /// Appended join negatives must not change the incoming certificate.
+    fn fieldValueIsDefinedWithLimit(
+        self: *const AbstractState,
+        parent: LocalId,
+        path: []const u8,
+        negative_count: usize,
+        ignore_elements: bool,
+        unproved_root_is_unknown: bool,
+    ) bool {
+        std.debug.assert(negative_count <= self.unknown_field_values.count());
+        const negatives = self.unknown_field_values.keys()[0..negative_count];
+        const unknown_root = (unproved_root_is_unknown and self.unknown_values.contains(parent)) or
+            (if (self.locals.get(parent)) |origin| origin == .undef else false);
+        var initialized_prefix: ?usize = null;
+        for (self.fields.keys(), self.fields.values()) |key, origin| {
+            if (key.parent != parent or origin == .undef or !fieldPathPrefix(key.name, path)) continue;
+            const negative_index = self.unknown_field_values.getIndexContext(key, .{});
+            const uncertain_record = unproved_root_is_unknown and
+                (if (negative_index) |index| index < negative_count else false);
+            if (!uncertain_record and (initialized_prefix == null or key.name.len > initialized_prefix.?)) {
+                initialized_prefix = key.name.len;
+            }
+        }
+        for (negatives) |key| {
+            if (!unproved_root_is_unknown) break;
+            if (key.parent != parent) continue;
+            if (ignore_elements and key.name.len > path.len and
+                std.mem.startsWith(u8, key.name, path) and key.name[path.len] == '[') continue;
+            if (fieldPathPrefix(path, key.name)) return false;
+            if (fieldPathPrefix(key.name, path) and
+                (initialized_prefix == null or initialized_prefix.? <= key.name.len)) return false;
+        }
+        for (self.fields.keys(), self.fields.values()) |key, origin| {
+            if (key.parent != parent or origin != .undef) continue;
+            if (ignore_elements and key.name.len > path.len and
+                std.mem.startsWith(u8, key.name, path) and key.name[path.len] == '[') continue;
+            if (fieldPathPrefix(path, key.name)) return false;
+            if (fieldPathPrefix(key.name, path) and
+                (initialized_prefix == null or initialized_prefix.? <= key.name.len)) return false;
+        }
+        // A specific initialized field can repair an uncertain ancestor,
+        // but cannot initialize its siblings or an enclosing whole payload.
+        return !unknown_root or initialized_prefix != null;
+    }
+
+    pub fn bindFieldValue(self: *AbstractState, gpa: std.mem.Allocator, key: FieldKey, defined: bool) !void {
+        if (defined) try self.bindWrittenField(gpa, key, false);
+        var index: usize = 0;
+        while (index < self.unknown_field_values.count()) {
+            const old = self.unknown_field_values.keys()[index];
+            if (old.parent == key.parent and fieldPathPrefix(key.name, old.name)) {
+                _ = self.unknown_field_values.swapRemoveAt(index);
+            } else index += 1;
+        }
+        index = 0;
+        while (index < self.fields.count()) {
+            const old = self.fields.keys()[index];
+            if (old.parent == key.parent and fieldPathPrefix(key.name, old.name)) {
+                _ = self.fields.swapRemoveAt(index);
+            } else index += 1;
+        }
+        if (!defined) try self.unknown_field_values.putContext(gpa, key, {}, .{});
+    }
+
+    pub fn markArrayComplete(self: *AbstractState, gpa: std.mem.Allocator, array: LocalId) !void {
+        try self.complete_arrays.put(gpa, array, {});
+        retainWhere(&self.undefined_elements, array, elementNotOwnedBy);
+        self.forgetUndefinedBytes(array);
+    }
+
+    pub fn hasExactElement(self: *const AbstractState, array: LocalId, index: u64) bool {
+        const key: ElementKey = .{ .array = array, .index = index };
+        if (self.undefined_elements.contains(key)) return false;
+        return self.baseComplete(array) or self.exact_elements.contains(key) or
+            index < self.fixedPrefix(array);
+    }
+
+    pub fn fixedPrefix(self: *const AbstractState, array: LocalId) u64 {
+        return self.fixed_prefixes.get(array) orelse 0;
+    }
+
+    pub fn setFixedPrefix(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        array: LocalId,
+        count: u64,
+    ) !void {
+        try self.fixed_prefixes.put(gpa, array, count);
+    }
+
+    /// Union an initialized range with the existing prefix and sparse suffix.
+    /// Disconnected ranges add no fact; holes outside the range remain intact.
+    pub fn markArrayRangeComplete(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        array: LocalId,
+        start: u64,
+        end: u64,
+    ) !void {
+        std.debug.assert(start <= end);
+        if (start == end) return;
+        var hole_index: usize = 0;
+        while (hole_index < self.undefined_elements.count()) {
+            const hole = self.undefined_elements.keys()[hole_index];
+            if (hole.array == array and hole.index >= start and hole.index < end) {
+                _ = self.undefined_elements.swapRemoveAt(hole_index);
+            } else hole_index += 1;
+        }
+        if (self.baseComplete(array) or self.fixedPrefix(array) < start) return;
+        try self.advanceExactPrefix(gpa, array, @max(self.fixedPrefix(array), end));
+    }
+
+    pub fn setExactElement(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        array: LocalId,
+        index: u64,
+        initialized: bool,
+    ) !void {
+        const key: ElementKey = .{ .array = array, .index = index };
+        if (!initialized) {
+            // A base initializer survives except for the selected sparse hole.
+            try self.undefined_elements.put(gpa, key, {});
+            _ = self.exact_elements.swapRemove(key);
+            if (self.fixed_prefixes.getPtr(array)) |prefix| prefix.* = @min(prefix.*, index);
+            retainWhere(&self.symbolic_prefixes, array, prefixNotOwnedBy);
+            return;
+        }
+        _ = self.undefined_elements.swapRemove(key);
+        if (self.baseComplete(array)) {
+            _ = self.undefined_elements.swapRemove(key);
+            return;
+        }
+        try self.exact_elements.put(gpa, key, {});
+        try self.advanceExactPrefix(gpa, array, self.fixedPrefix(array));
+    }
+
+    fn advanceExactPrefix(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        array: LocalId,
+        count: u64,
+    ) !void {
+        var prefix = count;
+        // Each advance consumes a distinct stored fact, not an extent-sized scan.
+        var remaining = self.exact_elements.count();
+        while (remaining > 0 and prefix < std.math.maxInt(u64)) : (remaining -= 1) {
+            if (!self.exact_elements.contains(.{ .array = array, .index = prefix })) break;
+            prefix += 1;
+        }
+        if (prefix != self.fixedPrefix(array)) try self.setFixedPrefix(gpa, array, prefix);
+    }
+
+    pub fn symbolicPrefixOffset(
+        self: *const AbstractState,
+        array: LocalId,
+        counter: LocalId,
+    ) ?i8 {
+        return if (self.symbolic_prefixes.get(.{ .array = array, .counter = counter })) |prefix|
+            if (prefix.scale == 1) prefix.offset else null
+        else
+            null;
+    }
+
+    pub fn setSymbolicPrefix(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        array: LocalId,
+        counter: LocalId,
+        offset: i8,
+        fixed_extent: u64,
+    ) !void {
+        std.debug.assert(offset >= -1 and offset <= 1);
+        try self.symbolic_prefixes.put(gpa, .{ .array = array, .counter = counter }, .{
+            .offset = offset,
+            .extent = fixed_extent,
+        });
+    }
+
+    pub fn setScaledSymbolicPrefix(self: *AbstractState, gpa: std.mem.Allocator, array: LocalId, counter: LocalId, scale: u64, extent: u64) !void {
+        if (scale == 0) return;
+        try self.symbolic_prefixes.put(gpa, .{ .array = array, .counter = counter }, .{
+            .offset = 0,
+            .extent = extent,
+            .scale = scale,
+        });
+    }
+
+    pub fn hasInitializedScaledElement(self: *const AbstractState, array: LocalId, element: ScaledElement) bool {
+        if (element.scale == 0 or element.offset >= element.scale) return false;
+        const index: IndexTerm = .{ .local = .{ .local = element.index } };
+        if (!self.provesNonNegative(index)) return false;
+        for (self.undefined_elements.keys()) |hole| if (hole.array == array) return false;
+        for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+            if (key.array == array and prefix.scale == element.scale and prefix.offset == 0 and !prefix.capped and
+                self.provesLessThan(index, .{ .local = .{ .local = key.counter } })) return true;
+        }
+        return false;
+    }
+
+    pub fn scalarValue(self: *const AbstractState, local: LocalId) ?u64 {
+        return self.scalar_values.get(local);
+    }
+
+    pub fn setScalarValue(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        local: LocalId,
+        value: ?u64,
+    ) !void {
+        self.forgetInitializationLocal(local);
+        if (value) |known| {
+            try self.scalar_values.put(gpa, local, known);
+            try self.nonnegative_locals.put(gpa, local, {});
+        }
+    }
+
+    /// Copy the current numeric value and its coverage bounds, not an alias
+    /// to the source slot. Later writes to either slot invalidate only that
+    /// slot's predicates.
+    pub fn copyCounterValue(self: *AbstractState, gpa: std.mem.Allocator, target: LocalId, source: LocalId) !void {
+        if (target == source) return;
+        const value = self.scalarValue(source);
+        const nonnegative = self.provesNonNegative(.{ .local = .{ .local = source } });
+        const source_bounds = self.termBounds(.{ .local = .{ .local = source } });
+        self.forgetInitializationLocal(target);
+        if (value) |known| try self.scalar_values.put(gpa, target, known);
+        if (nonnegative) try self.nonnegative_locals.put(gpa, target, {});
+        const prefix_count = self.symbolic_prefixes.count();
+        var index: usize = 0;
+        while (index < prefix_count) : (index += 1) {
+            const key = self.symbolic_prefixes.keys()[index];
+            const prefix = self.symbolic_prefixes.values()[index];
+            if (key.counter == source) {
+                try self.symbolic_prefixes.put(gpa, .{ .array = key.array, .counter = target }, prefix);
+            }
+        }
+        const comparison_count = self.comparisons.items.len;
+        index = 0;
+        while (index < comparison_count) : (index += 1) {
+            const premise = self.comparisons.items[index];
+            if (!termNamesLocal(premise.lhs, source) and !termNamesLocal(premise.rhs, source)) continue;
+            try self.comparisons.append(gpa, .{
+                .lhs = copiedCounterTerm(premise.lhs, source, target),
+                .rhs = copiedCounterTerm(premise.rhs, source, target),
+                .op = premise.op,
+            });
+        }
+        // Snapshot current finite endpoints, not the source binding's type.
+        // Copied facts or the destination's own type may already imply them.
+        if (value == null and source_bounds.valid()) {
+            const target_term: IndexTerm = .{ .local = .{ .local = target } };
+            if (source_bounds.lower) |lower| {
+                if (lower > 0 and lower <= std.math.maxInt(u64)) {
+                    const bound: Comparison = .{ .lhs = target_term, .rhs = .{ .constant = @intCast(lower) }, .op = .ge };
+                    if (!self.provesComparison(bound)) try self.comparisons.append(gpa, bound);
+                }
+            }
+            if (source_bounds.upper) |upper| {
+                if (upper >= 0 and upper <= std.math.maxInt(u64)) {
+                    const bound: Comparison = .{ .lhs = target_term, .rhs = .{ .constant = @intCast(upper) }, .op = .le };
+                    if (!self.provesComparison(bound)) try self.comparisons.append(gpa, bound);
+                }
+            }
+        }
+    }
+
+    pub fn forgetInitializationArray(self: *AbstractState, array: LocalId) void {
+        retainWhere(&self.written_fields, array, fieldNotOwnedPayload);
+        _ = self.complete_arrays.swapRemove(array);
+        _ = self.fixed_prefixes.swapRemove(array);
+        retainWhere(&self.exact_elements, array, elementNotOwnedBy);
+        retainWhere(&self.undefined_elements, array, elementNotOwnedBy);
+        retainWhere(&self.symbolic_prefixes, array, prefixNotOwnedBy);
+    }
+
+    pub fn forgetInitializationLocal(self: *AbstractState, local: LocalId) void {
+        _ = self.scalar_values.swapRemove(local);
+        _ = self.nonnegative_locals.swapRemove(local);
+        retainWhere(&self.symbolic_prefixes, local, prefixCounterIsNot);
+        self.forgetComparisonsLocal(local);
+    }
+
+    pub fn forgetAllComparisons(self: *AbstractState) void {
+        self.comparisons.clearRetainingCapacity();
+    }
+
+    fn forgetComparisonsLocal(self: *AbstractState, local: LocalId) void {
+        var index: usize = 0;
+        while (index < self.comparisons.items.len) {
+            const premise = self.comparisons.items[index];
+            if (termNamesLocal(premise.lhs, local) or termNamesLocal(premise.rhs, local)) {
+                _ = self.comparisons.swapRemove(index);
+            } else index += 1;
+        }
+    }
+
+    pub fn forgetFieldComparisons(self: *AbstractState, parent: LocalId) void {
+        var index: usize = 0;
+        while (index < self.comparisons.items.len) {
+            const premise = self.comparisons.items[index];
+            if ((premise.lhs == .field and premise.lhs.field.parent == parent) or
+                (premise.rhs == .field and premise.rhs.field.parent == parent))
+            {
+                _ = self.comparisons.swapRemove(index);
+            } else index += 1;
+        }
+    }
+
+    pub fn provesNonNegative(self: *const AbstractState, term: IndexTerm) bool {
+        if (!termSupported(term)) return false;
+        const bounds = self.termBounds(term);
+        return bounds.valid() and if (bounds.lower) |lower| lower >= 0 else false;
+    }
+
+    pub fn provesCounterPositive(self: *const AbstractState, local: LocalId) bool {
+        return self.provesComparison(.{
+            .lhs = .{ .local = .{ .local = local } },
+            .rhs = .{ .constant = 0 },
+            .op = .gt,
+        });
+    }
+
+    pub fn provesLessThan(self: *const AbstractState, lhs: IndexTerm, rhs: IndexTerm) bool {
+        return self.provesComparison(.{ .lhs = lhs, .rhs = rhs, .op = .lt });
+    }
+
+    pub fn provesIndexInBounds(self: *const AbstractState, index: IndexTerm, extent: u64) bool {
+        return self.provesNonNegative(index) and
+            self.provesLessThan(index, .{ .constant = extent });
+    }
+
+    pub fn hasInitializedElement(
+        self: *const AbstractState,
+        array: LocalId,
+        index: IndexTerm,
+    ) bool {
+        if (!self.provesNonNegative(index)) return false;
+        // Dynamic selection must exclude every hole, not merely fit a prefix.
+        for (self.undefined_elements.keys()) |hole| {
+            if (hole.array == array and !self.provesComparison(.{
+                .lhs = index,
+                .rhs = .{ .constant = hole.index },
+                .op = .ne,
+            })) return false;
+        }
+        if (self.baseComplete(array)) return true;
+        if (self.concreteTerm(index)) |known| {
+            if (self.hasExactElement(array, known)) return true;
+        }
+        if (self.provesLessThan(index, .{ .constant = self.fixedPrefix(array) })) return true;
+        for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+            if (key.array == array and prefix.scale == 1 and
+                (!prefix.capped or self.provesLessThan(index, .{ .constant = prefix.extent })) and
+                self.provesLessThan(index, .{
+                    .local = .{ .local = key.counter, .offset = prefix.offset },
+                })) return true;
+        }
+        return false;
+    }
+
+    pub fn hasInitializedPrefix(self: *const AbstractState, array: LocalId, count: u64) bool {
+        if (count == 0) return true;
+        for (self.undefined_elements.keys()) |hole| {
+            if (hole.array == array and hole.index < count) return false;
+        }
+        if (self.baseComplete(array) or self.fixedPrefix(array) >= count) return true;
+        for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+            if (key.array == array and prefix.scale == 1 and (!prefix.capped or count <= prefix.extent) and self.provesComparison(.{
+                .lhs = .{ .constant = count },
+                .rhs = .{ .local = .{ .local = key.counter, .offset = prefix.offset } },
+                .op = .le,
+            })) return true;
+        }
+        return false;
+    }
+
+    fn concreteTerm(self: *const AbstractState, term: IndexTerm) ?u64 {
+        switch (term) {
+            .unknown, .field => return null,
+            .constant => |value| return value,
+            .local => |value| {
+                if (value.offset < -1 or value.offset > 1) return null;
+                const scalar = self.scalarValue(value.local) orelse return null;
+                const result = @as(i128, scalar) + value.offset;
+                if (result < 0 or result > std.math.maxInt(u64)) return null;
+                return @intCast(result);
+            },
+        }
+    }
+
+    fn integerDomainBounds(self: *const AbstractState, local: LocalId) TermBounds {
+        const id = @intFromEnum(local);
+        if (self.integer_domains.len == 0) return .{};
+        std.debug.assert(id < self.integer_domains.len);
+        const domain = self.integer_domains[id];
+        return switch (domain.kind) {
+            .unknown, .signed_unbounded => .{},
+            .unsigned_unbounded => .{ .lower = 0 },
+            .unsigned => if (domain.bits <= 64) integer_endpoints.unsigned[domain.bits] else .{ .lower = 0 },
+            .signed => if (domain.bits <= 64) integer_endpoints.signed[domain.bits] else .{},
+        };
+    }
+
+    fn termBounds(self: *const AbstractState, term: IndexTerm) TermBounds {
+        if (!termSupported(term)) return .{};
+        if (term == .constant) return .{ .lower = term.constant, .upper = term.constant };
+        var bounds: TermBounds = if (term == .local) self.integerDomainBounds(term.local.local) else .{};
+        var nonnegative = switch (term) {
+            .local => |value| self.nonnegative_locals.contains(value.local),
+            .field => |value| value.is_unsigned,
+            else => unreachable,
+        };
+        if (term == .field and !nonnegative) {
+            for (self.comparisons.items) |premise| {
+                if ((premise.lhs == .field and premise.lhs.field.is_unsigned and termSameBase(term, premise.lhs)) or
+                    (premise.rhs == .field and premise.rhs.field.is_unsigned and termSameBase(term, premise.rhs)))
+                {
+                    nonnegative = true;
+                    break;
+                }
+            }
+        }
+        if (nonnegative) bounds.raiseLower(0);
+        if (term == .local) {
+            if (self.scalarValue(term.local.local)) |known| bounds.intersect(.{ .lower = known, .upper = known });
+            for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+                if (key.counter != term.local.local or prefix.capped) continue;
+                bounds.raiseLower(-@as(i128, prefix.offset));
+                bounds.lowerUpper(@as(i128, prefix.extent / prefix.scale) - prefix.offset);
+            }
+        }
+        for (self.comparisons.items) |original| {
+            var premise = original;
+            if (termSameBase(premise.rhs, term)) premise = reverseComparison(premise);
+            if (!termSameBase(premise.lhs, term)) continue;
+            const known = self.concreteTerm(premise.rhs) orelse continue;
+            const endpoint = @as(i128, known) - termOffset(premise.lhs);
+            switch (premise.op) {
+                .eq => bounds.intersect(.{ .lower = endpoint, .upper = endpoint }),
+                .lt => bounds.lowerUpper(endpoint - 1),
+                .le => bounds.lowerUpper(endpoint),
+                .gt => bounds.raiseLower(endpoint + 1),
+                .ge => bounds.raiseLower(endpoint),
+                .ne => {},
+            }
+        }
+        // Apply exclusions after intersecting base bounds, then add the offset.
+        for (self.comparisons.items) |original| {
+            var premise = original;
+            if (termSameBase(premise.rhs, term)) premise = reverseComparison(premise);
+            if (premise.op != .ne or !termSameBase(premise.lhs, term)) continue;
+            const known = self.concreteTerm(premise.rhs) orelse continue;
+            const endpoint = @as(i128, known) - termOffset(premise.lhs);
+            if (bounds.lower) |lower| {
+                if (lower == endpoint) bounds.lower = std.math.add(i128, lower, 1) catch null;
+            }
+            if (bounds.upper) |upper| {
+                if (upper == endpoint) bounds.upper = std.math.sub(i128, upper, 1) catch null;
+            }
+        }
+        return bounds.offset(termOffset(term));
+    }
+
+    fn directComparison(self: *const AbstractState, comparison: Comparison) bool {
+        if (!termSupported(comparison.lhs) or !termSupported(comparison.rhs)) return false;
+        if (termSameBase(comparison.lhs, comparison.rhs)) {
+            return compareIntegers(termOffset(comparison.lhs), termOffset(comparison.rhs), comparison.op);
+        }
+        for (self.comparisons.items) |premise| {
+            if (comparisonImplies(premise, comparison) or
+                comparisonImplies(reverseComparison(premise), comparison)) return true;
+        }
+        const lhs = self.termBounds(comparison.lhs);
+        const rhs = self.termBounds(comparison.rhs);
+        return boundsProveComparison(lhs, rhs, comparison.op);
+    }
+
+    pub fn provesComparison(self: *const AbstractState, comparison: Comparison) bool {
+        if (self.directComparison(comparison)) return true;
+        var normalized = comparison;
+        if (normalized.op == .gt or normalized.op == .ge) normalized = reverseComparison(normalized);
+        if (normalized.op != .lt and normalized.op != .le) return false;
+        if (normalized.op == .lt and self.directComparison(.{
+            .lhs = normalized.lhs,
+            .rhs = normalized.rhs,
+            .op = .le,
+        }) and self.directComparison(.{
+            .lhs = normalized.lhs,
+            .rhs = normalized.rhs,
+            .op = .ne,
+        })) return true;
+        // One explicit comparison bridge suffices for index<count<=capacity.
+        // This is bounded by stored premises; no recursive arithmetic closure is used.
+        for (self.comparisons.items) |original| {
+            var premise = original;
+            if (premise.op == .gt or premise.op == .ge) premise = reverseComparison(premise);
+            if (premise.op != .lt and premise.op != .le and premise.op != .eq) continue;
+            if (!self.directComparison(.{ .lhs = normalized.lhs, .rhs = premise.lhs, .op = .le })) continue;
+            const first_strict = premise.op == .lt or self.directComparison(.{
+                .lhs = normalized.lhs,
+                .rhs = premise.lhs,
+                .op = .lt,
+            });
+            const bridge_op: @TypeOf(normalized.op) =
+                if (normalized.op == .le or first_strict) .le else .lt;
+            if (self.directComparison(.{
+                .lhs = premise.rhs,
+                .rhs = normalized.rhs,
+                .op = bridge_op,
+            })) return true;
+        }
+        return false;
+    }
+
+    pub fn assumeComparison(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        comparison: Comparison,
+    ) !bool {
+        if (!termSupported(comparison.lhs) or !termSupported(comparison.rhs)) return true;
+        var opposite = comparison;
+        opposite.op = negateComparisonOp(comparison.op);
+        if (self.provesComparison(opposite)) return false;
+        if (!self.directComparison(comparison)) try self.comparisons.append(gpa, comparison);
+        return true;
+    }
+
+    pub fn stepCounter(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        local: LocalId,
+        step: i8,
+    ) !void {
+        if (step != 1 and step != -1) {
+            self.forgetInitializationLocal(local);
+            return;
+        }
+        const term: IndexTerm = .{ .local = .{ .local = local } };
+        const valid = if (step == -1) self.provesCounterPositive(local) else self.provesComparison(.{
+            .lhs = term,
+            .rhs = .{ .constant = std.math.maxInt(u64) },
+            .op = .lt,
+        });
+        const nonnegative = valid and self.provesNonNegative(term);
+        const old_value = self.scalarValue(local);
+        for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+            if (key.counter == local and self.hasInitializedPrefix(key.array, prefix.extent)) {
+                try self.setFixedPrefix(gpa, key.array, prefix.extent);
+            }
+        }
+        self.forgetComparisonsLocal(local);
+        _ = self.scalar_values.swapRemove(local);
+        _ = self.nonnegative_locals.swapRemove(local);
+        if (nonnegative) try self.nonnegative_locals.put(gpa, local, {});
+        if (valid) {
+            if (old_value) |known| {
+                const next: u64 = if (step == 1) known + 1 else known - 1;
+                try self.scalar_values.put(gpa, local, next);
+            }
+        }
+        var index: usize = 0;
+        while (index < self.symbolic_prefixes.count()) {
+            const key = self.symbolic_prefixes.keys()[index];
+            if (key.counter != local) {
+                index += 1;
+                continue;
+            }
+            const prefix = &self.symbolic_prefixes.values()[index];
+            const offset = @as(i16, prefix.offset) - step;
+            if (prefix.scale != 1 or (!valid and !(step == 1 and prefix.capped)) or offset < -1) {
+                _ = self.symbolic_prefixes.swapRemoveAt(index);
+            } else {
+                // A pop can weaken a longer initialized suffix to one
+                // element without inventing a store. An extra push cannot.
+                prefix.offset = @intCast(@min(offset, 1));
+                index += 1;
+            }
+        }
+    }
+
+    fn retainInitializationDependencies(self: *const AbstractState, keep: []u8) bool {
+        var grew = false;
+        for (self.symbolic_prefixes.keys()) |key| {
+            if (isRetained(keep, key.array) or isRetained(keep, key.counter)) {
+                grew = retainLocal(keep, key.array) or grew;
+                grew = retainLocal(keep, key.counter) or grew;
+            }
+        }
+        for (self.comparisons.items) |comparison| {
+            if (termIsRetained(keep, comparison.lhs) or termIsRetained(keep, comparison.rhs)) {
+                grew = retainTerm(keep, comparison.lhs) or grew;
+                grew = retainTerm(keep, comparison.rhs) or grew;
+            }
+        }
+        return grew;
+    }
+
+    fn projectInitialization(self: *AbstractState, keep: []const u8) void {
+        retainWhere(&self.exact_elements, keep, elementIsRetained);
+        retainWhere(&self.undefined_elements, keep, elementIsRetained);
+        retainWhere(&self.complete_arrays, keep, isRetained);
+        retainWhere(&self.fixed_prefixes, keep, isRetained);
+        retainWhere(&self.scalar_values, keep, isRetained);
+        retainWhere(&self.nonnegative_locals, keep, isRetained);
+        retainWhere(&self.symbolic_prefixes, keep, prefixIsRetained);
+        var index: usize = 0;
+        while (index < self.comparisons.items.len) {
+            const comparison = self.comparisons.items[index];
+            if (!termIsRetained(keep, comparison.lhs) and
+                !termIsRetained(keep, comparison.rhs))
+            {
+                _ = self.comparisons.swapRemove(index);
+            } else index += 1;
+        }
+    }
+
+    fn initializationProjectionIsIdentity(self: *const AbstractState, keep: []const u8) bool {
+        for (self.exact_elements.keys()) |key| if (!elementIsRetained(keep, key)) return false;
+        for (self.undefined_elements.keys()) |key| if (!elementIsRetained(keep, key)) return false;
+        for (self.complete_arrays.keys()) |key| if (!isRetained(keep, key)) return false;
+        for (self.fixed_prefixes.keys()) |key| if (!isRetained(keep, key)) return false;
+        for (self.scalar_values.keys()) |key| if (!isRetained(keep, key)) return false;
+        for (self.nonnegative_locals.keys()) |key| if (!isRetained(keep, key)) return false;
+        for (self.symbolic_prefixes.keys()) |key| if (!prefixIsRetained(keep, key)) return false;
+        for (self.comparisons.items) |comparison| {
+            if (comparison.lhs == .local and
+                !isRetained(keep, comparison.lhs.local.local)) return false;
+            if (comparison.rhs == .local and
+                !isRetained(keep, comparison.rhs.local.local)) return false;
+        }
+        return true;
+    }
+
+    fn entailedPrefixOffset(
+        self: *const AbstractState,
+        key: PrefixKey,
+        wanted: SymbolicPrefix,
+    ) ?struct { offset: i8, capped: bool } {
+        const mirror = self.symbolic_prefixes.get(key);
+        if (wanted.scale != 1) {
+            const prefix = mirror orelse return null;
+            if (prefix.scale != wanted.scale or prefix.offset != wanted.offset or prefix.capped != wanted.capped) return null;
+            return .{ .offset = wanted.offset, .capped = wanted.capped };
+        }
+        if (mirror) |prefix| if (prefix.scale != 1) return null;
+        // A skipped store at capacity is safe only when that capacity is
+        // already initialized. It proves a clipped endpoint, not count<=len.
+        if (self.hasInitializedPrefix(key.array, wanted.extent) and
+            (wanted.capped or mirror == null or mirror.?.capped or mirror.?.offset < wanted.offset))
+        {
+            return .{ .offset = wanted.offset, .capped = true };
+        }
+        if (mirror) |prefix| return .{
+            .offset = @min(prefix.offset, wanted.offset),
+            .capped = prefix.capped or wanted.capped,
+        };
+        const scalar = self.scalarValue(key.counter) orelse return null;
+        var offset: i8 = wanted.offset;
+        while (offset >= -1) : (offset -= 1) {
+            const endpoint = @as(i128, scalar) + offset;
+            if (!wanted.capped and (endpoint < 0 or endpoint > wanted.extent)) continue;
+            const clipped: u64 = @intCast(@min(@max(endpoint, 0), wanted.extent));
+            if (self.hasInitializedPrefix(key.array, clipped)) {
+                return .{ .offset = offset, .capped = wanted.capped };
+            }
+        }
+        return null;
+    }
+
+    fn joinInitialization(
+        self: *AbstractState,
+        other: *const AbstractState,
+        gpa: std.mem.Allocator,
+    ) !bool {
+        var changed = false;
+        // A guard can be implicit in one input's exact scalar and explicit
+        // in the other. Preserve common predicates before weakening either
+        // input's scalar or prefix proof.
+        for (other.comparisons.items) |premise| {
+            var recorded = false;
+            for (self.comparisons.items) |existing| {
+                if (comparisonEql(existing, premise) or
+                    comparisonEql(existing, reverseComparison(premise)))
+                {
+                    recorded = true;
+                    break;
+                }
+            }
+            if (!recorded and self.provesComparison(premise)) {
+                try self.comparisons.append(gpa, premise);
+                changed = true;
+            }
+        }
+        var comparison_index: usize = 0;
+        while (comparison_index < self.comparisons.items.len) {
+            if (!other.provesComparison(self.comparisons.items[comparison_index])) {
+                _ = self.comparisons.swapRemove(comparison_index);
+                changed = true;
+            } else comparison_index += 1;
+        }
+        // Evaluate inductive candidates before weakening exact scalar/coverage facts.
+        for (other.symbolic_prefixes.keys(), other.symbolic_prefixes.values()) |key, prefix| {
+            if (self.symbolic_prefixes.contains(key)) continue;
+            if (self.entailedPrefixOffset(key, prefix)) |entailed| {
+                try self.symbolic_prefixes.put(gpa, key, .{
+                    .offset = entailed.offset,
+                    .extent = prefix.extent,
+                    .capped = entailed.capped,
+                    .scale = prefix.scale,
+                });
+                changed = true;
+            }
+        }
+        var index: usize = 0;
+        while (index < self.symbolic_prefixes.count()) {
+            const key = self.symbolic_prefixes.keys()[index];
+            const prefix = &self.symbolic_prefixes.values()[index];
+            if (other.entailedPrefixOffset(key, prefix.*)) |entailed| {
+                const capped = prefix.capped or entailed.capped;
+                const extent = if (other.symbolic_prefixes.get(key)) |mirror|
+                    (if (capped) @min(prefix.extent, mirror.extent) else @max(prefix.extent, mirror.extent))
+                else
+                    prefix.extent;
+                if (entailed.offset != prefix.offset or extent != prefix.extent or capped != prefix.capped) changed = true;
+                prefix.* = .{ .offset = entailed.offset, .extent = extent, .capped = capped, .scale = prefix.scale };
+                index += 1;
+            } else {
+                _ = self.symbolic_prefixes.swapRemoveAt(index);
+                changed = true;
+            }
+        }
+        index = 0;
+        while (index < self.exact_elements.count()) {
+            const key = self.exact_elements.keys()[index];
+            if (!other.hasInitializedElement(key.array, .{ .constant = key.index })) {
+                _ = self.exact_elements.swapRemoveAt(index);
+                changed = true;
+            } else index += 1;
+        }
+        index = 0;
+        while (index < self.fixed_prefixes.count()) {
+            const array = self.fixed_prefixes.keys()[index];
+            const prefix = &self.fixed_prefixes.values()[index];
+            const common = if (other.hasInitializedPrefix(array, prefix.*)) prefix.* else @min(prefix.*, other.fixedPrefix(array));
+            if (common != prefix.*) {
+                prefix.* = common;
+                changed = true;
+            }
+            index += 1;
+        }
+        index = 0;
+        while (index < self.complete_arrays.count()) {
+            const array = self.complete_arrays.keys()[index];
+            if (!other.baseComplete(array)) {
+                _ = self.complete_arrays.swapRemoveAt(index);
+                changed = true;
+            } else index += 1;
+        }
+        for (other.undefined_elements.keys()) |key| {
+            if (!self.undefined_elements.contains(key)) {
+                try self.undefined_elements.put(gpa, key, {});
+                changed = true;
+            }
+        }
+        changed = intersectPredicates(@TypeOf(self.scalar_values), &self.scalar_values, &other.scalar_values) or changed;
+        index = 0;
+        while (index < self.nonnegative_locals.count()) {
+            const local = self.nonnegative_locals.keys()[index];
+            if (!other.provesNonNegative(.{ .local = .{ .local = local } })) {
+                _ = self.nonnegative_locals.swapRemoveAt(index);
+                changed = true;
+            } else index += 1;
+        }
+        return changed;
+    }
 };
+
+fn elementNotOwnedBy(array: LocalId, key: ElementKey) bool {
+    return key.array != array;
+}
+
+fn prefixNotOwnedBy(array: LocalId, key: PrefixKey) bool {
+    return key.array != array;
+}
+
+fn prefixCounterIsNot(counter: LocalId, key: PrefixKey) bool {
+    return key.counter != counter;
+}
+
+fn elementIsRetained(keep: []const u8, key: ElementKey) bool {
+    return isRetained(keep, key.array);
+}
+
+fn copiedCounterTerm(term: IndexTerm, source: LocalId, target: LocalId) IndexTerm {
+    return switch (term) {
+        .local => |value| if (value.local == source)
+            .{ .local = .{ .local = target, .offset = value.offset } }
+        else
+            term,
+        else => term,
+    };
+}
+
+fn prefixIsRetained(keep: []const u8, key: PrefixKey) bool {
+    return isRetained(keep, key.array) and isRetained(keep, key.counter);
+}
+
+fn termNamesLocal(term: IndexTerm, local: LocalId) bool {
+    return switch (term) {
+        .local => |value| value.local == local,
+        .field => |value| value.parent == local,
+        else => false,
+    };
+}
+
+fn termSupported(term: IndexTerm) bool {
+    return switch (term) {
+        .unknown => false,
+        .constant => true,
+        .local => |value| value.offset >= -1 and value.offset <= 1,
+        .field => |value| value.offset >= -1 and value.offset <= 1,
+    };
+}
+
+fn termEql(lhs: IndexTerm, rhs: IndexTerm) bool {
+    return switch (lhs) {
+        .unknown => rhs == .unknown,
+        .constant => |value| rhs == .constant and value == rhs.constant,
+        .local => |value| rhs == .local and value.local == rhs.local.local and
+            value.offset == rhs.local.offset,
+        .field => |value| rhs == .field and value.parent == rhs.field.parent and
+            std.mem.eql(u8, value.name, rhs.field.name) and value.offset == rhs.field.offset,
+    };
+}
+
+fn termSameBase(lhs: IndexTerm, rhs: IndexTerm) bool {
+    return switch (lhs) {
+        .local => |value| rhs == .local and value.local == rhs.local.local,
+        .field => |value| rhs == .field and value.parent == rhs.field.parent and
+            std.mem.eql(u8, value.name, rhs.field.name),
+        else => false,
+    };
+}
+
+fn termOffset(term: IndexTerm) i8 {
+    return switch (term) {
+        .local => |value| value.offset,
+        .field => |value| value.offset,
+        else => 0,
+    };
+}
+
+fn comparisonEql(lhs: Comparison, rhs: Comparison) bool {
+    return lhs.op == rhs.op and termEql(lhs.lhs, rhs.lhs) and termEql(lhs.rhs, rhs.rhs);
+}
+
+fn reverseComparison(comparison: Comparison) Comparison {
+    return .{
+        .lhs = comparison.rhs,
+        .rhs = comparison.lhs,
+        .op = switch (comparison.op) {
+            .eq => .eq,
+            .ne => .ne,
+            .lt => .gt,
+            .le => .ge,
+            .gt => .lt,
+            .ge => .le,
+        },
+    };
+}
+
+fn negateComparisonOp(op: @TypeOf(@as(Comparison, undefined).op)) @TypeOf(op) {
+    return switch (op) {
+        .eq => .ne,
+        .ne => .eq,
+        .lt => .ge,
+        .le => .gt,
+        .gt => .le,
+        .ge => .lt,
+    };
+}
+
+fn compareIntegers(lhs: i128, rhs: i128, op: @TypeOf(@as(Comparison, undefined).op)) bool {
+    return switch (op) {
+        .eq => lhs == rhs,
+        .ne => lhs != rhs,
+        .lt => lhs < rhs,
+        .le => lhs <= rhs,
+        .gt => lhs > rhs,
+        .ge => lhs >= rhs,
+    };
+}
+
+fn comparisonImplies(premise: Comparison, query: Comparison) bool {
+    if (!(termSameBase(premise.lhs, query.lhs) or termEql(premise.lhs, query.lhs)) or
+        !(termSameBase(premise.rhs, query.rhs) or termEql(premise.rhs, query.rhs))) return false;
+    // Move offsets to the difference between the same two storage values.
+    // Thus length<=count also proves length-1<count, without dropping the
+    // separate nonnegative-index requirement.
+    const shift = @as(i16, termOffset(query.lhs)) - termOffset(query.rhs) -
+        (@as(i16, termOffset(premise.lhs)) - termOffset(premise.rhs));
+    const bounds: TermBounds = switch (premise.op) {
+        .eq => .{ .lower = shift, .upper = shift },
+        .lt => .{ .upper = @as(i128, shift) - 1 },
+        .le => .{ .upper = shift },
+        .gt => .{ .lower = @as(i128, shift) + 1 },
+        .ge => .{ .lower = shift },
+        .ne => return shift == 0 and query.op == .ne,
+    };
+    return boundsProveComparison(bounds, .{ .lower = 0, .upper = 0 }, query.op);
+}
+
+fn boundsProveComparison(lhs: TermBounds, rhs: TermBounds, op: @TypeOf(@as(Comparison, undefined).op)) bool {
+    if (!lhs.valid() or !rhs.valid()) return false;
+    return switch (op) {
+        .eq => blk: {
+            const lhs_lower = lhs.lower orelse break :blk false;
+            const lhs_upper = lhs.upper orelse break :blk false;
+            const rhs_lower = rhs.lower orelse break :blk false;
+            const rhs_upper = rhs.upper orelse break :blk false;
+            break :blk lhs_lower == lhs_upper and rhs_lower == rhs_upper and lhs_lower == rhs_lower;
+        },
+        .ne => boundsProveComparison(lhs, rhs, .lt) or boundsProveComparison(lhs, rhs, .gt),
+        .lt => if (lhs.upper) |upper| if (rhs.lower) |lower| upper < lower else false else false,
+        .le => if (lhs.upper) |upper| if (rhs.lower) |lower| upper <= lower else false else false,
+        .gt => if (lhs.lower) |lower| if (rhs.upper) |upper| lower > upper else false else false,
+        .ge => if (lhs.lower) |lower| if (rhs.upper) |upper| lower >= upper else false else false,
+    };
+}
+
+fn termIsRetained(keep: []const u8, term: IndexTerm) bool {
+    return switch (term) {
+        .local => |value| isRetained(keep, value.local),
+        .field => |value| isRetained(keep, value.parent),
+        else => false,
+    };
+}
+
+fn retainLocal(keep: []u8, local: LocalId) bool {
+    if (isRetained(keep, local)) return false;
+    markRetained(keep, local);
+    return true;
+}
+
+fn retainTerm(keep: []u8, term: IndexTerm) bool {
+    return switch (term) {
+        .local => |value| retainLocal(keep, value.local),
+        .field => |value| retainLocal(keep, value.parent),
+        else => false,
+    };
+}
 
 /// Two liveness records name the same hazard state when every field a
 /// transfer function branches on agrees.  `killed_at` is a diagnostic
@@ -726,6 +1948,10 @@ fn fieldNotOwnedBy(parent: LocalId, key: FieldKey) bool {
     return key.parent != parent;
 }
 
+fn fieldNotOwnedPayload(parent: LocalId, key: FieldKey) bool {
+    return key.parent != parent or std.mem.eql(u8, key.name, "ptr") or std.mem.eql(u8, key.name, "len");
+}
+
 /// Add to `keep` every local that a surviving `.stack` origin points
 /// into — whether the origin sits in `locals` or in `fields` — and report
 /// whether anything was added.  `project` drives this to a false and
@@ -779,6 +2005,35 @@ fn namesId(ids: []const u32, id: u32) bool {
     return false;
 }
 
+fn nextFieldPathByte(path: []const u8, index: *usize, quoted: *bool, escaped: *bool) ?u8 {
+    while (index.* < path.len) {
+        const byte = path[index.*];
+        index.* += 1;
+        if (!quoted.* and std.ascii.isWhitespace(byte)) continue;
+        if (byte == '"' and !escaped.*) quoted.* = !quoted.*;
+        const was_escaped = escaped.*;
+        escaped.* = quoted.* and byte == '\\' and !was_escaped;
+        return byte;
+    }
+    return null;
+}
+
+fn fieldPathPrefix(prefix: []const u8, path: []const u8) bool {
+    if (prefix.len == 0) return true;
+    var left: usize = 0;
+    var right: usize = 0;
+    var left_quoted = false;
+    var right_quoted = false;
+    var left_escaped = false;
+    var right_escaped = false;
+    while (nextFieldPathByte(prefix, &left, &left_quoted, &left_escaped)) |byte| {
+        const actual = nextFieldPathByte(path, &right, &right_quoted, &right_escaped) orelse return false;
+        if (actual != byte) return false;
+    }
+    const next = nextFieldPathByte(path, &right, &right_quoted, &right_escaped) orelse return true;
+    return next == '.' or next == '[';
+}
+
 pub const FieldKey = struct {
     parent: LocalId,
     name: []const u8,
@@ -807,9 +2062,89 @@ pub fn join(
 ) !JoinResult {
     std.debug.assert(self.feasible);
     std.debug.assert(other.feasible);
+    std.debug.assert(self.integer_domains.len == other.integer_domains.len);
+    std.debug.assert(self.integer_domains.len == 0 or self.integer_domains.ptr == other.integer_domains.ptr);
     // The predicate maps join on their own rule: a fact survives only
     // when BOTH paths carry it.  Nothing above or below may insert one.
     var changed = self.facts.joinFrom(&other.facts);
+    changed = (try self.joinInitialization(other, gpa)) or changed;
+    for (other.written_fields.keys()) |key| {
+        if (!self.fieldBytesAreWritten(key.parent, key.name)) continue;
+        const entry = try self.written_fields.getOrPutContext(gpa, key, .{});
+        if (!entry.found_existing) changed = true;
+    }
+    var written_index: usize = 0;
+    while (written_index < self.written_fields.count()) {
+        const key = self.written_fields.keys()[written_index];
+        if (!other.fieldBytesAreWritten(key.parent, key.name)) {
+            _ = self.written_fields.swapRemoveAt(written_index);
+            changed = true;
+        } else written_index += 1;
+    }
+    for (other.may_undefined_values.keys()) |local| {
+        const entry = try self.may_undefined_values.getOrPut(gpa, local);
+        if (!entry.found_existing) changed = true;
+    }
+    for (other.undefined_field_values.keys()) |key| {
+        const entry = try self.undefined_field_values.getOrPutContext(gpa, key, .{});
+        if (!entry.found_existing) changed = true;
+    }
+    for (self.locals.keys(), self.locals.values()) |local, origin| {
+        if (origin == .undef) {
+            const entry = try self.may_undefined_values.getOrPut(gpa, local);
+            if (!entry.found_existing) changed = true;
+        }
+    }
+    for (other.locals.keys(), other.locals.values()) |local, origin| {
+        if (origin == .undef) {
+            const entry = try self.may_undefined_values.getOrPut(gpa, local);
+            if (!entry.found_existing) changed = true;
+        }
+    }
+    for (self.fields.keys(), self.fields.values()) |key, origin| {
+        if (origin == .undef) {
+            const entry = try self.undefined_field_values.getOrPutContext(gpa, key, .{});
+            if (!entry.found_existing) changed = true;
+        }
+    }
+    for (other.fields.keys(), other.fields.values()) |key, origin| {
+        if (origin == .undef) {
+            const entry = try self.undefined_field_values.getOrPutContext(gpa, key, .{});
+            if (!entry.found_existing) changed = true;
+        }
+    }
+    // Physical field origins join by union below. They cannot certify a
+    // selected opaque payload unless that field was defined on both paths.
+    // ArrayHashMap appends without reordering old keys here. Retain the
+    // incoming boundary so first-loop negatives cannot poison second-loop
+    // common descendant proofs. No certificate snapshot allocation is needed.
+    const incoming_negative_count = self.unknown_field_values.count();
+    if (other.unknown_values.count() != 0) {
+        for (self.fields.keys()) |key| {
+            if (other.unknown_values.contains(key.parent) and !other.fieldValueIsDefined(key.parent, key.name)) {
+                const entry = try self.unknown_field_values.getOrPutContext(gpa, key, .{});
+                if (!entry.found_existing) changed = true;
+            }
+        }
+    }
+    if (self.unknown_values.count() != 0) {
+        for (other.fields.keys()) |key| {
+            if (self.unknown_values.contains(key.parent) and
+                !self.fieldValueIsDefinedWithLimit(key.parent, key.name, incoming_negative_count, false, true))
+            {
+                const entry = try self.unknown_field_values.getOrPutContext(gpa, key, .{});
+                if (!entry.found_existing) changed = true;
+            }
+        }
+    }
+    for (other.unknown_field_values.keys()) |key| {
+        const entry = try self.unknown_field_values.getOrPutContext(gpa, key, .{});
+        if (!entry.found_existing) changed = true;
+    }
+    for (other.unknown_values.keys()) |local| {
+        const entry = try self.unknown_values.getOrPut(gpa, local);
+        if (!entry.found_existing) changed = true;
+    }
 
     for (other.locals.keys(), other.locals.values()) |local, other_val| {
         const gop = try self.locals.getOrPut(gpa, local);
@@ -1116,9 +2451,8 @@ test "clone: predicate facts arrive intact and stop being shared" {
     try std.testing.expect(try copy.facts.assumeGuard(gpa, guard, false));
 }
 
-/// Fill one entry into every map a clone copies — both `Facts` maps
-/// included — then clone.  Run under a failing allocator this walks the
-/// sweep across all seven maps' allocation sites.
+/// Fill every owned map and the comparison list, then clone under a failing
+/// allocator to exercise partial construction and cleanup.
 fn cloneOneEntryPerMap(gpa: std.mem.Allocator) !void {
     var src: AbstractState = .{};
     defer src.deinit(gpa);
@@ -1130,8 +2464,22 @@ fn cloneOneEntryPerMap(gpa: std.mem.Allocator) !void {
     try src.out_param_writes.put(gpa, local, heap);
     const field = try src.fields.getOrPutContext(gpa, .{ .parent = local, .name = "buf" }, .{});
     field.value_ptr.* = .{ .heap = heap };
+    try src.unknown_field_values.putContext(gpa, .{ .parent = local, .name = "bytes" }, {}, .{});
+    try src.unknown_values.put(gpa, local, {});
     try src.facts.bindBoolean(gpa, @enumFromInt(1), true);
     _ = try src.facts.assumeGuard(gpa, @enumFromInt(0), true);
+    const array: LocalId = @enumFromInt(2);
+    const counter: LocalId = @enumFromInt(3);
+    try src.setExactElement(gpa, array, 0, true);
+    try src.markArrayComplete(gpa, @enumFromInt(4));
+    try src.setExactElement(gpa, @enumFromInt(4), 1, false);
+    try src.setScalarValue(gpa, counter, 0);
+    try src.setSymbolicPrefix(gpa, array, counter, 0, 16);
+    _ = try src.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = @enumFromInt(5) } },
+        .rhs = .{ .constant = 16 },
+        .op = .lt,
+    });
 
     // A clone that dies partway through owns every map it had already
     // refilled through its errdefer.  The failure propagates so the
@@ -1142,8 +2490,561 @@ fn cloneOneEntryPerMap(gpa: std.mem.Allocator) !void {
     // And a clone that succeeds is mergeable with its source, which is
     // only true when the fact maps came across too.
     try std.testing.expect(src.canMerge(&copy));
+    // Payload consumers must remain conservative in the independently owned copy.
+    try std.testing.expect(!copy.fieldValueIsDefined(local, "bytes"));
+    copy.forgetFields(local);
+    try std.testing.expect(copy.fieldValueIsDefined(local, "bytes"));
+    try std.testing.expect(!src.fieldValueIsDefined(local, "bytes"));
+
+    _ = try join(&copy, &src, gpa);
+    try std.testing.expect(!copy.fieldValueIsDefined(local, "bytes"));
+    var keep = [_]u8{1};
+    const live_out = [_]u8{1};
+    var heaps: std.ArrayListUnmanaged(u32) = .empty;
+    defer heaps.deinit(gpa);
+    var arenas: std.ArrayListUnmanaged(u32) = .empty;
+    defer arenas.deinit(gpa);
+    try copy.project(gpa, &keep, &live_out, &heaps, &arenas);
+    try std.testing.expect(!copy.fieldValueIsDefined(local, "bytes"));
+    @memset(&keep, 0);
+    try copy.project(gpa, &keep, &.{0}, &heaps, &arenas);
+    try std.testing.expect(copy.fieldValueIsDefined(local, "bytes"));
 }
 
 test "clone: a failure partway through leaves nothing allocated" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneOneEntryPerMap, .{});
+}
+
+// Initialization facts must remain sparse even for a very large fixed extent.
+test "initialization: exact stores preserve gaps and undefined holes" {
+    const gpa = std.testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    const array: LocalId = @enumFromInt(0);
+    try state.setFixedPrefix(gpa, array, 0);
+    try state.setExactElement(gpa, array, 2, true);
+    try std.testing.expect(state.hasExactElement(array, 2));
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .constant = 0 }));
+    try std.testing.expect(!state.hasInitializedPrefix(array, std.math.maxInt(u64)));
+    try state.markArrayComplete(gpa, array);
+    try state.setExactElement(gpa, array, 0, false);
+    try std.testing.expect(state.baseComplete(array));
+    try std.testing.expect(!state.isArrayComplete(array));
+    try std.testing.expect(state.hasInitializedElement(array, .{ .constant = 1 }));
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .constant = 0 }));
+    try std.testing.expect(!state.hasInitializedPrefix(array, 2));
+    try state.setExactElement(gpa, array, 0, true);
+    try std.testing.expect(state.isArrayComplete(array));
+}
+
+// An exclusive prefix does not credit its endpoint or an unguarded negative index.
+test "initialization: affine prefix bounds and guarded counter steps" {
+    const gpa = std.testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const index: LocalId = @enumFromInt(2);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 16);
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .local = .{ .local = count } }));
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .local = .{ .local = count, .offset = -1 } }));
+    try std.testing.expect(try state.assumeComparison(gpa, .{
+        .lhs = .{ .constant = 0 },
+        .rhs = .{ .local = .{ .local = count } },
+        .op = .lt,
+    }));
+    try std.testing.expect(state.hasInitializedElement(array, .{ .local = .{ .local = count, .offset = -1 } }));
+    try std.testing.expect(try state.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = count } },
+        .rhs = .{ .constant = 16 },
+        .op = .ne,
+    }));
+    try std.testing.expect(state.provesIndexInBounds(.{ .local = .{ .local = count } }, 16));
+    try state.setScalarValue(gpa, index, 0);
+    try std.testing.expect(try state.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = count } },
+        .rhs = .{ .local = .{ .local = index } },
+        .op = .gt,
+    }));
+    try std.testing.expect(state.hasInitializedElement(array, .{ .local = .{ .local = index } }));
+    state.forgetInitializationLocal(index);
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .local = .{ .local = index } }));
+    try state.stepCounter(gpa, count, -1);
+    try std.testing.expectEqual(@as(?i8, 1), state.symbolicPrefixOffset(array, count));
+    try std.testing.expect(state.hasInitializedElement(array, .{ .local = .{ .local = count } }));
+}
+
+test "initialization: scaled slice prefixes retain lane bounds through joins and revoke on mutation" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const index: LocalId = @enumFromInt(2);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setScaledSymbolicPrefix(gpa, array, count, 2, 8);
+    try state.setScalarValue(gpa, index, 0);
+    try std.testing.expect(try state.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = index } },
+        .rhs = .{ .local = .{ .local = count } },
+        .op = .lt,
+    }));
+    try std.testing.expect(state.hasInitializedScaledElement(array, .{ .index = index, .scale = 2 }));
+    try std.testing.expect(state.hasInitializedScaledElement(array, .{ .index = index, .scale = 2, .offset = 1 }));
+    try std.testing.expect(!state.hasInitializedScaledElement(array, .{ .index = count, .scale = 2 }));
+    try std.testing.expect(!state.hasInitializedScaledElement(array, .{ .index = index, .scale = 3 }));
+    var mirror = try state.clone(gpa);
+    defer mirror.deinit(gpa);
+    _ = try join(&state, &mirror, gpa);
+    try std.testing.expect(state.hasInitializedScaledElement(array, .{ .index = index, .scale = 2, .offset = 1 }));
+    try state.stepCounter(gpa, count, -1);
+    try std.testing.expect(!state.hasInitializedScaledElement(array, .{ .index = index, .scale = 2 }));
+}
+
+test "initialization: unequal scaled prefixes do not survive an intersection" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var lhs: AbstractState = .{};
+    defer lhs.deinit(gpa);
+    var rhs: AbstractState = .{};
+    defer rhs.deinit(gpa);
+    try lhs.setScaledSymbolicPrefix(gpa, array, count, 2, 8);
+    try rhs.setScaledSymbolicPrefix(gpa, array, count, 3, 8);
+    _ = try join(&lhs, &rhs, gpa);
+    try std.testing.expectEqual(@as(usize, 0), lhs.symbolic_prefixes.count());
+}
+
+// The zero-count entry path entails an empty prefix at the loop header.
+test "initialization: join synthesizes inductive prefix and unions complete holes" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var entry: AbstractState = .{};
+    defer entry.deinit(gpa);
+    try entry.setFixedPrefix(gpa, array, 0);
+    try entry.setScalarValue(gpa, count, 0);
+    var back: AbstractState = .{};
+    defer back.deinit(gpa);
+    try back.setSymbolicPrefix(gpa, array, count, 0, 16);
+    _ = try join(&entry, &back, gpa);
+    try std.testing.expectEqual(@as(?i8, 0), entry.symbolicPrefixOffset(array, count));
+    try std.testing.expectEqual(@as(?u64, null), entry.scalarValue(count));
+    try entry.markArrayComplete(gpa, array);
+    try back.markArrayComplete(gpa, array);
+    try entry.setExactElement(gpa, array, 0, false);
+    try back.setExactElement(gpa, array, 1, false);
+    _ = try join(&entry, &back, gpa);
+    try std.testing.expect(!entry.hasInitializedElement(array, .{ .constant = 0 }));
+    try std.testing.expect(!entry.hasInitializedElement(array, .{ .constant = 1 }));
+    try std.testing.expect(entry.hasInitializedElement(array, .{ .constant = 2 }));
+}
+
+test "initialization: join keeps bounds entailed by different scalar facts" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const term: IndexTerm = .{ .local = .{ .local = count } };
+    for ([_]@TypeOf(@as(Comparison, undefined).op){ .lt, .ne }) |op| {
+        var first: AbstractState = .{};
+        defer first.deinit(gpa);
+        try first.setScalarValue(gpa, count, 0);
+        try first.setFixedPrefix(gpa, array, 0);
+        var later: AbstractState = .{};
+        defer later.deinit(gpa);
+        try later.setSymbolicPrefix(gpa, array, count, 0, 2);
+        const guard: Comparison = .{ .lhs = term, .rhs = .{ .constant = 2 }, .op = op };
+        try std.testing.expect(try later.assumeComparison(gpa, guard));
+        _ = try join(&first, &later, gpa);
+        try std.testing.expectEqual(@as(?u64, null), first.scalarValue(count));
+        try std.testing.expect(first.provesComparison(guard));
+        try std.testing.expect(first.provesComparison(.{ .lhs = term, .rhs = .{ .constant = 2 }, .op = .lt }));
+        _ = try join(&later, &first, gpa);
+        try std.testing.expect(later.provesComparison(guard));
+    }
+}
+
+// Cloning and projection retain dependencies without sharing mutable fact storage.
+test "initialization: clone projection and alias invalidation" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const index: LocalId = @enumFromInt(2);
+    var source: AbstractState = .{};
+    defer source.deinit(gpa);
+    try source.setSymbolicPrefix(gpa, array, count, 0, 16);
+    try source.setScalarValue(gpa, index, 0);
+    _ = try source.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = index } },
+        .rhs = .{ .local = .{ .local = count } },
+        .op = .lt,
+    });
+    var copy = try source.clone(gpa);
+    defer copy.deinit(gpa);
+    var keep = [_]u8{1};
+    const out = [_]u8{0};
+    var heaps: std.ArrayListUnmanaged(u32) = .empty;
+    defer heaps.deinit(gpa);
+    var arenas: std.ArrayListUnmanaged(u32) = .empty;
+    defer arenas.deinit(gpa);
+    try copy.project(gpa, &keep, &out, &heaps, &arenas);
+    try std.testing.expect(isRetained(&keep, count));
+    try std.testing.expect(isRetained(&keep, index));
+    try std.testing.expect(copy.hasInitializedElement(array, .{ .local = .{ .local = index } }));
+    copy.forgetInitializationArray(array);
+    copy.forgetInitializationLocal(count);
+    try std.testing.expect(!copy.hasInitializedElement(array, .{ .constant = 0 }));
+    try std.testing.expect(source.hasInitializedElement(array, .{ .local = .{ .local = index } }));
+}
+
+test "initialization: copied counters retain independent guarded-pop prefixes" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const depth: LocalId = @enumFromInt(1);
+    const cursor: LocalId = @enumFromInt(2);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setSymbolicPrefix(gpa, array, depth, 0, 64);
+    try state.copyCounterValue(gpa, cursor, depth);
+    const cursor_term: IndexTerm = .{ .local = .{ .local = cursor } };
+    for (0..2) |_| {
+        try std.testing.expect(try state.assumeComparison(gpa, .{ .lhs = cursor_term, .rhs = .{ .constant = 0 }, .op = .gt }));
+        try state.stepCounter(gpa, cursor, -1);
+        try std.testing.expect(state.hasInitializedElement(array, cursor_term));
+    }
+    state.forgetInitializationLocal(depth);
+    try std.testing.expect(state.hasInitializedElement(array, cursor_term));
+}
+
+test "initialization: guarded unsigned field offsets retain prefix and lower bounds" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const entry: LocalId = @enumFromInt(2);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 64);
+    const field: IndexTerm = .{ .field = .{ .parent = entry, .name = "length", .is_unsigned = true } };
+    try std.testing.expect(try state.assumeComparison(gpa, .{ .lhs = field, .rhs = .{ .local = .{ .local = count } }, .op = .le }));
+    try std.testing.expect(try state.assumeComparison(gpa, .{ .lhs = field, .rhs = .{ .constant = 0 }, .op = .ne }));
+    const index: IndexTerm = .{ .field = .{ .parent = entry, .name = "length", .offset = -1 } };
+    try std.testing.expect(state.provesIndexInBounds(index, 64));
+    try std.testing.expect(state.hasInitializedElement(array, index));
+    state.forgetInitializationLocal(entry);
+    try std.testing.expect(!state.hasInitializedElement(array, index));
+}
+
+test "initialization: saturated push paths retain only a capacity-clipped prefix" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const term: IndexTerm = .{ .local = .{ .local = count } };
+    var stored: AbstractState = .{};
+    defer stored.deinit(gpa);
+    try stored.setScalarValue(gpa, count, 0);
+    try stored.setSymbolicPrefix(gpa, array, count, 1, 2);
+    var saturated: AbstractState = .{};
+    defer saturated.deinit(gpa);
+    try saturated.setSymbolicPrefix(gpa, array, count, 0, 2);
+    try std.testing.expect(try saturated.assumeComparison(gpa, .{ .lhs = term, .rhs = .{ .constant = 2 }, .op = .ge }));
+    _ = try join(&stored, &saturated, gpa);
+    try std.testing.expect(stored.symbolic_prefixes.values()[0].capped);
+    try std.testing.expectEqual(@as(?i8, 1), stored.symbolicPrefixOffset(array, count));
+    try stored.stepCounter(gpa, count, 1);
+    try std.testing.expect(!stored.provesIndexInBounds(term, 2));
+    var entry: AbstractState = .{};
+    defer entry.deinit(gpa);
+    try entry.setScalarValue(gpa, count, 0);
+    try entry.setFixedPrefix(gpa, array, 0);
+    _ = try join(&entry, &stored, gpa);
+    try std.testing.expect(!entry.hasInitializedElement(array, .{ .constant = 0 }));
+    try std.testing.expect(try entry.assumeComparison(gpa, .{ .lhs = term, .rhs = .{ .constant = 0 }, .op = .gt }));
+    try std.testing.expect(entry.hasInitializedElement(array, .{ .constant = 0 }));
+    try std.testing.expect(!entry.hasInitializedElement(array, .{ .constant = 2 }));
+}
+
+// A missing store or an extra increment leaves a real gap at the prefix boundary.
+test "initialization: skipped stores and unsupported counter changes revoke proofs" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setScalarValue(gpa, count, 0);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 8);
+    try state.stepCounter(gpa, count, 1);
+    try std.testing.expectEqual(@as(?i8, -1), state.symbolicPrefixOffset(array, count));
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .constant = 0 }));
+    try state.stepCounter(gpa, count, 1);
+    try std.testing.expectEqual(@as(?i8, null), state.symbolicPrefixOffset(array, count));
+    try state.setSymbolicPrefix(gpa, array, count, 0, 8);
+    try state.stepCounter(gpa, count, 2);
+    try std.testing.expectEqual(@as(?i8, null), state.symbolicPrefixOffset(array, count));
+    try std.testing.expectEqual(@as(?u64, null), state.scalarValue(count));
+}
+
+// Decrementing a possibly empty count must not manufacture initialized slots.
+test "initialization: unguarded pop drops its affine coverage" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 8);
+    try state.stepCounter(gpa, count, -1);
+    try std.testing.expectEqual(@as(?i8, null), state.symbolicPrefixOffset(array, count));
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .local = .{ .local = count } }));
+}
+
+// Independent branch writes are intersected; neither path fills the other's gap.
+test "initialization: joins intersect sparse stores and weaken fixed prefixes" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    var lhs: AbstractState = .{};
+    defer lhs.deinit(gpa);
+    var rhs: AbstractState = .{};
+    defer rhs.deinit(gpa);
+    try lhs.setExactElement(gpa, array, 0, true);
+    try lhs.setExactElement(gpa, array, 1, true);
+    try rhs.setExactElement(gpa, array, 1, true);
+    _ = try join(&lhs, &rhs, gpa);
+    try std.testing.expectEqual(@as(u64, 0), lhs.fixedPrefix(array));
+    try std.testing.expect(!lhs.hasExactElement(array, 0));
+    try std.testing.expect(lhs.hasExactElement(array, 1));
+    try std.testing.expect(!lhs.hasInitializedPrefix(array, 2));
+}
+
+// A dynamic selected read needs a proof that it cannot select an undefined hole.
+test "initialization: dynamic holes require exclusion and completion clears holes" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const index: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.markArrayComplete(gpa, array);
+    try state.setExactElement(gpa, array, 1, false);
+    _ = try state.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = index } },
+        .rhs = .{ .constant = 0 },
+        .op = .ge,
+    });
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .local = .{ .local = index } }));
+    _ = try state.assumeComparison(gpa, .{
+        .lhs = .{ .constant = 1 },
+        .rhs = .{ .local = .{ .local = index } },
+        .op = .ne,
+    });
+    try std.testing.expect(state.hasInitializedElement(array, .{ .local = .{ .local = index } }));
+    try state.markArrayComplete(gpa, array);
+    try std.testing.expect(state.isArrayComplete(array));
+    state.forgetInitializationArray(array);
+    try std.testing.expect(!state.hasInitializedElement(array, .{ .constant = 2 }));
+}
+
+// Reversed conditions and their negated successors retain the same bounded premise.
+test "initialization: reversed guards and contradictions" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 16);
+    try std.testing.expect(try state.assumeComparison(gpa, .{
+        .lhs = .{ .constant = 16 },
+        .rhs = .{ .local = .{ .local = count } },
+        .op = .ne,
+    }));
+    try std.testing.expect(state.provesLessThan(.{ .local = .{ .local = count } }, .{ .constant = 16 }));
+    try std.testing.expect(!try state.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = count } },
+        .rhs = .{ .constant = 16 },
+        .op = .ge,
+    }));
+    state.forgetAllComparisons();
+    try std.testing.expect(try state.assumeComparison(gpa, .{
+        .lhs = .{ .constant = 16 },
+        .rhs = .{ .local = .{ .local = count } },
+        .op = .le,
+    }));
+    try std.testing.expect(state.hasInitializedPrefix(array, 16));
+    try std.testing.expect(!state.hasInitializedPrefix(array, 17));
+}
+
+// Projection drops wholly unobserved initialization maps while retaining Origin rules.
+test "initialization: dead coverage keys are projected away" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setExactElement(gpa, array, 0, true);
+    try state.setScalarValue(gpa, count, 0);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 8);
+    var keep = [_]u8{0};
+    var heaps: std.ArrayListUnmanaged(u32) = .empty;
+    defer heaps.deinit(gpa);
+    var arenas: std.ArrayListUnmanaged(u32) = .empty;
+    defer arenas.deinit(gpa);
+    try std.testing.expect(!state.projectionIsIdentity(&keep, &keep));
+    try state.project(gpa, &keep, &keep, &heaps, &arenas);
+    try std.testing.expectEqual(@as(usize, 0), state.exact_elements.count());
+    try std.testing.expectEqual(@as(usize, 0), state.fixed_prefixes.count());
+    try std.testing.expectEqual(@as(usize, 0), state.symbolic_prefixes.count());
+    try std.testing.expectEqual(@as(usize, 0), state.scalar_values.count());
+}
+
+// The else successor of count==0 supplies count!=0, not a syntactic count>0.
+test "initialization: negated zero guard proves a nonnegative previous slot" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setSymbolicPrefix(gpa, array, count, 0, 16);
+    _ = try state.assumeComparison(gpa, .{
+        .lhs = .{ .local = .{ .local = count } },
+        .rhs = .{ .constant = 0 },
+        .op = .ne,
+    });
+    try std.testing.expect(state.provesCounterPositive(count));
+    try std.testing.expect(state.hasInitializedElement(array, .{
+        .local = .{ .local = count, .offset = -1 },
+    }));
+}
+
+test "integer domains: supported endpoints and unbounded widths stay conservative" {
+    const domains = [_]IntegerDomain{
+        .{ .kind = .unsigned, .bits = 0 },
+        .{ .kind = .signed, .bits = 0 },
+        .{ .kind = .unsigned, .bits = 1 },
+        .{ .kind = .unsigned, .bits = 2 },
+        .{ .kind = .signed, .bits = 2 },
+        .{ .kind = .unsigned, .bits = 63 },
+        .{ .kind = .unsigned, .bits = 64 },
+        .{ .kind = .unsigned_unbounded },
+        .{},
+    };
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(std.testing.allocator);
+    for ([_]u32{ 0, 1 }) |id| {
+        try std.testing.expect(state.provesIndexInBounds(.{ .local = .{ .local = @enumFromInt(id) } }, 1));
+    }
+    try std.testing.expect(state.provesIndexInBounds(.{ .local = .{ .local = @enumFromInt(2) } }, 2));
+    try std.testing.expect(!state.provesIndexInBounds(.{ .local = .{ .local = @enumFromInt(3) } }, 2));
+    try std.testing.expect(!state.provesNonNegative(.{ .local = .{ .local = @enumFromInt(4) } }));
+    try std.testing.expect(state.provesIndexInBounds(.{ .local = .{ .local = @enumFromInt(5) } }, @as(u64, 1) << 63));
+    for ([_]u32{ 6, 7, 8 }) |id| {
+        try std.testing.expect(!state.provesIndexInBounds(.{ .local = .{ .local = @enumFromInt(id) } }, std.math.maxInt(u64)));
+    }
+    try std.testing.expect(state.termBounds(.{ .local = .{ .local = @enumFromInt(7) } }).upper == null);
+    try std.testing.expect(state.termBounds(.{ .local = .{ .local = @enumFromInt(8) } }).lower == null);
+    try std.testing.expect(!state.provesNonNegative(.{ .local = .{ .local = @enumFromInt(2), .offset = -1 } }));
+    try std.testing.expect(state.provesIndexInBounds(.{ .local = .{ .local = @enumFromInt(2), .offset = 1 } }, 3));
+}
+
+test "integer domains: widening copies snapshot values and forget mutations" {
+    const gpa = std.testing.allocator;
+    const domains = [_]IntegerDomain{
+        .{ .kind = .unsigned, .bits = 1 },
+        .{ .kind = .unsigned, .bits = 64 },
+    };
+    const source: LocalId = @enumFromInt(0);
+    const dest: LocalId = @enumFromInt(1);
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(gpa);
+    try state.copyCounterValue(gpa, dest, source);
+    state.forgetInitializationLocal(source);
+    try std.testing.expect(state.provesIndexInBounds(.{ .local = .{ .local = dest } }, 2));
+    var cloned = try state.clone(gpa);
+    defer cloned.deinit(gpa);
+    state.forgetInitializationLocal(dest);
+    try std.testing.expect(!state.provesIndexInBounds(.{ .local = .{ .local = dest } }, 2));
+    try std.testing.expect(cloned.provesIndexInBounds(.{ .local = .{ .local = dest } }, 2));
+    _ = try join(&cloned, &state, gpa);
+    try std.testing.expect(!cloned.provesIndexInBounds(.{ .local = .{ .local = dest } }, 2));
+    try std.testing.expect(cloned.provesIndexInBounds(.{ .local = .{ .local = source } }, 2));
+    var keep = [_]u8{0};
+    var heaps: std.ArrayListUnmanaged(u32) = .empty;
+    defer heaps.deinit(gpa);
+    var arenas: std.ArrayListUnmanaged(u32) = .empty;
+    defer arenas.deinit(gpa);
+    try cloned.project(gpa, &keep, &keep, &heaps, &arenas);
+    try std.testing.expect(cloned.projectionIsIdentity(&keep, &keep));
+    try std.testing.expect(cloned.provesIndexInBounds(.{ .local = .{ .local = source } }, 2));
+}
+
+test "integer domains: contradictory intervals do not invent finite proofs" {
+    const gpa = std.testing.allocator;
+    const domains = [_]IntegerDomain{.{ .kind = .unsigned, .bits = 1 }};
+    const term: IndexTerm = .{ .local = .{ .local = @enumFromInt(0) } };
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(gpa);
+    try state.comparisons.append(gpa, .{ .lhs = term, .rhs = .{ .constant = 4 }, .op = .ge });
+    try std.testing.expect(!state.provesNonNegative(term));
+    try std.testing.expect(!state.provesLessThan(term, .{ .constant = 2 }));
+}
+
+test "integer domains: zero equality and guarded endpoint exclusions" {
+    const gpa = std.testing.allocator;
+    const domains = [_]IntegerDomain{
+        .{ .kind = .signed, .bits = 0 },
+        .{ .kind = .unsigned, .bits = 1 },
+        .{ .kind = .signed, .bits = 64 },
+    };
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(gpa);
+    const zero: IndexTerm = .{ .local = .{ .local = @enumFromInt(0) } };
+    const bit: IndexTerm = .{ .local = .{ .local = @enumFromInt(1) } };
+    try std.testing.expect(state.provesComparison(.{ .lhs = zero, .rhs = .{ .constant = 0 }, .op = .eq }));
+    try std.testing.expect(!state.provesComparison(.{ .lhs = zero, .rhs = .{ .constant = 0 }, .op = .ne }));
+    try std.testing.expect(try state.assumeComparison(gpa, .{ .lhs = bit, .rhs = .{ .constant = 0 }, .op = .ne }));
+    try std.testing.expect(state.provesComparison(.{ .lhs = bit, .rhs = .{ .constant = 1 }, .op = .eq }));
+    try std.testing.expect(!try state.assumeComparison(gpa, .{ .lhs = bit, .rhs = .{ .constant = 1 }, .op = .ne }));
+    const signed = state.termBounds(.{ .local = .{ .local = @enumFromInt(2) } });
+    try std.testing.expectEqual(@as(?i128, std.math.minInt(i64)), signed.lower);
+    try std.testing.expectEqual(@as(?i128, std.math.maxInt(i64)), signed.upper);
+}
+
+test "integer domains: reusable scratch follows source context and survives source teardown" {
+    const gpa = std.testing.allocator;
+    const narrow = [_]IntegerDomain{.{ .kind = .unsigned, .bits = 1 }};
+    const wide = [_]IntegerDomain{.{ .kind = .unsigned, .bits = 2 }};
+    const term: IndexTerm = .{ .local = .{ .local = @enumFromInt(0) } };
+    var scratch: AbstractState = .{};
+    defer scratch.deinit(gpa);
+    {
+        var source: AbstractState = .{ .integer_domains = &narrow };
+        defer source.deinit(gpa);
+        try source.locals.put(gpa, @enumFromInt(0), .plain);
+        try scratch.cloneFrom(&source, gpa);
+    }
+    try std.testing.expect(scratch.provesIndexInBounds(term, 2));
+    {
+        var source: AbstractState = .{ .integer_domains = &wide };
+        defer source.deinit(gpa);
+        try scratch.cloneFrom(&source, gpa);
+    }
+    try std.testing.expect(!scratch.provesIndexInBounds(term, 2));
+    const unknown: AbstractState = .{};
+    try scratch.cloneFrom(&unknown, gpa);
+    try std.testing.expect(!scratch.provesNonNegative(term));
+}
+
+test "integer domains: affine endpoint overflow loses only the unavailable endpoint" {
+    const maximum: TermBounds = .{ .lower = std.math.maxInt(i128), .upper = std.math.maxInt(i128) };
+    const shifted = maximum.offset(1);
+    try std.testing.expect(!boundsProveComparison(shifted, .{ .lower = 0, .upper = 0 }, .ge));
+    try std.testing.expect(!boundsProveComparison(shifted, .{ .lower = 2, .upper = 2 }, .lt));
+    const lower: TermBounds = .{ .lower = 0 };
+    try std.testing.expect(boundsProveComparison(lower.offset(1), .{ .lower = 0, .upper = 0 }, .gt));
+}
+
+test "integer domains: wide signed identity contributes neither endpoint" {
+    const domains = [_]IntegerDomain{.{ .kind = .signed_unbounded }};
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(std.testing.allocator);
+    const term: IndexTerm = .{ .local = .{ .local = @enumFromInt(0) } };
+    try std.testing.expect(!state.provesNonNegative(term));
+    try std.testing.expect(!state.provesLessThan(term, .{ .constant = std.math.maxInt(u64) }));
+    try std.testing.expect(state.termBounds(term).lower == null);
+    try std.testing.expect(state.termBounds(term).upper == null);
 }

@@ -1,5 +1,16 @@
 .zig-cache/
 zig-out/
+# Compiled object files.
+*.o
+
+# Root-local compiler diagnostics; retain them on disk, not in checkpoints.
+/main_test
+/project_cache
+/test_func
+/test_lib_problem
+/test_minimal
+/test_struct_fn
+
 # Zig dependency cache (populated by `zig build`).  Never tracked.
 zig-pkg/
 

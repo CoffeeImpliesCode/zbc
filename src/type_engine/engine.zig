@@ -17,10 +17,17 @@ const Ast = std.zig.Ast;
 
 pub const DocumentStore = @import("document_store.zig");
 const InternPool = @import("intern_pool.zig");
+
+test {
+    // The engine test artifact is rooted here; reference the intern pool so
+    // its type-coercion and peer-resolution tests run under `zig build test`.
+    _ = InternPool;
+}
 pub const ModuleId = DocumentStore.ModuleId;
 pub const ModuleRegistry = DocumentStore.ModuleRegistry;
 pub const SourceDocument = DocumentStore.SourceDocument;
 pub const ResolvedImport = DocumentStore.ResolvedImport;
+pub const SourceLoadError = DocumentStore.SourceLoadError;
 /// What a membership walk reads.  A session answers it from the store's
 /// shared `SourceDocument` parses; a standalone project cache answers it
 /// from its own AST pool.  Re-exported so neither has to import the store.
@@ -30,6 +37,9 @@ pub const RelativeEdges = DocumentStore.RelativeEdges;
 /// reaching past this facade into the store's own module tree.
 pub const Uri = @import("uri.zig");
 const Analyser = @import("analysis.zig");
+/// Stack a thread needs to run resolution to its depth limit in any build mode.
+pub const resolve_stack_bytes = Analyser.resolve_stack_bytes;
+const ast = @import("ast.zig");
 const DiagnosticsCollection = @import("diagnostics_collection.zig");
 const source_policy = @import("source_policy.zig");
 pub const SourcePolicy = source_policy.SourcePolicy;
@@ -53,51 +63,173 @@ fn freeToolchain(gpa: std.mem.Allocator, paths: ToolchainPaths) void {
     if (paths.zig_lib) |path| gpa.free(path);
 }
 
-fn queryToolchain(gpa: std.mem.Allocator, io: std.Io) !ToolchainPaths {
-    const output = try runCapture(gpa, io, &.{ "zig", "env" });
+/// Why `zig env` gave no usable toolchain.  Discovery fails with
+/// `error.ZigToolchainUnavailable` or `error.IncompatibleZigVersion`;
+/// this record says which step failed and carries the evidence a person
+/// needs: the exit status and the first line the compiler wrote to
+/// stderr.  Fixed buffers keep it allocation-free.
+pub const ToolchainFailure = struct {
+    pub const Reason = enum {
+        /// The process could not be started; `detail` is the error name.
+        spawn_failed,
+        /// The process exited nonzero; `code` is the status.
+        exited,
+        /// The process was killed; `code` is the signal number.
+        signaled,
+        /// The process stopped or ended in a state with no exit status.
+        ended_abnormally,
+        /// Exit 0 with nothing on stdout.
+        empty_output,
+        /// Output was neither JSON nor ZON with the expected fields.
+        malformed_output,
+        /// `zig_exe` or `lib_dir` missing or empty.
+        missing_paths,
+        /// The compiler's version differs from the one zbc parses; `detail` is that version.
+        incompatible_version,
+    };
+
+    reason: Reason = .spawn_failed,
+    code: u32 = 0,
+    detail_buffer: [200]u8 = undefined,
+    detail_len: usize = 0,
+
+    pub fn detail(self: *const ToolchainFailure) []const u8 {
+        return self.detail_buffer[0..self.detail_len];
+    }
+
+    fn setDetail(self: *ToolchainFailure, text: []const u8) void {
+        const len = @min(text.len, self.detail_buffer.len);
+        @memcpy(self.detail_buffer[0..len], text[0..len]);
+        self.detail_len = len;
+    }
+
+    fn setFirstLine(self: *ToolchainFailure, text: []const u8) void {
+        var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+            if (trimmed.len == 0) continue;
+            self.setDetail(trimmed);
+            return;
+        }
+    }
+
+    /// One clause, without the command name: "exited with status 1: <first stderr line>".
+    pub fn format(self: ToolchainFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const text = self.detail();
+        switch (self.reason) {
+            .spawn_failed => try writer.print("could not be started: {s}", .{text}),
+            .exited => try writer.print("exited with status {d}", .{self.code}),
+            .signaled => try writer.print("was terminated by signal {d}", .{self.code}),
+            .ended_abnormally => try writer.writeAll("ended without an exit status"),
+            .empty_output => try writer.writeAll("exited with status 0 and printed nothing on stdout"),
+            .malformed_output => try writer.writeAll("printed output that is not a Zig environment (JSON or ZON)"),
+            .missing_paths => try writer.writeAll("did not report non-empty `zig_exe` and `lib_dir`"),
+            .incompatible_version => try writer.print(
+                "reports Zig {s}, but zbc is built for Zig {s}",
+                .{ text, builtin.zig_version_string },
+            ),
+        }
+        switch (self.reason) {
+            .exited, .signaled, .ended_abnormally => {
+                if (text.len != 0) try writer.print(": {s}", .{text}) else try writer.writeAll(" (no stderr output)");
+            },
+            else => {},
+        }
+    }
+};
+
+pub const ToolchainError = error{ ZigToolchainUnavailable, IncompatibleZigVersion, OutOfMemory };
+
+/// Runs `<zig_command> env`.  On failure `failure` says why.
+fn queryToolchain(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    zig_command: []const u8,
+    failure: *ToolchainFailure,
+) ToolchainError!ToolchainPaths {
+    const output = try runCapture(gpa, io, &.{ zig_command, "env" }, failure);
     defer gpa.free(output);
-    return parseToolchainEnv(gpa, output);
+    return parseToolchainEnv(gpa, output, failure);
 }
 
-fn parseToolchainEnv(gpa: std.mem.Allocator, output: []const u8) !ToolchainPaths {
+fn parseToolchainEnv(gpa: std.mem.Allocator, output: []const u8, failure: *ToolchainFailure) ToolchainError!ToolchainPaths {
     const Environment = struct { zig_exe: []const u8, lib_dir: []const u8, version: []const u8 };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const temporary = arena.allocator();
     const source = std.mem.trim(u8, output, &std.ascii.whitespace);
-    const environment = if (std.mem.startsWith(u8, source, ".{"))
-        try std.zon.parse.fromSliceAlloc(
+    const parsed: ?Environment = if (std.mem.startsWith(u8, source, ".{")) zon: {
+        const terminated = try temporary.dupeSentinel(u8, source, 0);
+        break :zon std.zon.parse.fromSliceAlloc(
             Environment,
             temporary,
-            try temporary.dupeSentinel(u8, source, 0),
+            terminated,
             null,
             .{ .ignore_unknown_fields = true },
-        )
-    else
-        try std.json.parseFromSliceLeaky(Environment, temporary, source, .{ .ignore_unknown_fields = true });
-    if (environment.zig_exe.len == 0 or environment.lib_dir.len == 0) return error.NotFound;
-    if (!std.mem.eql(u8, environment.version, builtin.zig_version_string)) return error.IncompatibleZigVersion;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseZon => break :zon null,
+        };
+    } else json: {
+        break :json std.json.parseFromSliceLeaky(Environment, temporary, source, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => break :json null,
+        };
+    };
+    const environment = parsed orelse {
+        failure.* = .{ .reason = .malformed_output };
+        return error.ZigToolchainUnavailable;
+    };
+    if (environment.zig_exe.len == 0 or environment.lib_dir.len == 0) {
+        failure.* = .{ .reason = .missing_paths };
+        return error.ZigToolchainUnavailable;
+    }
+    if (!std.mem.eql(u8, environment.version, builtin.zig_version_string)) {
+        failure.* = .{ .reason = .incompatible_version };
+        failure.setDetail(environment.version);
+        return error.IncompatibleZigVersion;
+    }
     const executable = try gpa.dupe(u8, environment.zig_exe);
     errdefer gpa.free(executable);
     return .{ .zig_exe = executable, .zig_lib = try gpa.dupe(u8, environment.lib_dir) };
 }
 
-fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
-    const result = std.process.run(gpa, io, .{ .argv = argv }) catch return error.NotFound;
+fn runCapture(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    failure: *ToolchainFailure,
+) ToolchainError![]u8 {
+    const result = std.process.run(gpa, io, .{ .argv = argv }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            failure.* = .{ .reason = .spawn_failed };
+            failure.setDetail(@errorName(err));
+            return error.ZigToolchainUnavailable;
+        },
+    };
     defer gpa.free(result.stderr);
+    errdefer gpa.free(result.stdout);
     switch (result.term) {
         .exited => |code| if (code != 0) {
-            gpa.free(result.stdout);
-            return error.NotFound;
+            failure.* = .{ .reason = .exited, .code = code };
+            failure.setFirstLine(result.stderr);
+            return error.ZigToolchainUnavailable;
         },
-        else => {
-            gpa.free(result.stdout);
-            return error.NotFound;
+        .signal => |signal| {
+            failure.* = .{ .reason = .signaled, .code = @intFromEnum(signal) };
+            failure.setFirstLine(result.stderr);
+            return error.ZigToolchainUnavailable;
+        },
+        .stopped, .unknown => {
+            failure.* = .{ .reason = .ended_abnormally };
+            failure.setFirstLine(result.stderr);
+            return error.ZigToolchainUnavailable;
         },
     }
     if (result.stdout.len == 0) {
-        gpa.free(result.stdout);
-        return error.NotFound;
+        failure.* = .{ .reason = .empty_output };
+        return error.ZigToolchainUnavailable;
     }
     return result.stdout;
 }
@@ -124,8 +256,15 @@ pub const Toolchain = struct {
     gpa: std.mem.Allocator,
     paths: ToolchainPaths,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io) !Toolchain {
-        return .{ .gpa = gpa, .paths = try queryToolchain(gpa, io) };
+    /// Runs `<zig_command> env`; `zig_command` is looked up on `PATH` unless it has a directory part.
+    /// On error `failure` records which step failed and what the compiler said.
+    pub fn init(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        zig_command: []const u8,
+        failure: *ToolchainFailure,
+    ) ToolchainError!Toolchain {
+        return .{ .gpa = gpa, .paths = try queryToolchain(gpa, io, zig_command, failure) };
     }
 
     pub fn deinit(self: *Toolchain) void {
@@ -162,7 +301,8 @@ pub const TypeContext = struct {
     /// Discovers a toolchain for this context alone: one `zig env`, one
     /// answer this context owns and `deinit` frees.
     pub fn init(self: *TypeContext, gpa: std.mem.Allocator, io: std.Io) !void {
-        const paths = try queryToolchain(gpa, io);
+        var failure: ToolchainFailure = .{};
+        const paths = try queryToolchain(gpa, io, "zig", &failure);
         try self.initWithPaths(gpa, io, paths, .owned);
     }
 
@@ -243,7 +383,7 @@ pub const TypeContext = struct {
     /// belongs to.  A caller that has not proven a module passes
     /// `ModuleId.unscoped`, which resolves relative imports exactly and
     /// resolves a named import only when the declared modules agree.
-    pub fn sourceHandle(self: *TypeContext, file_path: []const u8, module: ModuleId) !DocumentStore.Handle {
+    pub fn sourceHandle(self: *TypeContext, file_path: []const u8, module: ModuleId) SourceLoadError!DocumentStore.Handle {
         std.debug.assert(std.fs.path.isAbsolute(file_path));
         const uri: Uri = try .fromPath(self.gpa, file_path);
         defer uri.deinit(self.gpa);
@@ -292,6 +432,7 @@ const ScopeKey = struct {
 /// InternPool).  Per-file documents stay open for the thread's lifetime
 /// so InternPool entries referencing them remain valid.
 pub const TypeResolver = struct {
+    pub const CallOperands = Analyser.CallOperands;
     gpa: std.mem.Allocator,
     ctx: *TypeContext,
     arena: std.heap.ArenaAllocator,
@@ -334,6 +475,54 @@ pub const TypeResolver = struct {
     /// otherwise.  Keyed the same way, because one resolver is one document
     /// asking about one declaration site, and that spelling is fixed for it.
     reference_cache: NameCache = .empty,
+
+    /// Payload certificates belong to the complete lexical instantiation.
+    literal_payload_cache: std.HashMapUnmanaged(
+        LiteralPayloadKey,
+        bool,
+        LiteralPayloadKey.Context,
+        std.hash_map.default_max_load_percentage,
+    ) = .empty,
+
+    const LiteralPayloadKey = struct {
+        handle: DocumentStore.Handle,
+        node: Ast.Node.Index,
+        container_type: ?ActualType,
+        actual_type: ?ActualTypeID,
+        runtime_selectors: bool,
+        depth: usize,
+
+        fn optionalTypeEql(a: ?ActualType, b: ?ActualType) bool {
+            return if (a) |left| if (b) |right| ActualType.eql(left, right) else false else b == null;
+        }
+
+        fn sameContext(a: LiteralPayloadKey, b: LiteralPayloadKey) bool {
+            return a.handle.eql(b.handle) and a.node == b.node and
+                optionalTypeEql(a.container_type, b.container_type) and
+                optionalTypeEql(a.actual_type, b.actual_type) and
+                a.runtime_selectors == b.runtime_selectors;
+        }
+
+        const Context = struct {
+            pub fn hash(_: Context, key: LiteralPayloadKey) u64 {
+                var hasher: std.hash.Wyhash = .init(0);
+                std.hash.autoHash(&hasher, @intFromPtr(key.handle.document));
+                std.hash.autoHash(&hasher, key.handle.module);
+                std.hash.autoHash(&hasher, key.node);
+                std.hash.autoHash(&hasher, key.container_type != null);
+                if (key.container_type) |ty| ty.hashWithHasher(&hasher);
+                std.hash.autoHash(&hasher, key.actual_type != null);
+                if (key.actual_type) |ty| ty.hashWithHasher(&hasher);
+                std.hash.autoHash(&hasher, key.runtime_selectors);
+                std.hash.autoHash(&hasher, key.depth);
+                return hasher.final();
+            }
+
+            pub fn eql(_: Context, a: LiteralPayloadKey, b: LiteralPayloadKey) bool {
+                return a.depth == b.depth and a.sameContext(b);
+            }
+        };
+    };
 
     /// What an alias names: the canonical URI of the target together with the
     /// module it is read in.  Byte equality and a byte hash, so a hit costs
@@ -448,15 +637,10 @@ pub const TypeResolver = struct {
     /// in reserve but a fault.  It is built bound to `bound` — no document
     /// at all, for a resolver that is still looking for one.
     ///
-    /// Its arena is this resolver's own, which the aggregate below cannot
-    /// hand to it directly: an arena names its allocator by the arena's own
-    /// address, and this assignment copies one into `self`, so an allocator
-    /// taken from the value on the right-hand side would go on naming a
-    /// local that is gone before anything is allocated.  It is built against
-    /// `gpa` instead and pointed at `self.arena` by the very next statement,
-    /// which changes nothing in between: `Analyser.init` only copies what it
-    /// is given — it allocates nothing and holds no allocation — and
-    /// nothing that can fail runs between the two.
+    /// The analyser borrows the final address of this resolver's arena.
+    /// `Analyser.init` stores that pointer without reading the arena, so the
+    /// aggregate can bind it directly before the arena value is installed.
+    /// The resolver must stay at this address throughout its lifetime.
     fn initOwned(
         self: *TypeResolver,
         ctx: *TypeContext,
@@ -470,9 +654,8 @@ pub const TypeResolver = struct {
             // A resolver that has not found its document holds no handle,
             // and nothing that runs before it does read one.
             .handle = bound orelse undefined,
-            .analyser = Analyser.init(gpa, gpa, &ctx.store, &ctx.ip, bound),
+            .analyser = Analyser.init(gpa, &self.arena, &ctx.store, &ctx.ip, bound),
         };
-        self.analyser.arena = self.arena.allocator();
     }
 
     /// The identity of the entry document: `file_path` as the kernel
@@ -600,6 +783,7 @@ pub const TypeResolver = struct {
         // releases them, and these two hold the entries that point at them.
         self.name_cache.deinit(self.gpa);
         self.reference_cache.deinit(self.gpa);
+        self.literal_payload_cache.deinit(self.gpa);
         self.analyser.deinit();
         self.arena.deinit();
     }
@@ -699,7 +883,87 @@ pub const TypeResolver = struct {
         }
 
         pub fn resolveValueOfNode(self: ResolutionFrame, node: Ast.Node.Index) !?ActualType {
-            return self.resolver.analyser.resolveTypeOfNode(self.options(node));
+            const tree = &self.handle.document.tree;
+            const value = if (tree.nodeTag(node) == .identifier) blk: {
+                const token = tree.nodeMainToken(node);
+                const declaration = (try self.resolver.analyser.lookupSymbolGlobal(
+                    self.handle,
+                    tree.tokenSlice(token),
+                    tree.tokenStart(token),
+                )) orelse break :blk try self.resolver.analyser.resolveTypeOfNode(self.options(node));
+                const framed = try self.declarationInFrame(declaration);
+                break :blk try framed.resolveType(&self.resolver.analyser);
+            } else try self.resolver.analyser.resolveTypeOfNode(self.options(node));
+            return try self.closeLiteralContext(node, value orelse return null);
+        }
+
+        /// A container literal written inside a factory captures that factory's
+        /// actual arguments. Its lexical declaration alone has only placeholders.
+        /// Close only this literal, never a type reached through another owner.
+        fn closeLiteralContext(self: ResolutionFrame, node: Ast.Node.Index, value: ActualType) !ActualType {
+            if (value.data != .container) return value;
+            const tree = &self.handle.document.tree;
+            switch (tree.nodeTag(node)) {
+                .call, .call_comma, .call_one, .call_one_comma => {
+                    // Close the returned literal under the exact factory call,
+                    // not under the caller or its uninstantiated lexical owner.
+                    const factory = switch (try self.functionReferenceOfCall(node)) {
+                        .function => |reference| reference,
+                        else => return value,
+                    };
+                    const literal = value.data.container;
+                    if (!literal.scope_handle.handle.eql(factory.handle) or
+                        literal.scope_handle.scope == .root) return value;
+                    const literal_node = literal.scope_handle.toNode();
+                    const frame = self.resolver.frameForFunction(factory);
+                    const declaration = (try frame.functionDeclarationNode(factory)) orelse return value;
+                    const factory_tree = &factory.handle.document.tree;
+                    const scopes = try factory.handle.getDocumentScope();
+                    const enclosing_scope = Analyser.innermostScopeAtIndexWithTag(
+                        scopes,
+                        factory_tree.tokenStart(factory_tree.nodeMainToken(literal_node)),
+                        .initOne(.function),
+                    ).unwrap() orelse return value;
+                    if (scopes.getScopeAstNode(enclosing_scope) != declaration) return value;
+                    return frame.closeLiteralContext(literal_node, value);
+                },
+                else => {},
+            }
+            const outer = self.container_type orelse return value;
+            if (outer.data != .container) return value;
+            const captured = outer.data.container;
+            if (captured.bound_params.count() == 0 and captured.bound_values.count() == 0) return value;
+            const literal = value.data.container;
+            if (!literal.scope_handle.handle.eql(self.handle) or
+                literal.scope_handle.toNode() != node or
+                !captured.scope_handle.handle.eql(self.handle)) return value;
+            const scopes = try self.handle.getDocumentScope();
+            var scope = literal.scope_handle.scope;
+            while (scope != captured.scope_handle.scope) {
+                scope = scopes.getScopeParent(scope).unwrap() orelse return value;
+            }
+            var closed = literal;
+            for (captured.bound_params.keys(), captured.bound_params.values()) |key, actual| {
+                if (literal.bound_params.get(key)) |previous| {
+                    if (previous.eql(actual)) continue;
+                }
+                closed.bound_params = try literal.bound_params.clone(self.resolver.analyser.arena.allocator());
+                for (captured.bound_params.keys(), captured.bound_params.values()) |token, binding| {
+                    try closed.bound_params.put(self.resolver.analyser.arena.allocator(), token, binding);
+                }
+                break;
+            }
+            for (captured.bound_values.keys(), captured.bound_values.values()) |key, actual| {
+                if (literal.bound_values.get(key)) |previous| {
+                    if (previous.eql(actual)) continue;
+                }
+                closed.bound_values = try literal.bound_values.clone(self.resolver.analyser.arena.allocator());
+                for (captured.bound_values.keys(), captured.bound_values.values()) |token, binding| {
+                    try closed.bound_values.put(self.resolver.analyser.arena.allocator(), token, binding);
+                }
+                break;
+            }
+            return .{ .data = .{ .container = closed }, .is_type_val = value.is_type_val };
         }
 
         /// Borrow the existing analyser's known string value. Unknown values
@@ -725,17 +989,775 @@ pub const TypeResolver = struct {
             return self.resolver.normalizedType(value);
         }
 
-        fn referenceOfValue(self: ResolutionFrame, value: ActualType) !FunctionResolution {
-            const callable = (try self.resolver.analyser.resolveFuncProtoOfCallable(value)) orelse {
-                const ty = (try self.resolver.normalizedType(value)) orelse return .unknown;
-                const tag = self.resolver.typeTag(ty) orelse return .unknown;
-                return switch (tag) {
-                    .pointer, .optional, .error_union, .@"fn", .@"opaque" => .unknown,
-                    else => .not_callable,
-                };
+        /// Expected expression type from its source ancestors in this exact
+        /// instantiation. Missing context remains unknown.
+        pub fn expectedTypeOfNode(self: ResolutionFrame, node: Ast.Node.Index) !?ActualType {
+            const tree = &self.handle.document.tree;
+            const lineage = try ast.nodesOverlappingIndex(
+                self.resolver.analyser.arena.allocator(),
+                tree,
+                tree.tokenStart(tree.nodeMainToken(node)),
+            );
+            defer self.resolver.analyser.arena.allocator().free(lineage);
+            if (lineage.len > 128) return null;
+            const index = std.mem.findScalar(Ast.Node.Index, lineage, node) orelse return null;
+            // These operators coerce their RHS to the LHS type. A shift's
+            // RHS has a different, width-derived type, so it is not included.
+            // Parentheses do not change this result-location relationship.
+            var expression = node;
+            for (lineage[index + 1 ..]) |ancestor| {
+                switch (tree.nodeTag(ancestor)) {
+                    .grouped_expression => expression = ancestor,
+                    .call, .call_comma, .call_one, .call_one_comma => {
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const call = CallOperands.full(tree, &buffer, ancestor) orelse return null;
+                        const argument = std.mem.findScalar(Ast.Node.Index, call.ast.params, expression) orelse break;
+                        const reached = (try self.reachedCall(&buffer, ancestor)) orelse return null;
+                        const parameter = argument + @intFromBool(reached.receiver);
+                        if (parameter >= reached.parameters.len) return null;
+                        // anytype does not supply a result-location type.
+                        if (reached.parameters[parameter].type.data == .anytype_parameter) return null;
+                        const callable = try Analyser.resolveFunctionTypeFromCall(
+                            &self.resolver.analyser,
+                            self.options(reached.call.ast.fn_expr),
+                            reached.call,
+                            reached.callable,
+                        );
+                        if (parameter >= callable.data.function.parameters.len) return null;
+                        // Generic substitution can already yield an instance.
+                        // Normalize that actual type, rather than requiring
+                        // another type-value-to-instance conversion.
+                        return self.resolver.normalizedType(callable.data.function.parameters[parameter].type);
+                    },
+                    .assign_mul,
+                    .assign_div,
+                    .assign_mod,
+                    .assign_add,
+                    .assign_sub,
+                    .assign_bit_and,
+                    .assign_bit_xor,
+                    .assign_bit_or,
+                    .assign_mul_wrap,
+                    .assign_add_wrap,
+                    .assign_sub_wrap,
+                    .assign_mul_sat,
+                    .assign_add_sat,
+                    .assign_sub_sat,
+                    => {
+                        const lhs, const rhs = tree.nodeData(ancestor).node_and_node;
+                        if (expression != rhs) return null;
+                        return self.typeOfNode(lhs);
+                    },
+                    else => break,
+                }
+            }
+            const value = (try self.resolver.analyser.resolveExpressionTypeFromAncestors(
+                self.options(node),
+                node,
+                lineage[index + 1 ..],
+            )) orelse return null;
+            return self.resolver.normalizedType(value);
+        }
+
+        const max_returned_callable_depth = 32;
+
+        fn declarationInFrame(
+            self: ResolutionFrame,
+            declaration: Analyser.DeclWithHandle,
+        ) !Analyser.DeclWithHandle {
+            if (declaration.container_type != null) return declaration;
+            const context = self.container_type orelse return declaration;
+            const container = switch (context.data) {
+                .container => |container| container,
+                else => return declaration,
             };
-            if (callable.is_type_val) return .not_callable;
-            return referenceOfCallable(callable);
+            const scope_handle = container.scope_handle;
+            if (scope_handle.handle.module != declaration.handle.module or
+                !scope_handle.handle.document.uri.eql(declaration.handle.document.uri))
+            {
+                return declaration;
+            }
+
+            const tree = &declaration.handle.document.tree;
+            const scopes = try declaration.handle.getDocumentScope();
+            const declaration_scope = Analyser.innermostScopeAtIndex(
+                scopes,
+                tree.tokens.items(.start)[declaration.nameToken()],
+            );
+            if (declaration.decl == .ast_node) {
+                switch (tree.nodeTag(declaration.decl.ast_node)) {
+                    .fn_decl, .fn_proto, .fn_proto_multi, .fn_proto_one, .fn_proto_simple => {
+                        const owner = Analyser.innermostScopeAtIndexWithTag(
+                            scopes,
+                            tree.tokenStart(tree.nodeMainToken(declaration.decl.ast_node)),
+                            .initOne(.container),
+                        ).unwrap() orelse .root;
+                        // A named callee belongs to its declaring namespace.
+                        // Caller captures bind its arguments, not its owner.
+                        if (scope_handle.scope != owner) return declaration;
+                    },
+                    else => {},
+                }
+            }
+            if (scope_handle.scope != .root) {
+                var enclosing_scope = scope_handle.scope;
+                var enclosed = false;
+                while (true) {
+                    if (enclosing_scope == declaration_scope) {
+                        enclosed = true;
+                        break;
+                    }
+                    enclosing_scope = scopes.getScopeParent(enclosing_scope).unwrap() orelse break;
+                }
+                if (!enclosed) {
+                    const parent = scopes.getScopeParent(declaration_scope).unwrap() orelse return declaration;
+                    if (parent != scope_handle.scope) {
+                        // Block-local aliases belong to this exact method,
+                        // but a nested function must keep its own context.
+                        const actual = self.actual_type orelse return declaration;
+                        if (actual.data != .function or
+                            !actual.data.function.handle.eql(declaration.handle)) return declaration;
+                        const selected_scope = Analyser.innermostScopeAtIndexWithTag(
+                            scopes,
+                            tree.tokenStart(declaration.nameToken()),
+                            .initOne(.function),
+                        ).unwrap() orelse return declaration;
+                        const enclosing = scopes.getScopeAstNode(selected_scope) orelse return declaration;
+                        if (tree.nodeMainToken(enclosing) != actual.data.function.fn_token)
+                            return declaration;
+                    }
+                }
+            }
+
+            var framed = declaration;
+            framed.container_type = context;
+            return framed;
+        }
+
+        fn frameForDeclaration(
+            self: ResolutionFrame,
+            declaration: Analyser.DeclWithHandle,
+        ) !ResolutionFrame {
+            const framed = try self.declarationInFrame(declaration);
+            return .{
+                .resolver = self.resolver,
+                .handle = framed.handle,
+                .container_type = framed.container_type,
+                .actual_type = self.actual_type,
+            };
+        }
+
+        const LiteralPayloadVisit = LiteralPayloadKey;
+
+        /// Prove literal bytes, not a selector's definedness or its bounds.
+        /// Runtime selectors are permitted only in the queried expression;
+        /// declaration initializers must also have literal selectors.
+        pub fn immutableLiteralPayloadOfNode(self: ResolutionFrame, node: Ast.Node.Index) Analyser.Error!bool {
+            var visits: [max_returned_callable_depth]LiteralPayloadVisit = undefined;
+            return self.immutableLiteralPayloadAtDepth(node, &visits, 0, true);
+        }
+
+        fn immutableLiteralPayloadAtDepth(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+            visits: *[max_returned_callable_depth]LiteralPayloadVisit,
+            depth: usize,
+            runtime_selectors: bool,
+        ) Analyser.Error!bool {
+            if (depth == visits.len) return false;
+            const key: LiteralPayloadKey = .{
+                .handle = self.handle,
+                .node = node,
+                .container_type = self.container_type,
+                .actual_type = self.actual_type,
+                .runtime_selectors = runtime_selectors,
+                .depth = depth,
+            };
+            for (visits[0..depth]) |visit|
+                if (visit.sameContext(key)) return false;
+            visits[depth] = key;
+            const tree = &self.handle.document.tree;
+            // Literal leaves are cheaper to read than to hash and memoize.
+            const memoize = switch (tree.nodeTag(node)) {
+                .identifier,
+                .field_access,
+                .array_access,
+                .array_init,
+                .array_init_comma,
+                .array_init_one,
+                .array_init_one_comma,
+                .array_init_dot,
+                .array_init_dot_comma,
+                .array_init_dot_two,
+                .array_init_dot_two_comma,
+                => true,
+                else => false,
+            };
+            if (memoize) if (self.resolver.literal_payload_cache.get(key)) |known| return known;
+            const defined = try self.immutableLiteralPayloadUncached(node, visits, depth, runtime_selectors);
+            // Failed resolution or allocation never installs a certificate.
+            if (memoize) try self.resolver.literal_payload_cache.put(self.resolver.gpa, key, defined);
+            return defined;
+        }
+
+        fn immutableLiteralPayloadUncached(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+            visits: *[max_returned_callable_depth]LiteralPayloadVisit,
+            depth: usize,
+            runtime_selectors: bool,
+        ) Analyser.Error!bool {
+            const tree = &self.handle.document.tree;
+            switch (tree.nodeTag(node)) {
+                .number_literal,
+                .char_literal,
+                .string_literal,
+                .multiline_string_literal,
+                .enum_literal,
+                .error_value,
+                => return true,
+                .identifier, .field_access => {
+                    if (tree.nodeTag(node) == .identifier) {
+                        const name = tree.tokenSlice(tree.nodeMainToken(node));
+                        if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or
+                            std.mem.eql(u8, name, "null")) return true;
+                        if (std.mem.eql(u8, name, "undefined")) return false;
+                    } else {
+                        // Only namespace declarations are immutable aliases.
+                        // An instance member or pointer's target is storage.
+                        const owner = (try self.resolveValueOfNode(tree.nodeData(node).node_and_token[0])) orelse return false;
+                        if (!owner.is_type_val or owner.data != .container) return false;
+                    }
+                    const declaration = (try self.declarationForCallableNode(node)) orelse return false;
+                    if (!declaration.isConst()) return false;
+                    const declaration_node = switch (declaration.decl) {
+                        .ast_node => |found| found,
+                        else => return false,
+                    };
+                    const source = &declaration.handle.document.tree;
+                    const variable = source.fullVarDecl(declaration_node) orelse return false;
+                    const initializer = variable.ast.init_node.unwrap() orelse return false;
+                    const frame = try self.frameForDeclaration(declaration);
+                    return frame.immutableLiteralPayloadAtDepth(initializer, visits, depth + 1, false);
+                },
+                .grouped_expression => return self.immutableLiteralPayloadAtDepth(
+                    tree.nodeData(node).node_and_token[0],
+                    visits,
+                    depth + 1,
+                    runtime_selectors,
+                ),
+                .negation, .bit_not, .bool_not => return self.immutableLiteralPayloadAtDepth(
+                    tree.nodeData(node).node,
+                    visits,
+                    depth + 1,
+                    runtime_selectors,
+                ),
+                .array_access => {
+                    const base, const index = tree.nodeData(node).node_and_node;
+                    if (!try self.immutableLiteralPayloadAtDepth(base, visits, depth + 1, runtime_selectors)) return false;
+                    return runtime_selectors or try self.immutableLiteralPayloadAtDepth(index, visits, depth + 1, false);
+                },
+                .array_mult => {
+                    const pattern, const count = tree.nodeData(node).node_and_node;
+                    return try self.immutableLiteralPayloadAtDepth(pattern, visits, depth + 1, runtime_selectors) and
+                        try self.immutableLiteralPayloadAtDepth(count, visits, depth + 1, false);
+                },
+                else => {},
+            }
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullArrayInit(&buffer, node)) |literal| {
+                for (literal.ast.elements) |element|
+                    if (!try self.immutableLiteralPayloadAtDepth(element, visits, depth + 1, runtime_selectors)) return false;
+                return true;
+            }
+            if (tree.builtinCallParams(&buffer, node)) |arguments| {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (std.mem.eql(u8, name, "@as") and arguments.len == 2)
+                    return self.immutableLiteralPayloadAtDepth(arguments[1], visits, depth + 1, runtime_selectors);
+                if (std.mem.eql(u8, name, "@splat") and arguments.len == 1)
+                    return self.immutableLiteralPayloadAtDepth(arguments[0], visits, depth + 1, runtime_selectors);
+            }
+            return false;
+        }
+
+        fn unresolvedValue(self: ResolutionFrame, value: ActualType) !FunctionResolution {
+            if (value.is_type_val) return .not_callable;
+            if (value.data == .function) return .unknown;
+            const ty = (try self.resolver.normalizedType(value)) orelse return .unknown;
+            const tag = self.resolver.typeTag(ty) orelse return .unknown;
+            return switch (tag) {
+                .pointer, .optional, .error_union, .@"fn", .@"opaque" => .unknown,
+                else => .not_callable,
+            };
+        }
+
+        fn unresolvedNode(self: ResolutionFrame, node: Ast.Node.Index) !FunctionResolution {
+            const value = (try self.resolveValueOfNode(node)) orelse return .unknown;
+            return self.unresolvedValue(value);
+        }
+
+        fn referenceOfDeclaration(
+            self: ResolutionFrame,
+            declaration: Analyser.DeclWithHandle,
+            depth: usize,
+        ) !FunctionResolution {
+            if (depth >= max_returned_callable_depth) return .unknown;
+            const framed = try self.declarationInFrame(declaration);
+            const frame = try self.frameForDeclaration(framed);
+            switch (framed.decl) {
+                .ast_node => |node| {
+                    const tree = &framed.handle.document.tree;
+                    switch (tree.nodeTag(node)) {
+                        .fn_decl,
+                        .fn_proto,
+                        .fn_proto_multi,
+                        .fn_proto_one,
+                        .fn_proto_simple,
+                        => {
+                            const value = (try framed.resolveType(&self.resolver.analyser)) orelse
+                                return .unknown;
+                            if (value.data == .function) {
+                                const reference = (try frame.authenticatedReferenceOfValue(value)) orelse
+                                    return .unknown;
+                                if (!sourceFunctionMatches(reference, framed)) return .unknown;
+                                return .{ .function = reference };
+                            }
+                            return frame.referenceOfValue(value);
+                        },
+                        .global_var_decl,
+                        .local_var_decl,
+                        .aligned_var_decl,
+                        .simple_var_decl,
+                        => {
+                            if (!framed.isConst()) {
+                                const value = (try framed.resolveType(&self.resolver.analyser)) orelse
+                                    return .unknown;
+                                return frame.unresolvedValue(value);
+                            }
+                            const initializer = tree.fullVarDecl(node).?.ast.init_node.unwrap() orelse {
+                                const value = (try framed.resolveType(&self.resolver.analyser)) orelse
+                                    return .unknown;
+                                return frame.unresolvedValue(value);
+                            };
+                            return frame.functionReferenceOfNode(initializer, depth + 1);
+                        },
+                        else => {
+                            const value = (try framed.resolveType(&self.resolver.analyser)) orelse
+                                return .unknown;
+                            return frame.unresolvedValue(value);
+                        },
+                    }
+                },
+                else => {
+                    const value = (try framed.resolveType(&self.resolver.analyser)) orelse
+                        return .unknown;
+                    return frame.referenceOfValue(value);
+                },
+            }
+        }
+        fn declarationForCallableNode(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+        ) Analyser.Error!?Analyser.DeclWithHandle {
+            const tree = &self.handle.document.tree;
+            switch (tree.nodeTag(node)) {
+                .identifier => {
+                    const token = tree.nodeMainToken(node);
+                    return self.resolver.analyser.lookupSymbolGlobal(
+                        self.handle,
+                        tree.tokenSlice(token),
+                        tree.tokens.items(.start)[token],
+                    );
+                },
+                .field_access => {
+                    const lhs_node, const field_token = tree.nodeData(node).node_and_token;
+                    var owner = (try self.resolveValueOfNode(lhs_node)) orelse return null;
+                    if (!owner.is_type_val) {
+                        if (try self.resolver.analyser.resolveDerefType(owner)) |deref| {
+                            owner = deref;
+                        }
+                        if (!owner.is_type_val and owner.data != .container) {
+                            owner = try owner.typeOf(&self.resolver.analyser);
+                        }
+                    }
+                    return owner.lookupSymbol(&self.resolver.analyser, tree.tokenSlice(field_token));
+                },
+                .enum_literal => {
+                    // The analyser resolves declaration literals against the
+                    // call site's expected container. Authenticate that source,
+                    // not another container with the same member spelling.
+                    const value = (try self.resolveValueOfNode(node)) orelse return null;
+                    const reference = (try self.authenticatedReferenceOfValue(value)) orelse
+                        return null;
+                    const declaration = (try self.functionDeclarationNode(reference)) orelse
+                        return null;
+                    return .{
+                        .decl = .{ .ast_node = declaration },
+                        .handle = reference.handle,
+                        .container_type = reference.actual_type.data.function.container_type.*,
+                    };
+                },
+                else => return null,
+            }
+        }
+
+        fn functionSourceDeclaration(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+            depth: usize,
+        ) Analyser.Error!?Analyser.DeclWithHandle {
+            if (depth >= max_returned_callable_depth) return null;
+            const declaration = (try self.declarationForCallableNode(node)) orelse return null;
+            const declaration_node = switch (declaration.decl) {
+                .ast_node => |found| found,
+                else => return null,
+            };
+            const tree = &declaration.handle.document.tree;
+            switch (tree.nodeTag(declaration_node)) {
+                .fn_decl,
+                .fn_proto,
+                .fn_proto_multi,
+                .fn_proto_one,
+                .fn_proto_simple,
+                => {
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    const proto = tree.fullFnProto(&buffer, declaration_node) orelse return null;
+                    if (proto.name_token == null) return null;
+                    return declaration;
+                },
+                .global_var_decl,
+                .local_var_decl,
+                .aligned_var_decl,
+                .simple_var_decl,
+                => {
+                    if (!declaration.isConst()) return null;
+                    const initializer = tree.fullVarDecl(declaration_node).?.ast.init_node.unwrap() orelse
+                        return null;
+                    const frame = try self.frameForDeclaration(declaration);
+                    return frame.functionSourceDeclaration(initializer, depth + 1);
+                },
+                else => return null,
+            }
+        }
+
+        /// Resolve a function value from its source declaration. A function
+        /// signature on a call's declared return type is not the returned
+        /// declaration, so follow const initializers and the factory body.
+        fn functionReferenceOfNode(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+            depth: usize,
+        ) Analyser.Error!FunctionResolution {
+            if (depth >= max_returned_callable_depth) return .unknown;
+            const tree = &self.handle.document.tree;
+            switch (tree.nodeTag(node)) {
+                .address_of, .deref => {
+                    const value = (try self.resolveValueOfNode(node)) orelse return .unknown;
+                    const callable = (try self.resolver.analyser.resolveFuncProtoOfCallable(value)) orelse
+                        return self.unresolvedValue(value);
+                    if (callable.is_type_val) return .not_callable;
+                    return self.functionReferenceOfNode(tree.nodeData(node).node, depth + 1);
+                },
+                .grouped_expression => return self.functionReferenceOfNode(
+                    tree.nodeData(node).node_and_token[0],
+                    depth + 1,
+                ),
+                else => {},
+            }
+            const is_call = switch (tree.nodeTag(node)) {
+                .call, .call_comma, .call_one, .call_one_comma => true,
+                else => false,
+            };
+            const value = if (is_call) null else try self.resolveValueOfNode(node);
+            if (!is_call) {
+                if (value) |resolved| {
+                    if (resolved.is_type_val) return .not_callable;
+                    if (resolved.data == .function) {
+                        if (try self.functionSourceDeclaration(node, depth + 1)) |source| {
+                            if (try self.authenticatedReferenceOfValue(resolved)) |reference| {
+                                if (sourceFunctionMatches(reference, source)) {
+                                    return .{ .function = reference };
+                                }
+                            }
+                        }
+                    } else {
+                        switch (tree.nodeTag(node)) {
+                            .identifier, .field_access => {},
+                            else => return self.referenceOfValue(resolved),
+                        }
+                    }
+                }
+            }
+            switch (tree.nodeTag(node)) {
+                .identifier => {
+                    const name_token = tree.nodeMainToken(node);
+                    const declaration = (try self.resolver.analyser.lookupSymbolGlobal(
+                        self.handle,
+                        tree.tokenSlice(name_token),
+                        tree.tokens.items(.start)[name_token],
+                    )) orelse return self.unresolvedNode(node);
+                    return self.referenceOfDeclaration(declaration, depth + 1);
+                },
+                .field_access => {
+                    const declaration = (try self.declarationForCallableNode(node)) orelse
+                        return self.unresolvedNode(node);
+                    return self.referenceOfDeclaration(declaration, depth + 1);
+                },
+                .call,
+                .call_comma,
+                .call_one,
+                .call_one_comma,
+                => {
+                    const factory = switch (try self.functionReferenceOfCallAtDepth(node, depth + 1)) {
+                        .function => |reference| reference,
+                        .unknown => return .unknown,
+                        .not_callable => return .not_callable,
+                    };
+                    return self.returnedFunctionValue(factory, depth + 1);
+                },
+                else => {},
+            }
+            const resolved = value orelse return .unknown;
+            if (resolved.is_type_val) return .not_callable;
+            if (resolved.data == .function) return .unknown;
+            return self.referenceOfValue(resolved);
+        }
+
+        fn sameFunctionResolution(a: FunctionResolution, b: FunctionResolution) bool {
+            return switch (a) {
+                .unknown => b == .unknown,
+                .not_callable => b == .not_callable,
+                .function => |left| switch (b) {
+                    .function => |right| left.fn_token == right.fn_token and
+                        left.handle.eql(right.handle) and
+                        ActualTypeID.eql(left.actual_type, right.actual_type),
+                    else => false,
+                },
+            };
+        }
+
+        fn functionNodeForDeclaration(
+            declaration: Analyser.DeclWithHandle,
+            fn_token: Ast.TokenIndex,
+        ) ?Ast.Node.Index {
+            const node = switch (declaration.decl) {
+                .ast_node => |node| node,
+                else => return null,
+            };
+            const tree = &declaration.handle.document.tree;
+            switch (tree.nodeTag(node)) {
+                .fn_decl, .fn_proto, .fn_proto_multi, .fn_proto_one, .fn_proto_simple => {},
+                else => return null,
+            }
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&buffer, node) orelse return null;
+            if (proto.name_token == null) return null;
+            if (proto.ast.fn_token != fn_token) return null;
+            return node;
+        }
+        fn sourceFunctionMatches(
+            reference: FunctionReference,
+            declaration: Analyser.DeclWithHandle,
+        ) bool {
+            const function = switch (reference.actual_type.data) {
+                .function => |function| function,
+                else => return false,
+            };
+            if (!reference.handle.eql(declaration.handle) or
+                functionNodeForDeclaration(declaration, function.fn_token) == null)
+            {
+                return false;
+            }
+            if (declaration.container_type) |container| {
+                if (!container.eql(function.container_type.*)) return false;
+            }
+            return true;
+        }
+        fn functionPrototypeMatches(
+            self: ResolutionFrame,
+            reference: FunctionReference,
+            node: Ast.Node.Index,
+        ) Analyser.Error!bool {
+            const actual = switch (reference.actual_type.data) {
+                .function => |function| function,
+                else => return false,
+            };
+            if (!actual.handle.eql(reference.handle)) return false;
+
+            const tree = &reference.handle.document.tree;
+            const declaration: Analyser.DeclWithHandle = .{
+                .decl = .{ .ast_node = node },
+                .handle = reference.handle,
+                .container_type = actual.container_type.*,
+            };
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&buffer, node) orelse return false;
+            const name_token = proto.name_token orelse return false;
+            if (!std.mem.eql(u8, actual.name orelse return false, tree.tokenSlice(name_token))) return false;
+            if (proto.ast.fn_token != actual.fn_token) return false;
+            const owner = switch (actual.container_type.data) {
+                .container => |container| container.scope_handle,
+                else => return false,
+            };
+            if (!owner.handle.eql(reference.handle)) return false;
+            const scopes = try reference.handle.getDocumentScope();
+            const declared_owner = Analyser.innermostScopeAtIndexWithTag(
+                scopes,
+                tree.tokenStart(proto.ast.fn_token),
+                .initOne(.container),
+            ).unwrap() orelse .root;
+            if (owner.scope != declared_owner) return false;
+            var source_parameters = proto.iterate(tree);
+            var parameter_index: usize = 0;
+            var source_has_varargs = false;
+            while (source_parameters.next()) |source_parameter| {
+                if (source_has_varargs) return false;
+                if (source_parameter.anytype_ellipsis3) |token| {
+                    switch (tree.tokenTag(token)) {
+                        .ellipsis3 => {
+                            source_has_varargs = true;
+                            continue;
+                        },
+                        .keyword_anytype => {},
+                        else => return false,
+                    }
+                }
+                if (parameter_index >= actual.parameters.len) return false;
+                const actual_parameter = actual.parameters[parameter_index];
+                parameter_index += 1;
+                if (source_parameter.name_token != actual_parameter.name_token) return false;
+                const source_modifier: ?Analyser.Type.Data.Parameter.Modifier =
+                    if (source_parameter.comptime_noalias) |token|
+                        switch (tree.tokenTag(token)) {
+                            .keyword_comptime => .comptime_param,
+                            .keyword_noalias => .noalias_param,
+                            else => return false,
+                        }
+                    else
+                        null;
+                if (source_modifier != actual_parameter.modifier) return false;
+            }
+            if (parameter_index != actual.parameters.len or
+                source_has_varargs != actual.has_varargs) return false;
+
+            const resolved = (try declaration.resolveType(&self.resolver.analyser)) orelse return false;
+            const source = switch (resolved.data) {
+                .function => |function| function,
+                else => return false,
+            };
+            if (source.fn_token != actual.fn_token or
+                !source.handle.eql(actual.handle) or
+                !source.container_type.eql(actual.container_type.*) or
+                source.has_varargs != actual.has_varargs or
+                source.parameters.len != actual.parameters.len or
+                !source.return_value.eql(actual.return_value.*))
+            {
+                return false;
+            }
+            for (source.parameters, actual.parameters) |source_parameter, actual_parameter| {
+                if (!source_parameter.type.eql(actual_parameter.type)) return false;
+            }
+            return true;
+        }
+
+        fn authenticatedReferenceOfValue(
+            self: ResolutionFrame,
+            value: ActualType,
+        ) Analyser.Error!?FunctionReference {
+            if (value.is_type_val or value.data != .function) return null;
+            const reference = switch (referenceOfCallable(value)) {
+                .function => |reference| reference,
+                else => unreachable,
+            };
+            const node = (try self.functionDeclarationNode(reference)) orelse return null;
+            if (!try self.functionPrototypeMatches(reference, node)) return null;
+            return reference;
+        }
+
+        fn functionDeclarationNode(
+            self: ResolutionFrame,
+            reference: FunctionReference,
+        ) !?Ast.Node.Index {
+            const function = switch (reference.actual_type.data) {
+                .function => |function| function,
+                else => return null,
+            };
+            const tree = &reference.handle.document.tree;
+            const name = function.name orelse return null;
+            const source_index = tree.tokens.items(.start)[function.fn_token];
+            if (try self.resolver.analyser.lookupSymbolGlobal(
+                reference.handle,
+                name,
+                source_index,
+            )) |decl| {
+                if (functionNodeForDeclaration(decl, function.fn_token)) |node| return node;
+            }
+
+            var owner = function.container_type.*;
+            if (!owner.is_type_val) owner = try owner.typeOf(&self.resolver.analyser);
+            if (try owner.lookupSymbol(&self.resolver.analyser, name)) |decl| {
+                if (functionNodeForDeclaration(decl, function.fn_token)) |node| return node;
+            }
+
+            const scopes = try reference.handle.getDocumentScope();
+            const scope_index_type = @TypeOf(Analyser.innermostScopeAtIndex(scopes, 0));
+            for (0..scopes.scopes.items(.parent_scope).len) |raw_index| {
+                const index: scope_index_type = @enumFromInt(raw_index);
+                if (scopes.getScopeTag(index) != .function) continue;
+                const node = scopes.getScopeAstNode(index).?;
+                if (functionNodeForDeclaration(.{
+                    .decl = .{ .ast_node = node },
+                    .handle = reference.handle,
+                }, function.fn_token)) |found| return found;
+            }
+            return null;
+        }
+
+        fn returnedFunctionValue(
+            self: ResolutionFrame,
+            reference: FunctionReference,
+            depth: usize,
+        ) !FunctionResolution {
+            if (depth >= max_returned_callable_depth) return .unknown;
+            const function_node = (try self.functionDeclarationNode(reference)) orelse return .unknown;
+            const tree = &reference.handle.document.tree;
+            if (tree.nodeTag(function_node) != .fn_decl) return .unknown;
+            const body = tree.nodeData(function_node).node_and_node[1];
+            var walker = try AstWalker.init(self.resolver.gpa, tree, body);
+            defer walker.deinit(self.resolver.gpa);
+            const frame = self.resolver.frameForFunction(reference);
+            var answer: ?FunctionResolution = null;
+
+            while (try walker.next(self.resolver.gpa, tree)) |event| {
+                switch (event) {
+                    .open => |node| switch (tree.nodeTag(node)) {
+                        .fn_decl => walker.skip(),
+                        .@"return" => {
+                            const expression = tree.nodeData(node).opt_node.unwrap() orelse return .not_callable;
+                            const returned = try frame.functionReferenceOfNode(expression, depth + 1);
+                            if (answer) |previous| {
+                                if (!sameFunctionResolution(previous, returned)) return .unknown;
+                            } else {
+                                answer = returned;
+                            }
+                        },
+                        else => {},
+                    },
+                    .close => {},
+                }
+            }
+            return answer orelse .unknown;
+        }
+
+        fn referenceOfValue(self: ResolutionFrame, value: ActualType) !FunctionResolution {
+            if (value.is_type_val) return .not_callable;
+            if (value.data == .function) return .unknown;
+            const ty = (try self.resolver.normalizedType(value)) orelse return .unknown;
+            const tag = self.resolver.typeTag(ty) orelse return .unknown;
+            return switch (tag) {
+                .pointer, .optional, .error_union, .@"fn", .@"opaque" => .unknown,
+                else => .not_callable,
+            };
         }
 
         fn referenceOfCallable(callable: ActualType) FunctionResolution {
@@ -748,16 +1770,21 @@ pub const TypeResolver = struct {
             } };
         }
 
-        pub fn functionReference(self: ResolutionFrame, node: Ast.Node.Index) !FunctionResolution {
-            return self.referenceOfValue((try self.resolveValueOfNode(node)) orelse return .unknown);
+        pub fn functionReference(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+        ) !FunctionResolution {
+            return self.functionReferenceOfNode(node, 0);
         }
 
-        /// Preserve the actual call's formal anytype/comptime bindings in
-        /// the reached function, rather than resolving only its spelling.
-        pub fn functionReferenceOfCall(self: ResolutionFrame, node: Ast.Node.Index) !FunctionResolution {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = self.handle.document.tree.fullCall(&buffer, node) orelse return .unknown;
-            const reference = switch (try self.functionReference(call.ast.fn_expr)) {
+        fn functionReferenceOfCallAtDepth(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+            depth: usize,
+        ) Analyser.Error!FunctionResolution {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const call = CallOperands.full(&self.handle.document.tree, &buffer, node) orelse return .unknown;
+            const reference = switch (try self.functionReferenceOfNode(call.ast.fn_expr, depth + 1)) {
                 .function => |reference| reference,
                 .unknown => return .unknown,
                 .not_callable => return .not_callable,
@@ -772,6 +1799,98 @@ pub const TypeResolver = struct {
             return referenceOfCallable(callable);
         }
 
+        /// Preserve the actual call's formal anytype/comptime bindings in
+        /// the reached function, rather than resolving only its spelling.
+        pub fn functionReferenceOfCall(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+        ) !FunctionResolution {
+            return self.functionReferenceOfCallAtDepth(node, 0);
+        }
+
+        /// Resolve each iteration of a direct, type-valued inline tuple loop.
+        /// The complete tuple supplies the census; merged payload types do not.
+        /// Returned references borrow the resolver's arena.
+        pub fn inlineTupleCallReferences(
+            self: ResolutionFrame,
+            node: Ast.Node.Index,
+            remaining: *u32,
+            instances_remaining: *usize,
+        ) !?[]const FunctionReference {
+            const tree = &self.handle.document.tree;
+            var call_buffer: [2]Ast.Node.Index = undefined;
+            const call = CallOperands.full(tree, &call_buffer, node) orelse return null;
+            var has_loop_payload = false;
+            for (call.ast.params) |argument| {
+                if (remaining.* == 0) return error.InlineTupleStepsExceeded;
+                remaining.* -= 1;
+                if (tree.nodeTag(argument) != .identifier) continue;
+                const argument_token = tree.nodeMainToken(argument);
+                const declaration = (try self.resolver.analyser.lookupSymbolGlobal(
+                    self.handle,
+                    tree.tokenSlice(argument_token),
+                    tree.tokenStart(argument_token),
+                )) orelse continue;
+                if (declaration.decl == .for_loop_payload) {
+                    has_loop_payload = true;
+                    break;
+                }
+            }
+            if (!has_loop_payload) return null;
+            const token = tree.nodeMainToken(node);
+            var selected: ?Ast.Node.Index = null;
+            var enclosing_function_token: Ast.TokenIndex = 0;
+            for (tree.nodes.items(.tag), 0..) |tag, raw| {
+                if (remaining.* == 0) return error.InlineTupleStepsExceeded;
+                remaining.* -= 1;
+                const candidate: Ast.Node.Index = @enumFromInt(raw);
+                if (tag == .fn_decl or tag == .test_decl) {
+                    if (tree.firstToken(candidate) <= token and token <= tree.lastToken(candidate))
+                        enclosing_function_token = @max(enclosing_function_token, tree.firstToken(candidate));
+                    continue;
+                }
+                if (tag != .@"for" and tag != .for_simple) continue;
+                const loop = ast.fullFor(tree, candidate).?;
+                if (token < tree.firstToken(loop.ast.then_expr) or token > tree.lastToken(loop.ast.then_expr)) continue;
+                if (loop.inline_token == null or selected != null) return null;
+                selected = candidate;
+            }
+            const loop_node = selected orelse return null;
+            // A nested function is not an iteration of its enclosing loop.
+            if (enclosing_function_token > tree.firstToken(loop_node)) return null;
+            const loop = ast.fullFor(tree, loop_node).?;
+            if (loop.ast.inputs.len != 1 or tree.tokenTag(loop.payload_token) != .identifier or
+                tree.tokenTag(loop.payload_token + 1) != .pipe) return null;
+            var tuple_buffer: [2]Ast.Node.Index = undefined;
+            const tuple = tree.fullArrayInit(&tuple_buffer, loop.ast.inputs[0]) orelse return null;
+            if (tuple.ast.type_expr != .none or tuple.ast.elements.len == 0) return null;
+            // Enforce the caller's existing whole-query limits before allocating
+            // references or resolving/cloning any iteration frame.
+            if (tuple.ast.elements.len > instances_remaining.*) return error.InlineTupleCallersExceeded;
+            if (tuple.ast.elements.len > remaining.*) return error.InlineTupleStepsExceeded;
+            instances_remaining.* -= tuple.ast.elements.len;
+            remaining.* -= @intCast(tuple.ast.elements.len);
+            const arena = self.resolver.analyser.arena.allocator();
+            const references = try arena.alloc(FunctionReference, tuple.ast.elements.len);
+            for (tuple.ast.elements, references) |element, *reference| {
+                const actual = (try self.resolveValueOfNode(element)) orelse return null;
+                if (!actual.is_type_val) return null;
+                var container: ActualType.Data.Container = if (self.container_type) |context|
+                    if (context.data == .container) context.data.container else return null
+                else
+                    .{ .scope_handle = .{ .handle = self.handle, .scope = .root }, .bound_params = .empty };
+                container.bound_params = try container.bound_params.clone(arena);
+                try container.bound_params.put(arena, .{ .token = loop.payload_token, .handle = self.handle }, actual);
+                var iteration = self;
+                iteration.container_type = .{ .data = .{ .container = container }, .is_type_val = true };
+                reference.* = switch (try iteration.functionReferenceOfCall(node)) {
+                    .function => |found| found,
+                    else => return null,
+                };
+            }
+            return references;
+        }
+
         pub fn typeParameterReference(self: ResolutionFrame, node: Ast.Node.Index) !?TypeParameterReference {
             const value = (try self.resolveValueOfNode(node)) orelse return null;
             const parameter = switch (value.data) {
@@ -781,26 +1900,37 @@ pub const TypeResolver = struct {
             return .{ .tree = &parameter.handle.document.tree, .token = parameter.token };
         }
 
-        fn reachedCall(self: ResolutionFrame, buffer: *[1]Ast.Node.Index, node: Ast.Node.Index) !?ReachedCall {
-            const call = self.handle.document.tree.fullCall(buffer, node) orelse return null;
-            const value = (try self.resolveValueOfNode(call.ast.fn_expr)) orelse return null;
-            const callable = (try self.resolver.analyser.resolveFuncProtoOfCallable(value)) orelse return null;
-            return self.reachedCallable(call, callable);
+        fn reachedCall(self: ResolutionFrame, buffer: *[2]Ast.Node.Index, node: Ast.Node.Index) !?ReachedCall {
+            const call = CallOperands.full(&self.handle.document.tree, buffer, node) orelse return null;
+            if (try self.resolveValueOfNode(call.ast.fn_expr)) |value| {
+                if (try self.resolver.analyser.resolveFuncProtoOfCallable(value)) |callable| {
+                    if (try self.reachedCallable(call, callable)) |reached| return reached;
+                }
+            }
+            // Raw expression resolution can lose a block-local alias's
+            // instantiated owner. The canonical source reference retains it.
+            // Type-only signatures still describe dynamic calls above.
+            const reference = switch (try self.functionReference(call.ast.fn_expr)) {
+                .function => |reference| reference,
+                else => return null,
+            };
+            return self.reachedCallable(call, reference.actual_type);
         }
 
-        fn reachedCallable(self: ResolutionFrame, call: Ast.full.Call, callable: ActualType) !?ReachedCall {
+        fn reachedCallable(self: ResolutionFrame, call: CallOperands, callable: ActualType) !?ReachedCall {
             if (callable.is_type_val or callable.data.function.has_varargs) return null;
-            const receiver = try self.resolver.analyser.isInstanceCall(self.options(call.ast.fn_expr), call, callable);
+            const receiver = call.ast.params.len + 1 == callable.data.function.parameters.len and
+                try self.resolver.analyser.isInstanceCall(self.options(call.ast.fn_expr), call, callable);
             if (call.ast.params.len + @intFromBool(receiver) != callable.data.function.parameters.len) return null;
             return .{ .call = call, .receiver = receiver, .parameters = callable.data.function.parameters, .callable = callable };
         }
 
         pub fn callArgument(self: ResolutionFrame, node: Ast.Node.Index, parameter: usize) !?Ast.Node.Index {
-            var buffer: [1]Ast.Node.Index = undefined;
+            var buffer: [2]Ast.Node.Index = undefined;
             return self.callArgumentIn(&buffer, node, parameter);
         }
 
-        pub fn callArgumentIn(self: ResolutionFrame, buffer: *[1]Ast.Node.Index, node: Ast.Node.Index, parameter: usize) !?Ast.Node.Index {
+        pub fn callArgumentIn(self: ResolutionFrame, buffer: *[2]Ast.Node.Index, node: Ast.Node.Index, parameter: usize) !?Ast.Node.Index {
             const reached = (try self.reachedCall(buffer, node)) orelse return null;
             if (parameter >= reached.parameters.len) return null;
             if (reached.receiver and parameter == 0)
@@ -808,7 +1938,7 @@ pub const TypeResolver = struct {
             return reached.call.ast.params[parameter - @intFromBool(reached.receiver)];
         }
 
-        pub fn callArgumentsOf(self: ResolutionFrame, buffer: *[1]Ast.Node.Index, node: Ast.Node.Index) !?CallArguments {
+        pub fn callArgumentsOf(self: ResolutionFrame, buffer: *[2]Ast.Node.Index, node: Ast.Node.Index) !?CallArguments {
             const reached = (try self.reachedCall(buffer, node)) orelse return null;
             return .{
                 .arguments = reached.call.ast.params,
@@ -829,7 +1959,28 @@ pub const TypeResolver = struct {
         }
 
         pub fn intInfo(self: ResolutionFrame, node: Ast.Node.Index) !?IntInfo {
+            const tree = &self.handle.document.tree;
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.builtinCallParams(&buffer, node)) |params| {
+                if (params.len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@intFromEnum")) {
+                    return self.resolver.enumTagIntInfoOfType((try self.typeOfNode(params[0])) orelse return null);
+                }
+            }
             return self.resolver.intInfoOfType((try self.typeOfNode(node)) orelse return null);
+        }
+
+        /// Integer result location under this exact actual frame, including
+        /// optional and error-union payloads rather than their wrapper types.
+        pub fn contextIntInfo(self: ResolutionFrame, node: Ast.Node.Index) !?IntInfo {
+            var expected = (try self.expectedTypeOfNode(node)) orelse return null;
+            for (0..128) |_| {
+                switch (self.resolver.typeTag(expected) orelse return null) {
+                    .optional, .error_union =>
+                        expected = self.resolver.childType(expected) orelse return null,
+                    else => return self.resolver.intInfoOfType(expected),
+                }
+            }
+            return null;
         }
 
         pub fn floatBits(self: ResolutionFrame, node: Ast.Node.Index) !?u16 {
@@ -943,6 +2094,18 @@ pub const TypeResolver = struct {
             if (!std.mem.eql(u8, declaration.name orelse return false, "eql")) return false;
             return self.resolver.declaredInToolchainFile(declaration.handle, "/std/mem.zig");
         }
+
+        pub fn stdTestingExpectOf(self: ResolutionFrame, callee: Ast.Node.Index, arguments: usize) !bool {
+            if (arguments != 1) return false;
+            const reference = switch (try self.functionReference(callee)) {
+                .function => |reference| reference,
+                else => return false,
+            };
+            const declaration = reference.actual_type.data.function;
+            if (declaration.parameters.len != 1) return false;
+            if (!std.mem.eql(u8, declaration.name orelse return false, "expect")) return false;
+            return self.resolver.declaredInToolchainFile(declaration.handle, "/std/testing.zig");
+        }
     };
 
     pub fn resolutionFrame(self: *TypeResolver) ResolutionFrame {
@@ -1019,7 +2182,7 @@ pub const TypeResolver = struct {
     /// call shapes, so it is valid only while that buffer lives and
     /// never escapes the function that read it.
     const ReachedCall = struct {
-        call: Ast.full.Call,
+        call: CallOperands,
         receiver: bool,
         /// The callee's own parameter list, borrowed from the resolved
         /// declaration.  The arity this call was proved against IS this
@@ -1036,7 +2199,7 @@ pub const TypeResolver = struct {
     /// disagree about which expression a parameter received.
     fn reachedCall(
         self: *TypeResolver,
-        buffer: *[1]Ast.Node.Index,
+        buffer: *[2]Ast.Node.Index,
         node: Ast.Node.Index,
     ) !?ReachedCall {
         return self.resolutionFrame().reachedCall(buffer, node);
@@ -1044,7 +2207,7 @@ pub const TypeResolver = struct {
 
     /// Map a declared parameter to its actual argument, including method receivers.
     pub fn callArgument(self: *TypeResolver, node: Ast.Node.Index, parameter: usize) !?Ast.Node.Index {
-        var buffer: [1]Ast.Node.Index = undefined;
+        var buffer: [2]Ast.Node.Index = undefined;
         return self.callArgumentIn(&buffer, node, parameter);
     }
 
@@ -1056,7 +2219,7 @@ pub const TypeResolver = struct {
     /// every node the caller reads back.
     pub fn callArgumentIn(
         self: *TypeResolver,
-        buffer: *[1]Ast.Node.Index,
+        buffer: *[2]Ast.Node.Index,
         node: Ast.Node.Index,
         parameter: usize,
     ) !?Ast.Node.Index {
@@ -1067,11 +2230,10 @@ pub const TypeResolver = struct {
     /// instance call passes implicitly (`receiver`, null when the call
     /// writes every argument itself).
     ///
-    /// Nothing is copied and nothing is bounded: `arguments` borrows
-    /// the tree's own nodes — or, for the fixed-arity call shapes, the
-    /// `buffer` this call was given — so a declaration with any number
-    /// of parameters is read the same way as one with two.  The borrow
-    /// lasts exactly as long as `buffer`.
+    /// Larger operand lists borrow immutable AST data. Small ordinary calls
+    /// and literal `@call` tuples borrow the two-node caller scratch instead;
+    /// no operand list is heap-allocated or truncated. The scratch must stay
+    /// live until the caller finishes reading every borrowed node.
     pub const CallArguments = struct {
         arguments: []const Ast.Node.Index,
         receiver: ?Ast.Node.Index,
@@ -1079,7 +2241,7 @@ pub const TypeResolver = struct {
 
     pub fn callArgumentsOf(
         self: *TypeResolver,
-        buffer: *[1]Ast.Node.Index,
+        buffer: *[2]Ast.Node.Index,
         node: Ast.Node.Index,
     ) !?CallArguments {
         return self.resolutionFrame().callArgumentsOf(buffer, node);
@@ -1091,7 +2253,7 @@ pub const TypeResolver = struct {
     /// answers null for — a variadic callee, an arity the declaration does
     /// not have, a callee this snapshot cannot name.
     fn argumentParameterType(self: *TypeResolver, node: Ast.Node.Index, argument: usize) !?Analyser.Type {
-        var buffer: [1]Ast.Node.Index = undefined;
+        var buffer: [2]Ast.Node.Index = undefined;
         const reached = (try self.reachedCall(&buffer, node)) orelse return null;
         if (argument >= reached.call.ast.params.len) return null;
         // The arity `reachedCall` proved keeps this index inside the
@@ -1115,40 +2277,15 @@ pub const TypeResolver = struct {
         return self.intInfoOfType(parameter);
     }
 
-    /// The integer type `node` is COERCED to when it has no type of its own.
+    /// Integer result-location type in this node's exact source context.
     ///
-    /// A conversion such as `@intCast(x)` takes the type of the context it
-    /// is written in, so a cast in argument position has to be read against
-    /// the parameter it is passed as rather than against itself.  The
-    /// innermost call that takes it as an argument is the one whose
-    /// coercion applies: an outer call coerces the whole argument
-    /// expression, and the inner one has already fixed this node's type.
+    /// Read the nearest ancestor relationship, not an enclosing call's whole
+    /// argument: a struct or union initializer contributes its selected field
+    /// type, and @as fixes its operand before an outer call can coerce it.
+    /// Optional and error-union result locations contribute their payload.
+    /// Unknown contexts and other non-integer destinations remain unknown.
     pub fn contextIntInfo(self: *TypeResolver, node: Ast.Node.Index) !?IntInfo {
-        const tree = &self.handle.document.tree;
-        const target_first = tree.firstToken(node);
-        const target_last = tree.lastToken(node);
-        const Found = struct { call: Ast.Node.Index, argument: usize, first: Ast.TokenIndex };
-        var best: ?Found = null;
-        var buffer: [1]Ast.Node.Index = undefined;
-        for (tree.nodes.items(.tag), 0..) |tag, index| {
-            switch (tag) {
-                .call, .call_comma, .call_one, .call_one_comma => {},
-                else => continue,
-            }
-            const candidate: Ast.Node.Index = @enumFromInt(index);
-            const first = tree.firstToken(candidate);
-            if (target_first < first or target_last > tree.lastToken(candidate)) continue;
-            if (best) |previous| if (first <= previous.first) continue;
-            const call = tree.fullCall(&buffer, candidate) orelse continue;
-            for (call.ast.params, 0..) |argument, position| {
-                if (target_first < tree.firstToken(argument)) continue;
-                if (target_last > tree.lastToken(argument)) continue;
-                best = .{ .call = candidate, .argument = position, .first = first };
-                break;
-            }
-        }
-        const found = best orelse return null;
-        return self.argumentIntInfo(found.call, found.argument);
+        return self.resolutionFrame().contextIntInfo(node);
     }
 
     pub fn externUnionFloatFieldBits(self: *TypeResolver, node: Ast.Node.Index, field_name: []const u8) !?u16 {
@@ -1194,7 +2331,7 @@ pub const TypeResolver = struct {
         };
     }
 
-    /// Return one pointer, array, vector, or optional child of a resolved type value.
+    /// Return one pointer, array, vector, optional child, or error-union payload.
     /// The child borrows the original resolver; non-wrapper types answer null.
     pub fn childType(self: *TypeResolver, ty: ActualType) ?ActualType {
         std.debug.assert(ty.is_type_val);
@@ -1202,6 +2339,7 @@ pub const TypeResolver = struct {
             .pointer => |info| info.elem_ty.*,
             .array => |info| info.elem_ty.*,
             .optional => |payload| payload.*,
+            .error_union => |info| info.payload.*,
             .ip_index => blk: {
                 const index = ty.ipIndex() orelse return null;
                 const child = switch (self.ctx.ip.indexToKey(index)) {
@@ -1209,6 +2347,7 @@ pub const TypeResolver = struct {
                     .array_type => |info| info.child,
                     .vector_type => |info| info.child,
                     .optional_type => |info| info.payload_type,
+                    .error_union_type => |info| info.payload_type,
                     else => return null,
                 };
                 break :blk Analyser.Type.fromIP(&self.analyser, .type_type, child);
@@ -1278,10 +2417,36 @@ pub const TypeResolver = struct {
         suffix: []const u8,
     ) !bool {
         const library = self.ctx.store.toolchainRoot() orelse return false;
-        const path = try handle.document.uri.toFsPath(self.arena.allocator());
+        // The path is compared and dropped: asked per call, it must not
+        // pile up in the arena.
+        var scratch = std.heap.stackFallback(std.Io.Dir.max_path_bytes, self.gpa);
+        const scratch_allocator = scratch.get();
+        const path = try handle.document.uri.toFsPath(scratch_allocator);
+        defer scratch_allocator.free(path);
         const base = std.mem.trimEnd(u8, library, std.fs.path.sep_str);
         return path.len == base.len + suffix.len and
             std.mem.startsWith(u8, path, base) and std.mem.endsWith(u8, path, suffix);
+    }
+
+    /// `declaredInToolchainFile` for a whole directory: true when `handle`
+    /// is a document anywhere below `<toolchain library>/<directory>`
+    /// (`"/std"` is the standard library).  Same canonical comparison, same
+    /// identity rule: a project file that merely shares a spelling is not below it.
+    pub fn declaredUnderToolchain(
+        self: *TypeResolver,
+        handle: DocumentStore.Handle,
+        directory: []const u8,
+    ) !bool {
+        const library = self.ctx.store.toolchainRoot() orelse return false;
+        var scratch = std.heap.stackFallback(std.Io.Dir.max_path_bytes, self.gpa);
+        const scratch_allocator = scratch.get();
+        const path = try handle.document.uri.toFsPath(scratch_allocator);
+        defer scratch_allocator.free(path);
+        const base = std.mem.trimEnd(u8, library, std.fs.path.sep_str);
+        return path.len > base.len + directory.len and
+            std.mem.startsWith(u8, path, base) and
+            std.mem.startsWith(u8, path[base.len..], directory) and
+            std.fs.path.isSep(path[base.len + directory.len]);
     }
 
     pub fn isStdAllocator(self: *TypeResolver, node: Ast.Node.Index) !?bool {
@@ -1326,6 +2491,11 @@ pub const TypeResolver = struct {
     /// Resolve the declaration, so aliases match and project lookalikes do not.
     pub fn stdMemEqlOf(self: *TypeResolver, callee: Ast.Node.Index, arguments: usize) !bool {
         return self.resolutionFrame().stdMemEqlOf(callee, arguments);
+    }
+
+    /// Match standard testing assertions through their declaring toolchain document.
+    pub fn stdTestingExpectOf(self: *TypeResolver, callee: Ast.Node.Index, arguments: usize) !bool {
+        return self.resolutionFrame().stdTestingExpectOf(callee, arguments);
     }
 
     /// Name usable for dispatch from this file. Never substitute a foreign
@@ -1476,6 +2646,21 @@ pub const TypeResolver = struct {
 
     pub const IntInfo = struct { signed: bool, bits: u16 };
 
+    /// Signedness and bit-width of the integer a cast into `node`'s type
+    /// produces when that type is `?T`: the payload `T`, through nested
+    /// optionals.  Null when the type is not an optional, or its payload is
+    /// not an integer — a plain `u64` is `intInfo`'s answer, not this one's.
+    pub fn optionalPayloadIntInfo(self: *TypeResolver, node: Ast.Node.Index) !?IntInfo {
+        var ty = (try self.resolutionFrame().typeOfNode(node)) orelse return null;
+        var depth: u8 = 0;
+        while ((self.typeTag(ty) orelse return null) == .optional) : (depth += 1) {
+            if (depth == 8) return null;
+            ty = (try self.normalizedType(self.childType(ty) orelse return null)) orelse return null;
+        }
+        if (depth == 0) return null;
+        return self.intInfoOfType(ty);
+    }
+
     /// Signedness and bit-width of `node`'s type when it resolves to an integer
     /// type, else null.  Used e.g. to tell signed subtraction (well-defined,
     /// can't "wrap to a huge value") from unsigned underflow.
@@ -1534,6 +2719,65 @@ pub const TypeResolver = struct {
     /// resolution here means the access is comptime-verified safe.
     pub fn comptimeIntValue(self: *TypeResolver, node: Ast.Node.Index) !?u64 {
         return self.analyser.resolveIntegerLiteral(u64, .of(node, self.handle));
+    }
+
+    pub const EnumIntegerRange = struct { min: i128, max: i128 };
+
+    /// Bounds of the actual declared tags of an exhaustive enum. Unknown
+    /// tag values, non-exhaustive enums and non-enums do not supply proof.
+    /// Resolve each initializer in its owning container, including imports
+    /// and generic bindings, rather than interpreting names in this file.
+    pub fn enumIntegerRange(self: *TypeResolver, node: Ast.Node.Index) !?EnumIntegerRange {
+        const ty = (try self.typeOfNode(node)) orelse return null;
+        return self.enumIntegerRangeOfType(ty);
+    }
+
+    /// The same exhaustive-tag proof for a canonical instantiated type.
+    /// This preserves generic bindings when the consumer already resolved
+    /// the type in a different declaration's context.
+    pub fn enumIntegerRangeOfType(self: *TypeResolver, ty: ActualType) !?EnumIntegerRange {
+        if (self.typeTag(ty) != .@"enum" or ty.data != .container) return null;
+        const container = ty.data.container;
+        const frame = self.frameForContainer(container);
+        const tree = &frame.handle.document.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const declaration = tree.fullContainerDecl(&buffer, container.scope_handle.toNode()) orelse return null;
+        var range: ?EnumIntegerRange = null;
+        var previous: ?i128 = null;
+        for (declaration.ast.members) |member| {
+            const field = tree.fullContainerField(member) orelse continue;
+            if (std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), "_")) return null;
+            const value = if (field.ast.value_expr.unwrap()) |initializer|
+                (try self.analyser.resolveIntegerLiteral(i128, frame.options(initializer))) orelse return null
+            else if (previous) |last|
+                std.math.add(i128, last, 1) catch return null
+            else
+                0;
+            previous = value;
+            if (range) |*bounds| {
+                bounds.min = @min(bounds.min, value);
+                bounds.max = @max(bounds.max, value);
+            } else {
+                range = .{ .min = value, .max = value };
+            }
+        }
+        return range;
+    }
+
+    fn enumTagIntInfoOfType(self: *TypeResolver, ty: ActualType) !?IntInfo {
+        if (self.typeTag(ty) != .@"enum" or ty.data != .container) return null;
+        const container = ty.data.container;
+        const frame = self.frameForContainer(container);
+        const tree = &frame.handle.document.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const declaration = tree.fullContainerDecl(&buffer, container.scope_handle.toNode()) orelse return null;
+        if (declaration.ast.arg.unwrap()) |tag_type| {
+            return self.intInfoOfType((try frame.typeOfNode(tag_type)) orelse return null);
+        }
+        const range = (try self.enumIntegerRangeOfType(ty)) orelse return null;
+        if (range.min < 0) return null;
+        const max: u128 = @intCast(range.max);
+        return .{ .signed = false, .bits = if (max == 0) 0 else @intCast(128 - @clz(max)) };
     }
 };
 
@@ -1597,9 +2841,10 @@ fn scanContainerName(arena: std.mem.Allocator, container: Analyser.Type.Data.Con
 
 test "toolchain environment parses JSON paths and ignores extra fields" {
     const gpa = std.testing.allocator;
+    var failure: ToolchainFailure = .{};
     const paths = try parseToolchainEnv(gpa,
         \\{"zig_exe":"/opt/zig/bin/zig","lib_dir":"/opt/zig/lib","version":"0.16.0","env":{}}
-    );
+    , &failure);
     defer gpa.free(paths.zig_exe.?);
     defer gpa.free(paths.zig_lib.?);
     try std.testing.expectEqualStrings("/opt/zig/bin/zig", paths.zig_exe.?);
@@ -1608,9 +2853,10 @@ test "toolchain environment parses JSON paths and ignores extra fields" {
 
 test "toolchain environment parses ZON paths and escaped characters" {
     const gpa = std.testing.allocator;
+    var failure: ToolchainFailure = .{};
     const paths = try parseToolchainEnv(gpa,
         \\.{ .zig_exe = "/opt/zig/bin/zig", .lib_dir = "/opt/zig \"dev\"/lib", .version = "0.16.0", .env = .{} }
-    );
+    , &failure);
     defer gpa.free(paths.zig_exe.?);
     defer gpa.free(paths.zig_lib.?);
     try std.testing.expectEqualStrings("/opt/zig/bin/zig", paths.zig_exe.?);
@@ -1619,12 +2865,46 @@ test "toolchain environment parses ZON paths and escaped characters" {
 
 test "toolchain environment rejects missing and empty library paths" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.MissingField, parseToolchainEnv(gpa,
+    var failure: ToolchainFailure = .{};
+    try std.testing.expectError(error.ZigToolchainUnavailable, parseToolchainEnv(gpa,
         \\{"zig_exe":"/opt/zig/bin/zig"}
-    ));
-    try std.testing.expectError(error.NotFound, parseToolchainEnv(gpa,
+    , &failure));
+    try std.testing.expectEqual(ToolchainFailure.Reason.malformed_output, failure.reason);
+    try std.testing.expectError(error.ZigToolchainUnavailable, parseToolchainEnv(gpa,
         \\.{ .zig_exe = "/opt/zig/bin/zig", .lib_dir = "", .version = "0.16.0" }
-    ));
+    , &failure));
+    try std.testing.expectEqual(ToolchainFailure.Reason.missing_paths, failure.reason);
+}
+
+test "toolchain failure messages name status, stderr line and versions" {
+    var buffer: [512]u8 = undefined;
+    var failure: ToolchainFailure = .{ .reason = .exited, .code = 1 };
+    failure.setFirstLine("\n  error: no build.zig.zon found\nsecond line\n");
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.print("{f}", .{failure});
+    try std.testing.expectEqualStrings("exited with status 1: error: no build.zig.zon found", writer.buffered());
+
+    failure = .{ .reason = .exited, .code = 1 };
+    failure.setFirstLine("  \n");
+    writer = .fixed(&buffer);
+    try writer.print("{f}", .{failure});
+    try std.testing.expectEqualStrings("exited with status 1 (no stderr output)", writer.buffered());
+
+    failure = .{ .reason = .spawn_failed };
+    failure.setDetail("FileNotFound");
+    writer = .fixed(&buffer);
+    try writer.print("{f}", .{failure});
+    try std.testing.expectEqualStrings("could not be started: FileNotFound", writer.buffered());
+}
+
+test "toolchain discovery maps a missing compiler to ZigToolchainUnavailable" {
+    var failure: ToolchainFailure = .{};
+    try std.testing.expectError(
+        error.ZigToolchainUnavailable,
+        Toolchain.init(std.testing.allocator, std.testing.io, "/nonexistent/zbc-test-zig", &failure),
+    );
+    try std.testing.expectEqual(ToolchainFailure.Reason.spawn_failed, failure.reason);
+    try std.testing.expectEqualStrings("FileNotFound", failure.detail());
 }
 
 test "stable double pointer parameters resolve as pointers" {
@@ -1648,9 +2928,11 @@ test "stable double pointer parameters resolve as pointers" {
 }
 
 test "toolchain environment rejects a different compiler dialect" {
+    var failure: ToolchainFailure = .{};
     try std.testing.expectError(error.IncompatibleZigVersion, parseToolchainEnv(std.testing.allocator,
         \\{"zig_exe":"/opt/zig/bin/zig","lib_dir":"/opt/zig/lib","version":"0.0.0-incompatible"}
-    ));
+    , &failure));
+    try std.testing.expectEqualStrings("0.0.0-incompatible", failure.detail());
 }
 
 fn testIdentifier(tree: *const Ast, name: []const u8) !Ast.Node.Index {
@@ -1973,6 +3255,206 @@ test "constant queries do not use mutable initializers as value facts" {
     }
 }
 
+test "imported integer constants retain exact values through aliases and shifts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "limits.zig", .data =
+        \\pub const base: usize = 4;
+        \\pub const bound: usize = base << 2;
+        \\pub var changing: usize = 16;
+        \\pub const unknown = missing;
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var context: TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path,
+        \\const imported = @import("limits.zig");
+        \\const alias = imported.bound;
+        \\fn observe(runtime: usize) void {
+        \\    _ = alias;
+        \\    _ = imported.changing;
+        \\    _ = imported.unknown;
+        \\    _ = runtime;
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    try std.testing.expectEqual(@as(?u64, 16), try resolver.comptimeIntValue(try testIdentifier(tree, "alias")));
+    try std.testing.expectEqual(@as(?u64, null), try resolver.comptimeIntValue(try testIdentifier(tree, "runtime")));
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .field_access) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
+        const expected: ?u64 = if (std.mem.eql(u8, name, "bound")) 16 else null;
+        try std.testing.expectEqual(expected, try resolver.comptimeIntValue(node));
+    }
+}
+
+test "immutable literal payloads authenticate imported aliases and reject holes and opaque storage" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tables.zig", .data =
+        \\pub const leaf = [2]u8{ 3, 7 };
+        \\pub const Namespace = struct {
+        \\    pub const alias = leaf;
+        \\    pub const nested = [2][2]u8{ alias, .{ 11, 13 } };
+        \\    pub const holes = [2][2]u8{ alias, .{ 11, undefined } };
+        \\};
+        \\pub const selected = Namespace.nested[1];
+        \\pub const bad_selector = Namespace.nested[undefined];
+        \\pub const negatives = [2]f64{ -0.5, -0.125 };
+        \\pub var mutable = [2]u8{ 3, 7 };
+        \\pub const unknown = missing;
+        \\extern fn opaqueValue() u8;
+        \\pub const called = [2]u8{ opaqueValue(), 7 };
+        \\pub const recursive = recursive;
+        \\pub const pointed = (&leaf).*;
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var context: TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path,
+        \\const imported = @import("tables.zig");
+        \\const safe = imported.Namespace.alias;
+        \\const nested = imported.Namespace.nested;
+        \\const selected = imported.selected;
+        \\const negatives = imported.negatives;
+        \\const bad_selector = imported.bad_selector;
+        \\const holes = imported.Namespace.holes;
+        \\const mutable = imported.mutable;
+        \\const unknown = imported.unknown;
+        \\const called = imported.called;
+        \\const recursive = imported.recursive;
+        \\const pointed = imported.pointed;
+        \\fn observe(index: usize) void {
+        \\    _ = safe;
+        \\    _ = nested;
+        \\    _ = selected;
+        \\    _ = negatives;
+        \\    _ = bad_selector;
+        \\    _ = holes;
+        \\    _ = mutable;
+        \\    _ = unknown;
+        \\    _ = called;
+        \\    _ = recursive;
+        \\    _ = pointed;
+        \\    _ = nested[index][index];
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const frame = resolver.resolutionFrame();
+    for ([_][]const u8{ "safe", "nested", "selected", "negatives" }) |name|
+        try std.testing.expect(try frame.immutableLiteralPayloadOfNode(try testIdentifier(tree, name)));
+    for ([_][]const u8{ "holes", "mutable", "unknown", "called", "recursive", "pointed", "bad_selector" }) |name|
+        try std.testing.expect(!try frame.immutableLiteralPayloadOfNode(try testIdentifier(tree, name)));
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .array_access) continue;
+        // Payload proof is independent of the runtime selector's bytes and
+        // bounds. The CFG must retain the selector as a separate value input.
+        try std.testing.expect(try frame.immutableLiteralPayloadOfNode(@enumFromInt(raw)));
+    }
+}
+
+test "literal payload memo retries allocation failure and reuses a settled certificate" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-payload-memo.zig",
+        \\const table = [2]u8{ 3, 7 };
+        \\fn observe() void { _ = table; }
+    );
+    defer resolver.deinit();
+    const node = try testIdentifier(&resolver.handle.document.tree, "table");
+    const frame = resolver.resolutionFrame();
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    resolver.gpa = failing.allocator();
+    defer resolver.gpa = gpa;
+    try std.testing.expectError(error.OutOfMemory, frame.immutableLiteralPayloadOfNode(node));
+    try std.testing.expectEqual(@as(usize, 0), resolver.literal_payload_cache.count());
+    resolver.gpa = gpa;
+    try std.testing.expect(try frame.immutableLiteralPayloadOfNode(node));
+    const entries = resolver.literal_payload_cache.count();
+    try std.testing.expect(entries > 0);
+    try std.testing.expect(try frame.immutableLiteralPayloadOfNode(node));
+    try std.testing.expectEqual(entries, resolver.literal_payload_cache.count());
+}
+
+test "enum integer ranges use exhaustive resolved tags and reject unknown values" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-enum-integer-range.zig",
+        \\const Dense = enum { a, b, c };
+        \\const Sparse = enum(i16) { a = -3, b = 17, c };
+        \\const Open = enum(u8) { a = 1, _ };
+        \\const Unknown = enum(u8) { a = missing, b };
+        \\fn observe(dense: Dense, sparse: Sparse, open: Open, unknown: Unknown, other: anytype) void {
+        \\    _ = dense; _ = sparse; _ = open; _ = unknown; _ = other;
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    try std.testing.expectEqual(TypeResolver.EnumIntegerRange{ .min = 0, .max = 2 }, (try resolver.enumIntegerRange(try testIdentifier(tree, "dense"))).?);
+    try std.testing.expectEqual(TypeResolver.EnumIntegerRange{ .min = -3, .max = 18 }, (try resolver.enumIntegerRange(try testIdentifier(tree, "sparse"))).?);
+    for ([_][]const u8{ "open", "unknown", "other" }) |name| {
+        try std.testing.expectEqual(@as(?TypeResolver.EnumIntegerRange, null), try resolver.enumIntegerRange(try testIdentifier(tree, name)));
+    }
+}
+
+test "enum integer conversions expose inferred and explicit tag types" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-enum-tag-type.zig",
+        \\const Dense = enum { a, b, c };
+        \\const Wide = enum(u32) { a, b };
+        \\fn observe(dense: Dense, wide: Wide, unknown: anytype) void {
+        \\    _ = @intFromEnum(dense);
+        \\    _ = @intFromEnum(wide);
+        \\    _ = @intFromEnum(unknown);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var count: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@intFromEnum")) continue;
+        const expected: ?TypeResolver.IntInfo = switch (count) {
+            0 => .{ .signed = false, .bits = 2 },
+            1 => .{ .signed = false, .bits = 32 },
+            else => null,
+        };
+        try std.testing.expectEqual(expected, try resolver.intInfo(node));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
 test "numeric conversions resolve their declared and returned result types" {
     const gpa = std.testing.allocator;
     var context: TypeContext = undefined;
@@ -2013,6 +3495,234 @@ test "numeric conversions resolve their declared and returned result types" {
     }
 }
 
+test "typed integer-to-float initializers resolve after either public query order" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |declaration_first| {
+        var context: TypeContext = undefined;
+        try context.init(gpa, std.testing.io);
+        defer context.deinit();
+        var resolver: TypeResolver = undefined;
+        try resolver.init(&context, gpa, "/tmp/zbc-float-initializer-order.zig",
+            \\fn convert(number: i128) void {
+            \\    const wide: f128 = @floatFromInt(number);
+            \\    const small: f32 = @floatFromInt(number);
+            \\    _ = wide;
+            \\    _ = small;
+            \\}
+        );
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        var seen: usize = 0;
+        for (0..tree.nodes.len) |raw| {
+            const declaration: Ast.Node.Index = @enumFromInt(raw);
+            const variable = tree.fullVarDecl(declaration) orelse continue;
+            const name = tree.tokenSlice(variable.ast.mut_token + 1);
+            const width: u16 = if (std.mem.eql(u8, name, "wide")) 128 else if (std.mem.eql(u8, name, "small")) 32 else continue;
+            const initializer = variable.ast.init_node.unwrap() orelse return error.MissingConversion;
+            const first = if (declaration_first) declaration else initializer;
+            const second = if (declaration_first) initializer else declaration;
+            try std.testing.expectEqual(@as(?u16, width), try resolver.floatBits(first));
+            try std.testing.expectEqual(@as(?u16, width), try resolver.floatBits(second));
+            // Repeated consumer predicates must see the completed type, not a
+            // null left by the initializer's recursive request for its parent.
+            try std.testing.expectEqual(@as(?bool, true), try resolver.isFloatType(initializer));
+            try std.testing.expectEqual(@as(?u16, width), try resolver.floatBits(initializer));
+            try std.testing.expectEqual(@as(?u16, width), try resolver.floatBits(declaration));
+            seen += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    }
+}
+
+test "inferred float arithmetic and builtin results resolve their result widths" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-inferred-float-results.zig",
+        \\fn f(progress: f32, duration: u32, elapsed: f32) void {
+        \\    const duration_sec: f32 = @floatFromInt(duration);
+        \\    const clipped = @max(@as(f32, 0), @min(progress, duration_sec));
+        \\    const minutes = elapsed / 60.0;
+        \\    const remainder = @mod(elapsed, 60.0);
+        \\    const sum = progress + 1.0;
+        \\    const difference = progress - 1.0;
+        \\    const product = progress * 60.0;
+        \\    const rounded = @round(elapsed);
+        \\    const floored = @floor(elapsed);
+        \\    const ceiling = @ceil(elapsed);
+        \\    const truncated = @trunc(elapsed);
+        \\    const nested_minutes = clipped / 60.0;
+        \\    const nested_remainder = @mod(clipped, 60.0);
+        \\    const nested_rounded = @round(@max(@as(f32, 0), elapsed));
+        \\    const min_many = @min(progress, elapsed, duration_sec);
+        \\    const max_many = @max(progress, elapsed, duration_sec);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const expected_names = [_][]const u8{
+        "duration_sec",
+        "clipped",
+        "minutes",
+        "remainder",
+        "sum",
+        "difference",
+        "product",
+        "rounded",
+        "floored",
+        "ceiling",
+        "truncated",
+        "nested_minutes",
+        "nested_remainder",
+        "nested_rounded",
+        "min_many",
+        "max_many",
+    };
+    var seen = [_]bool{false} ** expected_names.len;
+    var seen_count: usize = 0;
+    for (0..tree.nodes.len) |raw| {
+        const declaration: Ast.Node.Index = @enumFromInt(raw);
+        const variable = tree.fullVarDecl(declaration) orelse continue;
+        const name = tree.tokenSlice(variable.ast.mut_token + 1);
+        const expected_index = for (expected_names, 0..) |expected_name, index| {
+            if (std.mem.eql(u8, name, expected_name)) break index;
+        } else continue;
+        try std.testing.expect(!seen[expected_index]);
+        seen[expected_index] = true;
+        seen_count += 1;
+        const initializer = variable.ast.init_node.unwrap() orelse return error.MissingInitializer;
+        for (0..2) |_| {
+            try std.testing.expectEqual(@as(?u16, 32), try resolver.floatBits(declaration));
+            try std.testing.expectEqual(@as(?u16, 32), try resolver.floatBits(initializer));
+        }
+    }
+    try std.testing.expectEqual(expected_names.len, seen_count);
+    for (seen) |was_seen| try std.testing.expect(was_seen);
+}
+
+test "mixed float operands widen inferred builtin and arithmetic results" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-mixed-float-results.zig",
+        \\fn f(small: f32, wide: f64) void {
+        \\    const sum = small + wide;
+        \\    const minimum = @min(small, wide);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const expected_names = [_][]const u8{ "sum", "minimum" };
+    var seen = [_]bool{false} ** expected_names.len;
+    var seen_count: usize = 0;
+    for (0..tree.nodes.len) |raw| {
+        const declaration: Ast.Node.Index = @enumFromInt(raw);
+        const variable = tree.fullVarDecl(declaration) orelse continue;
+        const name = tree.tokenSlice(variable.ast.mut_token + 1);
+        const expected_index = for (expected_names, 0..) |expected_name, index| {
+            if (std.mem.eql(u8, name, expected_name)) break index;
+        } else continue;
+        try std.testing.expect(!seen[expected_index]);
+        seen[expected_index] = true;
+        seen_count += 1;
+        const initializer = variable.ast.init_node.unwrap() orelse return error.MissingInitializer;
+        for (0..2) |_| {
+            try std.testing.expectEqual(@as(?u16, 64), try resolver.floatBits(declaration));
+            try std.testing.expectEqual(@as(?u16, 64), try resolver.floatBits(initializer));
+        }
+    }
+    try std.testing.expectEqual(expected_names.len, seen_count);
+    for (seen) |was_seen| try std.testing.expect(was_seen);
+}
+
+test "mismatched and unknown operands stay unknown for float inference" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-unknown-float-results.zig",
+        \\fn f(value: f32, flag: bool, unknown: anytype) void {
+        \\    const mismatch = @min(value, flag);
+        \\    const unknown_min = @min(value, unknown);
+        \\    const unknown_max = @max(value, unknown);
+        \\    const unknown_mod = @mod(value, unknown);
+        \\    const unknown_sum = value + unknown;
+        \\    const unknown_round = @round(unknown);
+        \\    const unknown_min_late = @min(value, 1.0, unknown);
+        \\}
+        \\fn generic(comptime T: type, value: f32, unknown: T) void {
+        \\    const generic_min = @min(value, unknown);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const expected_names = [_][]const u8{
+        "mismatch",
+        "unknown_min",
+        "unknown_max",
+        "unknown_mod",
+        "unknown_sum",
+        "unknown_round",
+        "unknown_min_late",
+        "generic_min",
+    };
+    var seen = [_]bool{false} ** expected_names.len;
+    var seen_count: usize = 0;
+    for (0..tree.nodes.len) |raw| {
+        const declaration: Ast.Node.Index = @enumFromInt(raw);
+        const variable = tree.fullVarDecl(declaration) orelse continue;
+        const name = tree.tokenSlice(variable.ast.mut_token + 1);
+        const expected_index = for (expected_names, 0..) |expected_name, index| {
+            if (std.mem.eql(u8, name, expected_name)) break index;
+        } else continue;
+        try std.testing.expect(!seen[expected_index]);
+        seen[expected_index] = true;
+        seen_count += 1;
+        const initializer = variable.ast.init_node.unwrap() orelse return error.MissingInitializer;
+        for (0..2) |_| {
+            try std.testing.expectEqual(@as(?u16, null), try resolver.floatBits(declaration));
+            try std.testing.expectEqual(@as(?u16, null), try resolver.floatBits(initializer));
+        }
+    }
+    try std.testing.expectEqual(expected_names.len, seen_count);
+    for (seen) |was_seen| try std.testing.expect(was_seen);
+}
+
+test "unbound generic conversions and recursive declarations remain unknown on retry" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-unresolved-binding-retry.zig",
+        \\const cycle = cycle;
+        \\fn openGeneric(comptime T: type, number: i128) void {
+        \\    const unknown: T = @floatFromInt(number);
+        \\    _ = unknown;
+        \\    _ = cycle;
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const conversion = for (0..tree.nodes.len) |raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.builtinCallParams(&buffer, node) == null) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@floatFromInt")) break node;
+    } else return error.MissingConversion;
+    const cycle = try testIdentifier(tree, "cycle");
+    for (0..2) |_| {
+        try std.testing.expectEqual(@as(?u16, null), try resolver.floatBits(conversion));
+        try std.testing.expectEqual(@as(?bool, null), try resolver.isFloatType(conversion));
+        try std.testing.expect((try resolver.resolutionFrame().typeOfNode(cycle)) == null);
+    }
+}
+
 test "failed relative imports never resolve a different file beside the caller" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2043,6 +3753,35 @@ test "failed relative imports never resolve a different file beside the caller" 
         if (tag == .field_access) break @as(Ast.Node.Index, @enumFromInt(index));
     } else return error.MissingFieldAccess;
     try std.testing.expectEqual(@as(?[]const u8, null), try resolver.typeNameOfNode(field));
+    try std.testing.expectEqual(@as(?anyerror, error.ImportInvalidSyntax), context.store.failureSnapshot().source_failure);
+    // Repeated public queries preserve the failure rather than treating an
+    // unfinished source load as a resolved type.
+    for (0..2) |_| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try resolver.typeNameOfNode(field));
+        try std.testing.expectEqual(@as(?anyerror, error.ImportInvalidSyntax), context.store.failureSnapshot().source_failure);
+    }
+
+    // Source documents are immutable within a session. Retry the corrected
+    // source in an isolated session rather than replacing the failed snapshot
+    // or resetting the first resolver's memo.
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/types.zig", .data = "pub const Target = struct { value: u16 };" });
+    var retry_context: TypeContext = undefined;
+    try retry_context.init(gpa, io);
+    defer retry_context.deinit();
+    retry_context.store.source_policy = .{ .roots = &.{directory} };
+    var retry_resolver: TypeResolver = undefined;
+    try retry_resolver.init(&retry_context, gpa, path,
+        \\const package = @import("sub/package.zig");
+        \\fn inspect(value: package.Target) void { _ = value; }
+    );
+    defer retry_resolver.deinit();
+    const retry_tree = &retry_resolver.handle.document.tree;
+    const retry_field = for (retry_tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag == .field_access) break @as(Ast.Node.Index, @enumFromInt(index));
+    } else return error.MissingFieldAccess;
+    try std.testing.expect((try retry_resolver.resolutionFrame().typeOfNode(retry_field)) != null);
+    try std.testing.expectEqual(@as(?anyerror, null), retry_context.store.failureSnapshot().source_failure);
+    // The original failure remains isolated and still cannot become an answer.
     try std.testing.expectEqual(@as(?anyerror, error.ImportInvalidSyntax), context.store.failureSnapshot().source_failure);
 }
 
@@ -3169,18 +4908,258 @@ test "borrowed generic frames resolve field types independently across reentrant
     try std.testing.expectEqual(@as(?TypeResolver.IntInfo, null), try resolver.intInfo(field));
 }
 
+test "inline tuple call frames enforce existing work and expanded caller limits" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-inline-tuple-call-limits.zig",
+        \\fn checked(comptime T: type) T { return 0; }
+        \\test "native" {
+        \\    inline for (.{ u8, c_int, c_uint }) |T| {
+        \\        _ = checked(T);
+        \\    }
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const call = try testNthCallNamed(tree, "checked", 0);
+    const frame = resolver.resolutionFrame();
+    var caller_work: u32 = @intCast(tree.nodes.len + 4);
+    var too_few_callers: usize = 2;
+    try std.testing.expectError(error.InlineTupleCallersExceeded, frame.inlineTupleCallReferences(call, &caller_work, &too_few_callers));
+    try std.testing.expectEqual(@as(usize, 2), too_few_callers);
+    var too_few_steps: u32 = 1;
+    var callers: usize = 3;
+    try std.testing.expectError(error.InlineTupleStepsExceeded, frame.inlineTupleCallReferences(call, &too_few_steps, &callers));
+    try std.testing.expectEqual(@as(u32, 0), too_few_steps);
+    try std.testing.expectEqual(@as(usize, 3), callers);
+}
+
+test "test-local inline tuple frames retain each generic conversion destination" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-test-local-inline-tuple-destinations.zig",
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn checked(comptime T: type, source: anytype) error{Bad}!T {
+        \\            const value: f64 = @floatCast(source);
+        \\            return @intFromFloat(value);
+        \\        }
+        \\    };
+        \\    _ = Native.checked(u8, @as(f64, 0)) catch 0;
+        \\    inline for (.{ u8, c_int, c_uint }) |T| {
+        \\        _ = Native.checked(T, @as(f64, 0)) catch 0;
+        \\    }
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const call = try testNthCallNamed(tree, "checked", 1);
+    var conversion: ?Ast.Node.Index = null;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@intFromFloat")) {
+            conversion = node;
+            break;
+        }
+    }
+    const conversion_node = conversion orelse return error.MissingConversion;
+    // The uninstantiated declaration still has no concrete destination.
+    try std.testing.expectEqual(
+        @as(?TypeResolver.IntInfo, null),
+        try resolver.contextIntInfo(conversion_node),
+    );
+    const direct = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "checked", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingDirectFrame,
+    };
+    const direct_frame = resolver.frameForFunction(direct);
+    try std.testing.expectEqual(
+        @as(?TypeResolver.IntInfo, null),
+        try direct_frame.intInfo(conversion_node),
+    );
+    try std.testing.expectEqual(
+        @as(?TypeResolver.IntInfo, .{ .bits = 8, .signed = false }),
+        try direct_frame.contextIntInfo(conversion_node),
+    );
+    var work: u32 = 4096;
+    var callers: usize = 3;
+    const references = (try resolver.resolutionFrame().inlineTupleCallReferences(
+        call, &work, &callers,
+    )) orelse return error.MissingTupleFrames;
+    try std.testing.expectEqual(@as(usize, 3), references.len);
+    try std.testing.expectEqual(@as(usize, 0), callers);
+    const expected = [_]TypeResolver.IntInfo{
+        .{ .bits = 8, .signed = false },
+        .{ .bits = 32, .signed = true },
+        .{ .bits = 32, .signed = false },
+    };
+    for (references, expected) |reference, destination| {
+        const frame = resolver.frameForFunction(reference);
+        try std.testing.expectEqual(
+            @as(?TypeResolver.IntInfo, destination),
+            try frame.contextIntInfo(conversion_node),
+        );
+    }
+}
+
+fn testFieldExpression(tree: *const Ast, expression: []const u8, first: Ast.TokenIndex, last: Ast.TokenIndex) !Ast.Node.Index {
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .field_access) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const start = tree.firstToken(node);
+        const end = tree.lastToken(node);
+        if (start < first or end > last) continue;
+        const source = tree.source[tree.tokenStart(start) .. tree.tokenStart(end) + tree.tokenSlice(end).len];
+        if (std.mem.eql(u8, source, expression)) return node;
+    }
+    return error.MissingFieldAccess;
+}
+
+fn testFunctionDeclaration(reference: TypeResolver.FunctionReference) !Ast.Node.Index {
+    const tree = reference.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .fn_decl) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const proto = tree.fullFnProto(&buffer, node).?;
+        if (proto.ast.fn_token == reference.fn_token) return node;
+    }
+    return error.MissingDeclaration;
+}
+
+test "actual allocating writer method frames retain the lexical Writer alias" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-actual-writer-method-frame.zig",
+        \\const std = @import("std");
+        \\const Buffer = []u8;
+        \\fn copy(gpa: std.mem.Allocator, reader: []const u8) !Buffer {
+        \\    var writer = std.Io.Writer.Allocating.init(gpa);
+        \\    try writer.writer.writeAll(reader);
+        \\    return writer.toOwnedSlice();
+        \\}
+        \\fn entry(gpa: std.mem.Allocator, reader: []const u8) !Buffer {
+        \\    _ = std.Io.Writer.writeAll;
+        \\    return copy(gpa, reader);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const copy = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "copy", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingCopy,
+    };
+    const copy_frame = resolver.frameForFunction(copy);
+    const owned = switch (try copy_frame.functionReferenceOfCall(try testNthCallNamed(tree, "toOwnedSlice", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    const owned_frame = resolver.frameForFunction(owned);
+    const owned_tree = owned.tree;
+    const owned_declaration = try testFunctionDeclaration(owned);
+    const buffer = try testFieldExpression(owned_tree, "a.writer.buffer", owned_tree.firstToken(owned_declaration), owned_tree.lastToken(owned_declaration));
+    const buffer_type = (try owned_frame.typeOfNode(buffer)) orelse return error.MissingBufferType;
+    try std.testing.expectEqual(std.builtin.TypeId.pointer, resolver.typeTag(buffer_type).?);
+    try std.testing.expectEqual(std.builtin.Type.Pointer.Size.slice, resolver.pointerSize(buffer_type).?);
+    const expected_buffer = (try resolver.typeOfNode(try testIdentifier(tree, "Buffer"))) orelse return error.MissingExpectedBufferType;
+    try std.testing.expect(TypeResolver.ActualTypeID.eql(expected_buffer, buffer_type));
+
+    const written = switch (try copy_frame.functionReferenceOfCall(try testNthCallNamed(tree, "writeAll", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingWriterMethod,
+    };
+    try std.testing.expect(written.handle.eql(owned.handle));
+    try std.testing.expectEqualStrings("writeAll", written.actual_type.data.function.name.?);
+    const sdk_method = try testFieldExpression(tree, "std.Io.Writer.writeAll", 0, @intCast(tree.tokens.len - 1));
+    const expected_method = switch (try resolver.functionReference(sdk_method)) {
+        .function => |reference| reference,
+        else => return error.MissingCanonicalWriterMethod,
+    };
+    try std.testing.expect(written.handle.eql(expected_method.handle));
+    try std.testing.expectEqual(expected_method.fn_token, written.fn_token);
+    const writer_frame = resolver.frameForFunction(written);
+    const write_declaration = try testFunctionDeclaration(written);
+    const nested_write = try testFieldExpression(written.tree, "w.write", written.tree.firstToken(write_declaration), written.tree.lastToken(write_declaration));
+    const nested = switch (try writer_frame.functionReference(nested_write)) {
+        .function => |reference| reference,
+        else => return error.MissingWriterBodyMethod,
+    };
+    try std.testing.expect(nested.handle.eql(written.handle));
+    try std.testing.expectEqualStrings("write", nested.actual_type.data.function.name.?);
+}
+
+test "ancestor This aliases retain generic field types without becoming nested receivers" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-ancestor-this-alias.zig",
+        \\fn Outer(comptime T: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        buffer: []T,
+        \\        fn writeAll(w: *Self, reader: []const T) void { _ = w.buffer; _ = reader; }
+        \\        const Allocating = struct {
+        \\            writer: Self,
+        \\            fn read(a: *@This()) T { return a.writer.buffer[0]; }
+        \\            fn copy(a: *@This(), reader: []const T) void { a.writer.writeAll(reader); }
+        \\        };
+        \\    };
+        \\}
+        \\fn wide(a: *Outer(u64).Allocating) u64 { a.copy(&.{}); return a.read(); }
+        \\fn narrow(a: *Outer(u8).Allocating) u8 { a.copy(&.{}); return a.read(); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const read_field = try testFieldExpression(tree, "a.writer.buffer", 0, @intCast(tree.tokens.len - 1));
+    for ([_]usize{ 0, 1, 0 }) |occurrence| {
+        const read = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "read", occurrence))) {
+            .function => |reference| reference,
+            else => return error.MissingCallee,
+        };
+        const frame = resolver.frameForFunction(read);
+        const field = (try frame.typeOfNode(read_field)) orelse return error.MissingBufferType;
+        try std.testing.expectEqual(std.builtin.Type.Pointer.Size.slice, resolver.pointerSize(field).?);
+        const element = resolver.childType(field) orelse return error.MissingElementType;
+        try std.testing.expectEqual(@as(?u16, if (occurrence == 0) 64 else 8), try testUnsignedBitsOf(&resolver, element));
+        const copy = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "copy", occurrence))) {
+            .function => |reference| reference,
+            else => return error.MissingCallee,
+        };
+        const written = switch (try (resolver.frameForFunction(copy)).functionReferenceOfCall(try testNthCallNamed(tree, "writeAll", 0))) {
+            .function => |reference| reference,
+            else => return error.MissingWriterMethod,
+        };
+        try std.testing.expectEqual(@as(?u16, if (occurrence == 0) 64 else 8), try testUnsignedBitsOf(&resolver, resolver.childType(written.actual_type.data.function.parameters[1].type).?));
+    }
+}
+
 /// `Cache.run` is written once and calls the context's own `read` and `write`, so
 /// which body a resolution reaches is decided by the instantiation, not by the
 /// declaration.  The same body type-checks for both contexts.
 const GenericContextFixture =
     \\const Reading = struct {
+    \\    const Self = @This();
     \\    total: u64,
-    \\    pub fn read(self: *const Reading) u64 { return self.total; }
+    \\    pub fn read(self: Self) u64 { return self.total; }
     \\    pub fn write(self: *Reading, value: u64) void { self.total = value; }
     \\};
     \\const Writing = struct {
+    \\    const Self = @This();
     \\    slot: u8,
-    \\    pub fn read(self: *const Writing) u8 { return self.slot; }
+    \\    pub fn read(self: Self) u8 { return self.slot; }
     \\    pub fn write(self: *Writing, value: u8) void { self.slot = value; }
     \\};
     \\fn Cache(comptime T: type, comptime Context: type) type {
@@ -3258,29 +5237,6 @@ fn testNthCallNamed(tree: *const Ast, name: []const u8, occurrence: usize) !Ast.
     return error.TestUnexpectedResult;
 }
 
-/// The first call the body of the declaration this `fn` keyword names writes.
-fn testFirstCallInBody(tree: *const Ast, fn_token: Ast.TokenIndex) !Ast.Node.Index {
-    for (tree.nodes.items(.tag), 0..) |tag, index| {
-        if (tag != .fn_decl) continue;
-        const declaration: Ast.Node.Index = @enumFromInt(index);
-        if (tree.nodeMainToken(declaration) != fn_token) continue;
-        const body = tree.nodeData(declaration).node_and_node[1];
-        const first = tree.firstToken(body);
-        const last = tree.lastToken(body);
-        for (tree.nodes.items(.tag), 0..) |body_tag, body_index| {
-            switch (body_tag) {
-                .call, .call_comma, .call_one, .call_one_comma => {},
-                else => continue,
-            }
-            const node: Ast.Node.Index = @enumFromInt(body_index);
-            if (tree.firstToken(node) < first or tree.lastToken(node) > last) continue;
-            return node;
-        }
-        return error.TestUnexpectedResult;
-    }
-    return error.TestUnexpectedResult;
-}
-
 /// The function type a reference actually resolved to: the callee as THIS call
 /// instantiated it, which is what a rule asks about afterwards.
 fn testActualFunction(reference: TypeResolver.FunctionReference) !Analyser.Type.Data.Function {
@@ -3309,14 +5265,6 @@ fn testUnsignedBitsOf(resolver: *TypeResolver, value: Analyser.Type) !?u16 {
     const info = (try resolver.intInfoOfType(value)) orelse return null;
     if (info.signed) return error.SignedIntegerType;
     return info.bits;
-}
-
-/// The value inside an optional result a rule must see through.
-fn testOptionalPayload(resolver: *TypeResolver, value: Analyser.Type) !Analyser.Type {
-    const ty = (try resolver.normalizedType(value)) orelse return error.UnresolvedType;
-    if ((resolver.typeTag(ty) orelse return error.UnresolvedType) != .optional) return error.NotAnOptionalType;
-    return (try resolver.normalizedType(resolver.childType(ty) orelse return error.UnresolvedType)) orelse
-        error.UnresolvedType;
 }
 
 test "one generic declaration reaches a different callback body per instantiation" {
@@ -3378,6 +5326,104 @@ test "one generic declaration reaches a different callback body per instantiatio
         try std.testing.expect((try resolver.intInfoOfType(wide_callback.return_value.*)) == null);
         try std.testing.expect((try resolver.intInfoOfType(narrow_callback.return_value.*)) == null);
     }
+}
+
+test "nongeneric method identity excludes sibling generic call bindings" {
+    const source: [:0]const u8 =
+        \\const Cell = struct {
+        \\    value: u32,
+        \\    fn poison(self: *Cell) void { self.value = undefined; }
+        \\    fn forward(self: *Cell, value: anytype) void { _ = value; self.poison(); }
+        \\    fn select(self: *Cell, comptime poison_value: bool) void {
+        \\        if (poison_value) self.value = undefined;
+        \\    }
+        \\};
+        \\fn use(cell: *Cell) void {
+        \\    cell.forward(@as(u8, 1));
+        \\    cell.forward(@as(u64, 2));
+        \\    cell.select(false);
+        \\    cell.select(true);
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-sibling-callee-identity.zig", source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const narrow = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "forward", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    const wide = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "forward", 1))) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    try std.testing.expect(!narrow.actual_type.eql(wide.actual_type));
+    const poison_call = try testNthCallNamed(tree, "poison", 0);
+    const narrow_poison = switch (try resolver.frameForFunction(narrow).functionReferenceOfCall(poison_call)) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    const wide_poison = switch (try resolver.frameForFunction(wide).functionReferenceOfCall(poison_call)) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    try std.testing.expect(narrow_poison.actual_type.eql(wide_poison.actual_type));
+    try std.testing.expectEqual(narrow_poison.actual_type.hash64(), wide_poison.actual_type.hash64());
+    try std.testing.expectEqual(@as(usize, 0), narrow_poison.actual_type.data.function.container_type.data.container.bound_params.count());
+    const quiet = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "select", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    const loud = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "select", 1))) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    try std.testing.expect(!quiet.actual_type.eql(loud.actual_type));
+}
+
+test "method identity retains enclosing and transported factory bindings" {
+    const source: [:0]const u8 =
+        \\fn Cell(comptime T: type) type {
+        \\    return struct {
+        \\        value: T,
+        \\        fn select(self: *@This(), next: T) void {
+        \\            self.value = next;
+        \\        }
+        \\    };
+        \\}
+        \\fn Wrapped(comptime T: type) type { return Cell(T); }
+        \\fn use(quiet: *Cell(u8), loud: *Cell(u64), wrapped_quiet: *Wrapped(u8), wrapped_loud: *Wrapped(u64)) void {
+        \\    quiet.select(0);
+        \\    loud.select(0);
+        \\    wrapped_quiet.select(0);
+        \\    wrapped_loud.select(0);
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-enclosing-callee-identity.zig", source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var references: [4]TypeResolver.FunctionReference = undefined;
+    for (&references, [_]u16{ 8, 64, 8, 64 }, 0..) |*reference, bits, index| {
+        reference.* = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "select", index))) {
+            .function => |function| function,
+            else => return error.MissingCallee,
+        };
+        const container = reference.actual_type.data.function.container_type.data.container;
+        try std.testing.expect(container.bound_params.count() != 0);
+        const function = try testActualFunction(reference.*);
+        try std.testing.expectEqual(@as(?u16, bits), try testUnsignedBitsOf(&resolver, function.parameters[1].type));
+    }
+    try std.testing.expect(!references[0].actual_type.eql(references[1].actual_type));
+    try std.testing.expect(!references[2].actual_type.eql(references[3].actual_type));
 }
 
 test "an anytype parameter is bound by the call, so one declaration has two callbacks" {
@@ -3495,69 +5541,6 @@ test "a callee nothing names is unknown, and a framed query leaves the root wher
     try std.testing.expect(TypeResolver.ActualTypeID.eql(again.actual_type, reference.actual_type));
 }
 
-test "an SDK map method answers with the key and result its instantiation binds" {
-    const gpa = std.testing.allocator;
-    var context: TypeContext = undefined;
-    try context.init(gpa, std.testing.io);
-    defer context.deinit();
-    var resolver: TypeResolver = undefined;
-    try resolver.init(&context, gpa, "/tmp/zbc-sdk-map-instantiation.zig",
-        \\const std = @import("std");
-        \\fn observe(map: *std.AutoHashMap(u64, u64)) void {
-        \\    _ = map.get(1);
-        \\    _ = map.count();
-        \\}
-    );
-    defer resolver.deinit();
-    const tree = &resolver.handle.document.tree;
-    const get = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "get", 0))) {
-        .function => |reference| reference,
-        else => return error.MissingCallee,
-    };
-    const count = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "count", 0))) {
-        .function => |reference| reference,
-        else => return error.MissingCallee,
-    };
-
-    // The compiler's own methods, reached through the `AutoHashMap` alias
-    // and the defaults it spells, in the document that declares them.
-    try std.testing.expect(!get.handle.eql(resolver.handle));
-    try std.testing.expect(try resolver.declaredInToolchainFile(get.handle, "/std/hash_map.zig"));
-    try std.testing.expect(try resolver.declaredInToolchainFile(count.handle, "/std/hash_map.zig"));
-
-    // The key the lookup takes is the `K` this map was instantiated with and
-    // its result the `V`, so a rule reading the callee learns 64 bits on both
-    // sides instead of a bare `K` and `V` it cannot use.
-    const get_function = try testActualFunction(get);
-    var key: ?Analyser.Type = null;
-    for (get_function.parameters[1..]) |parameter| {
-        if (std.mem.eql(u8, parameter.name orelse "", "key")) key = parameter.type;
-    }
-    try std.testing.expectEqual(@as(?u16, 64), try testUnsignedBitsOf(&resolver, key orelse return error.MissingKeyParameter));
-    try std.testing.expectEqual(@as(?u16, 64), try testUnsignedBitsOf(
-        &resolver,
-        try testOptionalPayload(&resolver, get_function.return_value.*),
-    ));
-    // `count` answers with the table's own `Size`: an integer whose width is
-    // the SDK's to choose, so only "a known unsigned integer" is asserted.
-    const counted = (try resolver.intInfoOfType((try testActualFunction(count)).return_value.*)) orelse
-        return error.MissingCountType;
-    try std.testing.expect(!counted.signed);
-
-    // One hop further, in the SDK's own document and carrying the same
-    // instantiation: whatever this lookup calls is a `/std/hash_map.zig`
-    // declaration, and not one this file can name.
-    const inner = switch (try (resolver.frameForFunction(get)).functionReferenceOfCall(
-        try testFirstCallInBody(get.tree, get.fn_token),
-    )) {
-        .function => |reference| reference,
-        else => return error.MissingTransitiveCallee,
-    };
-    try std.testing.expect(inner.fn_token != get.fn_token);
-    try std.testing.expect(!inner.handle.eql(resolver.handle));
-    try std.testing.expect(try resolver.declaredInToolchainFile(inner.handle, "/std/hash_map.zig"));
-}
-
 test "a copied vector payload exposes its resolved scalar element type" {
     const gpa = std.testing.allocator;
     var context: TypeContext = undefined;
@@ -3572,6 +5555,32 @@ test "a copied vector payload exposes its resolved scalar element type" {
     const vector = (try resolver.resolutionFrame().typeOfNode(value)).?;
     const element = resolver.childType(vector) orelse return error.MissingVectorElement;
     try std.testing.expectEqual(@as(u16, 64), (try resolver.intInfoOfType(element)).?.bits);
+}
+
+test "error-union child queries retain the allocated slice payload" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-error-union-child.zig",
+        \\const std = @import("std");
+        \\fn allocate(gpa: std.mem.Allocator) ![]u8 {
+        \\    return gpa.alloc(u8, 1);
+        \\}
+        \\fn use(gpa: std.mem.Allocator) void { _ = allocate(gpa); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const call = try testNthCallNamed(tree, "allocate", 0);
+    const frame = resolver.resolutionFrame();
+    const result = (try frame.typeOfNode(call)) orelse return error.MissingResultType;
+    try std.testing.expectEqual(@as(?std.builtin.TypeId, .error_union), resolver.typeTag(result));
+    const payload = resolver.childType(result) orelse return error.MissingErrorPayload;
+    try std.testing.expectEqual(@as(?std.builtin.TypeId, .pointer), resolver.typeTag(payload));
+    try std.testing.expectEqual(@as(?std.builtin.Type.Pointer.Size, .slice), resolver.pointerSize(payload));
+    const element = resolver.childType(payload) orelse return error.MissingSliceElement;
+    try std.testing.expectEqual(@as(?u16, 8), (try resolver.intInfoOfType(element)).?.bits);
 }
 
 test "comptime boolean call bindings keep branch decisions query-local" {
@@ -3599,4 +5608,750 @@ test "comptime boolean call bindings keep branch decisions query-local" {
     try std.testing.expectEqual(@as(?bool, false), try resolver.frameForFunction(no).boolValueOfNode(formal));
     try std.testing.expectEqual(@as(?bool, true), try resolver.frameForFunction(yes).boolValueOfNode(formal));
     try std.testing.expect(!yes.actual_type.eql(no.actual_type));
+}
+test "returned callable values retain their declarations and factory bindings" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-returned-callable.zig",
+        \\fn makeEql(comptime K: type, comptime Context: type) fn(Context, K, K) bool {
+        \\    return struct {
+        \\        fn eql(ctx: Context, a: K, b: K) bool {
+        \\            _ = ctx;
+        \\            return a == b;
+        \\        }
+        \\    }.eql;
+        \\}
+        \\fn AutoContext(comptime K: type) type {
+        \\    return struct {
+        \\        pub const eql = makeEql(K, @This());
+        \\    };
+        \\}
+        \\fn invoke(context: anytype, value: anytype) bool {
+        \\    return context.eql(undefined, value, value);
+        \\}
+        \\fn invokeImplicit(context: anytype, value: anytype) bool {
+        \\    return context.eql(value, value);
+        \\}
+        \\fn useImplicitWide() bool { return invokeImplicit(AutoContext(u64){}, @as(u64, 1)); }
+        \\fn useImplicitNarrow() bool { return invokeImplicit(AutoContext(u8){}, @as(u8, 1)); }
+        \\fn useWide() bool { return invoke(AutoContext(u64){}, @as(u64, 1)); }
+        \\fn useNarrow() bool { return invoke(AutoContext(u8){}, @as(u8, 1)); }
+        \\fn dynamic(callback: *const fn(u64) bool, value: u64) bool {
+        \\    return callback(value);
+        \\}
+        \\fn nonCallable(value: u64) void { _ = value(1); }
+        \\fn chooseDifferent(flag: bool) fn(u64) bool {
+        \\    if (flag) {
+        \\        return struct {
+        \\            fn left(value: u64) bool { return true; }
+        \\        }.left;
+        \\    }
+        \\    return struct {
+        \\        fn right(value: u64) bool { return false; }
+        \\    }.right;
+        \\}
+        \\fn ambiguous(flag: bool, value: u64) bool {
+        \\    const callback = chooseDifferent(flag);
+        \\    return callback(value);
+        \\}
+        \\fn makeSameArity(comptime T: type, comptime flag: bool) fn(T, T) bool {
+        \\    _ = flag;
+        \\    return struct {
+        \\        fn same(a: T, b: T) bool { return a == b; }
+        \\    }.same;
+        \\}
+        \\fn useSameArity(value: u64) bool {
+        \\    const callback = makeSameArity(u64, true);
+        \\    return callback(value, value);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+
+    const wide = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "invoke", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingWideFactoryFrame,
+    };
+    const narrow = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "invoke", 1),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingNarrowFactoryFrame,
+    };
+    const callback_call = try testNthCallNamed(tree, "eql", 0);
+    const wide_callback = switch (try resolver.frameForFunction(wide).functionReferenceOfCall(
+        callback_call,
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingWideReturnedCallable,
+    };
+    const narrow_callback = switch (try resolver.frameForFunction(narrow).functionReferenceOfCall(
+        callback_call,
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingNarrowReturnedCallable,
+    };
+
+    for ([_]TypeResolver.FunctionReference{ wide, narrow }, 0..) |caller, occurrence| {
+        const context_type = caller.actual_type.data.function.parameters[0].type;
+        if (context_type.data != .container) return error.MissingBoundContextType;
+        const factory = switch (try resolver.frameForContainer(context_type.data.container).functionReferenceOfCall(
+            try testNthCallNamed(tree, "makeEql", 0),
+        )) {
+            .function => |reference| reference,
+            else => return error.MissingCanonicalFactory,
+        };
+        const actual_factory = try testActualFunction(factory);
+        if (actual_factory.container_type.data != .container) return error.MissingFactoryOwner;
+        const owner = actual_factory.container_type.data.container;
+        try std.testing.expect(owner.scope_handle.scope == .root);
+        const actual_context = owner.bound_params.get(.{
+            .token = actual_factory.parameters[1].name_token.?,
+            .handle = factory.handle,
+        }) orelse return error.MissingFactoryContextBinding;
+        try std.testing.expect(context_type.eql(actual_context));
+        const actual_key = owner.bound_params.get(.{
+            .token = actual_factory.parameters[0].name_token.?,
+            .handle = factory.handle,
+        }) orelse return error.MissingFactoryKeyBinding;
+        try std.testing.expectEqual(
+            @as(?u16, if (occurrence == 0) 64 else 8),
+            try testUnsignedBitsOf(&resolver, actual_key),
+        );
+    }
+    try std.testing.expect(wide_callback.handle.eql(resolver.handle));
+    try std.testing.expect(wide_callback.fn_token == narrow_callback.fn_token);
+    try std.testing.expect(!TypeResolver.ActualTypeID.eql(
+        wide_callback.actual_type,
+        narrow_callback.actual_type,
+    ));
+    const wide_function = try testActualFunction(wide_callback);
+    const narrow_function = try testActualFunction(narrow_callback);
+    try std.testing.expectEqualStrings("eql", wide_function.name.?);
+    try std.testing.expectEqual(
+        @as(?u16, 64),
+        try testUnsignedBitsOf(&resolver, wide_function.parameters[1].type),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, 8),
+        try testUnsignedBitsOf(&resolver, narrow_function.parameters[1].type),
+    );
+
+    const implicit_call = try testNthCallNamed(tree, "eql", 1);
+    for (0..2) |occurrence| {
+        const invoke = switch (try resolver.functionReferenceOfCall(
+            try testNthCallNamed(tree, "invokeImplicit", occurrence),
+        )) {
+            .function => |reference| reference,
+            else => return error.MissingImplicitFactoryFrame,
+        };
+        const frame = resolver.frameForFunction(invoke);
+        const callback = switch (try frame.functionReferenceOfCall(implicit_call)) {
+            .function => |reference| reference,
+            else => return error.MissingImplicitReturnedCallable,
+        };
+        try std.testing.expectEqualStrings("eql", (try testActualFunction(callback)).name.?);
+        try std.testing.expectEqual(
+            @as(?u16, if (occurrence == 0) 64 else 8),
+            try testUnsignedBitsOf(&resolver, (try testActualFunction(callback)).parameters[1].type),
+        );
+        var arguments_buffer: [2]Ast.Node.Index = undefined;
+        const arguments = (try frame.callArgumentsOf(&arguments_buffer, implicit_call)) orelse
+            return error.MissingImplicitReceiver;
+        try std.testing.expect(arguments.receiver != null);
+    }
+
+    const same_factory = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "makeSameArity", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingSameArityFactory,
+    };
+    const same_callback = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "callback", 2),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingSameArityReturnedCallable,
+    };
+    try std.testing.expect(same_factory.fn_token != same_callback.fn_token);
+    try std.testing.expectEqualStrings("same", (try testActualFunction(same_callback)).name.?);
+    const non_callable_call = try testNthCallNamed(tree, "value", 0);
+    switch (try resolver.functionReferenceOfCall(non_callable_call)) {
+        .not_callable => {},
+        else => return error.KnownValueMustRemainNotCallable,
+    }
+    switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "callback", 0))) {
+        .unknown => {},
+        else => return error.RuntimeFunctionPointerMustRemainUnknown,
+    }
+    switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "callback", 1))) {
+        .unknown => {},
+        else => return error.DifferentReturnedValuesMustRemainUnknown,
+    }
+}
+test "callable resolution preserves direct receiver and namespace bindings" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-direct-callable-bindings.zig",
+        \\const std = @import("std");
+        \\const Cell = struct {
+        \\    value: u32,
+        \\    fn make(default: u32) Cell { return .{ .value = default }; }
+        \\    fn setValue(self: *Cell, next: u32) void { self.value = next; }
+        \\};
+        \\const Alias = Cell;
+        \\fn throughAlias(seed: u32) Cell { return Alias.make(seed); }
+        \\fn throughContainer(seed: u32) Cell { return Cell.make(seed); }
+        \\fn throughReceiver(box: *Cell, next: u32) void { box.setValue(next); }
+        \\fn throughQualifiedReceiver(box: *Cell, next: u32) void {
+        \\    Alias.setValue(box, next);
+        \\}
+        \\const Namespace = struct {
+        \\    fn add(value: u32) u32 { return value + 1; }
+        \\};
+        \\const NamespaceAlias = Namespace;
+        \\fn throughNamespaceAlias(value: u32) u32 { return NamespaceAlias.add(value); }
+        \\fn direct(value: u32) u32 { return value; }
+        \\const FunctionAlias = direct;
+        \\fn throughConstAlias(value: u32) u32 { return FunctionAlias(value); }
+        \\fn sizeOwn(map: *std.AutoHashMap(u64, u64)) usize { return map.count(); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+
+    const alias_make = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "make", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingAliasFactory,
+    };
+    const container_make = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "make", 1))) {
+        .function => |reference| reference,
+        else => return error.MissingContainerFactory,
+    };
+    try std.testing.expect(alias_make.fn_token == container_make.fn_token);
+    try std.testing.expect(alias_make.handle.eql(container_make.handle));
+
+    const implicit_receiver = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "setValue", 0))) {
+        .function => |reference| reference,
+        else => return error.MissingImplicitReceiverCall,
+    };
+    const explicit_receiver = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "setValue", 1))) {
+        .function => |reference| reference,
+        else => return error.MissingExplicitReceiverCall,
+    };
+    try std.testing.expect(implicit_receiver.fn_token == explicit_receiver.fn_token);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        (try testActualFunction(implicit_receiver)).parameters.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        (try testActualFunction(explicit_receiver)).parameters.len,
+    );
+    try std.testing.expectEqualStrings("Cell", try testReceiverContainerName(&resolver, implicit_receiver));
+    try std.testing.expectEqualStrings("Cell", try testReceiverContainerName(&resolver, explicit_receiver));
+
+    const namespace_call = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "add", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingNamespaceAliasCall,
+    };
+    try std.testing.expectEqualStrings("add", (try testActualFunction(namespace_call)).name.?);
+
+    const const_alias_call = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "FunctionAlias", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingImmutableFunctionAlias,
+    };
+    try std.testing.expectEqualStrings("direct", (try testActualFunction(const_alias_call)).name.?);
+
+    const sdk_call = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "count", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingSdkReceiverCall,
+    };
+    try std.testing.expect(!sdk_call.handle.eql(resolver.handle));
+}
+
+test "bodyless factories do not authenticate their return signatures" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-bodyless-callable-factory.zig",
+        \\extern fn makeCallback() *const fn(u8) bool;
+        \\fn invoke(value: u8) bool {
+        \\    const callback = makeCallback();
+        \\    return callback(value);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const factory = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "makeCallback", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingBodylessFactory,
+    };
+    try std.testing.expectEqualStrings("makeCallback", (try testActualFunction(factory)).name.?);
+    switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "callback", 0))) {
+        .unknown => {},
+        else => return error.BodylessFactoryMustNotAuthenticateReturnSignature,
+    }
+}
+
+test "named variadic prototypes retain identity without fixed argument bindings" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-variadic-callable.zig",
+        \\extern fn variadic(first: u8, ...) void;
+        \\const VariadicAlias = variadic;
+        \\fn invoke() void { VariadicAlias(1, 2); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const call_node = try testNthCallNamed(tree, "VariadicAlias", 0);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node).?;
+    const reference = switch (try resolver.functionReference(call.ast.fn_expr)) {
+        .function => |reference| reference,
+        else => return error.MissingVariadicDeclaration,
+    };
+    const function = try testActualFunction(reference);
+    try std.testing.expectEqualStrings("variadic", function.name.?);
+    try std.testing.expect(function.has_varargs);
+    try std.testing.expectEqual(@as(usize, 1), function.parameters.len);
+    try std.testing.expect(reference.handle.eql(resolver.handle));
+    switch (try resolver.functionReferenceOfCall(call_node)) {
+        .unknown => {},
+        else => return error.VariadicArgumentsMustRemainUnbound,
+    }
+}
+
+test "canonical receiver contexts preserve generic declaration literal arguments" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-canonical-receiver-context.zig",
+        \\const Alignment = enum {
+        \\    natural,
+        \\    fn of(comptime T: type) Alignment { _ = T; return .natural; }
+        \\};
+        \\const Allocator = struct {
+        \\    const Self = @This();
+        \\    fn create(self: Self, comptime T: type) void {
+        \\        self.useAlignment(.of(T));
+        \\    }
+        \\    fn useAlignment(self: Self, alignment: Alignment) void {
+        \\        _ = self;
+        \\        _ = alignment;
+        \\    }
+        \\};
+        \\fn use(allocator: Allocator) void {
+        \\    allocator.create(u8);
+        \\    allocator.create(u64);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var literal_call: ?Ast.Node.Index = null;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        switch (tag) {
+            .call, .call_comma, .call_one, .call_one_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node).?;
+        if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) literal_call = node;
+    }
+    const node = literal_call orelse return error.MissingDeclarationLiteral;
+    var actuals: [2]TypeResolver.FunctionReference = undefined;
+    for (&actuals, 0..) |*actual, index| {
+        const create = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "create", index))) {
+            .function => |reference| reference,
+            else => return error.MissingGenericReceiver,
+        };
+        const frame = resolver.frameForFunction(create);
+        actual.* = switch (try frame.functionReferenceOfCall(node)) {
+            .function => |reference| reference,
+            else => return error.MissingContextualDeclaration,
+        };
+        try std.testing.expectEqualStrings("of", (try testActualFunction(actual.*)).name.?);
+    }
+    try std.testing.expectEqual(actuals[0].fn_token, actuals[1].fn_token);
+    try std.testing.expect(!actuals[0].actual_type.eql(actuals[1].actual_type));
+}
+
+test "contextual declaration calls authenticate their expected owner" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-contextual-callable-owner.zig",
+        \\const Query = struct {
+        \\    fn submit(value: *u8) Query { _ = value; return .{}; }
+        \\};
+        \\const Other = struct {
+        \\    fn submit(value: *u8) Other { _ = value; return .{}; }
+        \\};
+        \\fn add(query: Query) void { _ = query; }
+        \\fn invoke(value: *u8) void {
+        \\    add(.submit(value));
+        \\    add(Query.submit(value));
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const direct = switch (try resolver.functionReferenceOfCall(
+        try testNthCallNamed(tree, "submit", 0),
+    )) {
+        .function => |reference| reference,
+        else => return error.MissingDirectDeclaration,
+    };
+    var found = false;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        switch (tag) {
+            .call, .call_comma, .call_one, .call_one_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = tree.fullCall(buffer[0..1], node).?;
+        if (tree.nodeTag(call.ast.fn_expr) != .enum_literal) continue;
+        const reached = switch (try resolver.functionReferenceOfCall(node)) {
+            .function => |reference| reference,
+            else => return error.MissingContextualDeclaration,
+        };
+        try std.testing.expect(reached.handle.eql(direct.handle));
+        try std.testing.expectEqual(direct.fn_token, reached.fn_token);
+        const arguments = (try resolver.callArgumentsOf(&buffer, node)).?;
+        try std.testing.expect(arguments.receiver == null);
+        try std.testing.expectEqual(@as(usize, 1), arguments.arguments.len);
+        try std.testing.expectEqual(
+            call.ast.params[0],
+            (try resolver.callArgumentIn(&buffer, node, 0)).?,
+        );
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "call intrinsic shares authentic generic identity and explicit argument mapping" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-call-intrinsic-operands.zig",
+        \\const Owner = struct {
+        \\    fn update(comptime T: type, value: *T) void { value.* = 0; }
+        \\};
+        \\fn run(value: *u8, callback: *const fn (*u8) void, args: struct { *u8 }) void {
+        \\    @call(.always_inline, Owner.update, .{u8, value});
+        \\    @call(.auto, callback, .{value});
+        \\    @call(.auto, callback, args);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        switch (tag) {
+            .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call")) continue;
+        const operands = tree.extraDataSlice(tree.nodeData(node).extra_range, Ast.Node.Index);
+        if (tree.nodeTag(operands[1]) == .field_access) {
+            const reference = switch (try resolver.functionReferenceOfCall(node)) {
+                .function => |reference| reference,
+                else => return error.MissingIntrinsicDeclaration,
+            };
+            try std.testing.expectEqualStrings("update", (try testActualFunction(reference)).name.?);
+            var buffer: [2]Ast.Node.Index = undefined;
+            const arguments = (try resolver.callArgumentsOf(&buffer, node)) orelse return error.MissingIntrinsicArguments;
+            try std.testing.expect(arguments.receiver == null);
+            try std.testing.expectEqual(@as(usize, 2), arguments.arguments.len);
+            try std.testing.expectEqualStrings("value", tree.tokenSlice(tree.nodeMainToken(
+                (try resolver.callArgumentIn(&buffer, node, 1)).?,
+            )));
+        } else {
+            try std.testing.expect((try resolver.functionReferenceOfCall(node)) == .unknown);
+        }
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "integer destination queries retain scalar contexts and stop at unrelated operands" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-integer-destination-context.zig",
+        \\fn take(value: u16) void { _ = value; }
+        \\fn wide(value: u64) void { _ = value; }
+        \\fn scalar(value: u64, floating: f64) u32 {
+        \\    _ = @as(u8, @intCast(value));
+        \\    _ = @as(u64, @intCast(value));
+        \\    take(@intCast(value));
+        \\    wide(@intCast(value));
+        \\    var narrow: u16 = 0;
+        \\    narrow += (@intCast(value));
+        \\    narrow -%= @intCast(value);
+        \\    narrow *|= @intCast(value);
+        \\    narrow &= @intCast(value);
+        \\    narrow *= @intCast(value);
+        \\    narrow /= @intCast(value);
+        \\    narrow %= @intCast(value);
+        \\    narrow -= @intCast(value);
+        \\    narrow |= @intCast(value);
+        \\    narrow ^= @intCast(value);
+        \\    narrow *%= @intCast(value);
+        \\    narrow +%= @intCast(value);
+        \\    narrow +|= @intCast(value);
+        \\    narrow -|= @intCast(value);
+        \\    narrow <<= @intCast(value);
+        \\    narrow <<|= @intCast(value);
+        \\    narrow >>= @intCast(value);
+        \\    take(@as(u64, @intCast(value)));
+        \\    take(missing(@intCast(value)));
+        \\    take(.{ .field = @intCast(value) });
+        \\    return @intFromFloat(floating);
+        \\}
+    );
+    defer resolver.deinit();
+    const expected = [_]?u16{ 8, 64, 16, 64 } ++ ([_]?u16{16} ** 14) ++
+        [_]?u16{ null, null, null, 64, null, null, 32 };
+    const tree = &resolver.handle.document.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        if (!std.mem.eql(u8, name, "@intCast") and !std.mem.eql(u8, name, "@intFromFloat")) continue;
+        try std.testing.expect(seen < expected.len);
+        const info = try resolver.contextIntInfo(node);
+        try std.testing.expectEqual(expected[seen], if (info) |integer| @as(?u16, integer.bits) else null);
+        if (info) |integer| try std.testing.expect(!integer.signed);
+        seen += 1;
+    }
+    try std.testing.expectEqual(expected.len, seen);
+}
+
+test "integer destination queries unwrap optional and error-union payloads only" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-wrapped-integer-destination.zig",
+        \\fn optional(value: f64) ?u64 { return @intFromFloat(value); }
+        \\fn fallible(value: f64) error{Bad}!i16 { return @intFromFloat(value); }
+        \\fn both(value: u64) error{Bad}!?u8 { return @intCast(value); }
+        \\fn explicit(value: u64) void { _ = @as(?u16, @intCast(value)); }
+        \\fn pointer(value: u64) *u8 { return @intCast(value); }
+        \\fn array(value: u64) [1]u8 { return @intCast(value); }
+    );
+    defer resolver.deinit();
+    const expected = [_]?TypeResolver.IntInfo{
+        .{ .signed = false, .bits = 64 },
+        .{ .signed = true, .bits = 16 },
+        .{ .signed = false, .bits = 8 },
+        .{ .signed = false, .bits = 16 },
+        null,
+        null,
+    };
+    const tree = &resolver.handle.document.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        if (!std.mem.eql(u8, name, "@intCast") and !std.mem.eql(u8, name, "@intFromFloat")) continue;
+        try std.testing.expect(seen < expected.len);
+        try std.testing.expectEqual(expected[seen], try resolver.contextIntInfo(node));
+        seen += 1;
+    }
+    try std.testing.expectEqual(expected.len, seen);
+}
+
+test "integer destination queries follow nested struct and union payloads in calls and returns" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-aggregate-integer-destination.zig",
+        \\const Payload = struct { narrow: u8, wide: u64 };
+        \\const Choice = union(enum) { payload: Payload, signed: i16 };
+        \\const Outer = struct { choice: Choice };
+        \\fn take(value: Outer) void { _ = value; }
+        \\fn calls(value: u64) void {
+        \\    take(.{ .choice = .{ .payload = .{
+        \\        .narrow = @intCast(value), .wide = @intCast(value),
+        \\    } } });
+        \\    take(.{ .choice = .{ .signed = @intCast(value) } });
+        \\}
+        \\fn returned(value: u64) Outer {
+        \\    return .{ .choice = .{ .payload = .{
+        \\        .narrow = @intCast(value), .wide = @intCast(value),
+        \\    } } };
+        \\}
+        \\fn unknown(value: u64) Missing {
+        \\    return .{ .choice = .{ .payload = .{ .narrow = @intCast(value) } } };
+        \\}
+    );
+    defer resolver.deinit();
+    const expected = [_]?TypeResolver.IntInfo{
+        .{ .signed = false, .bits = 8 },
+        .{ .signed = false, .bits = 64 },
+        .{ .signed = true, .bits = 16 },
+        .{ .signed = false, .bits = 8 },
+        .{ .signed = false, .bits = 64 },
+        null,
+    };
+    const tree = &resolver.handle.document.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@intCast")) continue;
+        try std.testing.expect(seen < expected.len);
+        try std.testing.expectEqual(expected[seen], try resolver.contextIntInfo(node));
+        seen += 1;
+    }
+    try std.testing.expectEqual(expected.len, seen);
+}
+
+test "integer destination queries retain imported and generic concrete parameter types" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "destinations.zig", .data =
+        \\pub const Payload = struct { small: u8, large: u64 };
+        \\pub fn take(value: Payload) void { _ = value; }
+        \\pub fn generic(comptime T: type, value: T) void { _ = value; }
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var context: TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path,
+        \\const imported = @import("destinations.zig");
+        \\fn Box(comptime T: type) type { return struct { value: T }; }
+        \\fn takeBox(comptime T: type, value: Box(T)) void { _ = value; }
+        \\fn use(value: u64, floating: f64) void {
+        \\    imported.take(.{ .small = @intCast(value), .large = @intCast(value) });
+        \\    imported.generic(u8, @intFromFloat(floating));
+        \\    imported.generic(u64, @intFromFloat(floating));
+        \\    takeBox(u8, .{ .value = @intCast(value) });
+        \\    takeBox(u64, .{ .value = @intCast(value) });
+        \\}
+        \\fn unbound(comptime T: type, value: u64) T { return @intCast(value); }
+    );
+    defer resolver.deinit();
+    const expected = [_]?u16{ 8, 64, 8, 64, 8, 64, null };
+    const tree = &resolver.handle.document.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        if (!std.mem.eql(u8, name, "@intCast") and !std.mem.eql(u8, name, "@intFromFloat")) continue;
+        try std.testing.expect(seen < expected.len);
+        const info = try resolver.contextIntInfo(node);
+        try std.testing.expectEqual(expected[seen], if (info) |integer| @as(?u16, integer.bits) else null);
+        seen += 1;
+    }
+    try std.testing.expectEqual(expected.len, seen);
+}
+
+test "float conversion destination follows resolved struct initializer fields" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-float-field-context.zig",
+        \\const Pipeline = extern struct { bias: f32 };
+        \\const Scratch = struct { rasterization: Pipeline = .{ .bias = 0 } };
+        \\fn depthBias(value: i32) i32 { return value; }
+        \\fn make(value: i32) Pipeline {
+        \\    return .{ .bias = @floatFromInt(depthBias(value)) };
+        \\}
+        \\fn fill(scratch: *Scratch, value: i32) void {
+        \\    scratch.rasterization = .{ .bias = @floatFromInt(depthBias(value)) };
+        \\}
+        \\fn unknown(value: i32) Missing {
+        \\    return .{ .bias = @floatFromInt(value) };
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@floatFromInt")) continue;
+        try std.testing.expectEqual(if (seen < 2) @as(?u16, 32) else null, try resolver.resolutionFrame().floatBits(node));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const params = tree.builtinCallParams(&buffer, node).?;
+        const source = (try resolver.intInfo(params[0])) orelse return error.MissingSourceType;
+        try std.testing.expect(source.signed);
+        try std.testing.expectEqual(@as(u16, 32), source.bits);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "generic allocator metadata retains its bounded integer field type" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-generic-index-bound.zig",
+        \\fn Allocator(comptime T: type) type {
+        \\    return struct {
+        \\        const Node = struct { index: u16 };
+        \\        fn nodeFromObject(object: *T) *Node { _ = object; return undefined; }
+        \\        fn offsetFrom(node: *Node, offset: isize) *Node { _ = offset; return node; }
+        \\        fn deallocate(object: *T) void {
+        \\            const node = nodeFromObject(object);
+        \\            _ = offsetFrom(node, -@as(isize, @intCast(node.index)));
+        \\        }
+        \\    };
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const node = try testFieldAccess(tree, "node");
+    try std.testing.expectEqual(TypeResolver.IntInfo{ .signed = false, .bits = 16 }, (try resolver.intInfo(node)).?);
 }

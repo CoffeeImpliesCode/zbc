@@ -29,6 +29,44 @@ declaring scope. A custom `ArenaAllocator`, a caller-chosen `std` parameter,
 or a custom namespace does not establish this identity. A method named
 `allocator` or `deinit` is not sufficient evidence.
 
+An explicit `*std.heap.ArenaAllocator` field preserves the same declaration
+identity when its allocator is derived at the allocation site. A field typed
+only as `std.mem.Allocator` does not establish this ownership contract.
+
+For typed checks, the rule authenticates standard-library allocation
+declarations and binds result storage to the allocator formal. Unmanaged
+`std.array_hash_map` `clone` and `cloneContext` use the supplied allocator;
+passing a proved arena therefore covers their fresh backing storage.
+An unrelated arena argument, a managed map's stored general allocator, or
+a project method named `clone` does not establish this proof.
+
+Source helpers are checked in the resolved declaration's actual frame.
+Every call that can acquire a non-value result must use proved arena
+storage or have a body with the same proof. Scalar and void results do not
+prove harmless effects: they can allocate through out-parameters or
+captured storage. Such calls require a complete read-only effect
+certificate or the same body check. Recursive edges retain the complete
+callable identity, including generic bindings; all other edges must still
+pass. Missing bodies and unknown effects remain unproved.
+The check also visits nested operands in the first initializer: an
+arena-allocated outer header cannot cover a payload allocated by a general
+allocator while its arguments are evaluated. Copies of existing headers
+do not acquire new storage.
+
+Compiler intrinsics are checked by allocation capability, not by read-only
+effects or result type. Atomics, arithmetic, casts, and memory copies cannot
+acquire fresh storage. Calls in their operands still require the ownership
+proof. A `@field` projection does not invoke its result; an enclosing function
+call must still resolve and pass the same proof. `@call`, `@extern`,
+`@wasmMemoryGrow`, frame intrinsics, and unknown builtins remain unproved.
+
+Each first-initializer query owns its effect memo and one existing 50,000-step
+allowance. Recursive helper depth remains bounded at 16. Completed helper
+proofs retain the actual callable identity and are reused only within this
+query. Declaration identity does not request a normal-cleanup summary; an
+unrelated consumer's failed summary must not change allocation provenance.
+Budget exhaustion propagates as incomplete rule analysis, not a leak finding.
+
 ## Why it matters
 
 `errdefer` works at statement level — it is not legal inside a struct literal expression. This means:

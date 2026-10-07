@@ -44,7 +44,6 @@ const file_cache_mod = @import("../cache/file_cache.zig");
 const FileCache = file_cache_mod.FileCache;
 const TokenIndex = tokens.TokenIndex;
 
-
 /// The module `@import("…")` written in `[first, last]` names, or
 /// null when that range is not exactly that call.  `first` is the
 /// `@import` builtin and `last` its closing paren; the literal is
@@ -318,13 +317,11 @@ const Answer = union(enum) {
 /// this frame cannot say — a scope this walk could not read, out of
 /// memory, or a budget spent.  Such a frame may still declare the
 /// name, so the frame outside it must not answer in its place.
-
 /// True for the container declarations, the frames whose declarations
 /// are written as members rather than in a body.
 fn isContainerTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
-        .container_decl, .container_decl_trailing, .container_decl_two,
-        .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => true,
+        .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => true,
         else => false,
     };
 }
@@ -344,9 +341,11 @@ const Walk = struct {
         return self.charge(1);
     }
 
-    fn charge(self: *Walk, ticks: u32) bool {
-        if (self.left < ticks) return false;
-        self.left -= ticks;
+    // Compare collection costs at their native width before narrowing the
+    // cost that fits the remaining bounded counter.
+    fn charge(self: *Walk, ticks: usize) bool {
+        if (ticks > @as(usize, self.left)) return false;
+        self.left -= @intCast(ticks);
         return true;
     }
 
@@ -412,43 +411,37 @@ const Walk = struct {
     /// The scopes a use at `use_token` is written in, or null when one
     /// of them cannot be read.
     ///
-    /// One pass over the nodes fills every frame: the functions whose
-    /// bodies cover the token and the containers whose bodies do,
-    /// merged into the order they nest in — which is the order their
-    /// first tokens run backwards.  The engine's scope index answers
-    /// only the INNERMOST function and is not consulted here — a type
-    /// factory around the use is as much a frame as the factory's own
-    /// body, and the file model indexes no container written inside
-    /// one at all, so neither seam can say what this pass says.
+    /// Follow the syntax path containing the token. Sibling initializers
+    /// and function bodies cannot enclose it, so their descendants are not
+    /// part of this query's work. Read every function and container on that
+    /// path, including factories outside the innermost function.
     ///
-    /// Charged a node at a time.  A walk that cannot finish refuses,
-    /// rather than reaching the file's top level behind a shadow it
-    /// never looked for.
+    /// Each inspected child spends a step. No recursion or temporary tree
+    /// is needed: syntax children have disjoint source spans, so at most
+    /// one child can contain the token.
     fn scopeAt(self: *Walk, use_token: TokenIndex) ?Scope {
         var scope: Scope = .{};
         const tree = self.tree;
-        var idx: u32 = 1;
-        while (idx < tree.nodes.len) : (idx += 1) {
+        const Iterator = @import("type_engine").AstIterator;
+        var children: Iterator = .{ .sub_range = .{
+            .items = tree.nodeData(.root).extra_range,
+        } };
+        while (children.next(tree)) |node| {
             if (!self.step()) return null;
-            const node: Ast.Node.Index = @enumFromInt(idx);
-            // Only a declaration is a scope, and only its own span
-            // matters.  The tag decides that, so it is asked FIRST:
-            // reading a node's first and last token walks down into it,
-            // and doing that for every expression in the file is what
-            // made one body of binary operators cost more than the
-            // file has nodes in it.
+            if (use_token < tree.firstToken(node) or use_token > tree.lastToken(node)) continue;
             const tag = tree.nodeTag(node);
             const container = isContainerTag(tag);
-            if (!container and tag != .fn_decl) continue;
-            if (use_token < tree.firstToken(node) or use_token > tree.lastToken(node)) continue;
-            if (container) {
-                if (scope.containers == container_frames) return null;
-                scope.containers += 1;
-            } else {
-                if (scope.functions == function_frames) return null;
-                scope.functions += 1;
+            if (container or tag == .fn_decl) {
+                if (container) {
+                    if (scope.containers == container_frames) return null;
+                    scope.containers += 1;
+                } else {
+                    if (scope.functions == function_frames) return null;
+                    scope.functions += 1;
+                }
+                if (!scope.frames.insert(tree, node)) return null;
             }
-            if (!scope.frames.insert(tree, node)) return null;
+            children = Iterator.init(tree, node);
         }
         return scope;
     }
@@ -523,7 +516,7 @@ const Walk = struct {
             // parameter is visible from outside a body, and
             // `fn f(comptime std: type, a: std.mem.Allocator) type`
             // names the CALLER's std there, not this file's import.
-            if (!self.charge(@intCast(bindings.items.len))) return null;
+            if (!self.charge(bindings.items.len)) return null;
             for (bindings.items) |*candidate| {
                 if (candidate.origin != .param) continue;
                 if (candidate.name_token > use_token) continue;
@@ -531,7 +524,7 @@ const Walk = struct {
             }
             return .absent;
         }
-        if (!self.charge(@intCast(bindings.items.len))) return null;
+        if (!self.charge(bindings.items.len)) return null;
         const binding = bindings.findAt(name, use_token) orelse return .absent;
         switch (binding.origin) {
             // A parameter is a value handed in and a capture is a
@@ -544,13 +537,15 @@ const Walk = struct {
         // A `var` can be written to after the question is asked, so
         // what it holds at the use is not what its initializer said.
         if (!binding.is_const) return .shadowed;
-        return .{ .found = .{
-            .range = .{ .first = binding.rhs_first, .last = binding.rhs_last },
-            .anchor = binding.name_token,
-            // A local is written inside a body, so the scopes around
-            // its value have to be read again.
-            .frames = .any,
-        } };
+        return .{
+            .found = .{
+                .range = .{ .first = binding.rhs_first, .last = binding.rhs_last },
+                .anchor = binding.name_token,
+                // A local is written inside a body, so the scopes around
+                // its value have to be read again.
+                .frames = .any,
+            },
+        };
     }
 
     /// What `container` declares under the name `name`, or null when
@@ -572,13 +567,15 @@ const Walk = struct {
             // its initializer somewhere else.
             if (tree.tokenTag(declared.ast.mut_token) != .keyword_const) return .shadowed;
             const initializer = declared.ast.init_node.unwrap() orelse return .shadowed;
-            return .{ .found = .{
-                .range = .{ .first = tree.firstToken(initializer), .last = tree.lastToken(initializer) },
-                .anchor = name_token,
-                // A member is written inside a body, so the scopes
-                // around its value have to be read again.
-                .frames = .any,
-            } };
+            return .{
+                .found = .{
+                    .range = .{ .first = tree.firstToken(initializer), .last = tree.lastToken(initializer) },
+                    .anchor = name_token,
+                    // A member is written inside a body, so the scopes
+                    // around its value have to be read again.
+                    .frames = .any,
+                },
+            };
         }
         return .absent;
     }
@@ -595,13 +592,15 @@ const Walk = struct {
         const initializer = (self.cache.fileConstInitializer(name) catch return null) orelse return null;
         const tree = self.tree;
         const first = tree.firstToken(initializer);
-        return .{ .const_value = .{
-            .range = .{ .first = first, .last = tree.lastToken(initializer) },
-            // A root declaration's value is written in this file's own
-            // scope, so its names are read there.
-            .anchor = first,
-            .frames = .root,
-        } };
+        return .{
+            .const_value = .{
+                .range = .{ .first = first, .last = tree.lastToken(initializer) },
+                // A root declaration's value is written in this file's own
+                // scope, so its names are read there.
+                .anchor = first,
+                .frames = .root,
+            },
+        };
     }
 
     /// The dotted name written in `[first..last]`: identifiers
@@ -675,3 +674,21 @@ const Walk = struct {
         return t;
     }
 };
+
+test "budget charges reject wide costs before narrowing" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "", .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    var walk = Walk.init(&cache, &tree, .{});
+    const remaining = walk.left;
+    try std.testing.expect(!walk.charge(std.math.maxInt(usize)));
+    try std.testing.expectEqual(remaining, walk.left);
+    try std.testing.expect(!walk.charge(@as(usize, remaining) + 1));
+    try std.testing.expectEqual(remaining, walk.left);
+    try std.testing.expect(walk.charge(remaining));
+    try std.testing.expectEqual(@as(u32, 0), walk.left);
+    try std.testing.expect(walk.charge(0));
+    try std.testing.expect(!walk.charge(1));
+}

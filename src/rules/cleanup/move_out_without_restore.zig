@@ -167,8 +167,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, m.name_token),
-        .end = Pos.fromTokenEnd(tree, m.name_token),
+        .start = try Pos.fromTokenStart(tree, m.name_token),
+        .end = try Pos.fromTokenEnd(tree, m.name_token),
         .message = msg,
     });
 }

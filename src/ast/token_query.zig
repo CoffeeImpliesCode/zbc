@@ -516,7 +516,6 @@ pub fn matchExact(
     return m;
 }
 
-
 /// True iff `atoms` matches anywhere in `[start, last]`, INCLUDING
 /// inside defer/errdefer (which findInSameScope skips).  Used for
 /// "is there ANY .release() in this fn body, even guarded by defer".
@@ -735,8 +734,8 @@ test "matchAt: any_of fails if no alternative matches" {
     const atoms = &[_]Atom{
         .{ .capture = 0 },
         .{ .any_of = &[_][]const Atom{
-            &[_]Atom{ .{ .tok = .period_asterisk } },
-            &[_]Atom{ .{ .tok = .period } },
+            &[_]Atom{.{ .tok = .period_asterisk }},
+            &[_]Atom{.{ .tok = .period }},
         } },
     };
     const matches = try findAll(testing.allocator, &tree, atoms, 0, last);

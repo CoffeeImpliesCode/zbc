@@ -15,8 +15,16 @@ The rule fires on two forms:
 
 The rule is quiet when the cast is provably safe:
 
-- **An explicitly aligned receiver** — `recv: []align(N) u8`, or a buffer
-  from `alignedAlloc`, is aligned by construction.
+- **An explicitly aligned receiver** whose alignment is proved to cover
+  the declared cast target. A real `std.mem.Allocator.alignedAlloc` call
+  with `.of(Target)` supplies this guarantee. A similarly named method,
+  weaker alignment, or unresolved target does not.
+- **Validated placement storage** — a same-block rejection of
+  `@intFromPtr(bytes.ptr) % @alignOf(Target) != 0`, or a real
+  `std.debug.assert` of the corresponding equality, proves this address.
+  Constant aliases and `@max` of known power-of-two alignments can supply
+  the modulus. The slice must not be replaced or its address escape.
+  Validation on only one branch cannot prove a cast after that branch.
 - **A non-byte slice** — `[]u32`, `[]Struct`, … is already wider than one
   byte, so `.ptr` is not the bug class this rule names.
 - **A guarded allocator context.** Recovering an allocator back out of its

@@ -4,8 +4,14 @@
 //! framework later without rewriting rules. For now we self-host —
 //! zlinter requires Zig 0.16.0 release / 0.17.0-dev (pulls ZLS), and
 //! we're on 0.16.0-dev.3028.
+//!
+//! `Pos` constructors read positions from the original AST source and
+//! return `error.SourceTooWide` before token reads when its byte length
+//! cannot leave room for a 1-indexed end column. Coordinate additions
+//! and narrowing also return that error; no position is truncated.
 
 const std = @import("std");
+const budget_mod = @import("budget.zig");
 
 pub const Severity = enum { off, warning, @"error" };
 
@@ -30,23 +36,34 @@ pub const Pos = struct {
     /// Byte offset into the source file.
     byte: u32,
 
-    pub fn fromTokenStart(tree: *const std.zig.Ast, tok: std.zig.Ast.TokenIndex) Pos {
+    /// Position in the original AST source. `tok` must belong to `tree`.
+    /// Refuses an unrepresentable source before reading any token.
+    pub fn fromTokenStart(tree: *const std.zig.Ast, tok: std.zig.Ast.TokenIndex) error{SourceTooWide}!Pos {
+        if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
         const loc = tree.tokenLocation(0, tok);
+        const line = std.math.cast(u32, loc.line) orelse return error.SourceTooWide;
+        const column = std.math.cast(u32, loc.column) orelse return error.SourceTooWide;
         return .{
-            .line = @intCast(loc.line + 1),
-            .column = @intCast(loc.column + 1),
-            .byte = @intCast(tree.tokens.items(.start)[tok]),
+            .line = std.math.add(u32, line, 1) catch return error.SourceTooWide,
+            .column = std.math.add(u32, column, 1) catch return error.SourceTooWide,
+            .byte = tree.tokens.items(.start)[tok],
         };
     }
 
-    pub fn fromTokenEnd(tree: *const std.zig.Ast, tok: std.zig.Ast.TokenIndex) Pos {
+    /// Exclusive end in the original AST source. `tok` must belong to `tree`.
+    /// The source bound leaves room for the 1-indexed column past its end.
+    pub fn fromTokenEnd(tree: *const std.zig.Ast, tok: std.zig.Ast.TokenIndex) error{SourceTooWide}!Pos {
+        if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
         const start = tree.tokens.items(.start)[tok];
-        const slice = tree.tokenSlice(tok);
-        const end_byte: u32 = @intCast(start + slice.len);
+        const slice_len = std.math.cast(u32, tree.tokenSlice(tok).len) orelse return error.SourceTooWide;
+        const end_byte = std.math.add(u32, start, slice_len) catch return error.SourceTooWide;
         const loc = tree.tokenLocation(0, tok);
+        const line = std.math.cast(u32, loc.line) orelse return error.SourceTooWide;
+        const column = std.math.cast(u32, loc.column) orelse return error.SourceTooWide;
+        const column_end = std.math.add(u32, column, slice_len) catch return error.SourceTooWide;
         return .{
-            .line = @intCast(loc.line + 1),
-            .column = @intCast(loc.column + 1 + slice.len),
+            .line = std.math.add(u32, line, 1) catch return error.SourceTooWide,
+            .column = std.math.add(u32, column_end, 1) catch return error.SourceTooWide,
             .byte = end_byte,
         };
     }
@@ -85,3 +102,56 @@ pub const Problem = struct {
         if (self.witness) |w| gpa.free(w);
     }
 };
+
+/// One part of a file's analysis that stopped on an analysis budget.
+/// Findings from that part are absent; every other part completed.
+pub const Incomplete = struct {
+    pub const Kind = enum {
+        /// Lowering or the flow check of one function.
+        function,
+        /// One pattern rule.
+        rule,
+        /// The file-level summary pass for one function.
+        summary,
+    };
+
+    kind: Kind,
+    /// Function name or rule id. Owned.
+    name: []const u8,
+    /// The limit that tripped. Null when the walk that gave up recorded none.
+    budget: ?budget_mod.Diagnostic,
+
+    pub fn deinit(self: *Incomplete, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+    }
+};
+
+/// Copy `name` and append it as an incomplete part.
+pub fn appendIncomplete(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Incomplete),
+    kind: Incomplete.Kind,
+    name: []const u8,
+    budget: ?budget_mod.Diagnostic,
+) std.mem.Allocator.Error!void {
+    const owned = try gpa.dupe(u8, name);
+    errdefer gpa.free(owned);
+    try list.append(gpa, .{ .kind = kind, .name = owned, .budget = budget });
+}
+
+/// Free and drop every Problem at index `len` and above.
+pub fn truncateProblems(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(Problem), len: usize) void {
+    std.debug.assert(len <= list.items.len);
+    for (list.items[len..]) |*problem| problem.deinit(gpa);
+    list.shrinkRetainingCapacity(len);
+}
+
+test "diagnostic token ends exclude inter-token whitespace and comments" {
+    const allocator = std.testing.allocator;
+    const source = "const alpha = 1 /* gap */ ;";
+    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    defer tree.deinit(allocator);
+
+    const end = try Pos.fromTokenEnd(&tree, 3);
+    try std.testing.expectEqual(Pos{ .line = 1, .column = 16, .byte = 15 }, end);
+}

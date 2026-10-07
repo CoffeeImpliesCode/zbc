@@ -52,10 +52,11 @@ re-baselining.
 
 The analyzer reports coverage for selected root files, not every file on disk.
 `selected=N` includes admitted files and explicitly refused files.
-The counts must satisfy `selected = analyzed + failed`.
+The counts must satisfy `selected = analyzed + partial + failed`.
+A `partial` file reported the findings of every function and rule that finished; stderr lists the others as `zbc: incomplete`.
 Before accepting a mass removal, compare the corpus with the selected root files.
 Neither empty findings (`[]`) nor nonzero counts prove complete coverage.
-Exit `2` means incomplete analysis because selection, parsing, or analysis failed or exceeded a budget.
+Exit `2` means incomplete analysis because selection, parsing, or analysis failed, or a file was only partly analyzed because it exceeded a budget.
 JSON and SARIF go to stdout. Operational diagnostics and the coverage summary go to stderr.
 
 Run the path-identity regressions with:

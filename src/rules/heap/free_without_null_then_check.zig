@@ -29,8 +29,8 @@
 //!      `<alloc>.free(<recv>.<field>);` where `<recv>` is a single
 //!      identifier.
 //!   4. After the free call's `;`, scan the remaining fn body for
-//!      any assignment `<recv>.<field> = ...` at any depth.  If
-//!      found, the field is reset → no fire.
+//!      any assignment `<recv>.<field> = ...` or `<recv>.* = ...`
+//!      at any depth.  If found, the field is reset → no fire.
 //!   5. Otherwise fire at the free call site.
 
 const std = @import("std");
@@ -273,15 +273,13 @@ fn hasFieldReassign(
         if (!std.mem.eql(u8, tree.tokenSlice(t), recv)) continue;
         // `<recv> = ...` — direct rebinding (rare for `self`).
         if (tags[t + 1] == .equal) return true;
-        if (tags[t + 1] != .period) continue;
-        if (t + 2 > last) continue;
-        // `<recv>.* = ...` — whole-struct reset.  `.*` is tokenized
-        // as `.` followed by `asterisk` (period_asterisk is a
-        // SEPARATE tag used in deref-then-something contexts).
-        if (tags[t + 2] == .asterisk) {
-            if (t + 3 <= last and tags[t + 3] == .equal) return true;
+        // `.*` is a single token, including in whole-struct resets.
+        if (tags[t + 1] == .period_asterisk) {
+            if (tags[t + 2] == .equal) return true;
             continue;
         }
+        if (tags[t + 1] != .period) continue;
+        if (t + 2 > last) continue;
         // `<recv>.<field> = ...` — direct field reset.
         if (tags[t + 2] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field)) continue;
@@ -317,8 +315,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "free-without-null-then-check",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, f.method_tok),
-        .end = Pos.fromTokenEnd(tree, f.method_tok),
+        .start = try Pos.fromTokenStart(tree, f.method_tok),
+        .end = try Pos.fromTokenEnd(tree, f.method_tok),
         .message = msg,
     });
 }
@@ -581,4 +579,88 @@ test "free-without-null-then-check: reassign to a fresh allocation counts as res
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-without-null-then-check: whole-receiver empty reset doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8 = &.{},
+        \\    fn release(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\        self.* = .{};
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-without-null-then-check: whole-receiver undefined reset doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8 = &.{},
+        \\    fn release(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\        self.* = undefined;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-without-null-then-check: free without field or receiver reset fires" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8 = &.{},
+        \\    fn release(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "free-without-null-then-check: resetting another receiver still fires" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8 = &.{},
+        \\    fn release(self: *Owner, other: *Owner, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\        other.* = .{};
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "free-without-null-then-check: whole-receiver read is not a reset" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8 = &.{},
+        \\    fn release(self: *Owner, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\        _ = self.*;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }

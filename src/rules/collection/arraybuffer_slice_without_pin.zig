@@ -1,12 +1,11 @@
-//! ArrayBuffer-slice-without-pin detector — a raw byte slice is taken
-//! from a JSC-managed buffer via `.slice()`, `.utf8()`, `.latin1()`,
-//! `.utf16()`, etc., then a function is called that may trigger GC
-//! (via JSC dispatch).  After the GC call, the backing buffer may
-//! have been moved/freed — the slice is now dangling.
+//! Advisory detector for raw-view and GC-dispatch method spellings.
+//! The names alone establish neither a GC-managed buffer nor a GC effect.
+//! Until ownership and dispatch are resolved, findings remain unknown
+//! warnings: callers must check the actual lifetime contract.
 //!
 //! Real-world: oven-sh/bun#31339, multiple instances.
 //!
-//! Fix:
+//! For a confirmed JSC-managed view, its API may require:
 //!   var pinned = buffer.pin(globalObject);
 //!   defer pinned.unpin();
 //!   const bytes = pinned.slice();
@@ -15,7 +14,7 @@
 //!   1. For each fn body, scan for `const/var NAME = recv.slice()` (or
 //!      .utf8(), .latin1(), .utf16(), .utf16le(), .bytes(), .toSlice(),
 //!      .toOwnedSlice(), .constSlice()) — a binding from a raw-view
-//!      method call with a single-ident receiver.
+//!      method spelling. Keep the full receiver path, not only its root.
 //!   2. After that binding (token position), scan for either:
 //!      a. A direct GC-trigger method call: any `any_recv.method(` where
 //!         isGcTriggerMethodName(method) → fire directly.
@@ -56,7 +55,7 @@ pub fn check(
     try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
-/// Raw-view methods that produce a slice into GC-managed buffer memory.
+/// Candidate raw-view spellings; names do not prove GC-managed storage.
 fn isRawSliceMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "slice") or
         std.mem.eql(u8, name, "utf8") or
@@ -69,7 +68,7 @@ fn isRawSliceMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "constSlice");
 }
 
-/// JSC dispatch / GC-triggering method names.
+/// Candidate JSC dispatch spellings; names do not prove a GC effect.
 fn isGcTriggerMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "call") or
         std.mem.eql(u8, name, "callAsFunction") or
@@ -133,7 +132,8 @@ fn calleeBodyMayInvokeGc(
 /// A raw-slice binding we're tracking.
 const SliceBorrow = struct {
     x_name: []const u8,
-    recv_name: []const u8,
+    recv_first: Ast.TokenIndex,
+    recv_last: Ast.TokenIndex,
     slice_method: []const u8,
     name_token: Ast.TokenIndex,
     /// Token index of the binding's terminating `;`.
@@ -163,16 +163,16 @@ fn checkFn(
         // method_call or try_method_call — needs a method field.
         const method = ca.method orelse continue;
         if (!isRawSliceMethodName(method)) continue;
-        // Require a non-empty single-ident receiver (no dots inside).
         const recv = ca.receiver;
         if (recv.len == 0) continue;
-        var recv_has_dot = false;
-        for (recv) |c| if (c == '.') { recv_has_dot = true; break; };
-        if (recv_has_dot) continue;
+        const method_token = ca.method_token orelse continue;
+        if (method_token < ca.receiver_token + 2) continue;
+        const receiver_last = method_token - 2;
 
         try borrows.append(gpa, .{
             .x_name = b.name,
-            .recv_name = recv,
+            .recv_first = ca.receiver_token,
+            .recv_last = receiver_last,
             .slice_method = method,
             .name_token = b.name_token,
             .end_token = b.rhs_last + 1,
@@ -186,8 +186,12 @@ fn checkFn(
         const scan_start = b.end_token + 1;
         if (scan_start > last) continue;
         const gc_tok = findGcTriggerCall(
-            tree, cache, tags,
-            scan_start, last, b.recv_name,
+            tree,
+            cache,
+            tags,
+            scan_start,
+            last,
+            b,
         ) orelse continue;
         try reportProblem(gpa, problems, tree, b, gc_tok);
     }
@@ -204,7 +208,7 @@ fn findGcTriggerCall(
     tags: []const std.zig.Token.Tag,
     start: Ast.TokenIndex,
     last: Ast.TokenIndex,
-    buf_recv: []const u8,
+    borrow: SliceBorrow,
 ) ?Ast.TokenIndex {
     if (start > last) return null;
     var t: Ast.TokenIndex = start;
@@ -226,16 +230,27 @@ fn findGcTriggerCall(
             continue;
         }
 
-        // Suppression: `buf_recv.pin(` — the buffer is being pinned.
-        if (tags[t] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(t), buf_recv) and
-            t + 3 <= last and
-            tags[t + 1] == .period and
-            tags[t + 2] == .identifier and
-            tags[t + 3] == .l_paren and
-            std.mem.eql(u8, tree.tokenSlice(t + 2), "pin"))
-        {
-            return null;
+        // Only a pin of this exact receiver path can protect its view.
+        if (tags[t] == .identifier) {
+            const receiver_len = borrow.recv_last - borrow.recv_first + 1;
+            if (receiver_len <= last - t and last - t - receiver_len >= 2 and
+                tags[t + receiver_len] == .period and
+                tags[t + receiver_len + 1] == .identifier and
+                tags[t + receiver_len + 2] == .l_paren and
+                std.mem.eql(u8, tree.tokenSlice(t + receiver_len + 1), "pin"))
+            {
+                var same_receiver = true;
+                var offset: Ast.TokenIndex = 0;
+                while (offset < receiver_len) : (offset += 1) {
+                    if (tags[t + offset] != tags[borrow.recv_first + offset] or
+                        !std.mem.eql(u8, tree.tokenSlice(t + offset), tree.tokenSlice(borrow.recv_first + offset)))
+                    {
+                        same_receiver = false;
+                        break;
+                    }
+                }
+                if (same_receiver) return null;
+            }
         }
 
         // Pattern A: `any_recv.gc_method(` — any receiver.
@@ -299,33 +314,35 @@ fn reportProblem(
         break :blk tree.tokenSlice(gc_tok);
     };
 
+    const starts = tree.tokens.items(.start);
+    const receiver_path = tree.source[starts[b.recv_first] .. starts[b.recv_last] + tree.tokenSlice(b.recv_last).len];
     const msg = try std.fmt.allocPrint(
         gpa,
-        "raw slice from `{s}.{s}()` is live across `{s}(...)` which may invoke GC — the backing buffer may be moved or freed; call `.pin(globalObject)` before taking the slice and `.unpin()` after",
-        .{ b.recv_name, b.slice_method, gc_callee },
+        "possible view from `{s}.{s}()` crosses `{s}(...)`; GC ownership and dispatch are unresolved — check the actual storage and callee lifetime contracts; if this is a GC-managed view, use the protection API its owner provides",
+        .{ receiver_path, b.slice_method, gc_callee },
     );
     errdefer gpa.free(msg);
 
     const note_label = try std.fmt.allocPrint(
         gpa,
-        "raw slice borrowed here via `{s}.{s}()`",
-        .{ b.recv_name, b.slice_method },
+        "possible view produced here via `{s}.{s}()`",
+        .{ receiver_path, b.slice_method },
     );
     errdefer gpa.free(note_label);
 
     const notes = try gpa.alloc(problem_mod.Note, 1);
     errdefer gpa.free(notes);
     notes[0] = .{
-        .start = Pos.fromTokenStart(tree, b.name_token),
-        .end = Pos.fromTokenEnd(tree, b.name_token),
+        .start = try Pos.fromTokenStart(tree, b.name_token),
+        .end = try Pos.fromTokenEnd(tree, b.name_token),
         .label = note_label,
     };
 
     try problems.append(gpa, .{
         .rule_id = R,
-        .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, gc_tok),
-        .end = Pos.fromTokenEnd(tree, gc_tok),
+        .severity = .warning,
+        .start = try Pos.fromTokenStart(tree, gc_tok),
+        .end = try Pos.fromTokenEnd(tree, gc_tok),
         .message = msg,
         .notes = notes,
     });
@@ -385,5 +402,50 @@ test "arraybuffer-slice-without-pin: no GC call does not fire" {
         \\    _ = s;
         \\}
         \\
+    );
+}
+
+test "arraybuffer-slice-without-pin: argv and path spellings remain an unknown advisory" {
+    var problems = try testing.runRuleTyped(std.testing.allocator, check,
+        \\const std = @import("std");
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const args = try init.minimal.args.toSlice(init.arena.allocator());
+        \\    const path = try std.fs.path.resolve(init.gpa, &.{ ".", "share" });
+        \\    defer init.gpa.free(path);
+        \\    _ = args.len;
+        \\}
+    );
+    defer testing.freeProblems(std.testing.allocator, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqual(problem_mod.Severity.warning, problems.items[0].severity);
+    try std.testing.expectEqual(problem_mod.Verdict.unknown, problems.items[0].verdict);
+}
+
+test "arraybuffer-slice-without-pin: unknown nested buffer view still fires" {
+    try testing.expectFires(check, R,
+        \\pub fn use(holder: anytype, vm: anytype) void {
+        \\    const bytes = holder.buffer.toSlice();
+        \\    _ = vm.call(bytes);
+        \\}
+    );
+}
+
+test "arraybuffer-slice-without-pin: root pin does not protect nested buffer" {
+    try testing.expectFires(check, R,
+        \\pub fn use(holder: anytype, vm: anytype, globalObject: anytype) void {
+        \\    const bytes = holder.buffer.toSlice();
+        \\    _ = holder.pin(globalObject);
+        \\    _ = vm.call(bytes);
+        \\}
+    );
+}
+
+test "arraybuffer-slice-without-pin: exact nested receiver pin suppresses" {
+    try testing.expectNoFire(check,
+        \\pub fn use(holder: anytype, vm: anytype, globalObject: anytype) void {
+        \\    const bytes = holder.buffer.toSlice();
+        \\    _ = holder.buffer.pin(globalObject);
+        \\    _ = vm.call(bytes);
+        \\}
     );
 }

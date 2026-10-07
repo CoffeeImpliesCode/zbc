@@ -409,8 +409,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "destroy-after-deinit-in-loop",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, for_tok),
-        .end = Pos.fromTokenEnd(tree, for_tok),
+        .start = try Pos.fromTokenStart(tree, for_tok),
+        .end = try Pos.fromTokenEnd(tree, for_tok),
         .message = msg,
     });
 }

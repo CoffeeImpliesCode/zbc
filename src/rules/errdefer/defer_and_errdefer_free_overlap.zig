@@ -169,8 +169,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "defer-and-errdefer-free-overlap",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, errdefer_tok),
-        .end = Pos.fromTokenEnd(tree, errdefer_tok),
+        .start = try Pos.fromTokenStart(tree, errdefer_tok),
+        .end = try Pos.fromTokenEnd(tree, errdefer_tok),
         .message = msg,
     });
 }

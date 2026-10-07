@@ -175,15 +175,16 @@ fn report(
     errdefer gpa.free(msg);
     const note_label = try std.fmt.allocPrint(gpa, "returned by value here", .{});
     errdefer gpa.free(note_label);
-    const ret_start = Pos.fromTokenStart(tree, ret_tok);
-    const ret_end = Pos.fromTokenEnd(tree, ret_tok);
+    const ret_start = try Pos.fromTokenStart(tree, ret_tok);
+    const ret_end = try Pos.fromTokenEnd(tree, ret_tok);
     const notes_slice = try gpa.alloc(problem_mod.Note, 1);
+    errdefer gpa.free(notes_slice);
     notes_slice[0] = .{ .start = ret_start, .end = ret_end, .label = note_label };
     try problems.append(gpa, .{
         .rule_id = "self-pointer-in-returned-value",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, sb.lhs_name_token),
-        .end = Pos.fromTokenEnd(tree, sb.eq_token),
+        .start = try Pos.fromTokenStart(tree, sb.lhs_name_token),
+        .end = try Pos.fromTokenEnd(tree, sb.eq_token),
         .message = msg,
         .notes = notes_slice,
     });

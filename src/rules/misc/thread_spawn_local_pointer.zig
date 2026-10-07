@@ -214,8 +214,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "thread-spawn-local-pointer",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, amp_tok),
-        .end = Pos.fromTokenEnd(tree, amp_tok + 1),
+        .start = try Pos.fromTokenStart(tree, amp_tok),
+        .end = try Pos.fromTokenEnd(tree, amp_tok + 1),
         .message = msg,
     });
 }

@@ -116,8 +116,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = problem.Pos.fromTokenStart(tree, write_tok),
-        .end = problem.Pos.fromTokenEnd(tree, write_tok),
+        .start = try problem.Pos.fromTokenStart(tree, write_tok),
+        .end = try problem.Pos.fromTokenEnd(tree, write_tok),
         .message = msg,
     });
 }

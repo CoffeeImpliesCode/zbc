@@ -12,6 +12,8 @@ const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("cache/file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
 const zls_resolver_mod = @import("type_resolver.zig");
+const budget_mod = @import("budget.zig");
+const tokens = @import("ast/tokens.zig");
 const project_cache_mod = @import("cache/project_cache.zig");
 
 pub const Config = config_mod.Config;
@@ -21,6 +23,7 @@ pub const all_invariants = config_mod.all_invariants;
 pub const isEnabled = config_mod.isEnabled;
 pub const invariantFromName = config_mod.invariantFromName;
 pub const Problem = problem_mod.Problem;
+pub const Incomplete = problem_mod.Incomplete;
 pub const Note = problem_mod.Note;
 pub const Pos = problem_mod.Pos;
 pub const Severity = problem_mod.Severity;
@@ -28,184 +31,276 @@ pub const Verdict = problem_mod.Verdict;
 pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
 pub const lookupRule = rule_catalog_mod.lookup;
+pub const SourcePolicy = @import("type_engine").SourcePolicy;
+/// Borrowed parser details; Session owns a copy of its optional source path.
+pub const ParseFailure = @import("type_engine").ParseFailure;
+pub const Toolchain = zls_resolver_mod.Toolchain;
+pub const ToolchainFailure = zls_resolver_mod.ToolchainFailure;
 pub const trace = @import("trace.zig");
-pub fn analyzeEscape(
+/// Budget limits and diagnostics carried by `Incomplete`.
+pub const budget = budget_mod;
+/// One worker and one immutable source snapshot.
+///
+/// ProjectCache models borrow ASTs from TypeContext. Initialize in place;
+/// do not move or share the value. Policy slices, allocator, and I/O
+/// provider must remain valid until `deinit`.
+pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    path: []const u8,
-    config: *const Config,
-    type_ctx: ?*zls_resolver_mod.TypeContext,
-) ![]Problem {
-    trace.setFile(path);
-    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        gpa,
-        std.Io.Limit.limited(16 * 1024 * 1024),
-    );
-    defer gpa.free(src_bytes);
+    project: project_cache_mod.ProjectCache,
+    type_context: zls_resolver_mod.TypeContext,
+    /// Details from the last syntax failure; valid until next analysis/deinit.
+    /// The optional path is copied and owned by this session.
+    parse_failure: ?ParseFailure = null,
 
-    const src = try gpa.allocSentinel(u8, src_bytes.len, 0);
-    defer gpa.free(src);
-    @memcpy(src[0..src_bytes.len], src_bytes);
-    rewriteNonStandardSyntax(src);
+    /// `policy.roots` must be canonical absolute paths. Empty roots deny all.
+    pub fn init(self: *Session, gpa: std.mem.Allocator, io: std.Io, policy: SourcePolicy) !void {
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .project = project_cache_mod.ProjectCache.init(gpa, io, policy),
+            .type_context = undefined,
+        };
+        errdefer self.project.deinit();
+        try self.type_context.init(gpa, io);
+        self.type_context.store.source_policy = policy;
+        self.project.type_context = &self.type_context;
+    }
 
-    var tree = try Ast.parse(gpa, src, .zig);
-    defer tree.deinit(gpa);
+    /// The borrowed `toolchain` must outlive this session.
+    /// `policy.roots` must be canonical absolute paths. Empty roots deny all.
+    pub fn initWithToolchain(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        policy: SourcePolicy,
+        toolchain: *const Toolchain,
+    ) !void {
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .project = project_cache_mod.ProjectCache.init(gpa, io, policy),
+            .type_context = undefined,
+        };
+        errdefer self.project.deinit();
+        try self.type_context.initWithToolchain(gpa, io, toolchain);
+        self.type_context.store.source_policy = policy;
+        self.project.type_context = &self.type_context;
+    }
+
+    /// Drop models before their borrowed ASTs, then release context state.
+    pub fn deinit(self: *Session) void {
+        self.clearParseFailure();
+        self.project.deinit();
+        self.type_context.deinit();
+        self.* = undefined;
+    }
+
+    fn clearParseFailure(self: *Session) void {
+        if (self.parse_failure) |failure| {
+            if (failure.source_path) |path| self.gpa.free(path);
+        }
+        self.parse_failure = null;
+    }
+
+    fn recordParseFailure(self: *Session, failure: ?ParseFailure, source_path: ?[]const u8) !void {
+        self.clearParseFailure();
+        const value = failure orelse return;
+        const owned_path = if (source_path) |path| try self.gpa.dupe(u8, path) else null;
+        self.parse_failure = .{
+            .source_path = owned_path,
+            .position = value.position,
+            .reason = value.reason,
+        };
+    }
+
+    fn captureCurrentParseFailure(self: *Session, source_is_input: bool) !void {
+        const failure = self.project.parse_failure orelse self.type_context.store.failureSnapshot().parse_failure;
+        const source_path = if (source_is_input)
+            null
+        else if (failure) |value|
+            value.source_path
+        else
+            null;
+        try self.recordParseFailure(failure, source_path);
+    }
+};
+
+/// Findings of one analyzed file plus the parts that gave up.
+///
+/// `incomplete` is empty when the whole file was analyzed. Otherwise every
+/// listed function, summary, or rule exhausted an analysis budget and
+/// contributed no findings; all other parts completed and their findings
+/// are in `problems`. Release with `freeAnalysis`.
+pub const Analysis = struct {
+    problems: []Problem,
+    incomplete: []Incomplete,
+};
+
+/// Analyze one source admitted by the session's policy.
+///
+/// Uses the original source tree. `path` and `config` are borrowed for the
+/// call. A successful Analysis does not borrow from Session and may outlive
+/// it while the allocator remains valid; release it with `freeAnalysis`.
+/// Only `error.AnalysisBudgetExceeded` raised inside one function, one
+/// function's summary, or one pattern rule is absorbed into
+/// `Analysis.incomplete`; that part reports no findings and the rest of the
+/// file is still analyzed. Every other error fails the whole call.
+/// Syntax errors set `session.parse_failure`.
+/// Source-load errors propagate even when type resolution returned unknown.
+/// A failed load retains no source snapshot, so a later analysis can retry it.
+/// The caller reports returned errors; source loading emits no duplicate diagnostic.
+pub fn analyzeEscape(session: *Session, path: []const u8, config: *const Config) !Analysis {
+    const gpa = session.gpa;
+    session.clearParseFailure();
+    session.project.failure = null;
+    session.project.parse_failure = null;
+    session.type_context.store.clearFailure();
+
+    const canonical = try session.project.sourcePath(path);
+    trace.setFile(canonical);
+    const maybe_model = session.project.modelForPath(canonical) catch |err|
+        return remapImportSyntaxError(session, err, true);
+    const model = maybe_model orelse return error.FileNotFound;
+    const tree = model.tree;
+
+    var resolver: zls_resolver_mod.TypeResolver = undefined;
+    resolver.init(&session.type_context, gpa, canonical, tree.source) catch |err|
+        return remapImportSyntaxError(session, err, false);
+    defer resolver.deinit();
+    const zls_ptr: ?*zls_resolver_mod.TypeResolver = &resolver;
+
+    var rule_cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer rule_cache.deinit();
+    rule_cache.setZls(zls_ptr);
+    rule_cache.setProject(&session.project, canonical);
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);
+    var incomplete: std.ArrayListUnmanaged(Incomplete) = .empty;
+    errdefer freeIncompleteArrayList(gpa, &incomplete);
 
-    // Type resolver backed by the extracted type engine.  TypeContext is
-    // per-thread (see main.zig workerLoop); falls through to AST-only
-    // analysis when unavailable or when init fails.
-    var own_ctx: zls_resolver_mod.ManagedContext = .{};
-    if (type_ctx == null) own_ctx.tryInit(gpa, io);
-    defer own_ctx.deinit();
-    const ctx = type_ctx orelse own_ctx.get();
+    var summary_failures: std.ArrayListUnmanaged(file_cache_mod.SummaryFailure) = .empty;
+    defer summary_failures.deinit(gpa);
+    budget_mod.clear();
+    rule_cache.resolveTransitiveTakesCollecting(&summary_failures) catch |err|
+        return remapImportSyntaxError(session, err, false);
+    for (summary_failures.items) |failure| {
+        try problem_mod.appendIncomplete(gpa, &incomplete, .summary, fnName(tree, failure.fn_decl), failure.budget);
+    }
 
-    var own_resolver: zls_resolver_mod.ManagedResolver = .{};
-    if (ctx) |c| own_resolver.tryInit(c, gpa, path, src);
-    defer own_resolver.deinit();
-    const zls_ptr = own_resolver.get();
-
-    // Per-file shared cache, used by both flow analysis (cfg) and
-    // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary
-    // across every consumer.
-    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer rule_cache.deinit();
-    rule_cache.setZls(zls_ptr);
-    // Project-wide ProjectCache for cross-file model lookups via
-    // relative `@import("./X.zig")` declarations.  Static across
-    // the process so subsequent analyzeEscape calls reuse the
-    // loaded models — saves re-parsing the same shared headers
-    // across every file in a sweep.
-    rule_cache.setProject(getProjectCache(gpa, io), path);
-    try rule_cache.resolveTransitiveTakes();
-
-    // Flow analysis — per-fn CFG + worklist fixed-point.
-    // Iterate raw fn_decls (incl. type-builders) — lowerFunctionFull
-    // decides per-fn whether to lower (returns null to skip).
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_builder.lowerFunctionFullWithZls(
-            gpa,
-            &tree,
-            node,
-            config,
-            &rule_cache,
-            zls_ptr,
-        )) orelse continue;
-        defer cfg.deinit(gpa);
-        try worklist.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
+        const before = problems.items.len;
+        budget_mod.clear();
+        analyzeFunction(gpa, tree, node, config, &rule_cache, zls_ptr, canonical, &problems) catch |err| {
+            if (err != error.AnalysisBudgetExceeded) return remapImportSyntaxError(session, err, false);
+            problem_mod.truncateProblems(gpa, &problems, before);
+            const diagnostic = budget_mod.take();
+            // The summary pass already named this function.
+            if (!summaryFailed(summary_failures.items, node)) {
+                try problem_mod.appendIncomplete(gpa, &incomplete, .function, fnName(tree, node), diagnostic);
+            }
+        };
     }
 
-    // Pattern detectors — dispatched via the comptime registry so
-    // adding a rule is a one-file change (see rule_catalog.zig).
-    try rule_catalog_mod.runEscape(gpa, &tree, &rule_cache, config, &problems);
+    rule_catalog_mod.runEscape(gpa, tree, &rule_cache, config, &problems, &incomplete) catch |err|
+        return remapImportSyntaxError(session, err, false);
+    if (session.project.failure) |failure|
+        return remapImportSyntaxError(session, failure, false);
+    if (session.type_context.store.failureSnapshot().source_failure) |failure|
+        return remapImportSyntaxError(session, failure, false);
 
-    // Apply per-line suppressions parsed from `// zbc-disable-line` /
-    // `// zbc-disable-next-line` source comments.  Filter happens at
-    // the boundary so individual rules don't need to know about it.
-    var supp = try suppressions_mod.parse(gpa, src);
+    var supp = try suppressions_mod.parse(gpa, tree.source);
     defer supp.deinit();
-    return try filterSuppressed(gpa, &problems, &supp);
+    const incomplete_owned = try incomplete.toOwnedSlice(gpa);
+    errdefer freeIncomplete(gpa, incomplete_owned);
+    const kept = try filterSuppressed(gpa, &problems, &supp);
+    return .{ .problems = kept, .incomplete = incomplete_owned };
 }
 
-/// Bun's codebase uses a non-standard `fn #<name>(...)` method-name
-/// syntax (their build pipeline preprocesses it).  The stock Zig
-/// tokenizer chokes on `#` and emits `invalid` tokens, which causes
-/// the AST past the first such fn to be lost — entire types appear
-/// to have no methods, masking real cleanup methods like `finalize`
-/// and producing cascades of FPs (missing-deinit, owned-field-no-
-/// outer-cleanup, etc.) on every file that touches the pattern.
-///
-/// Workaround: in-place byte-level rewrite of `fn #` → `fn _` and
-/// `.#<ident>(` → `._<ident>(` (call-site form).  Both replacements
-/// are length-preserving so source positions remain stable.
-/// Replacing only after `fn ` or `.` avoids touching `#`-containing
-/// string literals or comments that happen to start a line.
-fn rewriteNonStandardSyntax(src: [:0]u8) void {
-    if (src.len < 2) return;
-    // `#` is not a valid token start in Zig 0.17.  Bun uses it as
-    // a private-name prefix in three positions:
-    //   1. method decls:  `fn #foo(...)`
-    //   2. field decls:   `#foo: Foo = .{}`
-    //   3. accesses:      `this.#foo` / `this.#foo()`
-    // In all three, `#` is immediately followed by an identifier
-    // character (letter or `_`).  Rewriting `#<id-char>` → `_<id-char>`
-    // covers all three positions and is length-preserving.  The only
-    // false-positive is a `#` inside a STRING LITERAL whose next char
-    // is a letter — but the analyzer doesn't track string CONTENTS,
-    // so it's harmless.
-    var i: usize = 0;
-    while (i + 1 < src.len) : (i += 1) {
-        if (src[i] != '#') continue;
-        const next = src[i + 1];
-        if (isIdentStart(next)) src[i] = '_';
+/// Lower one function and run the flow check on it, appending Problems.
+fn analyzeFunction(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    config: *const Config,
+    rule_cache: *file_cache_mod.FileCache,
+    zls_ptr: ?*zls_resolver_mod.TypeResolver,
+    path: []const u8,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
+    var cfg = (try cfg_builder.lowerFunctionFullWithZls(
+        gpa,
+        tree,
+        node,
+        config,
+        rule_cache,
+        zls_ptr,
+    )) orelse return;
+    defer cfg.deinit(gpa);
+    try worklist.check(gpa, &cfg, .{ .path = path, .config = config }, problems);
+}
+
+fn summaryFailed(failures: []const file_cache_mod.SummaryFailure, node: Ast.Node.Index) bool {
+    for (failures) |failure| {
+        if (failure.fn_decl == node) return true;
     }
+    return false;
 }
 
-fn isIdentStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+fn fnName(tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, node) orelse return "";
+    const name_token = proto.name_token orelse return "";
+    return tree.tokenSlice(name_token);
 }
 
-/// Drop any Problems whose start.line matches an active suppression.
-/// Frees dropped problems immediately; the caller still owns the
-/// returned slice and the surviving problems' message storage.
+fn remapImportSyntaxError(session: *Session, err: anyerror, source_is_input: bool) anyerror {
+    if (err != error.ImportInvalidSyntax) return err;
+    session.captureCurrentParseFailure(source_is_input) catch |capture_err| return capture_err;
+    return error.InvalidSyntax;
+}
+
+/// Drop Problems whose start.line matches an active suppression.
+/// Frees dropped Problems and returns the owned survivors.
 fn filterSuppressed(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     supp: *const suppressions_mod.Suppressions,
 ) ![]Problem {
     if (supp.entries.len == 0) return problems.toOwnedSlice(gpa);
-    var kept: std.ArrayListUnmanaged(Problem) = .empty;
-    errdefer freeProblemsArrayList(gpa, &kept);
-    for (problems.items) |p| {
-        if (supp.isSuppressed(p.rule_id, p.start.line)) {
-            var dead = p;
+    // Compact in place so error cleanup owns only surviving Problems.
+    var kept_len: usize = 0;
+    for (problems.items) |problem| {
+        if (supp.isSuppressed(problem.rule_id, problem.start.line)) {
+            var dead = problem;
             dead.deinit(gpa);
             continue;
         }
-        try kept.append(gpa, p);
+        problems.items[kept_len] = problem;
+        kept_len += 1;
     }
-    problems.deinit(gpa);
-    return kept.toOwnedSlice(gpa);
+    problems.items.len = kept_len;
+    return problems.toOwnedSlice(gpa);
+}
+/// Releases an Analysis with the same allocator passed to `Session.init`.
+pub fn freeAnalysis(gpa: std.mem.Allocator, analysis: Analysis) void {
+    for (analysis.problems) |*p| p.deinit(gpa);
+    gpa.free(analysis.problems);
+    freeIncomplete(gpa, analysis.incomplete);
 }
 
-/// Process-static ProjectCache.  Holds parsed FileModels for
-/// sibling `.zig` files reached via relative `@import("./X.zig")`
-/// declarations.  Initialised on first analyzeEscape call,
-/// persists for the process lifetime — multi-file sweeps reuse
-/// the loaded models.  Lives on the heap (page_allocator) so test
-/// gpa boundaries don't reclaim it.
-var global_project: ?*project_cache_mod.ProjectCache = null;
-
-fn getProjectCache(gpa: std.mem.Allocator, io: std.Io) *project_cache_mod.ProjectCache {
-    _ = gpa;
-    if (global_project) |p| return p;
-    const pa = std.heap.page_allocator;
-    const p = pa.create(project_cache_mod.ProjectCache) catch unreachable;
-    p.* = project_cache_mod.ProjectCache.init(pa, io);
-    global_project = p;
-    return p;
-}
-
-/// Test-only: clear the process-static project cache so leak
-/// detectors don't see the cached entries between test gpas.
-pub fn clearProjectCacheForTesting() void {
-    if (global_project) |p| {
-        p.deinit();
-        std.heap.page_allocator.destroy(p);
-        global_project = null;
-    }
-}
-
-pub fn freeProblems(gpa: std.mem.Allocator, slice: []Problem) void {
-    for (slice) |*p| p.deinit(gpa);
+fn freeIncomplete(gpa: std.mem.Allocator, slice: []Incomplete) void {
+    for (slice) |*part| part.deinit(gpa);
     gpa.free(slice);
+}
+
+fn freeIncompleteArrayList(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(Incomplete)) void {
+    for (list.items) |*part| part.deinit(gpa);
+    list.deinit(gpa);
 }
 
 fn freeProblemsArrayList(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(Problem)) void {
@@ -235,19 +330,208 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
         \\
     });
 
-    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base_dir = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
     defer gpa.free(base_dir);
     const path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
     defer gpa.free(path);
 
-    const problems = try analyzeEscape(gpa, tio, path, &DefaultConfig, null);
-    defer freeProblems(gpa, problems);
+    var session: Session = undefined;
+    try session.init(gpa, tio, .{ .roots = &.{base_dir} });
+    defer session.deinit();
+    const analysis = try analyzeEscape(&session, path, &DefaultConfig);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
 
     var found = false;
-    for (problems) |p| {
+    for (analysis.problems) |p| {
         if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "lib API: canonical imported enum tag values prove complete lookup tables" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "ops.zig",
+        .data =
+        \\pub const Op = enum(u8) { entry = 0, add, exit };
+        \\pub const Sparse = enum(u8) { entry = 0, add = 2, exit = 3 };
+        ,
+    });
+    const source =
+        \\const std = @import("std");
+        \\const ops = @import("ops.zig");
+        \\const Alias = ops.Op;
+        \\pub fn complete() [std.meta.fields(ops.Op).len]u8 {
+        \\    var result: [std.meta.fields(ops.Op).len]u8 = undefined;
+        \\    inline for (std.meta.fields(ops.Op)) |field| {
+        \\        const op: ops.Op = @enumFromInt(field.value);
+        \\        result[field.value] = hooksForOp(op);
+        \\    }
+        \\    return result;
+        \\}
+        \\pub fn aliasComplete() [std.meta.fields(Alias).len]u8 {
+        \\    var result: [std.meta.fields(Alias).len]u8 = undefined;
+        \\    inline for (std.meta.fields(Alias)) |field| result[field.value] = 1;
+        \\    return result;
+        \\}
+        \\pub fn hole() [std.meta.fields(ops.Sparse).len]u8 {
+        \\    var result: [std.meta.fields(ops.Sparse).len]u8 = undefined;
+        \\    inline for (std.meta.fields(ops.Sparse)) |field| result[field.value] = 1;
+        \\    return result;
+        \\}
+        \\fn hooksForOp(op: ops.Op) u8 { return @intFromEnum(op); }
+    ;
+    try tmp.dir.writeFile(tio, .{ .sub_path = "consumer.zig", .data = source });
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "consumer.zig" });
+    defer gpa.free(path);
+    var session: Session = undefined;
+    try session.init(gpa, tio, .{ .roots = &.{root} });
+    defer session.deinit();
+    const analysis = try analyzeEscape(&session, path, &DefaultConfig);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    for ([_]struct { function: []const u8, warns: bool }{
+        .{ .function = "pub fn complete()", .warns = false },
+        .{ .function = "pub fn aliasComplete()", .warns = false },
+        .{ .function = "pub fn hole()", .warns = true },
+    }) |case| {
+        const function = std.mem.indexOf(u8, source, case.function).?;
+        const returned = std.mem.indexOfPos(u8, source, function, "return result").?;
+        const end = returned + "return result".len;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expectEqual(case.warns, reported);
+    }
+}
+
+test "lib API: imported enum fields fix runtime array fill extent" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "icons.zig",
+        .data =
+        \\pub const widget = struct {
+        \\    pub const Icon = enum(u8) { a = 2, b = 9, c = 17 };
+        \\};
+        ,
+    });
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "consumer.zig",
+        .data =
+        \\const icons = @import("icons.zig");
+        \\const Icon = icons.widget.Icon;
+        \\const count = @typeInfo(Icon).@"enum".fields.len;
+        \\const documents = [_]u8{ 1, 2, 3 };
+        \\pub fn complete() [count]u8 {
+        \\    var values: [count]u8 = undefined;
+        \\    for (documents, 0..) |document, i| values[i] = document;
+        \\    return values;
+        \\}
+        \\pub fn hole() [count]u8 {
+        \\    var values: [count]u8 = undefined;
+        \\    for (documents[0..2], 0..) |document, i| values[i] = document;
+        \\    return values;
+        \\}
+        ,
+    });
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "consumer.zig" });
+    defer gpa.free(path);
+    var session: Session = undefined;
+    try session.init(gpa, tio, .{ .roots = &.{root} });
+    defer session.deinit();
+    const analysis = try analyzeEscape(&session, path, &DefaultConfig);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    var saw_hole = false;
+    for (analysis.problems) |problem| {
+        if (!std.mem.eql(u8, problem.rule_id, "use-undefined")) continue;
+        try std.testing.expect(problem.start.line >= 10);
+        saw_hole = true;
+    }
+    try std.testing.expect(saw_hole);
+}
+
+test "lib API: an imported source width failure cannot return a clean result" {
+    // A sparse import reaches the real reader's width refusal without
+    // allocating its contents. The next analysis must not inherit its failure.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var wide = try tmp.dir.createFile(io, "wide.zig", .{ .read = true });
+        defer wide.close(io);
+        try wide.setLength(io, SourcePolicy.max_source_bytes);
+    }
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "main.zig",
+        .data =
+        \\const wide = @import("wide.zig");
+        \\pub fn use() void { const value = wide.value; _ = value; }
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "clean.zig",
+        .data = "pub fn clean() void {}",
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const main_path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(main_path);
+    const clean_path = try std.fs.path.join(gpa, &.{ directory, "clean.zig" });
+    defer gpa.free(clean_path);
+    var session: Session = undefined;
+    try session.init(gpa, io, .{ .roots = &.{directory} });
+    defer session.deinit();
+    for (0..2) |_| {
+        try std.testing.expectError(error.SourceTooWide, analyzeEscape(
+            &session,
+            main_path,
+            &DefaultConfig,
+        ));
+        try std.testing.expect(session.parse_failure == null);
+        try std.testing.expectEqual(
+            @as(?anyerror, error.SourceTooWide),
+            session.type_context.store.failureSnapshot().source_failure,
+        );
+    }
+    const analysis = try analyzeEscape(&session, clean_path, &DefaultConfig);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.problems.len);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(
+        @as(?anyerror, null),
+        session.type_context.store.failureSnapshot().source_failure,
+    );
+
+    // A failed import owns no source snapshot. Once it becomes readable,
+    // the same session must load it instead of reusing a failed reservation.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wide.zig",
+        .data = "pub const value: u8 = 7;",
+    });
+    const retried = try analyzeEscape(&session, main_path, &DefaultConfig);
+    defer freeAnalysis(gpa, retried);
+    try std.testing.expectEqual(@as(usize, 0), retried.problems.len);
+    try std.testing.expectEqual(@as(usize, 0), retried.incomplete.len);
+    try std.testing.expect(session.parse_failure == null);
+    try std.testing.expectEqual(
+        @as(?anyerror, null),
+        session.type_context.store.failureSnapshot().source_failure,
+    );
 }
 
 // ── Suppression integration tests ───────────────────────────────
@@ -263,14 +547,17 @@ fn analyzeSrc(
     io: std.Io,
     tmp: *std.testing.TmpDir,
     src: []const u8,
-) ![]Problem {
+) !Analysis {
     const name = "check.zig";
     try tmp.dir.writeFile(io, .{ .sub_path = name, .data = src });
-    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(base_dir);
     const path = try std.fs.path.join(gpa, &.{ base_dir, name });
     defer gpa.free(path);
-    return analyzeEscape(gpa, io, path, &DefaultConfig, null);
+    var session: Session = undefined;
+    try session.init(gpa, io, .{ .roots = &.{base_dir} });
+    defer session.deinit();
+    return analyzeEscape(&session, path, &DefaultConfig);
 }
 
 fn countByRule(problems: []const Problem, rule_id: []const u8) usize {
@@ -288,14 +575,14 @@ test "suppression: zbc-disable-line drops the finding on the same line" {
 
     // Without directive: @ptrFromInt(0) on line 2 → 1 problem.
     // With directive on the same line: 0 problems.
-    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
         \\fn zero_ptr() *anyopaque {
         \\    return @ptrFromInt(0); // zbc-disable-line: ptrfromint-zero
         \\}
         \\
     );
-    defer freeProblems(gpa, problems);
-    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "ptrfromint-zero"));
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "ptrfromint-zero"));
 }
 
 test "suppression: without directive the finding is not dropped" {
@@ -303,14 +590,14 @@ test "suppression: without directive the finding is not dropped" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
         \\fn zero_ptr() *anyopaque {
         \\    return @ptrFromInt(0);
         \\}
         \\
     );
-    defer freeProblems(gpa, problems);
-    try std.testing.expect(countByRule(problems, "ptrfromint-zero") >= 1);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expect(countByRule(analysis.problems, "ptrfromint-zero") >= 1);
 }
 
 test "suppression: zbc-disable-next-line drops the finding on the following line" {
@@ -318,15 +605,15 @@ test "suppression: zbc-disable-next-line drops the finding on the following line
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
         \\fn zero_ptr() *anyopaque {
         \\    // zbc-disable-next-line: ptrfromint-zero
         \\    return @ptrFromInt(0);
         \\}
         \\
     );
-    defer freeProblems(gpa, problems);
-    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "ptrfromint-zero"));
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "ptrfromint-zero"));
 }
 
 test "suppression: wildcard zbc-disable-line: * drops any rule" {
@@ -334,14 +621,14 @@ test "suppression: wildcard zbc-disable-line: * drops any rule" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
         \\fn zero_ptr() *anyopaque {
         \\    return @ptrFromInt(0); // zbc-disable-line: *
         \\}
         \\
     );
-    defer freeProblems(gpa, problems);
-    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "ptrfromint-zero"));
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "ptrfromint-zero"));
 }
 
 test "suppression: wrong rule id leaves the finding" {
@@ -350,14 +637,14 @@ test "suppression: wrong rule id leaves the finding" {
     defer tmp.cleanup();
 
     // Directive targets a different rule → ptrfromint-zero still fires.
-    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
         \\fn zero_ptr() *anyopaque {
         \\    return @ptrFromInt(0); // zbc-disable-line: some-other-rule
         \\}
         \\
     );
-    defer freeProblems(gpa, problems);
-    try std.testing.expect(countByRule(problems, "ptrfromint-zero") >= 1);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expect(countByRule(analysis.problems, "ptrfromint-zero") >= 1);
 }
 
 test "suppression: directive only suppresses its own line, not others" {
@@ -367,7 +654,7 @@ test "suppression: directive only suppresses its own line, not others" {
 
     // Two @ptrFromInt(0) calls on different lines.
     // Only the first has a directive — second still fires.
-    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
         \\fn a() *anyopaque {
         \\    return @ptrFromInt(0); // zbc-disable-line: ptrfromint-zero
         \\}
@@ -376,8 +663,581 @@ test "suppression: directive only suppresses its own line, not others" {
         \\}
         \\
     );
-    defer freeProblems(gpa, problems);
-    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "ptrfromint-zero"));
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(analysis.problems, "ptrfromint-zero"));
+}
+
+// ── Partial-result tests ────────────────────────────────────────
+
+/// A function whose flow check exhausts the per-block path-state limit: ten
+/// independent conditions leave 2^10 distinguishable states at the join.
+/// It also double-frees early, so a finding the aborted function had already
+/// produced would show up in the result if it were kept.
+fn manyPathsFn(gpa: std.mem.Allocator) ![]u8 {
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.appendSlice(gpa, "const std = @import(\"std\");\nfn many(a: std.mem.Allocator");
+    for (0..10) |i| try text.print(gpa, ", f{d}: bool", .{i});
+    try text.appendSlice(gpa, ") void {\n    const q = a.alloc(u8, 1) catch return;\n    a.free(q);\n    a.free(q);\n");
+    for (0..10) |i| try text.print(gpa, "    const p{d} = a.alloc(u8, 1) catch return;\n", .{i});
+    for (0..10) |i| try text.print(gpa, "    if (f{d}) a.free(p{d});\n", .{ i, i });
+    try text.appendSlice(gpa, "}\n");
+    return text.toOwnedSlice(gpa);
+}
+
+test "partial: an exhausted function keeps the findings of the others" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const many = try manyPathsFn(gpa);
+    defer gpa.free(many);
+    const src = try std.mem.concat(gpa, u8, &.{
+        many,
+        "pub fn bad() *u8 { var x: u8 = 1; return &x; }\n",
+        "pub fn fine() u8 { return 1; }\n",
+    });
+    defer gpa.free(src);
+
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, src);
+    defer freeAnalysis(gpa, analysis);
+
+    try std.testing.expectEqual(@as(usize, 1), countByRule(analysis.problems, "stack-escape"));
+    // The aborted function contributes nothing, not even what it found first.
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "heap-double-free"));
+    try std.testing.expectEqual(@as(usize, 1), analysis.incomplete.len);
+    const part = analysis.incomplete[0];
+    try std.testing.expectEqual(Incomplete.Kind.function, part.kind);
+    try std.testing.expectEqualStrings("many", part.name);
+    const diagnostic = part.budget orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.path_states, diagnostic.limit);
+    try std.testing.expectEqual(@as(u32, 64), diagnostic.limit_value);
+    try std.testing.expect(diagnostic.line != 0);
+}
+
+test "partial: the same function alone, within budget, reports its finding" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const std = @import("std");
+        \\fn few(a: std.mem.Allocator) void {
+        \\    const q = a.alloc(u8, 1) catch return;
+        \\    a.free(q);
+        \\    a.free(q);
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(analysis.problems, "heap-double-free"));
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+}
+
+test "partial: a summary-pass failure names the function and keeps the rest" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Past the normal-cleanup depth limit the summary of `too_deep` gives up.
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "fn too_deep(flag: bool) bool { return ");
+    for (0..70) |_| try src.append(gpa, '(');
+    try src.appendSlice(gpa, "flag");
+    for (0..70) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa, "; }\npub fn bad() *u8 { var x: u8 = 1; return &x; }\n");
+
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, src.items);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(analysis.problems, "stack-escape"));
+    // Listed once even though lowering `too_deep` may fail again.
+    try std.testing.expectEqual(@as(usize, 1), analysis.incomplete.len);
+    const part = analysis.incomplete[0];
+    try std.testing.expectEqual(Incomplete.Kind.summary, part.kind);
+    try std.testing.expectEqualStrings("too_deep", part.name);
+    const diagnostic = part.budget orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_depth, diagnostic.limit);
+}
+
+test "partial: a caller of a failed summary root is incomplete and reports no finding" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `too_deep` exhausts the normal-cleanup depth during the summary pass.
+    // `caller` reads that summary. Answering from a body-only recomputation
+    // would present an unfinished fold as a finished one and report the
+    // escape below; the failure must instead make `caller` incomplete.
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "fn too_deep(flag: bool) bool { return ");
+    for (0..70) |_| try src.append(gpa, '(');
+    try src.appendSlice(gpa, "flag");
+    for (0..70) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa,
+        \\; }
+        \\pub fn caller(flag: bool) *u8 {
+        \\    var x: u8 = 1;
+        \\    _ = too_deep(flag);
+        \\    return &x;
+        \\}
+        \\pub fn control() *u8 { var y: u8 = 1; return &y; }
+        \\
+    );
+
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, src.items);
+    defer freeAnalysis(gpa, analysis);
+    // Only the control, which reads no failed summary, still reports.
+    try std.testing.expectEqual(@as(usize, 1), countByRule(analysis.problems, "stack-escape"));
+    try std.testing.expect(std.mem.indexOf(u8, analysis.problems[0].message, "`y`") != null);
+    // `caller` reads the failed summary while its own summary is built, so
+    // the summary pass records it (kind `.summary`) and the per-function
+    // pass does not list it again. Either kind makes it incomplete; it must
+    // be listed exactly once and carry the budget that stopped it.
+    var caller_entries: usize = 0;
+    for (analysis.incomplete) |part| {
+        if (!std.mem.eql(u8, part.name, "caller")) continue;
+        try std.testing.expect(part.kind == .summary or part.kind == .function);
+        try std.testing.expect(part.budget != null);
+        caller_entries += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), caller_entries);
+}
+
+test "partial: a claimed budget record does not leak into the next file" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const many = try manyPathsFn(gpa);
+    defer gpa.free(many);
+    const first = try analyzeSrc(gpa, std.testing.io, &tmp, many);
+    defer freeAnalysis(gpa, first);
+    try std.testing.expectEqual(@as(usize, 1), first.incomplete.len);
+    try std.testing.expect(budget_mod.peek() == null);
+
+    const second = try analyzeSrc(gpa, std.testing.io, &tmp, "pub fn fine() u8 { return 1; }\n");
+    defer freeAnalysis(gpa, second);
+    try std.testing.expectEqual(@as(usize, 0), second.incomplete.len);
+}
+
+// ── Comptime-exhaustive field initialization ─────────────────────
+//
+// `var x: T = undefined;` followed by
+// `inline for (@typeInfo(T).@"struct".fields) |f| { … @field(x, f.name) = …; }`
+// leaves every semantic field of T written before the loop's normal
+// exit, so returning x is not a leak of `undefined`.  The generic CFG
+// models any loop as possibly running zero times, so these pin the
+// narrow proof that closes that gap — and, just as importantly, pin
+// the near-miss shapes it must still diagnose.
+//
+// The positives assert ZERO `use-undefined` diagnostics.  The near-misses
+// count REPORTED SITES (`countRuleLines`), not diagnostics: handing back
+// one undefined value is diagnosed twice — once for reading it, once for
+// the value leaving the function — and how many ways a single leak gets
+// phrased is not the contract here.  What they pin is WHICH leaks the
+// proof must still let through.
+
+/// Distinct source lines carrying `rule_id`.
+fn countRuleLines(problems: []const Problem, rule_id: []const u8) usize {
+    var n: usize = 0;
+    for (problems, 0..) |p, i| {
+        if (!std.mem.eql(u8, p.rule_id, rule_id)) continue;
+        var repeats = false;
+        for (problems[0..i]) |earlier| {
+            if (!std.mem.eql(u8, earlier.rule_id, rule_id)) continue;
+            if (earlier.start.line != p.start.line) continue;
+            repeats = true;
+            break;
+        }
+        if (!repeats) n += 1;
+    }
+    return n;
+}
+
+/// Every `rule_id` finding sits on `line`, and at least one exists.  A
+/// near-miss must report its leak where the undefined value leaves the
+/// function, not merely report SOMETHING: a count alone would let a
+/// spurious report on the store line stand in for a missed leak.
+fn expectRuleOnlyAtLine(problems: []const Problem, rule_id: []const u8, line: u32) !void {
+    var seen = false;
+    for (problems) |p| {
+        if (!std.mem.eql(u8, p.rule_id, rule_id)) continue;
+        try std.testing.expectEqual(line, p.start.line);
+        seen = true;
+    }
+    try std.testing.expect(seen);
+}
+
+test "inline field enumeration over the declared type clears the undefined seed" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn pack(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    var i: u32 = 0;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        const item = base + i;
+        \\        i += 1;
+        \\        @field(result, field.name) = switch (field.type) {
+        \\            u32 => item,
+        \\            else => @compileError("unexpected field type"),
+        \\        };
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "use-undefined"));
+}
+
+test "a zero-field struct is safe through the same enumeration" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Instantiated with `const Empty = struct {};` the field tuple is
+    // empty: the unrolled loop writes nothing, and `T` is zero-sized,
+    // so there are no bytes left undefined.  `base` keeps the fn off
+    // the all-comptime skip path so it is actually analysed.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\pub fn empty(comptime T: type, base: u8) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "use-undefined"));
+}
+
+test "a copy of the filled local is defined past the loop, not just the return" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Nothing here reads the target directly — the copy carries its
+    // origin, so without the proof this return leaks `undefined`.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn spill(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    const copy: T = result;
+        \\    return copy;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "use-undefined"));
+}
+
+test "a field write behind a conditional does not prove the whole struct" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The lvalue is no longer a top-level statement of the body, so
+    // some fields can skip it entirely.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn guarded(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        if (field.name.len == 1) {
+        \\            @field(result, field.name) = base;
+        \\        }
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 9);
+}
+
+test "enumerating a hand-written name subset does not prove the struct" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn subset(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (.{ "left" }) |name| {
+        \\        @field(result, name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 7);
+}
+
+test "an unlabeled break out of the enumeration does not prove the struct" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn early(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        if (base == 0) break;
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 8);
+}
+
+test "an unlabeled continue in the enumeration does not prove the struct" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn skipped(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        if (base == 0) continue;
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 8);
+}
+
+test "enumerating another struct's fields does not prove the target" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The descriptor names `Other`, so `right` is never enumerated.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\const Other = struct { left: u32 };
+        \\pub fn crossed(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(Other).@"struct".fields) |field| {
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 8);
+}
+
+test "a body-local shadow of the target does not prove the outer local" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn shadowed(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        var result: T = undefined;
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 8);
+}
+
+test "an undefined right-hand side does not define the field it writes" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The write happens; the VALUE is still undefined.  Claiming the
+    // struct is initialized here would hide a real use-undefined.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn undefRhs(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        @field(result, field.name) = undefined;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 7);
+}
+
+test "storing a local seeded undefined does not define the field" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The write target is right, but every field receives `src`'s
+    // undefined bytes.  Two sites stay diagnosed: the read of `src`
+    // itself, and the returned struct a synthetic "now defined" claim
+    // would otherwise have silenced (that second site reports twice —
+    // see the section header).
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn undefSource(comptime T: type, base: u32) T {
+        \\    var src: u32 = undefined;
+        \\    var result: T = undefined;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        @field(result, field.name) = src;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 2), countRuleLines(problems, "use-undefined"));
+}
+
+test "a comptime var type value is not the immutable parameter binding" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `T` here is a mutable comptime local, not a `comptime T: type`
+    // parameter, and the target is declared `Pair` — so `Other`'s
+    // single field says nothing about `Pair`'s two.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\const Other = struct { left: u32 };
+        \\pub fn mutableType(base: u32) Pair {
+        \\    var result: Pair = undefined;
+        \\    comptime var T = Other;
+        \\    inline for (@typeInfo(T).@"struct".fields) |field| {
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 9);
+}
+
+test "the same enumeration without inline is still a runtime zero-trip hazard" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `inline` is load-bearing: a runtime `for` over the same field
+    // tuple may run zero times, leaving every field undefined.
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Pair = struct { left: u32, right: u32 };
+        \\pub fn runtimeLoop(comptime T: type, base: u32) T {
+        \\    var result: T = undefined;
+        \\    for (@typeInfo(T).@"struct".fields) |field| {
+        \\        @field(result, field.name) = base;
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try expectRuleOnlyAtLine(problems, "use-undefined", 7);
+}
+
+test "a live child does not make its freed owner field readable" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const std = @import("std");
+        \\const Owner = struct { child: *u8 };
+        \\pub fn readFreedOwner(gpa: std.mem.Allocator) !u8 {
+        \\    const child = try gpa.create(u8);
+        \\    defer gpa.destroy(child);
+        \\    child.* = 7;
+        \\    const owner = try gpa.create(Owner);
+        \\    owner.child = child;
+        \\    gpa.destroy(owner);
+        \\    return owner.child.*;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "heap-use-after-free"));
+    for (problems) |problem| {
+        if (!std.mem.eql(u8, problem.rule_id, "heap-use-after-free")) continue;
+        try std.testing.expectEqual(@as(u32, 10), problem.start.line);
+    }
+}
+
+// ── Borrowed storage versus copied scalars ───────────────────────
+//
+// `defer child.deinit()` frees what the local owns, but a metric
+// read out of that local is a COPY: the out-param's own storage
+// holds it, and nothing in it points at the freed bytes.  A slice or
+// a pointer read out of the same local still addresses them.  The
+// twins below differ only in the type of the value that crosses the
+// boundary, so they pin that distinction rather than a name.
+
+test "a metric copied out of a deferred local is not a dangling out-param" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const std = @import("std");
+        \\const Stop = struct { limit: u8 = 0, cap: u32 = 0 };
+        \\const Child = struct {
+        \\    stopped: ?Stop = null,
+        \\    bytes: []u8 = &.{},
+        \\    pub fn deinit(self: *Child, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\    }
+        \\};
+        \\const Parent = struct { stopped: ?Stop = null };
+        \\pub fn adopt(parent: *Parent, gpa: std.mem.Allocator) void {
+        \\    var child: Child = .{};
+        \\    defer child.deinit(gpa);
+        \\    parent.stopped = parent.stopped orelse child.stopped;
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "borrowed-slice-into-out-param"));
+}
+
+test "a slice copied out of a deferred local is still a dangling out-param" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const std = @import("std");
+        \\const Child = struct {
+        \\    bytes: []u8 = &.{},
+        \\    pub fn deinit(self: *Child, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\    }
+        \\};
+        \\const Parent = struct { text: []const u8 = "" };
+        \\pub fn adopt(parent: *Parent, gpa: std.mem.Allocator) void {
+        \\    var child: Child = .{};
+        \\    defer child.deinit(gpa);
+        \\    parent.text = child.bytes;
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    const problems = analysis.problems;
+    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "borrowed-slice-into-out-param"));
 }
 
 test {
@@ -407,4 +1267,132 @@ test {
     _ = @import("model/model_query.zig");
     _ = @import("cache/project_cache.zig");
     std.testing.refAllDecls(@This());
+}
+
+test "catch-noreturn payload: std debug panic preserves the defined success value" {
+    // Exercise the imported decoder and the typed panic fallback from SIMD.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const std = @import("std");
+        \\const Result = struct { codepoint: u21, width: usize };
+        \\pub fn decode(first: u16, second: u16) !Result {
+        \\    if (!std.unicode.utf16IsHighSurrogate(first)) return error.InvalidFirst;
+        \\    if (!std.unicode.utf16IsLowSurrogate(second)) return error.InvalidSecond;
+        \\    const pair = [_]u16{ first, second };
+        \\    const codepoint = std.unicode.utf16DecodeSurrogatePair(&pair) catch |err| {
+        \\        std.debug.panic("validated pair failed: {s}", .{@errorName(err)});
+        \\    };
+        \\    return .{ .codepoint = codepoint, .width = 12 };
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "use-undefined"));
+}
+
+test "catch-noreturn payload: typed alias diverges on every fallback branch" {
+    // The callee type, not a standard-library name, proves divergence.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn halt() noreturn { @panic("halt"); }
+        \\fn load(value: u21) !u21 {
+        \\    if (value == 0) return error.Empty;
+        \\    return value;
+        \\}
+        \\pub fn decode(value: u21, flag: bool) u21 {
+        \\    const stop = halt;
+        \\    const codepoint = load(value) catch if (flag) stop() else halt();
+        \\    return codepoint;
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "use-undefined"));
+}
+
+test "catch-noreturn payload: one value-yielding branch retains undefined findings" {
+    // A divergent sibling cannot certify a fallback that yields undefined.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn halt() noreturn { @panic("halt"); }
+        \\fn load(value: u21) !u21 {
+        \\    if (value == 0) return error.Empty;
+        \\    return value;
+        \\}
+        \\pub fn decode(value: u21, flag: bool) u21 {
+        \\    const codepoint = load(value) catch blk: {
+        \\        if (flag) halt();
+        \\        break :blk @as(u21, undefined);
+        \\    };
+        \\    return codepoint;
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expect(countByRule(analysis.problems, "use-undefined") > 0);
+}
+
+test "catch-noreturn payload: panic lookalike with a returning type remains conservative" {
+    // A matching API name does not establish a noreturn return type.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const debug = struct { fn panic() u21 { return undefined; } };
+        \\fn load(value: u21) !u21 {
+        \\    if (value == 0) return error.Empty;
+        \\    return value;
+        \\}
+        \\pub fn decode(value: u21) u21 {
+        \\    const codepoint = load(value) catch debug.panic();
+        \\    return codepoint;
+        \\}
+        \\
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    var reported_at_return = false;
+    for (analysis.problems) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "use-undefined") and problem.start.line == 8) {
+            reported_at_return = true;
+        }
+    }
+    try std.testing.expect(reported_at_return);
+}
+
+test "catch-noreturn payload: exit lookalike retains its returning fallback" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\const process = struct { fn exit() u21 { return undefined; } };
+        \\fn load(value: u21) !u21 {
+        \\    if (value == 0) return error.Empty;
+        \\    return value;
+        \\}
+        \\pub fn decode(value: u21) u21 {
+        \\    const codepoint = load(value) catch process.exit();
+        \\    return codepoint;
+        \\}
+        \\
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    var reported_codepoint = false;
+    const caller_start = std.mem.indexOf(u8, source, "pub fn decode").?;
+    for (analysis.problems) |problem| {
+        if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+            problem.start.byte >= caller_start) reported_codepoint = true;
+    }
+    try std.testing.expect(reported_codepoint);
 }

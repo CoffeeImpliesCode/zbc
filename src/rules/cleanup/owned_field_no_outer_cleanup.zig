@@ -1,10 +1,12 @@
 //! Owned-field-no-outer-cleanup detector — a struct `Outer` has a
 //! value-typed field whose type (same file) exposes a cleanup
 //! method (`deinit` / `close` / `destroy` / `free` / `stop` /
-//! `finalize` / `dispose`).  But `Outer` itself exposes NO cleanup
+//! `finalize` / `dispose` / `release`). But `Outer` itself exposes NO cleanup
 //! method.  Users who treat `Outer` as a plain value silently leak
 //! the inner's owned non-memory resource (file handle, socket,
 //! ref, mmap) when the outer goes out of scope.
+//! A by-value mark whose cleanup only clears external boolean flags is
+//! borrowed state, not an owned resource. Unknown cleanup stays conservative.
 //!
 //! Complement to `missing-deinit-on-composed-owner`: that rule
 //! fires when `Outer.deinit` EXISTS but FORGETS to call
@@ -24,6 +26,7 @@ const trace = @import("../../trace.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const method_names = @import("../../model/method_names.zig");
+const tokens = @import("../../ast/tokens.zig");
 
 const R = "owned-field-no-outer-cleanup";
 
@@ -99,7 +102,7 @@ pub fn check(
             // only holds a non-null T when explicitly assigned.
             // A missing outer cleanup doesn't leak when the field
             // stays null — common for "lazy/optional sub-state".
-            if (model.fieldIsOptionalNullDefault(outer.name, f.name)) continue;
+            if (model.fieldIsOptionalNullDefault(outer.qualified_name, f.name)) continue;
             // Caller-supplied skip: the type's constructor takes a
             // parameter of the same name as `f`.  The field is
             // borrowed in from the caller's value; cleanup is
@@ -118,6 +121,7 @@ pub fn check(
             if (outerIsNestedInsideCleanupType(model, outer)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, f) orelse continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
+            if (cleanupOnlyClearsBorrowedFlags(tree, model, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
             // Tagged-union with ALL non-owned variants: dropping
             // the field never leaks regardless of the variant
@@ -278,7 +282,7 @@ fn fieldStaysNonOwnedAcrossFile(
     field: *const file_model.FieldInfo,
     inner_ti: *const file_model.TypeInfo,
 ) bool {
-    if (!model.isTaggedUnion(inner_ti.name)) return false;
+    if (!model.isTaggedUnion(inner_ti.qualified_name)) return false;
     // Field default must be a non-owned variant tag.  Use the
     // outer TypeInfo DIRECTLY (not by name) to avoid the
     // findType collision when multiple types in the file share
@@ -327,7 +331,7 @@ fn fieldStaysNonOwnedAcrossFile(
 /// on the outer is harmless.  Uses model.unionVariantIsOwned per
 /// variant; bails on the first owned variant found.
 fn allUnionVariantsNonOwned(model: *const file_model.FileModel, ti: *const file_model.TypeInfo) bool {
-    if (!model.isTaggedUnion(ti.name)) return false;
+    if (!model.isTaggedUnion(ti.qualified_name)) return false;
     const tree = model.tree;
     const tags = tree.tokens.items(.tag);
     // Walk variant identifiers between `{` and `}`.
@@ -335,13 +339,14 @@ fn allUnionVariantsNonOwned(model: *const file_model.FileModel, ti: *const file_
     while (t < ti.body_last) : (t += 1) {
         // Skip past method / const decls.
         if (tags[t] == .keyword_fn or tags[t] == .keyword_pub or
-            tags[t] == .keyword_const or tags[t] == .keyword_var) {
+            tags[t] == .keyword_const or tags[t] == .keyword_var)
+        {
             t = skipPastDecl(tags, t, ti.body_last);
             continue;
         }
         if (tags[t] != .identifier) continue;
         const name = tree.tokenSlice(t);
-        if (model.unionVariantIsOwned(ti.name, name)) |is_owned| {
+        if (model.unionVariantIsOwned(ti.qualified_name, name)) |is_owned| {
             if (is_owned) return false;
         }
         // Skip past this variant's payload (if any) to the comma.
@@ -555,6 +560,120 @@ fn cleanupTakesOnlySelf(tree: *const Ast, m: file_model.MethodInfo) bool {
 /// does nothing on drop, so a missing outer cleanup is harmless.
 const anyNonTrivialCleanup = mq.anyNonTrivialCleanup;
 
+/// A by-value token that only resets borrowed boolean flags has no owned
+/// resource to drop. Prove this narrow body shape; calls, arithmetic updates,
+/// pointer receivers, and unresolved field types retain the cleanup obligation.
+fn cleanupOnlyClearsBorrowedFlags(
+    tree: *const Ast,
+    model: *const file_model.FileModel,
+    ti: *const file_model.TypeInfo,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // No embedded aggregate, slice, opaque pointer, or unresolved storage.
+    for (ti.fields) |*field| {
+        if (isPlainScalarField(tree, field, false)) continue;
+        if (field.type_last != field.type_first + 1 or
+            tags[field.type_first] != .asterisk or tags[field.type_last] != .identifier) return false;
+        const state = model.findTypeInScope(tree.tokenSlice(field.type_last), ti) orelse return false;
+        if (state.kind != .struct_) return false;
+        for (state.fields) |*scalar| if (!isPlainScalarField(tree, scalar, false)) return false;
+    }
+    var saw_reset = false;
+    for (ti.methods) |m| {
+        if (!isCleanupName(m.name)) continue;
+        if (tokens.isTrivialBody(tree, m.body_first, m.body_last)) continue;
+        const receiver = m.receiver orelse return false;
+        if (receiver.is_ptr or !cleanupTakesOnlySelf(tree, m)) return false;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buf, m.fn_decl) orelse return false;
+        const rt = proto.ast.return_type.unwrap() orelse return false;
+        if (!std.mem.eql(u8, tree.getNodeSource(rt), "void")) return false;
+        var t = m.body_first + 1;
+        while (t < m.body_last) {
+            if (tags[t] == .keyword_if) {
+                if (tags[t + 1] != .l_paren) return false;
+                const close = tokens.matchParen(tags, t + 1, m.body_last) orelse return false;
+                var c = t + 2;
+                while (c < close) {
+                    if (tags[c] == .identifier) {
+                        const text = tree.tokenSlice(c);
+                        if (std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "false")) {
+                            c += 1;
+                        } else {
+                            c = borrowedScalarPathEnd(tree, model, ti, receiver.name, c, close, false) orelse return false;
+                        }
+                    } else switch (tags[c]) {
+                        .bang,
+                        .bang_equal,
+                        .equal_equal,
+                        .angle_bracket_left,
+                        .angle_bracket_right,
+                        .angle_bracket_left_equal,
+                        .angle_bracket_right_equal,
+                        .keyword_and,
+                        .keyword_or,
+                        .number_literal,
+                        => c += 1,
+                        else => return false,
+                    }
+                }
+                if (close + 2 >= m.body_last or tags[close + 1] != .keyword_return or
+                    tags[close + 2] != .semicolon) return false;
+                t = close + 3;
+                continue;
+            }
+            const end = borrowedScalarPathEnd(tree, model, ti, receiver.name, t, m.body_last, true) orelse return false;
+            if (end + 2 >= m.body_last or tags[end] != .equal or
+                tags[end + 1] != .identifier or !std.mem.eql(u8, tree.tokenSlice(end + 1), "false") or
+                tags[end + 2] != .semicolon) return false;
+            saw_reset = true;
+            t = end + 3;
+        }
+    }
+    return saw_reset;
+}
+
+/// Resolve `receiver.scalar` reads and `receiver.pointer.scalar` reads/resets.
+/// Only a direct pointer to a same-file type is accepted, never an alias or
+/// unresolved resource type. Writes must target a boolean in borrowed storage.
+fn borrowedScalarPathEnd(
+    tree: *const Ast,
+    model: *const file_model.FileModel,
+    ti: *const file_model.TypeInfo,
+    receiver: []const u8,
+    start: Ast.TokenIndex,
+    limit: Ast.TokenIndex,
+    writing: bool,
+) ?Ast.TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    if (start + 2 >= limit or tags[start] != .identifier or
+        !std.mem.eql(u8, tree.tokenSlice(start), receiver) or
+        tags[start + 1] != .period or tags[start + 2] != .identifier) return null;
+    const field = ti.findField(tree.tokenSlice(start + 2)) orelse return null;
+    if (start + 3 >= limit or tags[start + 3] != .period) {
+        if (writing or !isPlainScalarField(tree, field, false)) return null;
+        return start + 3;
+    }
+    if (start + 4 >= limit or tags[start + 4] != .identifier or
+        field.type_last != field.type_first + 1 or
+        tags[field.type_first] != .asterisk or tags[field.type_last] != .identifier) return null;
+    const pointee = model.findTypeInScope(tree.tokenSlice(field.type_last), ti) orelse return null;
+    const scalar = pointee.findField(tree.tokenSlice(start + 4)) orelse return null;
+    if (!isPlainScalarField(tree, scalar, writing)) return null;
+    return start + 5;
+}
+
+fn isPlainScalarField(tree: *const Ast, field: *const file_model.FieldInfo, bool_only: bool) bool {
+    if (field.type_first != field.type_last) return false;
+    const name = tree.tokenSlice(field.type_first);
+    if (std.mem.eql(u8, name, "bool")) return true;
+    if (bool_only) return false;
+    if (std.mem.eql(u8, name, "usize") or std.mem.eql(u8, name, "isize")) return true;
+    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return false;
+    for (name[1..]) |ch| if (!std.ascii.isDigit(ch)) return false;
+    return true;
+}
+
 const isCleanupName = method_names.isCleanupMethodName;
 
 fn report(
@@ -576,8 +695,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = problem.Pos.fromTokenStart(tree, field_tok),
-        .end = problem.Pos.fromTokenEnd(tree, field_tok),
+        .start = try problem.Pos.fromTokenStart(tree, field_tok),
+        .end = try problem.Pos.fromTokenEnd(tree, field_tok),
         .message = msg,
     });
 }
@@ -703,5 +822,72 @@ test "Inner with discard-only deinit body — no fire" {
         \\const Outer = struct {
         \\    inner: Inner,
         \\};
+    );
+}
+
+test "borrowed value cleanup only clears external boolean state — no fire" {
+    try testing.expectNoFire(check,
+        \\const State = struct { active: bool = false, claimed: bool = false, generation: u64 = 0 };
+        \\const Lease = struct {
+        \\    state: *State,
+        \\    generation: u64,
+        \\    fn release(self: Lease) void {
+        \\        if (!self.state.active) return;
+        \\        if (self.state.generation != self.generation) return;
+        \\        self.state.active = false;
+        \\        self.state.claimed = false;
+        \\    }
+        \\};
+        \\const Guard = struct { lease: Lease, expected_position: usize = 0 };
+    );
+}
+
+test "borrowed pointer cleanup decrements a reference — fires" {
+    try testing.expectFires(check, R,
+        \\const State = struct { refs: usize = 1, active: bool = true };
+        \\const Lease = struct {
+        \\    state: *State,
+        \\    fn release(self: Lease) void {
+        \\        self.state.active = false;
+        \\        self.state.refs -= 1;
+        \\    }
+        \\};
+        \\const Guard = struct { lease: Lease };
+    );
+}
+
+test "borrowed pointer cleanup calls unresolved resource release — fires" {
+    try testing.expectFires(check, R,
+        \\const State = struct { active: bool = true };
+        \\const Lease = struct {
+        \\    state: *State,
+        \\    fn release(self: Lease) void {
+        \\        self.state.active = false;
+        \\        releaseResource(self.state);
+        \\    }
+        \\};
+        \\const Guard = struct { lease: Lease };
+    );
+}
+
+test "boolean cleanup with unresolved pointee stays conservative — fires" {
+    try testing.expectFires(check, R,
+        \\const Lease = struct {
+        \\    state: *ExternalState,
+        \\    fn release(self: Lease) void { self.state.active = false; }
+        \\};
+        \\const Guard = struct { lease: Lease };
+    );
+}
+
+test "boolean cleanup does not hide embedded resource storage — fires" {
+    try testing.expectFires(check, R,
+        \\const State = struct { active: bool = true };
+        \\const Lease = struct {
+        \\    state: *State,
+        \\    bytes: []u8,
+        \\    fn release(self: Lease) void { self.state.active = false; }
+        \\};
+        \\const Guard = struct { lease: Lease };
     );
 }

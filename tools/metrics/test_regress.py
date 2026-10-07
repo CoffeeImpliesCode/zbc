@@ -30,7 +30,7 @@ def fake_analyzer(directory, payload, *, status=0):
     path = pathlib.Path(directory) / "zbc"
     path.write_text(FAKE_ZBC.format(
         python=sys.executable,
-        stderr="zbc: selected=1 analyzed=1 failed=0 findings=1\n",
+        stderr="zbc: selected=1 analyzed=1 partial=0 failed=0 findings=1\n",
         payload=payload,
         status=status,
     ))
@@ -288,7 +288,7 @@ class SymlinkedCheckoutTests(unittest.TestCase):
         self.checkout.symlink_to(regress.REPO, target_is_directory=True)
         self.addCleanup(self.checkout.unlink, missing_ok=True)
         self.zbc = fake_analyzer(self.scratch, json.dumps(
-            document(run(result(), invocations=COMPLETED))))
+            {"runs": [run(result(), invocations=COMPLETED)]}))
 
     def harness(self, checkout, *extra):
         """Run the harness script as CI does; return (exit code, output)."""

@@ -89,8 +89,11 @@ const TypeGroups = struct {
 };
 
 fn freeGroups(gpa: std.mem.Allocator, m: *std.StringHashMapUnmanaged(TypeGroups)) void {
-    var it = m.valueIterator();
-    while (it.next()) |v| v.deinit(gpa);
+    var it = m.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.deinit(gpa);
+        gpa.free(entry.key_ptr.*);
+    }
     m.deinit(gpa);
 }
 
@@ -101,17 +104,24 @@ fn buildAllGroups(
 ) !void {
     const root = tree.containerDeclRoot();
     const root_name = findRootSelfTypeName(tree);
-    try walkContainerForGroups(gpa, tree, root.ast.members, root_name, out);
+    try walkContainerForGroups(gpa, tree, root.ast.members, root_name, null, out);
 }
 
+/// `self_name` is the `FileModel.TypeInfo.qualified_name` of the
+/// container whose `members` are walked (null for an unnamed root).
+/// `child_prefix` is the qualified name nested decls are joined
+/// under: null at the file root, whose children are top-level types
+/// named by themselves, and `self_name` below it.  Map keys must equal
+/// `qualified_name` because `FileModel.findType` matches on it.
 fn walkContainerForGroups(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     members: []const Ast.Node.Index,
-    containing_type: ?[]const u8,
+    self_name: ?[]const u8,
+    child_prefix: ?[]const u8,
     out: *std.StringHashMapUnmanaged(TypeGroups),
 ) std.mem.Allocator.Error!void {
-    if (containing_type) |ct| {
+    if (self_name) |ct| {
         try gatherFieldsForType(gpa, tree, members, ct, out);
     }
     // Recurse into nested struct/union decls.
@@ -127,7 +137,13 @@ fn walkContainerForGroups(
                 const name_tok = vd.ast.mut_token + 1;
                 if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
                 const ty_name = tree.tokenSlice(name_tok);
-                try descendContainer(gpa, tree, init_node, ty_name, out);
+                if (child_prefix) |prefix| {
+                    const qualified = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ prefix, ty_name });
+                    defer gpa.free(qualified);
+                    try descendContainer(gpa, tree, init_node, qualified, out);
+                } else {
+                    try descendContainer(gpa, tree, init_node, ty_name, out);
+                }
             },
             else => {},
         }
@@ -138,19 +154,19 @@ fn descendContainer(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     node: Ast.Node.Index,
-    ty_name: []const u8,
+    qualified_name: []const u8,
     out: *std.StringHashMapUnmanaged(TypeGroups),
 ) std.mem.Allocator.Error!void {
     switch (tree.nodeTag(node)) {
         .container_decl, .container_decl_trailing => {
-            try walkContainerForGroups(gpa, tree, tree.containerDecl(node).ast.members, ty_name, out);
+            try walkContainerForGroups(gpa, tree, tree.containerDecl(node).ast.members, qualified_name, qualified_name, out);
         },
         .container_decl_two, .container_decl_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerForGroups(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, out);
+            try walkContainerForGroups(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, qualified_name, qualified_name, out);
         },
         .container_decl_arg, .container_decl_arg_trailing => {
-            try walkContainerForGroups(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, out);
+            try walkContainerForGroups(gpa, tree, tree.containerDeclArg(node).ast.members, qualified_name, qualified_name, out);
         },
         else => {},
     }
@@ -221,7 +237,17 @@ fn gatherFieldsForType(
         tg.deinit(gpa);
         return;
     }
-    try out.put(gpa, ct, tg);
+    const key = try gpa.dupe(u8, ct);
+    errdefer gpa.free(key);
+    const gop = try out.getOrPut(gpa, key);
+    if (gop.found_existing) {
+        // Same qualified name declared twice: keep the first, as the
+        // model's `findType` does.
+        gpa.free(key);
+        tg.deinit(gpa);
+        return;
+    }
+    gop.value_ptr.* = tg;
 }
 
 /// True iff `tt` is `?<NamedType>` where `<NamedType>` is plausibly
@@ -325,7 +351,7 @@ fn checkFn(
     if (!isDestructorName(fn_name)) return;
 
     const ct: []const u8 = if (model.containingTypeOf(fn_decl)) |ti|
-        ti.name
+        ti.qualified_name
     else
         root_self_type orelse return;
     const tg = groups.getPtr(ct) orelse return;
@@ -492,8 +518,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "asymmetric-field-free",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, f.name_tok),
-        .end = Pos.fromTokenEnd(tree, f.name_tok),
+        .start = try Pos.fromTokenStart(tree, f.name_tok),
+        .end = try Pos.fromTokenEnd(tree, f.name_tok),
         .message = msg,
     });
 }
@@ -603,6 +629,51 @@ test "asymmetric-field-free: arena-backed type — partial finalize does NOT fir
         \\    pub fn finalize(self: *Config) void {
         \\        if (self.shell_command) |*c| c.deinit();
         \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "asymmetric-field-free: nested type, partial deinit — fires like a top-level type" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const Map = struct { pub fn deinit(_: *Map) void {} };
+        \\const Outer = struct {
+        \\    pub const Route = struct {
+        \\        a_map: ?Map = null,
+        \\        b_map: ?Map = null,
+        \\        pub fn deinit(this: *Route) void {
+        \\            if (this.a_map) |*m| m.deinit();
+        \\        }
+        \\    };
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("asymmetric-field-free", problems.items[0].rule_id);
+}
+
+test "asymmetric-field-free: nested arena-backed type — partial finalize does NOT fire" {
+    // The arena-field gate looks the type up with `FileModel.findType`,
+    // which keys on the qualified name (`Outer.Mid.Config`).
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Command = struct { pub fn deinit(self: *Command) void { _ = self; } };
+        \\const Outer = struct {
+        \\    pub const Mid = struct {
+        \\        pub const Config = struct {
+        \\            _arena: ?std.heap.ArenaAllocator = null,
+        \\            initial_command: ?Command = null,
+        \\            shell_command: ?Command = null,
+        \\            pub fn finalize(self: *Config) void {
+        \\                if (self.shell_command) |*c| c.deinit();
+        \\            }
+        \\        };
+        \\    };
         \\};
         \\
     );

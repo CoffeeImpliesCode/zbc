@@ -110,8 +110,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "free-then-try-realloc",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, period_tok + 1),
-        .end = Pos.fromTokenEnd(tree, period_tok + 1),
+        .start = try Pos.fromTokenStart(tree, period_tok + 1),
+        .end = try Pos.fromTokenEnd(tree, period_tok + 1),
         .message = msg,
     });
 }

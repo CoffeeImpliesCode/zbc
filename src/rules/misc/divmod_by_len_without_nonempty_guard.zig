@@ -162,8 +162,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, span_first),
-        .end = Pos.fromTokenEnd(tree, span_last),
+        .start = try Pos.fromTokenStart(tree, span_first),
+        .end = try Pos.fromTokenEnd(tree, span_last),
         .message = msg,
     });
 }
@@ -485,6 +485,120 @@ test "product loop: a later call can empty a borrowed divisor before the next it
         \\        _ = index / right.data.len;
         \\        clear(right);
         \\    }
+        \\}
+    );
+}
+
+test "pointer field projection can replace a guarded slice" {
+    try testing.expectFiresTyped(check, R,
+        \\const Box = struct { bytes: []const u8, slot: *[]const u8 };
+        \\fn clear(p: *[]const u8) void { p.* = ""; }
+        \\pub fn divide(box: *Box) usize {
+        \\    if (box.bytes.len == 0) return 0;
+        \\    clear(box.slot);
+        \\    return 10 / box.bytes.len;
+        \\}
+    );
+}
+
+test "dereferenced pointer projection can replace a guarded slice" {
+    try testing.expectFiresTyped(check, R,
+        \\fn clear(p: *[]const u8) void { p.* = ""; }
+        \\pub fn divide(bytes: *[]const u8, slot: **[]const u8) usize {
+        \\    if (bytes.len == 0) return 0;
+        \\    clear(slot.*);
+        \\    return 10 / bytes.len;
+        \\}
+    );
+}
+
+test "indexed pointer projection can replace a guarded slice" {
+    try testing.expectFiresTyped(check, R,
+        \\fn clear(p: *[]const u8) void { p.* = ""; }
+        \\pub fn divide(bytes: *[]const u8, slots: []const *[]const u8) usize {
+        \\    if (bytes.len == 0) return 0;
+        \\    clear(slots[0]);
+        \\    return 10 / bytes.len;
+        \\}
+    );
+}
+
+test "opaque projection does not preserve a guarded indirect slice" {
+    try testing.expectFires(check, R,
+        \\pub fn divide(box: *Box) usize {
+        \\    if (box.bytes.len == 0) return 0;
+        \\    clear(box.slot);
+        \\    return 10 / box.bytes.len;
+        \\}
+    );
+}
+
+test "scalar field projection preserves a guarded indirect slice" {
+    try testing.expectNoFireTyped(check,
+        \\const Box = struct { bytes: []const u8, count: usize };
+        \\fn consume(count: usize) void { _ = count; }
+        \\pub fn divide(box: *Box) usize {
+        \\    if (box.bytes.len == 0) return 0;
+        \\    consume(box.count);
+        \\    return 10 / box.bytes.len;
+        \\}
+    );
+}
+
+test "read only pointer projection preserves a guarded indirect slice" {
+    try testing.expectNoFireTyped(check,
+        \\const Box = struct { bytes: []const u8, slot: *[]const u8 };
+        \\fn readOnly(p: *[]const u8) void { _ = p.*.len; }
+        \\pub fn divide(box: *Box) usize {
+        \\    if (box.bytes.len == 0) return 0;
+        \\    readOnly(box.slot);
+        \\    return 10 / box.bytes.len;
+        \\}
+    );
+}
+
+test "pointer projection cannot replace an unaddressed local slice header" {
+    try testing.expectNoFireTyped(check,
+        \\const Box = struct { slot: *[]const u8 };
+        \\fn clear(p: *[]const u8) void { p.* = ""; }
+        \\pub fn divide(bytes: []const u8, box: *Box) usize {
+        \\    if (bytes.len == 0) return 0;
+        \\    clear(box.slot);
+        \\    return 10 / bytes.len;
+        \\}
+    );
+}
+
+test "scalar dereference projection preserves a guarded indirect slice" {
+    try testing.expectNoFireTyped(check,
+        \\fn consume(count: usize) void { _ = count; }
+        \\pub fn divide(bytes: *[]const u8, count: *const usize) usize {
+        \\    if (bytes.len == 0) return 0;
+        \\    consume(count.*);
+        \\    return 10 / bytes.len;
+        \\}
+    );
+}
+
+test "scalar index projection preserves a guarded indirect slice" {
+    try testing.expectNoFireTyped(check,
+        \\fn consume(count: usize) void { _ = count; }
+        \\pub fn divide(bytes: *[]const u8, counts: []const usize) usize {
+        \\    if (bytes.len == 0) return 0;
+        \\    consume(counts[0]);
+        \\    return 10 / bytes.len;
+        \\}
+    );
+}
+
+test "slice field projection can carry pointers to a guarded slice header" {
+    try testing.expectFiresTyped(check, R,
+        \\const Box = struct { bytes: []const u8, slots: []const *[]const u8 };
+        \\fn clear(slots: []const *[]const u8) void { slots[0].* = ""; }
+        \\pub fn divide(box: *Box) usize {
+        \\    if (box.bytes.len == 0) return 0;
+        \\    clear(box.slots);
+        \\    return 10 / box.bytes.len;
         \\}
     );
 }

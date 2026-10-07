@@ -17,6 +17,10 @@
 //! state, no callback table and no interface layer.  What it owns is the
 //! reasoning about storage, which is a different reason for the code to
 //! change than the statement walk, the numeric evaluator or the loop prover.
+//!
+//! A failed resolver query is not a missing proof. Nonthrowing reachability
+//! helpers retain the first error in `Oracle.summary_error`; the enclosing
+//! throwing walk returns it before publishing an answer.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -33,13 +37,15 @@ const State = value_range.State;
 /// behind `path`, so `f(P)` must invalidate exactly what `f(&path)` does.
 /// `token` is the first token of the binding statement, so the target in
 /// force at a use is the LAST binding before that use — a later `P = &other`
-/// supersedes the declaration.  An empty `path` marks a target this body
-/// could not resolve: such a pointer may name ANY storage, so every call it
-/// reaches invalidates every path.
+/// supersedes the declaration. Unless `fresh` establishes new storage, an
+/// empty `path` marks an unresolved target that may name any storage.
 pub const EscapeAlias = struct {
     local: []const u8,
     path: []const u8,
     token: Ast.TokenIndex,
+    /// A successful standard allocator creation names new storage, not a
+    /// pre-existing object. The binding token is its allocation identity.
+    fresh: bool = false,
 };
 
 /// The storage a pointer chain names, as the leading storage plus the
@@ -61,6 +67,8 @@ const AliasStorage = struct {
     /// parameter looks like, and it is answered by a set rather than by an
     /// assumption — see `resolveAliasChain`.
     unbound: bool = false,
+    /// The allocation binding reached by the chain, including pointer copies.
+    fresh_token: ?Ast.TokenIndex = null,
 };
 
 /// How many pointer bindings one alias chain may have before the walk gives
@@ -81,6 +89,7 @@ pub const EffectScan = struct {
     call_count: usize = 0,
     writes: [effect_scan_cap][]const u8 = undefined,
     write_count: usize = 0,
+    write_pointers: [effect_scan_cap]?Ast.Node.Index = @splat(null),
     /// False once the subtree held an effect this scan does not model.  The
     /// answer is then "reaches everything", which is the sound direction: a
     /// missing effect would keep a fact that is no longer true.
@@ -88,8 +97,10 @@ pub const EffectScan = struct {
 
     pub fn reaches(scan: *const EffectScan, o: *Oracle, path: []const u8) bool {
         if (!scan.complete) return true;
-        for (scan.writes[0..scan.write_count]) |write| {
-            if (writeReachesPath(write, path)) return true;
+        for (scan.writes[0..scan.write_count], scan.write_pointers[0..scan.write_count]) |write, pointer| {
+            if (pointer) |operand| {
+                if (escapeReaches(o, operand, path)) return true;
+            } else if (writeReachesPath(write, path)) return true;
         }
         for (scan.calls[0..scan.call_count]) |call| {
             if (pathEscapedBy(o, call, path)) return true;
@@ -277,22 +288,17 @@ fn addressIsDiscarded(tree: *const Ast, node: Ast.Node.Index) bool {
 /// engine's question, asked separately; this one answers for the declaration
 /// that writes a pointer type out.
 ///
-/// `[*]T` is a `.ptr_type` in this toolchain, not a tag of its own — the many
-/// and the one pointer differ in the sentinel and address space the extra
-/// data carries, not in the node tag — so one arm answers for `*T`, `[*]T` and
-/// `[*c]T` together, and `.ptr_type_sentinel` adds the sentinel-carrying
-/// spelling of the same thing.
+/// Pointer AST tags also represent slices. Read the full pointer shape so all
+/// pointer spellings are covered without treating a by-value slice header as
+/// storage reached through an address.
 pub fn spellingIsPointer(tree: *const Ast, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(node)) {
-        .ptr_type, .ptr_type_sentinel => true,
-        .optional_type => switch (tree.nodeTag(tree.nodeData(node).node)) {
-            .ptr_type, .ptr_type_sentinel => true,
-            else => false,
-        },
-        else => false,
-    };
+    const pointer_node = if (tree.nodeTag(node) == .optional_type)
+        tree.nodeData(node).node
+    else
+        node;
+    const pointer = tree.fullPtrType(pointer_node) orelse return false;
+    return pointer.size != .slice;
 }
-
 
 /// Record `name` as pointer-valued when its declaration proves it: an explicit
 /// `*T` / `?*T` / `[*]T` type, a `&path` initializer, or a type the engine
@@ -341,14 +347,12 @@ fn markPointerLocal(
         }
     }
     if (o.cache) |cache| {
-        if (cache.typeRefIsPointerLike(target) != true) return;
+        // An explicit slice type coerces a string or array-pointer initializer
+        // into a by-value header. Classify the binding, not that initializer.
+        const value_type = type_node orelse target;
+        if (cache.typeRefIsPointerLike(value_type) != true) return;
         try o.pointer_roots.add(o.gpa, name);
-        // `typeRefIsPointerLike` also accepts a slice/array header, whose `.len`
-        // lives in the local itself.  Only a genuine address — a raw single
-        // pointer, or an optional wrapping one — makes `local.field` a load
-        // through that address.  An unresolved type is treated as a value,
-        // matching the token-only mode where nothing is marked at all.
-        if (valueIsAddress(o, target)) try o.indirection_roots.add(o.gpa, name);
+        if (valueIsAddress(o, value_type)) try o.indirection_roots.add(o.gpa, name);
     }
 }
 
@@ -374,19 +378,29 @@ fn parameterIsPointer(o: *Oracle, name: []const u8) bool {
 /// Does a value of `node`'s type live outside the binding's own frame slot?
 /// Resolved through the type engine, so an alias (`const P = *T;`) and an
 /// inferred binding are both classified by their actual type, never by the
-/// spelling of the call that produced them.  Null (no type engine, unresolved)
-/// is a "no": the caller has already established the value is pointer-LIKE, and
-/// the by-value reading is the one a slice header needs.
-pub fn valueIsAddress(o: *const Oracle, node: Ast.Node.Index) bool {
+/// spelling of the call that produced them. Null from a successful query (no
+/// type engine, unresolved) is a "no": the caller has already established the
+/// value is pointer-LIKE, and the by-value reading is the one a slice header
+/// needs. A failed query must not establish that reading: it can retain a
+/// field fact across a call that writes through the address.
+pub fn valueIsAddress(o: *Oracle, node: Ast.Node.Index) bool {
     const cache = o.cache orelse return false;
     const resolver = cache.zls orelse return false;
-    if ((resolver.isRawSinglePointerType(node) catch null) == true) return true;
-    return (resolver.optionalPayloadIsPointer(node) catch null) == true;
+    const raw_pointer = resolver.isRawSinglePointerType(node) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    };
+    if (raw_pointer == true) return true;
+    const optional_pointer = resolver.optionalPayloadIsPointer(node) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    };
+    return optional_pointer == true;
 }
 
-/// Record what `name` names from `token` on: `&x` names `x`, another pointer
-/// names whatever that pointer names, and anything else — including a
-/// rebinding nested in a branch, which may never execute — is unresolved.
+/// Record what `name` names from `token` on. Only the toolchain allocator's
+/// `create` contract establishes fresh storage; other call results and
+/// conditional rebindings remain unresolved.
 fn recordPointerTarget(
     o: *Oracle,
     name: []const u8,
@@ -396,9 +410,11 @@ fn recordPointerTarget(
 ) error{OutOfMemory}!void {
     const tree = o.tree;
     var path: []const u8 = "";
+    var fresh = false;
     if (unconditional) {
         if (init) |node| {
             const target = value_range.unwrapGrouped(tree, node);
+            fresh = stdAllocatorCreatesStorage(o, target);
             switch (tree.nodeTag(target)) {
                 .address_of => path = value_range.nodeSrc(tree, value_range.unwrapGrouped(tree, tree.nodeData(target).node)),
                 .identifier => {
@@ -419,7 +435,28 @@ fn recordPointerTarget(
             }
         }
     }
-    try o.escape_aliases.append(o.gpa, .{ .local = name, .path = path, .token = token });
+    try o.escape_aliases.append(o.gpa, .{ .local = name, .path = path, .token = token, .fresh = fresh });
+}
+
+fn stdAllocatorCreatesStorage(o: *Oracle, initializer: Ast.Node.Index) bool {
+    const tree = o.tree;
+    const node = value_range.unwrapGrouped(tree, if (tree.nodeTag(initializer) == .@"try") tree.nodeData(initializer).node else initializer);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    if (call.ast.params.len != 1) return false;
+    const resolver = (o.cache orelse return false).zls orelse return false;
+    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) {
+        .function => |reference| reference,
+        .unknown, .not_callable => return false,
+    };
+    if (!std.mem.eql(u8, reference.tree.tokenSlice(reference.fn_token + 1), "create")) return false;
+    return resolver.declaredInToolchainFile(reference.handle, "/std/mem/Allocator.zig") catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    };
 }
 
 /// The storage the pointer `name` names at `at`, following the chain of
@@ -508,6 +545,12 @@ fn resolveAliasChain(
             .unresolved = false,
             .unbound = true,
         };
+        if (entry.fresh) return .{
+            .lead = local,
+            .suffixes = orderApplied(suffixes[0..count]),
+            .unresolved = false,
+            .fresh_token = entry.token,
+        };
         const bound = entry.path;
         if (bound.len == 0) return .{};
         const lead = rootText(bound);
@@ -522,7 +565,7 @@ fn resolveAliasChain(
         // already in `suffixes` — handing `bound` back as the lead would apply
         // it twice, so `const a = &holder; const b = &a.count` would answer
         // `holder.count.count`.
-        if (!o.pointer_roots.contains(lead)) {
+        if (!o.indirection_roots.contains(lead)) {
             return .{
                 .lead = lead,
                 .suffixes = orderApplied(suffixes[0..count]),
@@ -533,6 +576,12 @@ fn resolveAliasChain(
         anchor = entry.token;
     }
     return .{};
+}
+
+/// True only when this binding chain ends at a certified fresh allocation.
+pub fn hasFreshStorage(o: *Oracle, name: []const u8, at: Ast.TokenIndex) bool {
+    var suffixes: [alias_hop_cap][]const u8 = undefined;
+    return resolveAliasChain(o, rootText(name), at, &suffixes).fresh_token != null;
 }
 
 /// The collected projections in the order they APPLY to the storage the chain
@@ -648,6 +697,31 @@ fn callStableRoot(o: *const Oracle, root: []const u8) bool {
     return value_range.isLocalName(o, root);
 }
 
+/// A slice parameter's length belongs to this frame's copied header. Passing
+/// the slice can expose its elements, but cannot expose this header unless
+/// this body takes its address. Unknown types and shadowed names prove nothing.
+fn copiedSliceLength(o: *Oracle, path: []const u8) bool {
+    const root = rootText(path);
+    if (!std.mem.eql(u8, path[root.len..], ".len") or !callStableRoot(o, root)) return false;
+    const tree = o.tree;
+    const declaration = value_range.enclosingFnDecl(o) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return false;
+    var parameters = proto.iterate(tree);
+    while (parameters.next()) |parameter| {
+        const name_token = parameter.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(name_token), root)) continue;
+        const type_node = parameter.type_expr orelse return false;
+        const pointer = tree.fullPtrType(type_node) orelse return false;
+        if (pointer.size != .slice) return false;
+        for (o.locals) |binding| {
+            if (binding.origin != .param and std.mem.eql(u8, binding.name, root)) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 /// A scalar fact survives a call when the callee cannot reach the storage the
 /// fact is about: its receiver and its arguments name no overlapping storage.
 ///
@@ -658,8 +732,19 @@ fn callStableRoot(o: *const Oracle, root: []const u8) bool {
 /// a callee handed `holder` still keeps `holder.index` only if it names that
 /// field — which is the point.
 pub fn scalarSurvivesCall(o: *Oracle, name: []const u8, effect: value_range.Reach) bool {
+    if (copiedSliceLength(o, name)) return true;
     if (std.mem.indexOfScalar(u8, name, '.') == null) {
         if (!localScalarSurvivesCall(o, name)) return false;
+        // Ordinary calls receive this frame's scalar by value. Even an
+        // anonymous temporary address in another argument cannot name it.
+        // Do not apply this to subtree effects: they can assign the local.
+        if (!o.addressed.contains(name)) switch (effect) {
+            .one => |node| {
+                var buffer: [1]Ast.Node.Index = undefined;
+                if (o.tree.fullCall(&buffer, node) != null) return true;
+            },
+            .unknown, .subtree => {},
+        };
         return !effect.reaches(o, name);
     }
     if (!value_range.isLocalName(o, rootText(name))) return false;
@@ -667,7 +752,7 @@ pub fn scalarSurvivesCall(o: *Oracle, name: []const u8, effect: value_range.Reac
 }
 
 pub fn containerSurvivesCall(o: *Oracle, path: []const u8, effect: value_range.Reach) bool {
-    if (!callStableRoot(o, rootText(path))) return false;
+    if (!value_range.isLocalName(o, rootText(path))) return false;
     return !effect.reaches(o, path);
 }
 
@@ -705,7 +790,10 @@ fn methodKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.In
     const resolver = cache.zls orelse return false;
     var call_buf: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buf, call_node) orelse return false;
-    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch return false) {
+    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) {
         .function => |reference| reference,
         .unknown, .not_callable => return false,
     };
@@ -729,8 +817,7 @@ fn methodKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.In
     const owner = cache.resolvedTypeAcrossImports(type_name) orelse return false;
     if (owner.info.kind != .struct_) return false;
     const body = tokens.bodyOf(tree, declaration) orelse return false;
-    const allowance = @min(o.budget, value_range.max_contract_steps);
-    if (allowance == 0) return false;
+    const allowance = value_range.contractAllowance(o) orelse return false;
     var scanner: Oracle = .{
         .gpa = o.gpa,
         .tree = tree,
@@ -743,6 +830,7 @@ fn methodKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.In
         .memo = o.memo,
     };
     defer scanner.deinit();
+    defer value_range.inheritStop(o, &scanner);
     defer o.budget -= value_range.chargeContractSteps(allowance, &scanner);
     var effects: EffectScan = .{};
     scanEffects(&scanner, body, &effects, 0);
@@ -766,6 +854,144 @@ fn methodKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.In
     return true;
 }
 
+/// Nested calls preserve a selected receiver path only when the existing,
+/// context-keyed effect summary proves it read-only. A const receiver is a
+/// cheap candidate filter, not the proof; unknown rooted or global effects
+/// still invalidate. The summary spends this oracle's remaining allowance.
+fn methodSummaryKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.Index, path: []const u8) bool {
+    const tree = o.tree;
+    if (tree.nodeTag(receiver) != .identifier) return false;
+    const receiver_name = tree.tokenSlice(tree.nodeMainToken(receiver));
+    if (!std.mem.startsWith(u8, path, receiver_name) or path.len <= receiver_name.len + 1 or
+        path[receiver_name.len] != '.') return false;
+    const field = path[receiver_name.len + 1 ..];
+    if (std.mem.indexOfAny(u8, field, "[*(") != null) return false;
+    const cache = o.cache orelse return false;
+    const resolver = cache.zls orelse return false;
+    const TypeResolver = @import("../type_resolver.zig").TypeResolver;
+    var call_buffer: [2]Ast.Node.Index = undefined;
+    const call = TypeResolver.CallOperands.full(tree, &call_buffer, call_node) orelse return false;
+    const token = call.queryToken(tree, call_node);
+    const frame = o.resolution_frame orelse resolver.resolutionFrame();
+    const actual = (cache.actualCallSummaryAt(token, frame) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) orelse return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(actual.callee.tree, &proto_buffer, actual.callee.declaration) orelse return false;
+    var parameters = proto.iterate(actual.callee.tree);
+    const parameter = parameters.next() orelse return false;
+    const pointer = actual.callee.tree.fullPtrType(parameter.type_expr orelse return false) orelse return false;
+    if (pointer.size != .one or pointer.const_token == null) return false;
+    const mapped = (actual.callArgumentFor(cache, &call_buffer, 0) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) orelse return false;
+    if (mapped != receiver) return false;
+    const context = @import("../cache/call_summary.zig").QueryContext{
+        .frame = frame,
+        .remaining = &o.budget,
+        .declaration = value_range.enclosingFnDecl(o),
+    };
+    const effect = (cache.callEffectAt(token, .{ .parameter = .{ .param = 0, .path = field } }, context) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) orelse return false;
+    if (effect != .read_only) return false;
+    const unrooted = (cache.callEffectAt(token, .unrooted, context) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) orelse return false;
+    return unrooted == .read_only;
+}
+
+/// `list.ensureTotalCapacity(…)`, `list.ensureTotalCapacityPrecise(…)` and
+/// `list.ensureUnusedCapacity(…)` of a `std/array_list.zig` container only
+/// reallocate: they write `capacity` and `items.ptr`, never `items.len`.  So
+/// a fact about `<receiver>.items.len` survives the call.  The declaration is
+/// the identity — its own document and its own name, as the resolver reads
+/// them — so a project method that shares the spelling and resizes the list
+/// still drops the fact.  Every other path under the receiver is still
+/// reached.
+fn capacityMethodKeepsLength(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.Index, path: []const u8) bool {
+    const tree = o.tree;
+    if (!value_range.isPureFieldPath(tree, receiver)) return false;
+    const spelling = value_range.nodeSrc(tree, receiver);
+    if (!std.mem.startsWith(u8, path, spelling) or !std.mem.eql(u8, path[spelling.len..], ".items.len")) return false;
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buf, call_node) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const method = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+    if (!std.mem.eql(u8, method, "ensureTotalCapacity") and
+        !std.mem.eql(u8, method, "ensureTotalCapacityPrecise") and
+        !std.mem.eql(u8, method, "ensureUnusedCapacity")) return false;
+    const resolver = (o.cache orelse return false).zls orelse return false;
+    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) {
+        .function => |reference| reference,
+        .unknown, .not_callable => return false,
+    };
+    const toolchain_file = resolver.declaredInToolchainFile(reference.handle, "/std/array_list.zig") catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    };
+    if (!toolchain_file) return false;
+    return std.mem.eql(u8, reference.tree.tokenSlice(reference.fn_token + 1), method);
+}
+
+/// The standard-library files whose container methods only write the
+/// container they are called on.
+const container_files = [_][]const u8{
+    "/std/array_list.zig",
+    "/std/hash_map.zig",
+    "/std/array_hash_map.zig",
+    "/std/multi_array_list.zig",
+};
+
+/// `object.a.method(…)` of a standard container hands the callee a pointer to
+/// `object.a` ALONE: it writes what that container holds, and nothing in the
+/// pointer names `object.b`.  So a fact about a SIBLING field path
+/// (`self.path_text.items.len` under a call on `self.paths`) survives it.
+/// The fact and the receiver must both be plain dotted field paths that
+/// diverge below their shared root — neither lies inside the other, because
+/// then the call writes the fact's own storage — and the callee's declaration
+/// must be a standard container's, by document identity: a project method
+/// that shares the spelling can write through anything it was given.  The
+/// call's other arguments are asked on their own by the caller.
+fn containerMethodKeepsSibling(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.Index, path: []const u8) bool {
+    const tree = o.tree;
+    const spelling = value_range.nodeSrc(tree, receiver);
+    if (std.mem.indexOfAny(u8, spelling, "[*(") != null or std.mem.indexOfAny(u8, path, "[*(") != null) return false;
+    var receiver_segments = std.mem.splitScalar(u8, spelling, '.');
+    var path_segments = std.mem.splitScalar(u8, path, '.');
+    while (true) {
+        const left = receiver_segments.next() orelse return false;
+        const right = path_segments.next() orelse return false;
+        if (!std.mem.eql(u8, left, right)) break;
+    }
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buf, call_node) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const resolver = (o.cache orelse return false).zls orelse return false;
+    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) {
+        .function => |reference| reference,
+        .unknown, .not_callable => return false,
+    };
+    for (container_files) |file| {
+        const toolchain_file = resolver.declaredInToolchainFile(reference.handle, file) catch |err| {
+            o.summary_error = o.summary_error orelse err;
+            return false;
+        };
+        if (toolchain_file) return true;
+    }
+    return false;
+}
+
 /// True when a call at `effect` can hand the callee storage that `path` names.
 /// `false` is only returned for effects we can enumerate completely: an
 /// ordinary call (receiver + arguments) or the writing argument of a
@@ -777,16 +1003,40 @@ fn methodKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.In
 /// writing callee the storage and a non-writing one a value it ignores.
 pub fn pathEscapedBy(o: *Oracle, effect: Ast.Node.Index, path: []const u8) bool {
     const tree = o.tree;
+    // Indexed stores can alias caller-owned pointers or escaped locals. They
+    // cannot change an independent frame-local index whose address never
+    // leaves this body. The base spelling alone does not prove disjointness:
+    // two slice/pointer parameters can name the same element.
+    if (std.mem.startsWith(u8, @tagName(tree.nodeTag(effect)), "assign") and
+        tree.nodeTag(effect) != .assign_destructure)
+    {
+        const target = tree.nodeData(effect).node_and_node[0];
+        if (tree.nodeTag(target) == .array_access) {
+            const root = rootText(path);
+            return o.indirection_roots.contains(root) or o.addressed.contains(root) or
+                !value_range.isLocalName(o, root);
+        }
+    }
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, effect)) |call| {
+        // An escaped local or indirect storage can be reached through a
+        // global pointer, even when this call passes only scalar arguments.
+        // Keep its facts only if the exact callee proves no unrooted write.
+        const root = rootText(path);
+        if ((o.addressed.contains(root) or o.indirection_roots.contains(root) or
+            !value_range.isLocalName(o, root)) and !callKeepsUnrootedStorage(o, effect))
+            return true;
         if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
             const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
             // Zig binds `recv.method(...)` as `method(&recv, ...)` whenever the
             // method takes a pointer receiver, so the receiver's own storage is
             // writable even though no address appears in the source.
             const overlaps = value_range.isPureFieldPath(tree, receiver) and
-                pathSegmentsOverlap(value_range.nodeSrc(tree, receiver), path);
-            if (overlaps and !methodKeepsField(o, effect, receiver, path)) return true;
+                pathSegmentsOverlap(value_range.nodeSrc(tree, receiver), path) and
+                !containerMethodKeepsSibling(o, effect, receiver, path);
+            if (overlaps and !methodKeepsField(o, effect, receiver, path) and
+                !capacityMethodKeepsLength(o, effect, receiver, path) and
+                !methodSummaryKeepsField(o, effect, receiver, path)) return true;
             if (!overlaps and escapeReaches(o, receiver, path)) return true;
         }
         for (call.ast.params) |param| {
@@ -805,145 +1055,53 @@ pub fn pathEscapedBy(o: *Oracle, effect: Ast.Node.Index, path: []const u8) bool 
     return true;
 }
 
-/// Does the argument at `index` hand the callee storage overlapping `path`?
+fn callKeepsUnrootedStorage(o: *Oracle, call_node: Ast.Node.Index) bool {
+    const cache = o.cache orelse return false;
+    const resolver = cache.zls orelse return false;
+    const TypeResolver = @import("../type_resolver.zig").TypeResolver;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const call = TypeResolver.CallOperands.full(o.tree, &buffer, call_node) orelse return false;
+    const context = @import("../cache/call_summary.zig").QueryContext{
+        .frame = o.resolution_frame orelse resolver.resolutionFrame(),
+        .remaining = &o.budget,
+        .declaration = value_range.enclosingFnDecl(o),
+    };
+    const effect = (cache.callEffectAt(call.queryToken(o.tree, call_node), .unrooted, context) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    }) orelse return false;
+    return effect == .read_only;
+}
+
+/// Does this argument hand the callee storage overlapping `path`?
 ///
-/// Every shape but an address is decided by the spelling alone and goes to
-/// `escapeReaches`.  An address hands over WRITE access, and whether that
-/// access is ever used is a question about the callee: a resolved in-file
-/// callee whose every write lands on storage this site does NOT pass it was
-/// handed a pointer it never writes through, so the storage it names is not
-/// reachable from the call.  Everything the proof cannot read answers as
-/// before, and an `&x` reaching a callee that writes it still invalidates.
+/// Pointer-bearing values can also reach escaped storage through their
+/// pointees. Only a complete read-only callee certificate can discharge
+/// that access; the argument's AST shape does not determine mutability.
 fn argumentReaches(o: *Oracle, call_node: Ast.Node.Index, argument: Ast.Node.Index, path: []const u8) bool {
-    const tree = o.tree;
-    const arg = value_range.unwrapGrouped(tree, argument);
-    if (tree.nodeTag(arg) != .address_of) return escapeReaches(o, argument, path);
-    const target = value_range.nodeSrc(tree, value_range.unwrapGrouped(tree, tree.nodeData(arg).node));
-    if (!pathSegmentsOverlap(target, path)) return false;
+    if (!escapeReaches(o, argument, path)) return false;
     return !calleeKeepsAddress(o, call_node);
 }
 
-/// Can the callee of `call_node` be shown to write NONE of the storage this
-/// site hands it?
-///
-/// Every part of this has to be readable, because the claim is "this callee
-/// never writes" and a missing part is a write it might have made:
-///
-///   * the callee resolves to a DECLARATION in this file — a document, a `fn`
-///     token and that token's own `fn_decl`, never a name.  Two containers in
-///     one file may each declare a private `apply`, and reading the wrong one
-///     is a claim about a body this call never entered;
-///   * its body is not this body and schedules no `defer` of its own;
-///   * it calls nothing.  A nested call is recorded as a call and refuses the
-///     answer, so the callee cannot hand the address to anyone else.
-///
-/// Everything after that is asked IN THE CALLEE'S OWN NAMESPACE, which is the
-/// only place it can be asked correctly: a write recorded inside the body is
-/// spelled with the callee's parameter name (`p.count`), while the storage the
-/// call site handed over is spelled with the CALLER's name (`state.list`).
-/// Comparing those two spellings segment by segment would approve a callee
-/// that writes through the very parameter it was handed, which is the opposite
-/// of the answer.  So the test is on the parameter NAMES:
-///
-///   * every write the effect scan can name must fail to reach every
-///     parameter.  `p.count = 0` reaches `p` and disqualifies the callee; a
-///     write of a callee-local (`q = 0`) reaches no parameter and does not;
-///   * every OCCURRENCE of a parameter name in the body must be a field access
-///     on it, or the discarded value of `_ = p`.  Anything else is the pointer
-///     being bound to a name (`var q = p`), stored somewhere (`self.saved = p`)
-///     or passed on — and a name bound from a parameter is a second spelling of
-///     the storage, so `q.count = 0` under a callee the scan read as complete
-///     is still a write.  This is the same discipline `methodKeepsField`
-///     applies to a receiver.
-///
-/// `_ = p` is the one occurrence that is allowed, and it is allowed because
-/// the discard target is not storage: writing it writes nothing any fact here
-/// is about.  Every other shape declines the answer, which leaves the address
-/// argument handing over write access exactly as it did before.
+/// A complete effect certificate covers every formal and unrooted storage.
+/// Reuse the cache's exact contextual query rather than rescanning the same
+/// callee for each surviving scalar and conditional length fact.
 fn calleeKeepsAddress(o: *Oracle, call_node: Ast.Node.Index) bool {
     const cache = o.cache orelse return false;
     const resolver = cache.zls orelse return false;
-    const tree = o.tree;
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, call_node) orelse return false;
-    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch return false) {
-        .function => |reference| reference,
-        .unknown, .not_callable => return false,
-    };
-    if (reference.tree != tree) return false;
-    const declaration = tokens.enclosingFnDecl(tree, reference.fn_token) orelse return false;
-    var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return false;
-    if (proto.ast.fn_token != reference.fn_token) return false;
-    const body = tokens.bodyOf(tree, declaration) orelse return false;
-    if (body == o.body or value_range.bodyDefers(tree, body)) return false;
-    var names: [value_range.max_contract_bindings][]const u8 = undefined;
-    var name_count: usize = 0;
-    var parameters = proto.iterate(tree);
-    while (parameters.next()) |parameter| {
-        const spelled = parameter.name_token orelse continue;
-        if (name_count == names.len) return false;
-        names[name_count] = tree.tokenSlice(spelled);
-        name_count += 1;
-    }
-    if (name_count == 0) return false;
-    const allowance = @min(o.budget, value_range.max_contract_steps);
-    if (allowance == 0) return false;
-    var scanner: Oracle = .{
-        .gpa = o.gpa,
-        .tree = tree,
-        .body = body,
-        .query = .numeric_range,
-        .target = "",
-        .use_token = 0,
-        .budget = allowance,
-        .budget_cap = o.budget_cap,
-        .memo = o.memo,
-    };
-    defer scanner.deinit();
-    defer o.budget -= value_range.chargeContractSteps(allowance, &scanner);
-    var effects: EffectScan = .{};
-    scanEffects(&scanner, body, &effects, 0);
-    if (!effects.complete or effects.call_count != 0) return false;
-    for (effects.writes[0..effects.write_count]) |write| {
-        for (names[0..name_count]) |name| {
-            if (writeReachesPath(write, name)) return false;
-        }
-    }
-    // Every mention of a parameter has to be a field access on it, or the
-    // value `_ = p` throws away.  A mention that is neither is a second
-    // spelling of the same storage, and nothing in the scan above can see it.
-    const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
-    var token = first;
-    while (token <= last) : (token += 1) {
-        if (!scanner.spend()) return false;
-        if (tags[token] != .identifier) continue;
-        const spelled = tree.tokenSlice(token);
-        var is_parameter = false;
-        for (names[0..name_count]) |name| {
-            if (std.mem.eql(u8, name, spelled)) is_parameter = true;
-        }
-        if (!is_parameter) continue;
-        if (token < last and tags[token + 1] == .period) {
-            // A field access on it is one read or one write the scan above
-            // already named — unless the address of that field is what is
-            // written.  `&p.field` hands the callee a pointer into the storage
-            // the caller owns, bound to a name of its own, and every write
-            // through THAT name is recorded under the alias rather than under
-            // `p`.  So an address taken of a parameter disqualifies the whole
-            // callee, whether it is returned, stored or written through.
-            if (token == 0 or tags[token - 1] != .ampersand) continue;
-            return false;
-        }
-        // `_ = p` discards the pointer without binding it to a name.
-        if (token >= 2 and token - 2 >= first and tags[token - 1] == .equal and
-            tags[token - 2] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(token - 2), "_")) continue;
+    const TypeResolver = @import("../type_resolver.zig").TypeResolver;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const call = TypeResolver.CallOperands.full(o.tree, &buffer, call_node) orelse return false;
+    const frame = o.resolution_frame orelse resolver.resolutionFrame();
+    const effect = (cache.callEffectAt(call.queryToken(o.tree, call_node), .{ .whole = null }, .{
+        .frame = frame,
+        .remaining = &o.budget,
+        .declaration = value_range.enclosingFnDecl(o),
+    }) catch |err| {
+        o.summary_error = o.summary_error orelse err;
         return false;
-    }
-    return true;
+    }) orelse return false;
+    return effect == .read_only;
 }
 
 /// Record every call and every direct write inside `node`.
@@ -1019,13 +1177,50 @@ pub fn scanEffects(o: *Oracle, node: Ast.Node.Index, scan: *EffectScan, depth: u
         else => plain: {
             if (!std.mem.startsWith(u8, @tagName(tag), "assign")) break :plain;
             const target = tree.nodeData(node).node_and_node[0];
+            if (tree.nodeTag(target) == .array_access) {
+                // Keep this as a non-leaf effect, not a direct field write.
+                // Receiver purity proofs reject it through call_count, while
+                // pathEscapedBy distinguishes independent local indices from
+                // storage that may alias an array element.
+                if (scan.call_count == effect_scan_cap) {
+                    scan.complete = false;
+                    return;
+                }
+                scan.calls[scan.call_count] = node;
+                scan.call_count += 1;
+                break :plain;
+            }
             if (!value_range.isPureFieldPath(tree, target)) {
-                scan.complete = false;
-                return;
+                if (tree.nodeTag(target) != .deref or scan.write_count == effect_scan_cap) {
+                    scan.complete = false;
+                    return;
+                }
+                const pointer = value_range.unwrapGrouped(tree, tree.nodeData(target).node);
+                if (tree.nodeTag(pointer) != .identifier or
+                    !o.pointer_roots.contains(tree.tokenSlice(tree.nodeMainToken(pointer))))
+                {
+                    scan.complete = false;
+                    return;
+                }
+                scan.write_pointers[scan.write_count] = pointer;
+                scan.writes[scan.write_count] = value_range.nodeSrc(tree, pointer);
+                scan.write_count += 1;
+                break :plain;
             }
             if (scan.write_count == effect_scan_cap) {
                 scan.complete = false;
                 return;
+            }
+            if (tree.nodeTag(target) == .field_access) {
+                var root = target;
+                while (tree.nodeTag(root) == .field_access) root = tree.nodeData(root).node_and_token[0];
+                if (tree.nodeTag(root) == .identifier and
+                    hasFreshStorage(o, tree.tokenSlice(tree.nodeMainToken(root)), tree.firstToken(node)))
+                {
+                    // Different local spellings can name the same allocation.
+                    // Charge this store to that storage, not only its spelling.
+                    scan.write_pointers[scan.write_count] = root;
+                }
             }
             scan.writes[scan.write_count] = value_range.nodeSrc(tree, target);
             scan.write_count += 1;
@@ -1035,9 +1230,9 @@ pub fn scanEffects(o: *Oracle, node: Ast.Node.Index, scan: *EffectScan, depth: u
     while (children.next(tree)) |child| scanEffects(o, child, scan, depth + 1);
 }
 
-/// Does this argument hand the callee storage overlapping `path`?  A `&x`
-/// argument names its write target directly; a bare pointer variable names
-/// whatever it was pointed at; every other argument is a copy.
+/// Does this argument hand the callee storage overlapping `path`? An address
+/// names its write target; a pointer variable names its resolved pointee.
+/// A projection is a copy of its value, which can itself carry pointers.
 fn escapeReaches(o: *Oracle, operand: Ast.Node.Index, path: []const u8) bool {
     const tree = o.tree;
     const arg = value_range.unwrapGrouped(tree, operand);
@@ -1055,6 +1250,16 @@ fn escapeReaches(o: *Oracle, operand: Ast.Node.Index, path: []const u8) bool {
             // truncating to a partial one.
             var suffixes: [alias_hop_cap][]const u8 = undefined;
             const chain = resolveAliasChain(o, name, tree.firstToken(arg), &suffixes);
+            if (chain.fresh_token) |allocation| {
+                const other_root = rootText(path);
+                if (!o.pointer_roots.contains(other_root)) return false;
+                var other_suffixes: [alias_hop_cap][]const u8 = undefined;
+                const other = resolveAliasChain(o, other_root, tree.firstToken(arg), &other_suffixes);
+                if (other.fresh_token) |other_allocation| return allocation == other_allocation;
+                // A parameter's object existed before this allocation; an
+                // unresolved local factory result may instead alias it.
+                return other.unresolved;
+            }
             var buffer: [256]u8 = undefined;
             if (composeAliasPath(chain, &buffer)) |target| {
                 return pathSegmentsOverlap(target, path);
@@ -1068,12 +1273,12 @@ fn escapeReaches(o: *Oracle, operand: Ast.Node.Index, path: []const u8) bool {
             // storage that already existed when the frame was created, so the
             // callee may write through it whatever it was aimed at: `f(holder)`
             // can rewrite `holder.index`, and a fact about that field does not
-            // survive.  A parameter pointer is one notch below that: it can
-            // only name a LOCAL of this body, and only if this body took that
-            // local's address — a root `addressed` already disqualifies.
+            // survive. A parameter cannot name an unescaped frame-local slot,
+            // but can alias another pointer parameter's backing storage.
             if (o.indirection_roots.contains(name)) {
                 if (isParameterRoot(o, name) and !std.mem.eql(u8, rootText(path), name)) {
-                    return o.addressed.contains(rootText(path));
+                    return o.addressed.contains(rootText(path)) or
+                        o.indirection_roots.contains(rootText(path));
                 }
                 return true;
             }
@@ -1090,11 +1295,52 @@ fn escapeReaches(o: *Oracle, operand: Ast.Node.Index, path: []const u8) bool {
             // test the parameter rule one branch up uses, generalised from
             // "is this a parameter" to "does this name hold an address", which
             // is the distinction that decides whether a copy is involved.
-            return o.addressed.contains(rootText(path));
+            return o.addressed.contains(rootText(path)) or
+                o.indirection_roots.contains(rootText(path));
         },
-        // `p.*`, `p[i]`, `p.field` all read through a copy.
+        .field_access, .deref, .array_access => {
+            if (projectionIsScalar(o, arg)) return false;
+            // The projection's spelling names the slot containing the pointer,
+            // not its pointee. Unknown and pointer-bearing values may reach any
+            // indirect or escaped storage, but not an unaddressed local header.
+            const root = rootText(path);
+            return o.indirection_roots.contains(root) or o.addressed.contains(root) or
+                !value_range.isLocalName(o, root);
+        },
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const params = tree.builtinCallParams(&buffer, arg) orelse return true;
+            const name = tree.tokenSlice(tree.nodeMainToken(arg));
+            if (params.len == 1 and (std.mem.eql(u8, name, "@constCast") or
+                std.mem.eql(u8, name, "@ptrCast") or std.mem.eql(u8, name, "@alignCast") or
+                std.mem.eql(u8, name, "@addrSpaceCast") or std.mem.eql(u8, name, "@volatileCast")))
+                return escapeReaches(o, params[0], path);
+            if (params.len == 2 and std.mem.eql(u8, name, "@as"))
+                return escapeReaches(o, params[1], path);
+            if (projectionIsScalar(o, arg)) return false;
+            // An unmodeled pointer-producing expression cannot prove that
+            // storage is unreachable.
+            return o.indirection_roots.contains(rootText(path)) or o.addressed.contains(rootText(path));
+        },
         else => return false,
     }
+}
+
+/// Only a resolved primitive proves a projected value carries no pointers.
+/// Aggregates, slices and unresolved types cannot establish that proof.
+fn projectionIsScalar(o: *Oracle, node: Ast.Node.Index) bool {
+    const cache = o.cache orelse return false;
+    const resolver = cache.zls orelse return false;
+    const frame = o.resolution_frame orelse resolver.resolutionFrame();
+    const resolved = frame.typeOfNode(node) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    };
+    const ty = resolved orelse return false;
+    return switch (resolver.typeTag(ty) orelse return false) {
+        .bool, .@"enum", .int, .comptime_int, .float, .comptime_float => true,
+        else => false,
+    };
 }
 
 /// Leading identifier of a source-spelled path (`self` from `self.items[0]`).
@@ -1224,18 +1470,32 @@ fn aliasedTarget(o: *Oracle, path: []const u8, at: Ast.TokenIndex) error{OutOfMe
 /// `p.* = v`, `p[i] = v`.  A bare rebind of a pointer (`p = other`) replaces
 /// which storage `p` names and writes none of it, so it never comes here.
 pub fn dropAliasedStorage(o: *Oracle, st: *State, name: []const u8, at: Ast.TokenIndex) error{OutOfMemory}!void {
+    var suffixes: [alias_hop_cap][]const u8 = undefined;
+    const chain = resolveAliasChain(o, rootText(name), at, &suffixes);
+    if (chain.fresh_token) |allocation| {
+        for (o.pointer_roots.keys.items) |root| {
+            var other_suffixes: [alias_hop_cap][]const u8 = undefined;
+            const other = resolveAliasChain(o, root, at, &other_suffixes);
+            if (other.unresolved or other.fresh_token == allocation) {
+                value_range.dropFactsForRebind(o, st, root);
+            }
+        }
+        return;
+    }
     switch (try aliasedTarget(o, name, at)) {
         .none => {},
         .storage => |storage| value_range.dropFactsForRebind(o, st, storage),
         .parameters => {
             // Everything that could be behind a pointer aimed before this frame
-            // existed: every pointer root — two of them may be one object — and
+            // existed: every indirection root — two may name one object — and
             // every name whose address this body handed out, which is the only
             // way a local can end up on the far side of a parameter.  A fresh
             // unaddressed local is not in either set and cannot be behind one,
             // which is the frame-lifetime invariant that makes this narrower
             // than a full-state drop and still sound.
-            for (o.pointer_roots.keys.items) |root| value_range.dropFactsForRebind(o, st, root);
+            // A by-value slice header is not indirect storage: aliases can
+            // change its elements but cannot replace its local length.
+            for (o.indirection_roots.keys.items) |root| value_range.dropFactsForRebind(o, st, root);
             for (o.addressed.keys.items) |root| value_range.dropFactsForRebind(o, st, root);
         },
         // The chain did not end, so this write may land on anything the state
@@ -1245,4 +1505,177 @@ pub fn dropAliasedStorage(o: *Oracle, st: *State, name: []const u8, at: Ast.Toke
         // guaranteed to contain them.
         .unknown => value_range.dropIndirectFacts(o, st, .unknown),
     }
+}
+
+test "failed escape resolver queries are errors rather than missing proofs" {
+    const resolver_mod = @import("../type_resolver.zig");
+    const gpa = std.testing.allocator;
+    const Query = enum { address, field, capacity, sibling, callee, capacity_identity, sibling_identity, first_error };
+    for (std.enums.values(Query)) |query| {
+        var context: resolver_mod.TypeContext = undefined;
+        try context.init(gpa, std.testing.io);
+        defer context.deinit();
+        var resolver: resolver_mod.TypeResolver = undefined;
+        try resolver.init(&context, gpa, "/tmp/zbc-numeric-escape-query-error.zig",
+            \\const Box = struct {
+            \\    count: usize,
+            \\    items: []u8,
+            \\    fn ensureTotalCapacity(self: *Box, n: usize) void { _ = self; _ = n; }
+            \\};
+            \\const Outer = struct { a: Box, b: Box };
+            \\fn f(holder: *Box, object: *Outer) void {
+            \\    _ = holder;
+            \\    holder.ensureTotalCapacity(1);
+            \\    object.a.ensureTotalCapacity(1);
+            \\    touch(&holder);
+            \\}
+            \\fn touch(value: **Box) void { _ = value; }
+        );
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        var cache = file_cache_mod.FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        var oracle: Oracle = .{
+            .gpa = gpa,
+            .tree = tree,
+            .body = .root,
+            .query = .numeric_range,
+            .target = "",
+            .use_token = 0,
+            .cache = &cache,
+        };
+        defer oracle.deinit();
+
+        var selected: ?Ast.Node.Index = null;
+        for (0..tree.nodes.len) |index| {
+            const node: Ast.Node.Index = @enumFromInt(index);
+            if (query == .address or query == .first_error) {
+                if (tree.nodeTag(node) == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "holder"))
+                {
+                    selected = node;
+                    break;
+                }
+            } else {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, node) orelse continue;
+                const wanted = switch (query) {
+                    .field, .capacity, .capacity_identity => "holder.ensureTotalCapacity",
+                    .sibling, .sibling_identity => "object.a.ensureTotalCapacity",
+                    .callee => "touch",
+                    .address, .first_error => unreachable,
+                };
+                if (std.mem.eql(u8, value_range.nodeSrc(tree, call.ast.fn_expr), wanted)) {
+                    selected = node;
+                    break;
+                }
+            }
+        }
+        const node = selected orelse return error.TestUnexpectedResult;
+        if (query == .first_error) oracle.summary_error = error.SourceExcluded;
+        const identity = query == .capacity_identity or query == .sibling_identity;
+        // Fail only query allocations, after the document and oracle exist.
+        // Cold types need the analyser arena. Identity queries use a URI that
+        // exceeds their stack scratch, so only their fallback allocator fails.
+        var long_uri: ?[]u8 = null;
+        defer if (long_uri) |uri| gpa.free(uri);
+        const original_uri = resolver.handle.document.uri;
+        defer resolver.handle.document.uri = original_uri;
+        if (identity) {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, node).?;
+            const reference = try resolver.functionReference(call.ast.fn_expr);
+            try std.testing.expect(reference == .function);
+            long_uri = try gpa.alloc(u8, std.Io.Dir.max_path_bytes + 32);
+            @memcpy(long_uri.?[0..8], "file:///");
+            @memset(long_uri.?[8..], 'a');
+            resolver.handle.document.uri = .{ .raw = long_uri.? };
+        }
+        var failing: std.testing.FailingAllocator = .init(
+            if (identity) resolver.gpa else resolver.analyser.arena.allocator(),
+            .{ .fail_index = 0 },
+        );
+        // Start empty so any analyser allocation reaches the failing child.
+        var failing_arena: std.heap.ArenaAllocator = .init(failing.allocator());
+        defer failing_arena.deinit();
+        const arena = resolver.analyser.arena;
+        const resolver_gpa = resolver.gpa;
+        defer resolver.analyser.arena = arena;
+        defer resolver.gpa = resolver_gpa;
+        if (identity) {
+            resolver.gpa = failing.allocator();
+        } else {
+            resolver.analyser.arena = &failing_arena;
+        }
+        const answer = switch (query) {
+            .address, .first_error => valueIsAddress(&oracle, node),
+            .field, .capacity, .sibling, .capacity_identity, .sibling_identity => blk: {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, node).?;
+                const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+                break :blk switch (query) {
+                    .field => methodKeepsField(&oracle, node, receiver, "holder.count"),
+                    .capacity, .capacity_identity => capacityMethodKeepsLength(&oracle, node, receiver, "holder.items.len"),
+                    .sibling, .sibling_identity => containerMethodKeepsSibling(&oracle, node, receiver, "object.b.items.len"),
+                    else => unreachable,
+                };
+            },
+            .callee => calleeKeepsAddress(&oracle, node),
+        };
+        try std.testing.expect(!answer);
+        try std.testing.expect(failing.has_induced_failure);
+        const expected: value_range.QueryError = if (query == .first_error) error.SourceExcluded else error.OutOfMemory;
+        try std.testing.expectEqual(@as(?value_range.QueryError, expected), oracle.summary_error);
+        var state: State = .{};
+        defer state.deinit(gpa);
+        try std.testing.expectError(expected, value_range.analyzeNode(&oracle, node, &state));
+    }
+}
+
+test "successful unresolved escape queries remain no proof without an error" {
+    const resolver_mod = @import("../type_resolver.zig");
+    const gpa = std.testing.allocator;
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: resolver_mod.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-numeric-escape-query-unknown.zig",
+        \\fn f() void { _ = missing; unknown(); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    var oracle: Oracle = .{
+        .gpa = gpa,
+        .tree = tree,
+        .body = .root,
+        .query = .numeric_range,
+        .target = "",
+        .use_token = 0,
+        .cache = &cache,
+    };
+    defer oracle.deinit();
+    var addressed = false;
+    var called = false;
+    for (0..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.nodeTag(node) == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "missing"))
+        {
+            try std.testing.expect(!valueIsAddress(&oracle, node));
+            addressed = true;
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, node) != null) {
+            try std.testing.expect(!calleeKeepsAddress(&oracle, node));
+            called = true;
+        }
+    }
+    try std.testing.expect(addressed and called);
+    try std.testing.expectEqual(@as(?value_range.QueryError, null), oracle.summary_error);
 }

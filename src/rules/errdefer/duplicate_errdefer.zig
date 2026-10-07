@@ -241,8 +241,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "duplicate-errdefer",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, dup.errdefer_tok),
-        .end = Pos.fromTokenEnd(tree, dup.errdefer_tok),
+        .start = try Pos.fromTokenStart(tree, dup.errdefer_tok),
+        .end = try Pos.fromTokenEnd(tree, dup.errdefer_tok),
         .message = msg,
     });
 }

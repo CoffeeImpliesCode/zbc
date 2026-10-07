@@ -1,5 +1,7 @@
 //! Report float-to-integer conversions without a proved finite conversion range.
 //! Rounding, a helper name, or a nearby comparison is not a range proof.
+//! Immutable scalar projections retain their stored floating format. Generic
+//! conversions require separate proofs for every closed actual call frame.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const problem_mod = @import("../../problem.zig");
@@ -11,6 +13,108 @@ const testing = @import("../../testing.zig");
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "intfromfloat-without-clamp";
+
+test "intfromfloat-without-clamp: finite repeat count excludes invalid inputs" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn count(extra: f32) ?usize {
+        \\    if (!std.math.isFinite(extra) or extra < 0) return null;
+        \\    if (extra > 16_777_216.0) return null;
+        \\    return @intFromFloat(extra);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn count(extra: f32) ?usize {
+        \\    if (extra < 0 or extra > 16_777_216.0) return null;
+        \\    return @intFromFloat(extra);
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: reduced wide integer maxima are safe float clamps" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn sleep(sleep_ms: f32) ?u64 {
+        \\    const ns = @as(f64, sleep_ms) * 1_000_000.0;
+        \\    const maximum = std.math.maxInt(u64) - 2048;
+        \\    const high: f64 = @floatFromInt(maximum);
+        \\    if (!std.math.isFinite(ns)) return null;
+        \\    if (ns < 0 or ns > high) return null;
+        \\    return @intFromFloat(@min(@max(ns, 0.0), high));
+        \\}
+        \\pub fn seek(seconds: f32) ?i64 {
+        \\    if (!std.math.isFinite(seconds)) return null;
+        \\    const us = @as(f64, @floatCast(seconds)) * 1_000_000.0;
+        \\    const high = std.math.maxInt(i64) - 1024;
+        \\    return @intFromFloat(@min(@max(us, 0.0), @as(f64, @floatFromInt(high))));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn seek(seconds: f32) i64 {
+        \\    const us = @as(f64, seconds) * 1_000_000.0;
+        \\    const high: f64 = @floatFromInt(std.math.maxInt(i64));
+        \\    return @intFromFloat(@min(@max(us, 0.0), high));
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: rounded finite nanoseconds retain a checked maximum" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn convert(ticks: u64, period: f64) ?u64 {
+        \\    if (!std.math.isFinite(period) or period <= 0) return null;
+        \\    const ns = @as(f64, @floatFromInt(ticks)) * period;
+        \\    if (!std.math.isFinite(ns) or ns < 0) return null;
+        \\    const rounded = @round(ns);
+        \\    if (rounded > 18_446_744_073_709_549_568.0) return null;
+        \\    return @intFromFloat(rounded);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn convert(ns: f64) ?u64 {
+        \\    const rounded = @round(ns);
+        \\    if (rounded < 0 or rounded > 18_446_744_073_709_549_568.0) return null;
+        \\    return @intFromFloat(rounded);
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: bounded player minutes divide below the integer limit" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn convert(progress: f32, duration: u32) u32 {
+        \\    const seconds: f32 = @floatFromInt(duration);
+        \\    const elapsed = @max(@as(f32, 0), @min(progress, seconds));
+        \\    return @intFromFloat(elapsed / 60.0);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn convert(progress: f32) u32 {
+        \\    return @intFromFloat(progress / 60.0);
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: bounded player seconds use a positive remainder divisor" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn convert(progress: f32, duration: u32) u32 {
+        \\    const seconds: f32 = @floatFromInt(duration);
+        \\    const elapsed = @max(@as(f32, 0), @min(progress, seconds));
+        \\    return @intFromFloat(@mod(elapsed, 60.0));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn convert(progress: f32) u32 {
+        \\    return @intFromFloat(@mod(progress, 60.0));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn convert(progress: f32, divisor: f32) u32 {
+        \\    const elapsed = @min(@max(progress, 0.0), 1000.0);
+        \\    return @intFromFloat(@mod(elapsed, divisor));
+        \\}
+    );
+}
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -33,17 +137,18 @@ pub fn check(
         var buffer: [2]Ast.Node.Index = undefined;
         const params = tree.builtinCallParams(&buffer, node).?;
         if (params.len != 1) continue;
-        if (cache.intInfoOf(node)) |destination| {
+        if (cache.coercedIntInfoOf(node) orelse cache.intInfoOf(node)) |destination| {
             const bounds = try value_range.boundsAt(gpa, tree, tokens.bodyOf(tree, declaration).?, params[0], token, cache);
             if (bounds.fitsInteger(destination.bits, destination.signed)) continue;
         }
+        if (try value_range.instantiatedConversionFits(gpa, tree, declaration, node, params[0], cache)) continue;
         const message = try gpa.dupe(u8, "a finite value within the destination conversion range was not proved for `@intFromFloat`; NaN, infinity, or an out-of-range value traps in Debug/ReleaseSafe and causes undefined behavior in unchecked builds");
         errdefer gpa.free(message);
         try problems.append(gpa, .{
             .rule_id = R,
             .severity = .warning,
-            .start = Pos.fromTokenStart(tree, token),
-            .end = Pos.fromTokenEnd(tree, tree.lastToken(node)),
+            .start = try Pos.fromTokenStart(tree, token),
+            .end = try Pos.fromTokenEnd(tree, tree.lastToken(node)),
             .message = message,
         });
     }
@@ -362,6 +467,116 @@ test "intfromfloat-without-clamp: a finite mask is not a destination bound" {
     );
 }
 
+test "intfromfloat-without-clamp: nested strict masks retain destination bounds beside unrelated exports" {
+    try testing.expectNoFireTyped(check,
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn convert(value: f32) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) < 0x5f00_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\        fn unrelated(value: f32) callconv(.c) f32 { return value; }
+        \\    };
+        \\    comptime { @export(&Native.unrelated, .{ .name = "unrelated" }); }
+        \\    _ = Native.convert(42.0);
+        \\    _ = Native.convert(0x1p63);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn convert(value: f32) callconv(.c) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) <= 0x5f00_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\        fn unrelated(value: f32) callconv(.c) f32 { return value; }
+        \\    };
+        \\    comptime {
+        \\        @export(&Native.unrelated, .{ .name = "unrelated" });
+        \\        @export(&Native.convert, .{ .name = "conversion" });
+        \\    }
+        \\    _ = Native.convert(42.0);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn convert(value: f32) callconv(.c) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) < 0x7f80_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\        fn unrelated(value: f32) callconv(.c) f32 { return value; }
+        \\    };
+        \\    comptime {
+        \\        @export(&Native.unrelated, .{ .name = "unrelated" });
+        \\        @export(&Native.convert, .{ .name = "conversion" });
+        \\    }
+        \\    _ = Native.convert(42.0);
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: nested private generic masks use the actual float format" {
+    try testing.expectNoFireTyped(check,
+        \\fn factory(comptime Float: type) type {
+        \\    return struct {
+        \\        fn convert(value: Float) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) < 0x5f00_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\pub fn convert(value: f32) i64 { return factory(f32).convert(value); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn factory(comptime Float: type) type {
+        \\    return struct {
+        \\        fn convert(value: Float) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) <= 0x5f00_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\pub fn convert(value: f32) i64 { return factory(f32).convert(value); }
+    );
+}
+
+test "intfromfloat-without-clamp: mixed factory widths cannot establish an exact bit format" {
+    try testing.expectFiresTyped(check, R,
+        \\fn factory(comptime Float: type) type {
+        \\    return struct {
+        \\        fn convert(value: Float) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) < 0x5f00_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\pub fn convert(value: f32) i64 { return factory(f32).convert(value); }
+        \\pub fn halfType() type { return factory(f16); }
+    );
+}
+
+test "intfromfloat-without-clamp: an open factory cannot establish an exact bit format" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn factory(comptime Float: type) type {
+        \\    return struct {
+        \\        fn convert(value: Float) i64 {
+        \\            const bits: u32 = @bitCast(value);
+        \\            if ((bits & 0x7fff_ffff) < 0x5f00_0000) return @intFromFloat(value);
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\pub fn convert(value: f32) i64 { return factory(f32).convert(value); }
+    );
+}
+
 test "intfromfloat-without-clamp: extern union views require matching field widths" {
     try testing.expectNoFireTyped(check,
         \\const View = extern union { float: f32, bits: u32 };
@@ -469,6 +684,20 @@ test "intfromfloat-without-clamp: generic predicates require lossless widening" 
         \\    return @intFromFloat(value);
         \\}
         \\pub fn extended(value: f128) i64 { return convert(f128, value); }
+    );
+}
+
+test "intfromfloat-without-clamp: widening cannot hide an inner narrowing cast" {
+    try testing.expectFiresTyped(check, R,
+        \\fn valid(comptime T: type, value: T) bool {
+        \\    const wide: f64 = @as(f32, @floatCast(value));
+        \\    return wide >= 0 and wide < 256;
+        \\}
+        \\fn convert(comptime T: type, value: T) u8 {
+        \\    if (!valid(T, value)) return 0;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn convertDouble(value: f64) u8 { return convert(f64, value); }
     );
 }
 
@@ -598,6 +827,144 @@ test "intfromfloat-without-clamp: a callee handed the address invalidates the bo
     );
 }
 
+test "intfromfloat-without-clamp: a generic mutable cast rounds a certified finite constant" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn convert(comptime T: type) u128 {
+        \\    var value: T = @floatCast(std.math.floatMax(f32));
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn use() u128 { return convert(f16); }
+    );
+}
+
+test "intfromfloat-without-clamp: a generic reassignment rounds at the stored format" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn convert(comptime T: type) u128 {
+        \\    var value: T = 0;
+        \\    value = @floatCast(std.math.floatMax(f32));
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn use() u128 { return convert(f16); }
+    );
+}
+
+test "intfromfloat-without-clamp: every closed generic destination format must fit" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn convert(comptime T: type) u128 {
+        \\    var value: T = @floatCast(std.math.floatMax(f32));
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn half() u128 { return convert(f16); }
+        \\pub fn double() u128 { return convert(f64); }
+    );
+}
+
+test "intfromfloat-without-clamp: an open generic store cannot retain a finite source bound" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn convert(comptime T: type) u128 {
+        \\    var value: T = @floatCast(std.math.floatMax(f32));
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn use() u128 { return convert(f32); }
+    );
+}
+
+test "intfromfloat-without-clamp: closed same and wider generic stores retain finite bounds" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn convert(comptime T: type) u128 {
+        \\    var value: T = @floatCast(std.math.floatMax(f32));
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn single() u128 { return convert(f32); }
+        \\pub fn double() u128 { return convert(f64); }
+    );
+}
+
+test "intfromfloat-without-clamp: a bounded constant remains finite in a closed half format" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn convert(comptime T: type) u16 {
+        \\    var value: T = @floatCast(std.math.floatMax(f16));
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn use() u16 { return convert(f16); }
+    );
+}
+
+test "intfromfloat-without-clamp: a closed generic same-format store keeps strict endpoints" {
+    try testing.expectNoFireTyped(check,
+        \\fn convert(comptime T: type, raw: T) u8 {
+        \\    if (!(raw >= 0.0 and raw < 256.0)) return 0;
+        \\    var value: T = raw;
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn use(raw: f32) u8 { return convert(f32, raw); }
+    );
+}
+
+test "intfromfloat-without-clamp: mixed closed same-parameter stores keep strict endpoints" {
+    try testing.expectNoFireTyped(check,
+        \\fn convert(comptime T: type, raw: T) u8 {
+        \\    if (!(raw >= 0.0 and raw < 256.0)) return 0;
+        \\    var value: T = raw;
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn single(raw: f32) u8 { return convert(f32, raw); }
+        \\pub fn double(raw: f64) u8 { return convert(f64, raw); }
+    );
+}
+
+test "intfromfloat-without-clamp: mixed same-parameter cast aliases keep later guards" {
+    try testing.expectNoFireTyped(check,
+        \\fn convert(comptime T: type, raw: T) u8 {
+        \\    var value: T = @as(T, @floatCast(raw));
+        \\    _ = &value;
+        \\    if (!(raw >= 0.0 and raw < 256.0)) return 0;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn single(raw: f32) u8 { return convert(f32, raw); }
+        \\pub fn double(raw: f64) u8 { return convert(f64, raw); }
+    );
+}
+
+test "intfromfloat-without-clamp: distinct generic parameters can round to an excluded limit" {
+    try testing.expectFiresTyped(check, R,
+        \\fn convert(comptime Source: type, comptime Destination: type, raw: Source) u8 {
+        \\    if (!(raw >= 0.0 and raw < 256.0)) return 0;
+        \\    var value: Destination = @as(Destination, @floatCast(raw));
+        \\    _ = &value;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn narrow(raw: f64) u8 { return convert(f64, f32, raw); }
+        \\pub fn widen(raw: f32) u8 { return convert(f32, f64, raw); }
+    );
+}
+
+test "intfromfloat-without-clamp: same-parameter stores cannot undo inner half narrowing" {
+    try testing.expectFiresTyped(check, R,
+        \\fn convert(comptime T: type, raw: T) u8 {
+        \\    var value: T = @floatCast(@as(f16, @floatCast(raw)));
+        \\    _ = &value;
+        \\    if (!(raw >= 0.0 and raw < 256.0)) return 0;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn single(raw: f32) u8 { return convert(f32, raw); }
+        \\pub fn double(raw: f64) u8 { return convert(f64, raw); }
+    );
+}
+
 // ── the same conversions, compiled ─────────────────────────
 //
 // The fixtures above are read as source text.  These are the conversions
@@ -696,4 +1063,331 @@ test "intfromfloat-without-clamp: the compiled copy-only consumer keeps its boun
     try std.testing.expectEqual(@as(u64, 0), Native.copy_only(std.math.nan(f64)));
     try std.testing.expectEqual(@as(u64, 0), Native.copy_only(std.math.inf(f64)));
     try std.testing.expectEqual(@as(u64, 0), Native.copy_only(-std.math.inf(f64)));
+}
+
+test "intfromfloat-without-clamp: concrete finite truncation controls cover the generic callers' domains" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn byte(value: f64) error{TypeMismatch}!u8 {
+        \\    if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\    const truncated = @trunc(value);
+        \\    if (truncated < 0.0 or truncated >= 256.0) return error.TypeMismatch;
+        \\    return @intFromFloat(truncated);
+        \\}
+        \\pub fn signed(value: f64) error{TypeMismatch}!c_int {
+        \\    if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\    const truncated = @trunc(value);
+        \\    if (truncated < -2147483648.0 or truncated >= 2147483648.0) return error.TypeMismatch;
+        \\    return @intFromFloat(truncated);
+        \\}
+        \\pub fn unsigned(value: f64) error{TypeMismatch}!c_uint {
+        \\    if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\    const truncated = @trunc(value);
+        \\    if (truncated < 0.0 or truncated >= 4294967296.0) return error.TypeMismatch;
+        \\    return @intFromFloat(truncated);
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: generic wide bounds cannot prove a narrow instantiation" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checked(comptime T: type, value: f64) error{TypeMismatch}!T {
+        \\    if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\    const truncated = @trunc(value);
+        \\    const lower: f64 = @floatFromInt(std.math.minInt(c_int));
+        \\    const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(c_uint))) + 1.0;
+        \\    if (truncated < lower or truncated >= upper) return error.TypeMismatch;
+        \\    return @intFromFloat(truncated);
+        \\}
+        \\pub fn byte(value: f64) error{TypeMismatch}!u8 { return checked(u8, value); }
+        \\pub fn signed(value: f64) error{TypeMismatch}!c_int { return checked(c_int, value); }
+        \\pub fn unsigned(value: f64) error{TypeMismatch}!c_uint { return checked(c_uint, value); }
+    );
+}
+
+test "intfromfloat-without-clamp: generic truncation without finite rejection still admits NaN" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checked(comptime T: type, value: f64) error{TypeMismatch}!T {
+        \\    const truncated = @trunc(value);
+        \\    const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\    const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\    if (truncated < lower or truncated >= upper) return error.TypeMismatch;
+        \\    return @intFromFloat(truncated);
+        \\}
+        \\pub fn byte(value: f64) error{TypeMismatch}!u8 { return checked(u8, value); }
+        \\pub fn signed(value: f64) error{TypeMismatch}!c_int { return checked(c_int, value); }
+    );
+}
+
+test "intfromfloat-without-clamp: generic inclusive exclusive-bound guard remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checked(comptime T: type, value: f64) error{TypeMismatch}!T {
+        \\    if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\    const truncated = @trunc(value);
+        \\    const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\    const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\    if (truncated < lower or truncated > upper) return error.TypeMismatch;
+        \\    return @intFromFloat(truncated);
+        \\}
+        \\pub fn byte(value: f64) error{TypeMismatch}!u8 { return checked(u8, value); }
+        \\pub fn signed(value: f64) error{TypeMismatch}!c_int { return checked(c_int, value); }
+    );
+}
+
+test "intfromfloat-without-clamp: test-local generic finite truncation covers every boundary and inline tuple call" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn checked(comptime T: type, source: anytype) error{TypeMismatch}!T {
+        \\            const value: f64 = @floatCast(source);
+        \\            if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\            const truncated = @trunc(value);
+        \\            const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\            if (truncated < lower or truncated >= upper) return error.TypeMismatch;
+        \\            return @intFromFloat(truncated);
+        \\        }
+        \\    };
+        \\    try std.testing.expectEqual(@as(u8, 0), try Native.checked(u8, @as(f64, -0.5)));
+        \\    try std.testing.expectEqual(@as(u8, 255), try Native.checked(u8, @as(f64, 255.75)));
+        \\    try std.testing.expectError(error.TypeMismatch, Native.checked(u8, @as(f64, -1.0)));
+        \\    try std.testing.expectError(error.TypeMismatch, Native.checked(u8, @as(f64, 256.0)));
+        \\    try std.testing.expectEqual(@as(c_int, -42), try Native.checked(c_int, @as(f32, -42.75)));
+        \\    try std.testing.expectEqual(std.math.minInt(c_int), try Native.checked(c_int, @as(f64, -2147483648.0)));
+        \\    try std.testing.expectEqual(std.math.maxInt(c_int), try Native.checked(c_int, @as(f64, 2147483647.75)));
+        \\    try std.testing.expectError(error.TypeMismatch, Native.checked(c_int, @as(f64, -2147483649.0)));
+        \\    try std.testing.expectError(error.TypeMismatch, Native.checked(c_int, @as(f32, 2147483648.0)));
+        \\    try std.testing.expectEqual(@as(c_uint, 42), try Native.checked(c_uint, @as(f16, 42.75)));
+        \\    try std.testing.expectEqual(std.math.maxInt(c_uint), try Native.checked(c_uint, @as(f64, 4294967295.75)));
+        \\    try std.testing.expectError(error.TypeMismatch, Native.checked(c_uint, @as(f16, -1.0)));
+        \\    try std.testing.expectError(error.TypeMismatch, Native.checked(c_uint, @as(f64, 4294967296.0)));
+        \\    inline for (.{ u8, c_int, c_uint }) |T| {
+        \\        try std.testing.expectError(error.TypeMismatch, Native.checked(T, std.math.nan(f64)));
+        \\        try std.testing.expectError(error.TypeMismatch, Native.checked(T, std.math.inf(f64)));
+        \\        try std.testing.expectError(error.TypeMismatch, Native.checked(T, -std.math.inf(f64)));
+        \\    }
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: test-local generic inline tuple calls retain unsafe controls" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn checked(comptime T: type, source: anytype) error{TypeMismatch}!T {
+        \\            const value: f64 = @floatCast(source);
+        \\            if (!std.math.isFinite(value)) return error.TypeMismatch;
+        \\            const truncated = @trunc(value);
+        \\            const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\            if (truncated < lower or truncated > upper) return error.TypeMismatch;
+        \\            return @intFromFloat(truncated);
+        \\        }
+        \\    };
+        \\    inline for (.{ u8, c_int, c_uint }) |T| {
+        \\        _ = Native.checked(T, @as(f64, 256.0)) catch 0;
+        \\    }
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn checked(comptime T: type, source: anytype) error{TypeMismatch}!T {
+        \\            const value: f64 = @floatCast(source);
+        \\            const truncated = @trunc(value);
+        \\            const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\            if (truncated < lower or truncated >= upper) return error.TypeMismatch;
+        \\            return @intFromFloat(truncated);
+        \\        }
+        \\    };
+        \\    inline for (.{ u8, c_int, c_uint }) |T| {
+        \\        _ = Native.checked(T, std.math.nan(f64)) catch 0;
+        \\    }
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: unrelated unresolved methods require a complete nonescaping census" {
+    const safe =
+        \\const std = @import("std");
+        \\fn unrelated(bounds: anytype) bool { return bounds.fitsInteger(8, false); }
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn checked(comptime T: type, source: anytype) error{Bad}!T {
+        \\            const value: f64 = @floatCast(source);
+        \\            if (!std.math.isFinite(value)) return error.Bad;
+        \\            const truncated = @trunc(value);
+        \\            const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\            if (truncated < lower or truncated >= upper) return error.Bad;
+        \\            return @intFromFloat(truncated);
+        \\        }
+        \\    };
+        \\    _ = Native.checked(u8, @as(f64, 42)) catch 0;
+        \\}
+    ;
+    try testing.expectNoFireTyped(check, safe);
+    const gpa = std.testing.allocator;
+    const inclusive = try std.mem.replaceOwned(u8, gpa, safe, "truncated >= upper", "truncated > upper");
+    defer gpa.free(inclusive);
+    try testing.expectFiresTyped(check, R, inclusive);
+    const no_finite = try std.mem.replaceOwned(u8, gpa, safe, "if (!std.math.isFinite(value)) return error.Bad;", "");
+    defer gpa.free(no_finite);
+    try testing.expectFiresTyped(check, R, no_finite);
+    const alias = try std.mem.replaceOwned(u8, gpa, safe, "_ = Native.checked", "const callback = Native.checked; _ = callback");
+    defer gpa.free(alias);
+    try testing.expectFiresTyped(check, R, alias);
+    const unknown_same_name = try std.mem.replaceOwned(u8, gpa, safe, "bounds.fitsInteger", "bounds.checked");
+    defer gpa.free(unknown_same_name);
+    try testing.expectFiresTyped(check, R, unknown_same_name);
+    const reflective = try std.mem.replaceOwned(u8, gpa, safe, "bounds.fitsInteger", "@field(bounds, \"fitsInteger\")");
+    defer gpa.free(reflective);
+    try testing.expectFiresTyped(check, R, reflective);
+    const namespace = try std.mem.replaceOwned(u8, gpa, safe, "_ = Native.checked", "unknown_owner.invoke(Native); _ = Native.checked");
+    defer gpa.free(namespace);
+    try testing.expectFiresTyped(check, R, namespace);
+    const instance_type = try std.mem.replaceOwned(u8, gpa, safe, "_ = Native.checked", "unknown_owner.invoke(@TypeOf(Native{})); _ = Native.checked");
+    defer gpa.free(instance_type);
+    try testing.expectFiresTyped(check, R, instance_type);
+    const nested_owner = try std.mem.replaceOwned(u8, gpa, safe, "const Native = struct", "const Outer = struct { const Native = struct");
+    defer gpa.free(nested_owner);
+    const nested_transport = try std.mem.replaceOwned(u8, gpa, nested_owner, "_ = Native.checked(u8, @as(f64, 42)) catch 0;", "fn run() void { _ = Native.checked(u8, @as(f64, 42)) catch 0; } }; unknown_owner.invoke(Outer);");
+    defer gpa.free(nested_transport);
+    try testing.expectFiresTyped(check, R, nested_transport);
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn unrelated(bounds: anytype) bool { return bounds.fitsInteger(8, false); }
+        \\test "native" {
+        \\    unknown_owner.invoke(struct {
+        \\        fn checked(comptime T: type, source: anytype) error{Bad}!T {
+        \\            const value: f64 = @floatCast(source);
+        \\            if (!std.math.isFinite(value)) return error.Bad;
+        \\            const truncated = @trunc(value);
+        \\            const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\            if (truncated < lower or truncated >= upper) return error.Bad;
+        \\            return @intFromFloat(truncated);
+        \\        }
+        \\        fn run() void { _ = @This().checked(u8, @as(f64, 42)) catch 0; }
+        \\    });
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: compiled generic finite truncation checks each instantiated boundary" {
+    const Native = struct {
+        fn checked(comptime T: type, source: anytype) error{TypeMismatch}!T {
+            const value: f64 = @floatCast(source);
+            if (!std.math.isFinite(value)) return error.TypeMismatch;
+            const truncated = @trunc(value);
+            const lower: f64 = @floatFromInt(std.math.minInt(T));
+            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+            if (truncated < lower or truncated >= upper) return error.TypeMismatch;
+            return @intFromFloat(truncated);
+        }
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), try Native.checked(u8, @as(f64, -0.5)));
+    try std.testing.expectEqual(@as(u8, 255), try Native.checked(u8, @as(f64, 255.75)));
+    try std.testing.expectError(error.TypeMismatch, Native.checked(u8, @as(f64, -1.0)));
+    try std.testing.expectError(error.TypeMismatch, Native.checked(u8, @as(f64, 256.0)));
+    try std.testing.expectEqual(@as(c_int, -42), try Native.checked(c_int, @as(f32, -42.75)));
+    try std.testing.expectEqual(std.math.minInt(c_int), try Native.checked(c_int, @as(f64, -2147483648.0)));
+    try std.testing.expectEqual(std.math.maxInt(c_int), try Native.checked(c_int, @as(f64, 2147483647.75)));
+    try std.testing.expectError(error.TypeMismatch, Native.checked(c_int, @as(f64, -2147483649.0)));
+    try std.testing.expectError(error.TypeMismatch, Native.checked(c_int, @as(f32, 2147483648.0)));
+    try std.testing.expectEqual(@as(c_uint, 42), try Native.checked(c_uint, @as(f16, 42.75)));
+    try std.testing.expectEqual(std.math.maxInt(c_uint), try Native.checked(c_uint, @as(f64, 4294967295.75)));
+    try std.testing.expectError(error.TypeMismatch, Native.checked(c_uint, @as(f16, -1.0)));
+    try std.testing.expectError(error.TypeMismatch, Native.checked(c_uint, @as(f64, 4294967296.0)));
+    inline for (.{ u8, c_int, c_uint }) |T| {
+        try std.testing.expectError(error.TypeMismatch, Native.checked(T, std.math.nan(f64)));
+        try std.testing.expectError(error.TypeMismatch, Native.checked(T, std.math.inf(f64)));
+        try std.testing.expectError(error.TypeMismatch, Native.checked(T, -std.math.inf(f64)));
+    }
+}
+
+test "intfromfloat-without-clamp: generic anytype truncation checks each concrete result location" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn convert(byte: f64, signed: f32, unsigned: f16) !void {
+        \\    const Native = struct {
+        \\        fn checked(comptime T: type, source: anytype) !T {
+        \\            const value: f64 = @floatCast(source);
+        \\            if (!std.math.isFinite(value)) return error.Bad;
+        \\            const truncated = @trunc(value);
+        \\            const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\            const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\            if (truncated < lower or truncated >= upper) return error.Bad;
+        \\            return @intFromFloat(truncated);
+        \\        }
+        \\    };
+        \\    _ = try Native.checked(u8, byte);
+        \\    _ = try Native.checked(c_int, signed);
+        \\    _ = try Native.checked(c_uint, unsigned);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checked(comptime T: type, source: anytype) !T {
+        \\    const value: f64 = @floatCast(source);
+        \\    if (!std.math.isFinite(value)) return error.Bad;
+        \\    const truncated = @trunc(value);
+        \\    const lower: f64 = @floatFromInt(std.math.minInt(T));
+        \\    const upper: f64 = @as(f64, @floatFromInt(std.math.maxInt(T))) + 1.0;
+        \\    if (truncated < lower or truncated > upper) return error.Bad;
+        \\    return @intFromFloat(truncated);
+        \\}
+        \\pub fn convert(value: f64) !u8 { return checked(u8, value); }
+    );
+}
+
+test "intfromfloat-without-clamp: floating integer width clamps retain rounded boundary hazards" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn pixel(point: f32, extent: u32) usize {
+        \\    const highest: f32 = @floatFromInt(extent);
+        \\    return @intFromFloat(std.math.clamp(point, 0, highest));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn pixel(point: f32, extent: u32) u32 {
+        \\    const highest: f32 = @floatFromInt(extent);
+        \\    return @intFromFloat(std.math.clamp(point, 0, highest));
+        \\}
+    );
+}
+
+test "intfromfloat-without-clamp: immutable floating constants supply conversion bounds" {
+    try testing.expectNoFireTyped(check,
+        \\const Extent = struct { width: f32, height: f32 };
+        \\const surface: Extent = .{ .width = 520, .height = 480 };
+        \\const limit: f64 = 4503599627370496.0;
+        \\pub fn width() u32 { return @intFromFloat(surface.width); }
+        \\pub fn count() usize { return @intFromFloat(limit); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Extent = struct { width: f32 };
+        \\const surface: Extent = .{ .width = 4294967295.0 };
+        \\pub fn width() u32 { return @intFromFloat(surface.width); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Extent = struct { width: f32 };
+        \\const surface: Extent = .{ .width = 520 };
+        \\pub fn width(surface: Extent) u32 { return @intFromFloat(surface.width); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Extent = struct { width: f32 };
+        \\var storage: Extent = .{ .width = 520 };
+        \\const surface = &storage;
+        \\pub fn width() u32 { return @intFromFloat(surface.width); }
+    );
 }

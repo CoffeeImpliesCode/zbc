@@ -102,8 +102,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, leq_tok),
-        .end = Pos.fromTokenEnd(tree, leq_tok),
+        .start = try Pos.fromTokenStart(tree, leq_tok),
+        .end = try Pos.fromTokenEnd(tree, leq_tok),
         .message = msg,
     });
 }

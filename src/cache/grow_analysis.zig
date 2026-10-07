@@ -39,7 +39,11 @@ const budget_mod = @import("../budget.zig");
 const FileCache = file_cache.FileCache;
 const fresh_storage = @import("fresh_storage.zig");
 const DeclKey = file_cache.DeclKey;
-const DocumentKey = file_cache.DocumentKey;
+const DocumentKey = struct {
+    tree: *const Ast,
+    module: ModuleId,
+    ctx: *zls_resolver_mod.TypeContext,
+};
 const OpenError = file_cache.OpenError;
 const SummaryError = file_cache.SummaryError;
 const ActualCallee = FileCache.ActualCallee;
@@ -52,7 +56,7 @@ const ModuleId = @import("type_engine").ModuleId;
 /// it named ITSELF.  An empty `paths` with `unknown` set is the reading
 /// that keeps a consumer conservative; the default is exactly that,
 /// because a declaration whose analysis has not run cannot say less.
-const GrowVerdict = struct {
+pub const GrowVerdict = struct {
     paths: []const fn_summary.GrowPath = &.{},
     unplaced: []const u32 = &.{},
     unknown: bool = true,
@@ -75,7 +79,7 @@ fn hasUnplacedParam(unplaced: []const u32, param: u32) bool {
     return false;
 }
 
-fn growFieldCovers(prefix: []const u8, field: []const u8) bool {
+pub fn growFieldCovers(prefix: []const u8, field: []const u8) bool {
     if (prefix.len == 0) return true;
     return std.mem.startsWith(u8, field, prefix) and
         (field.len == prefix.len or field[prefix.len] == '.');
@@ -173,7 +177,7 @@ fn growParamsEqual(a: []const u32, b: []const u32) bool {
 /// cannot dangle.  The resolver borrows the store's own handle, which is
 /// what keeps the document's imports and toolchain sources resolving the
 /// way they do for the file under analysis.
-const SourceDocument = struct {
+pub const SourceDocument = struct {
     resolver: *zls_resolver_mod.TypeResolver,
     cache: FileCache,
 
@@ -228,9 +232,8 @@ const max_grow_fold_work: u32 = 8192;
 pub const GrowState = struct {
     /// The root cache, which alone tears this down.
     owner: *FileCache,
-    /// One per document, keyed by that document's own tree AND the module it
-    /// was opened in: the same source compiled into two environments is two
-    /// documents here, and an answer about one says nothing about the other.
+    /// One per document, keyed by its tree, module and source context: an
+    /// ordinary document cache never lends another context its semantic facts.
     documents: std.AutoHashMapUnmanaged(DocumentKey, *SourceDocument) = .empty,
     /// Verdicts already computed, keyed by the declaration they answer.
     verdicts: std.AutoHashMapUnmanaged(DeclKey, GrowVerdict) = .empty,
@@ -492,16 +495,28 @@ fn appendUnplacedParam(
     try unplaced.append(arena, param);
 }
 
-pub fn isStandardSliceComparison(cache: *FileCache, callee_token: Ast.TokenIndex) error{OutOfMemory}!bool {
+/// Where the declaration a call TOKEN actually reaches grows, read from the
+/// document that declares it.  Null when the type engine cannot connect the
+/// token to a declaration, and when that declaration's fold met a cycle: both
+/// are open questions, so a caller keeps the name-based summary (or its own
+/// conservative reading) instead of treating null as "grows nothing".
+pub fn calleeGrowVerdict(cache: *FileCache, callee_token: Ast.TokenIndex) SummaryError!?GrowVerdict {
+    const callee = (try actualCalleeOf(cache, callee_token, null)) orelse return null;
+    return growVerdictOf(cache, callee);
+}
+
+/// A summary read as a verdict; see `verdictOf`.
+pub fn summaryGrowVerdict(summary: *const fn_summary.FnSummary) GrowVerdict {
+    return verdictOf(summary);
+}
+
+pub fn isStandardSliceComparison(cache: *FileCache, callee_token: Ast.TokenIndex) SummaryError!bool {
     const resolver = cache.zls orelse return false;
     const index = try cache.getCallIndex();
     const node = index.by_callee_token.get(callee_token) orelse return false;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = cache.tree.fullCall(&buffer, node) orelse return false;
-    return resolver.stdMemEqlOf(call.ast.fn_expr, call.ast.params.len) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => false,
-    };
+    return try resolver.stdMemEqlOf(call.ast.fn_expr, call.ast.params.len);
 }
 
 /// Propagate the coarse grow flag into `fn_decl` from its
@@ -676,6 +691,13 @@ pub fn resolveGrowPathsOne(
     const kept = cache.summary_arena.?.allocator();
 
     const direct = try directGrowEffects(cache, proto, body, bindings);
+    // Admit the argument domain once; every saturation check in this
+    // round reuses its checked width.
+    var widest_count: usize = 0;
+    for (direct.calls) |call| {
+        widest_count = @max(widest_count, call.args.len);
+    }
+    const widest = std.math.cast(u32, widest_count) orelse return error.SourceTooWide;
     var paths: std.ArrayListUnmanaged(fn_summary.GrowPath) = .empty;
     // A root is the conservative top for this parameter. Keep it across
     // passes so widening cannot narrow again through a recursive call.
@@ -696,7 +718,7 @@ pub fn resolveGrowPathsOne(
     for (direct.claims) |claim| {
         // A claim the declarations cannot vouch for is storage
         // somebody else may still be walking.
-        if (!try cache.provesFreshStorage(claim)) unknown = true;
+        if (!try cache.provesFreshStorage(claim, null)) unknown = true;
     }
 
     // Declarations of THIS document whose own summary a call below
@@ -715,7 +737,7 @@ pub fn resolveGrowPathsOne(
         // refined exactly as it stands.  What it saves is the rest
         // of this declaration's reachable graph, which for a call
         // into a large module is most of a standard library.
-        if (growFoldSaturated(cache, proto, direct, paths.items, unplaced.items, unknown)) break;
+        if (growFoldSaturated(cache, proto, widest, paths.items, unplaced.items, unknown)) break;
         if (try isStandardSliceComparison(cache, call.callee_token)) continue;
         if (try isStandardListLifecycleCall(cache, call.callee_token)) continue;
         // The declaration this call actually reaches, in the
@@ -745,7 +767,7 @@ pub fn resolveGrowPathsOne(
                 // re-charging every call edge in it.  Settling it
                 // here makes the read complete, so the round this
                 // belongs to settles instead of being revised.
-                const own_decl = ownGrowUnsettledByName(cache, call.name);
+                const own_decl = try ownGrowUnsettledByName(cache, call.name);
                 if (own_decl) |decl| try settleOwnGrowDecl(cache, decl);
                 if (try cache.summaryByName(call.name)) |cs| {
                     // Unsettled still: the fold above met a cycle it
@@ -769,23 +791,20 @@ pub fn resolveGrowPathsOne(
                 }
             },
             .qualified => qualified: {
-                if (try cache.qualifierModule(call.qualifier)) |imported| {
-                    // The declaration the qualifier's module really
-                    // declares under that name, read from the tree
-                    // that module was parsed from — never from the
-                    // spelling, which is all the call site wrote.
-                    if (FileCache.moduleFnDecl(imported, call.name)) |declared| {
-                        if (try cache.summaryOfResolvedMethod(declared)) |cs| {
-                            try foldCalleeGrow(arena, &paths, &unplaced, &unknown, call, .{
-                                .paths = cs.grow_paths,
-                                .unplaced = cs.unplaced_args,
-                                .unknown = cs.grows_self_named,
-                            });
-                            break :qualified;
-                        }
-                    }
-                    // The module is readable but the function in
-                    // it is not: the same blind spot as a bare call.
+                // No actual call frame was resolved. The qualified query
+                // reads the exact imported declaration's direct grow facts,
+                // not a contextual normal-cleanup certificate.
+                if (try cache.summaryByQualifiedName(call.qualifier, call.name)) |cs| {
+                    try foldCalleeGrow(arena, &paths, &unplaced, &unknown, call, .{
+                        .paths = cs.grow_paths,
+                        .unplaced = cs.unplaced_args,
+                        .unknown = cs.grows_self_named,
+                    });
+                    break :qualified;
+                }
+                if (try cache.qualifierModule(call.qualifier)) |_| {
+                    // The module is readable but its function is not:
+                    // the same blind spot as an unresolved bare call.
                     charged_storage = try chargeHandedStorage(cache, proto, arena, &paths, &unplaced, call, true);
                     break :qualified;
                 }
@@ -821,7 +840,7 @@ pub fn resolveGrowPathsOne(
                 if (type_name) |tn| {
                     // Settled before the read for the same reason
                     // the bare call above settles its own name.
-                    const own_decl = ownGrowUnsettledByMethod(cache, tn, call.name);
+                    const own_decl = try ownGrowUnsettledByMethod(cache, tn, call.name);
                     if (own_decl) |decl| try settleOwnGrowDecl(cache, decl);
                     if (try cache.summaryByMethod(tn, call.name)) |cs| {
                         if (own_decl != null and !ownGrowSettled(cache, own_decl.?)) {
@@ -834,15 +853,11 @@ pub fn resolveGrowPathsOne(
                         });
                         break :method;
                     }
-                    if (try cache.summaryByMethodCrossFile(tn, call.name)) |cs| {
-                        // Cross-file summaries expose only the coarse
-                        // flags (the project cache cannot carry the
-                        // paths), so they stay conservative.
-                        try foldCalleeGrow(arena, &paths, &unplaced, &unknown, call, .{
-                            .paths = cs.grow_paths,
-                            .unplaced = cs.unplaced_args,
-                            .unknown = cs.grows_self_named,
-                        });
+                    if (cache.findMethodAcrossImports(tn, call.name) != null) {
+                        // A method another file declares: this file reads
+                        // none of its body, so where it reallocates is not
+                        // something this fold can place.
+                        unknown = true;
                         break :method;
                     }
                 }
@@ -929,8 +944,8 @@ pub fn ownGrowSettled(cache: *FileCache, fn_decl: Ast.Node.Index) bool {
 /// query in flight has NOT folded it yet, and null otherwise: a
 /// name this file does not declare, or one whose answer is already
 /// memoized, is a read no later round can answer differently.
-pub fn ownGrowUnsettledByName(cache: *FileCache, name: []const u8) ?Ast.Node.Index {
-    const model = cache.fileModel() catch return null;
+pub fn ownGrowUnsettledByName(cache: *FileCache, name: []const u8) SummaryError!?Ast.Node.Index {
+    const model = try cache.fileModel();
     const fi = model.findFn(name) orelse return null;
     return if (ownGrowSettled(cache, fi.fn_decl)) null else fi.fn_decl;
 }
@@ -941,8 +956,8 @@ pub fn ownGrowUnsettledByMethod(
     cache: *FileCache,
     type_name: []const u8,
     method_name: []const u8,
-) ?Ast.Node.Index {
-    const model = cache.fileModel() catch return null;
+) SummaryError!?Ast.Node.Index {
+    const model = try cache.fileModel();
     const ti = model.findType(type_name) orelse return null;
     const m = ti.findMethod(method_name) orelse return null;
     return if (ownGrowSettled(cache, m.fn_decl)) null else m.fn_decl;
@@ -972,12 +987,10 @@ pub fn ownGrowUnsettledByMethod(
 /// `demandVerdict` answers null for it, and a cycle stays an open
 /// question the caller charges rather than something this settles.
 ///
-/// A cache with its own Phase 8 loop settles nothing here: that loop
-/// reads live summaries on purpose and converges on them itself, so
-/// folding a declaration underneath it would answer a question it is
-/// already asking.
+/// Every cache folds on demand: no loop of its own converges on live
+/// summaries first, so a same-document name read before its
+/// declaration is folded would read the unfolded default.
 pub fn settleOwnGrowDecl(cache: *FileCache, fn_decl: Ast.Node.Index) SummaryError!void {
-    if (!cache.grow_on_demand) return;
     if (ownGrowSettled(cache, fn_decl)) return;
     _ = try demandVerdict(cache, cache.tree, cache, fn_decl);
 }
@@ -1014,24 +1027,24 @@ pub fn growStateAlloc(cache: *FileCache) error{OutOfMemory}!*GrowState {
 }
 
 /// The per-file state that reads declarations of `handle`, opened
-/// once per document and owned until teardown.  Its resolver
-/// borrows the store's own handle for that document, so the
-/// document's imports and toolchain sources resolve exactly as they
-/// do for the file under analysis — no second reading of the file,
-/// and no path reconstructed from a name.
+/// once per document and source context and owned until teardown. Its resolver
+/// borrows the supplied context's handle, so imports and toolchain sources
+/// follow the actual caller without changing the root cache's resolver.
 pub fn sourceDocument(
     cache: *FileCache,
     handle: @import("type_engine").DocumentStore.Handle,
+    ctx: *zls_resolver_mod.TypeContext,
 ) OpenError!*SourceDocument {
     const state = try growStateAlloc(cache);
-    if (state.documents.get(.{ .tree = &handle.document.tree, .module = handle.module })) |document| return document;
+    const key: DocumentKey = .{ .tree = &handle.document.tree, .module = handle.module, .ctx = ctx };
+    if (state.documents.get(key)) |document| return document;
     // Heap-allocated before it is initialized: the analyser's
     // allocator points into the resolver's own arena, so the
     // resolver must not move once it holds one.
     const resolver = try cache.gpa.create(zls_resolver_mod.TypeResolver);
     errdefer cache.gpa.destroy(resolver);
     resolver.* = undefined;
-    try resolver.initBorrowed(cache.zls.?.ctx, cache.gpa, handle);
+    try resolver.initBorrowed(ctx, cache.gpa, handle);
     errdefer resolver.deinit();
     const document = try cache.gpa.create(SourceDocument);
     errdefer cache.gpa.destroy(document);
@@ -1047,7 +1060,7 @@ pub fn sourceDocument(
     document.cache.module_id = resolver.handle.module;
     document.cache.grow_state = state;
     document.cache.grow_on_demand = true;
-    try state.documents.put(cache.gpa, .{ .tree = &resolver.handle.document.tree, .module = resolver.handle.module }, document);
+    try state.documents.put(cache.gpa, key, document);
     return document;
 }
 
@@ -1070,21 +1083,14 @@ pub fn actualCalleeOf(
     cache: *FileCache,
     callee_token: Ast.TokenIndex,
     frame: ?zls_resolver_mod.TypeResolver.ResolutionFrame,
-) error{OutOfMemory}!?ActualCallee {
+) SummaryError!?ActualCallee {
     // A token memo belongs to this document's ordinary resolution context.
     // Instantiated queries borrow their original resolver and never publish
     // contextual answers into a foreign document's token-only memo.
     if (frame == null) {
         if (cache.actual_callees.get(callee_token)) |cached| return cached;
     }
-    const resolved = resolveActualCallee(cache, callee_token, frame) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // A resolution that failed for a reason of its own is not
-        // an answer about this callee, so it is not memoized as
-        // one either: publishing "resolves to nothing" would turn
-        // a failure to look into evidence that there is nothing.
-        else => return null,
-    };
+    const resolved = try resolveActualCallee(cache, callee_token, frame);
     if (frame == null) try cache.actual_callees.put(cache.gpa, callee_token, resolved);
     return resolved;
 }
@@ -1093,13 +1099,14 @@ pub fn actualCalleeOf(
 /// Resolve the declaration and arity; project lookalikes remain opaque.
 pub fn isStandardListLifecycleCall(cache: *FileCache, callee_token: Ast.TokenIndex) !bool {
     const callee = (try actualCalleeOf(cache, callee_token, null)) orelse return false;
-    const std_tree = (try fresh_storage.toolchainArrayListTree(cache)) orelse return false;
+    // This lifecycle query owns the ordinary context used by actualCalleeOf.
+    const std_tree = (try fresh_storage.toolchainArrayListTree(cache, null)) orelse return false;
     if (callee.tree != std_tree) return false;
     const name = std_tree.tokenSlice(callee.fn_token + 1);
     if (!std.mem.eql(u8, name, "init") and
         !std.mem.eql(u8, name, "initCapacity") and
         !std.mem.eql(u8, name, "deinit")) return false;
-    var buffer: [1]Ast.Node.Index = undefined;
+    var buffer: [2]Ast.Node.Index = undefined;
     return (try cache.zls.?.callArgumentsOf(&buffer, callee.call_node)) != null;
 }
 
@@ -1113,19 +1120,22 @@ pub fn isStandardListLifecycleCall(cache: *FileCache, callee_token: Ast.TokenInd
 /// on and cannot disagree with it: a direct map read had no way to
 /// tell a resolution that ran out of memory part-way — whose key
 /// used to be left behind holding an unwritten slot — from one that
-/// had settled on "resolves to nothing".  Running out of memory now
-/// travels out instead of quietly answering "not an unnamed call".
-pub fn isUnnamedCall(cache: *FileCache, callee_token: Ast.TokenIndex) error{OutOfMemory}!bool {
+/// had settled on "resolves to nothing". Source, cancellation and resource
+/// failures propagate instead of answering "not an unnamed call".
+pub fn isUnnamedCall(cache: *FileCache, callee_token: Ast.TokenIndex) SummaryError!bool {
     const index = try cache.getCallIndex();
     if (index.by_callee_token.get(callee_token) == null) return false;
     return (try actualCalleeOf(cache, callee_token, null)) == null;
 }
 
+/// Resolve an invocation's reached declaration without publishing a memo.
+/// Structural unknown and non-callable expressions return `null`; source,
+/// cancellation and resource failures propagate to the caller.
 pub fn resolveActualCallee(
     cache: *FileCache,
     callee_token: Ast.TokenIndex,
     frame: ?zls_resolver_mod.TypeResolver.ResolutionFrame,
-) !?ActualCallee {
+) SummaryError!?ActualCallee {
     const query = frame orelse (cache.zls orelse return null).resolutionFrame();
     const index = try cache.getCallIndex();
     const node = index.by_callee_token.get(callee_token) orelse return null;
@@ -1165,9 +1175,8 @@ pub fn resolveActualCallee(
 /// Where `callee`'s own reallocations land, computed in the
 /// document that declares it.
 ///
-/// A declaration of the file under analysis reads the live summary
-/// the fixed point is still filling, so a pass sees what the
-/// earlier passes learned.  A declaration anywhere else is computed
+/// A declaration of the file under analysis is folded on demand in
+/// that file's own cache.  A declaration anywhere else is computed
 /// here, in its own document and with its own imports intact —
 /// transitively, because that document folds its callees the same
 /// way.  Null when the declaration is already being computed: a
@@ -1179,15 +1188,23 @@ pub fn resolveActualCallee(
 /// position in an imported document printed under this file's path
 /// would name a line this file does not have.
 pub fn growVerdictOf(cache: *FileCache, callee: ActualCallee) SummaryError!?GrowVerdict {
-    if (callee.tree == cache.tree and !cache.grow_on_demand) {
-        const summary = try cache.summaryOfFn(callee.declaration);
-        return verdictOf(summary);
-    }
     const query = try growStateAlloc(cache);
     query.noteEntry(cache.tree, cache.tree.firstToken(callee.call_node));
     if (callee.tree == cache.tree) return demandVerdict(cache, cache.tree, cache, callee.declaration);
-    const document = try sourceDocument(cache, callee.handle);
+    const resolver = if (callee.caller_frame) |frame| frame.resolver else cache.zls orelse return null;
+    const document = try sourceDocument(cache, callee.handle, resolver.ctx);
     return demandVerdict(cache, callee.tree, &document.cache, callee.declaration);
+}
+
+/// `growVerdictOf` for the free fn `name` of THIS document, for a caller
+/// whose type engine cannot connect the call token to a declaration.  Null
+/// when the file declares no such fn and when the fold met a cycle.
+pub fn ownFnGrowVerdict(cache: *FileCache, name: []const u8) SummaryError!?GrowVerdict {
+    const model = try cache.fileModel();
+    const fi = model.findFn(name) orelse return null;
+    const query = try growStateAlloc(cache);
+    query.noteEntry(cache.tree, cache.tree.nodeMainToken(fi.fn_decl));
+    return demandVerdict(cache, cache.tree, cache, fi.fn_decl);
 }
 
 /// Compute one declaration's verdict on demand, once per
@@ -1339,6 +1356,12 @@ pub fn growVerdictStored(cache: *FileCache, body: Ast.Node.Index) GrowVerdict {
     return verdictOf(entry);
 }
 
+/// True when `callee` is declared in the toolchain's `std` sources.
+fn declaredInToolchain(cache: *FileCache, callee: ActualCallee) SummaryError!bool {
+    const resolver = if (callee.caller_frame) |frame| frame.resolver else cache.zls orelse return false;
+    return resolver.declaredUnderToolchain(callee.handle, "/std");
+}
+
 /// Fold the grow paths of the declaration `call` actually reaches
 /// into this fn's own answer.  True when the call was dispatched.
 ///
@@ -1349,9 +1372,9 @@ pub fn growVerdictStored(cache: *FileCache, body: Ast.Node.Index) GrowVerdict {
 ///     received — the real receiver arity, the real variadic rule;
 ///   - `unknown` carried over when the declaration has a
 ///     reallocation its own document could not place;
-///   - `unknown` recorded when the fold could not finish: a cycle,
-///     a document this session cannot read, an argument map the
-///     declaration's own arity does not admit.  None of those is
+///   - `unknown` recorded for a cycle or an argument map the
+///     declaration's own arity does not admit. Source and analysis failures
+///     propagate rather than becoming a growth verdict. None of those is
 ///     evidence that the declaration grows nothing, and none of
 ///     them may fall back to a NAME lookup, which could reach a
 ///     different declaration that happens to share the spelling.
@@ -1377,11 +1400,20 @@ pub fn foldActualGrow(
 ) SummaryError!bool {
     if (cache.zls == null) return false;
     const callee = (try actualCalleeOf(cache, call.callee_token, null)) orelse return false;
+    // The toolchain's own library reallocates through an allocator interface
+    // whose calls no declaration can name, so a fold INTO it can only read
+    // as "unknown".  What a std routine can move is what the call hands it:
+    // that is charged, per argument, exactly like a callee this file cannot
+    // read, and nothing beyond it.
+    if (try declaredInToolchain(cache, callee)) {
+        _ = try chargeHandedStorage(cache, proto, arena, paths, unplaced, call, false);
+        return true;
+    }
     const resolver = cache.zls.?;
     // One buffer backs both reads: the call's own argument storage
     // for the fixed-arity call shapes, so it outlives every node
     // taken from it here.
-    var call_buffer: [1]Ast.Node.Index = undefined;
+    var call_buffer: [2]Ast.Node.Index = undefined;
     // One unit for the EDGE, spent before it is traversed — and spent
     // whether or not the callee already has an answer, because
     // reaching it is the graph work either way.  What the callee's
@@ -1407,13 +1439,7 @@ pub fn foldActualGrow(
     // it.  A parameter the call does not pass is the callee's own
     // business and stays unattributed.
     for (verdict.unplaced) |param| {
-        const argument = (resolver.callArgumentIn(&call_buffer, callee.call_node, param) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                unknown.* = true;
-                continue;
-            },
-        }) orelse {
+        const argument = (try resolver.callArgumentIn(&call_buffer, callee.call_node, param)) orelse {
             unknown.* = true;
             continue;
         };
@@ -1430,13 +1456,7 @@ pub fn foldActualGrow(
     // was read from.
     const own = callee.tree == cache.tree;
     for (verdict.paths) |gp| {
-        const argument = (resolver.callArgumentIn(&call_buffer, callee.call_node, gp.param) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                unknown.* = true;
-                continue;
-            },
-        }) orelse {
+        const argument = (try resolver.callArgumentIn(&call_buffer, callee.call_node, gp.param)) orelse {
             // This declaration grows a parameter this call does not
             // hand it.  Where that storage came from is undecided.
             unknown.* = true;
@@ -1471,7 +1491,7 @@ pub fn foldActualGrow(
                     // no caller can ever discharge — and that is
                     // what charged `&out.writer` to every list the
                     // caller happened to be walking.
-                    if (!try cache.provesFreshStorage(claim)) {
+                    if (!try cache.provesFreshStorage(claim, null)) {
                         try appendUnplacedParam(arena, unplaced, gp.param);
                     }
                     break :blk null;
@@ -1545,7 +1565,7 @@ pub fn receiverTypeName(
 ) !?[]const u8 {
     const root = (try cache.paramContainerName(proto, owner.param)) orelse return null;
     if (owner.path.len == 0) return root;
-    var resolved = cache.findTypeAcrossImports(root) orelse return null;
+    var resolved = cache.resolvedTypeAcrossImports(root) orelse return null;
     var rest = owner.path;
     while (rest.len != 0) {
         const dot = std.mem.indexOfScalar(u8, rest, '.');
@@ -1573,15 +1593,13 @@ pub fn parameterIsNonAddressScalar(
     cache: *FileCache,
     proto: Ast.full.FnProto,
     origin: fn_summary.ParamPath,
-) error{OutOfMemory}!bool {
+) SummaryError!bool {
     if (origin.path.len != 0) return false;
     const key = (@as(u64, proto.ast.fn_token) << 32) | @as(u64, origin.param);
     if (cache.scalar_params.get(key)) |cached| return cached;
     const verdict = try classifyParameterScalar(cache, proto, origin.param);
-    // A type engine that failed for a reason of its own has said
-    // nothing about the parameter, so nothing is filed and the next
-    // caller asks again.  Until then the storage effect stands, which
-    // is the direction this question is allowed to fail in.
+    // Source failures propagate before publication. A successful unresolved
+    // type leaves no scalar certificate, so a later query can resolve it.
     if (verdict) |answer| try cache.scalar_params.put(cache.gpa, key, answer);
     return verdict orelse false;
 }
@@ -1595,27 +1613,18 @@ pub fn classifyParameterScalar(
     cache: *FileCache,
     proto: Ast.full.FnProto,
     index: u32,
-) error{OutOfMemory}!?bool {
+) SummaryError!?bool {
     var parameters = proto.iterate(cache.tree);
     var position: u32 = 0;
     while (parameters.next()) |parameter| : (position += 1) {
         if (position != index) continue;
         const type_node = parameter.type_expr orelse return false;
         if (cache.zls) |resolver| {
-            const bool_type = resolver.isBoolType(type_node) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return null,
-            };
-            if (bool_type == true) return true;
-            const int = resolver.intInfo(type_node) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return null,
-            };
+            const bool_type = (try resolver.isBoolType(type_node)) orelse return null;
+            if (bool_type) return true;
+            const int = try resolver.intInfo(type_node);
             if (int) |info| return info.bits < @bitSizeOf(usize);
-            const bits = resolver.floatBits(type_node) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return null,
-            };
+            const bits = try resolver.floatBits(type_node);
             if (bits) |width| return width < @bitSizeOf(usize);
             return false;
         }
@@ -1671,7 +1680,7 @@ pub fn chargeHandedStorage(
     unplaced: *std.ArrayListUnmanaged(u32),
     call: fn_summary.GrowCall,
     comptime charge_unplaced: bool,
-) error{OutOfMemory}!bool {
+) SummaryError!bool {
     var charged = false;
     for (call.args, 0..) |arg, param| {
         switch (arg) {
@@ -1723,10 +1732,11 @@ pub fn chargeHandedStorage(
 ///
 /// A declaration that cannot reach this reading is folded to the end,
 /// which is what every declaration did before.
+/// `widest` is the checked largest argument count for this round.
 pub fn growFoldSaturated(
     cache: *FileCache,
     proto: Ast.full.FnProto,
-    direct: fn_summary.GrowEffects,
+    widest: u32,
     paths: []const fn_summary.GrowPath,
     unplaced: []const u32,
     unknown: bool,
@@ -1736,10 +1746,6 @@ pub fn growFoldSaturated(
     var index: u32 = 0;
     while (parameters.next() != null) : (index += 1) {
         if (!hasRootGrowPath(paths, index)) return false;
-    }
-    var widest: u32 = 0;
-    for (direct.calls) |call| {
-        widest = @max(widest, @as(u32, @intCast(call.args.len)));
     }
     for (0..widest) |param| {
         if (!hasUnplacedParam(unplaced, @intCast(param))) return false;

@@ -9,15 +9,16 @@
 //! `env.grid_verify.deinit()` ran before `env.manifest_log_verify.deinit()`,
 //! and ManifestLog holds a pointer to Grid).
 //!
-//! Detection (purely syntactic, per-fn token walk):
+//! Detection (syntactic dep edges, AST deferred scopes):
 //!   1. Skip comptime type-builder fns.
 //!   2. Collect "dep" edges: `<A> = <T>.init(&<B>, ...)` or
 //!      `<A>.init(&<B>, ...)` — meaning A depends on B.  Both
 //!      LHS receiver chains (`a`, `env.grid_verify`) are
 //!      flattened to the last identifier for comparison.
-//!   3. Walk the body for sequences of `<X>.deinit(...)` calls.
-//!      For each pair (B-deinit, then A-deinit) in source order
-//!      where (B → A) is a dep edge, fire on the second deinit.
+//!   3. Collect `<X>.deinit(...)` calls and their enclosing defer.
+//!      Compare execution order: separate defers in one scope run
+//!      LIFO, while calls within one deferred body keep source order.
+//!      Report the dependent's deinit when its dependency runs first.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -60,23 +61,54 @@ const Dep = struct {
     b_name: []const u8, // last identifier of the &b argument
 };
 
-const Deinit = struct {
-    recv_name: []const u8, // last identifier of `<chain>.deinit(`
-    tok: Ast.TokenIndex,
-    deferred: bool, // true when this deinit is wrapped in `defer`
+const Deferred = struct {
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    scope_last: Ast.TokenIndex,
 };
 
-/// Returns true when the deinit call at `t` is of the form `defer <chain>.deinit(`.
-/// Walks backward past the receiver chain to find `keyword_defer` immediately before it.
-fn isDeferredDeinit(tags: []const std.zig.Token.Tag, t: Ast.TokenIndex) bool {
-    if (t < 2 or tags[t - 1] != .period) return false;
-    var u = t - 2;
-    // Walk backward through dotted chain: ident (. ident)*
-    while (u >= 2 and tags[u] == .identifier and tags[u - 1] == .period) {
-        u -= 2;
+const Deinit = struct {
+    recv_name: []const u8, // Last identifier of `<chain>.deinit(`.
+    tok: Ast.TokenIndex,
+    deferred: ?Deferred,
+
+    fn runsBefore(self: Deinit, other: Deinit, defers: []const Deferred) bool {
+        var self_deferred = self.deferred;
+        var other_deferred = other.deferred;
+        while (true) {
+            const self_at = if (self_deferred) |d| d.scope_last else self.tok;
+            const other_at = if (other_deferred) |d| d.scope_last else other.tok;
+            if (self_at != other_at) return self_at < other_at;
+            if (self_deferred) |self_defer| {
+                if (other_deferred) |other_defer| {
+                    // Separate registrations reverse. A shared deferred body
+                    // instead compares its own immediate and deferred calls.
+                    if (self_defer.first != other_defer.first) {
+                        return self_defer.first > other_defer.first;
+                    }
+                    self_deferred = deferredDeinit(defers, self.tok, self_defer.first);
+                    other_deferred = deferredDeinit(defers, other.tok, other_defer.first);
+                    continue;
+                }
+            }
+            return self.tok < other.tok;
+        }
     }
-    if (tags[u] != .identifier) return false;
-    return u >= 1 and tags[u - 1] == .keyword_defer;
+};
+
+/// Return the outermost deferred statement below an already shared body.
+/// Each descent increases `after`, so nested cleanup comparisons terminate.
+fn deferredDeinit(
+    defers: []const Deferred,
+    t: Ast.TokenIndex,
+    after: Ast.TokenIndex,
+) ?Deferred {
+    var enclosing: ?Deferred = null;
+    for (defers) |d| {
+        if (d.first <= after or t <= d.first or t > d.last) continue;
+        if (enclosing == null or d.first < enclosing.?.first) enclosing = d;
+    }
+    return enclosing;
 }
 
 fn checkBody(
@@ -118,6 +150,26 @@ fn checkBody(
     }
     if (deps.items.len == 0) return;
 
+    var defers: std.ArrayListUnmanaged(Deferred) = .empty;
+    defer defers.deinit(gpa);
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, node) orelse continue;
+        const scope_first = tree.firstToken(node);
+        const scope_last = tree.lastToken(node);
+        if (scope_first < first or scope_last > last) continue;
+        for (statements) |statement| {
+            if (tree.nodeTag(statement) != .@"defer") continue;
+            try defers.append(gpa, .{
+                .first = tree.firstToken(statement),
+                .last = tree.lastToken(statement),
+                .scope_last = scope_last,
+            });
+        }
+    }
+
     // Collect deinit calls in source order: `<chain>.deinit(`.
     var deinits: std.ArrayListUnmanaged(Deinit) = .empty;
     defer deinits.deinit(gpa);
@@ -132,23 +184,22 @@ fn checkBody(
         if (t == 0 or tags[t - 1] != .period) continue;
         if (tags[t + 1] != .l_paren) continue;
         const recv = lastIdentSegmentBack(tree, tags, t - 1);
-        const deferred = isDeferredDeinit(tags, t);
+        const deferred = deferredDeinit(defers.items, t, 0);
         try deinits.append(gpa, .{ .recv_name = recv, .tok = t, .deferred = deferred });
     }
     if (deinits.items.len < 2) return;
 
-    // For each ordered pair (deinit[i], deinit[j]) with i<j,
-    // check if deps contains (a=deinit[j].recv, b=deinit[i].recv).
-    // When BOTH are `defer`-wrapped, LIFO reverses execution order so
-    // source order j>i becomes execution order j-first — correct, no fire.
+    // Compare actual cleanup order, not the spelling order of registrations.
     for (deinits.items, 0..) |di, i| {
         for (deinits.items[i + 1 ..]) |dj| {
-            if (di.deferred and dj.deferred) continue;
+            const di_first = di.runsBefore(dj, defers.items);
+            const earlier = if (di_first) di else dj;
+            const later = if (di_first) dj else di;
             for (deps.items) |d| {
-                if (std.mem.eql(u8, d.a_name, dj.recv_name) and
-                    std.mem.eql(u8, d.b_name, di.recv_name))
+                if (std.mem.eql(u8, d.a_name, later.recv_name) and
+                    std.mem.eql(u8, d.b_name, earlier.recv_name))
                 {
-                    try report(gpa, problems, tree, dj.tok, d.a_name, d.b_name);
+                    try report(gpa, problems, tree, later.tok, d.a_name, d.b_name);
                     break;
                 }
             }
@@ -234,8 +285,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "deinit-order-violates-construction-dep",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, deinit_tok),
-        .end = Pos.fromTokenEnd(tree, deinit_tok),
+        .start = try Pos.fromTokenStart(tree, deinit_tok),
+        .end = try Pos.fromTokenEnd(tree, deinit_tok),
         .message = msg,
     });
 }
@@ -388,4 +439,168 @@ test "deinit-order-violates-construction-dep: explicit b before deferred a fires
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expect(problems.items.len >= 1);
+}
+
+test "deinit-order-violates-construction-dep: conditional defers preserve correct LIFO" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    defer if (typed) context.deinit();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) resolver.deinit();
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: reversed conditional defers fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) resolver.deinit();
+        \\    defer if (typed) context.deinit();
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings(
+        "deinit-order-violates-construction-dep",
+        problems.items[0].rule_id,
+    );
+}
+
+test "deinit-order-violates-construction-dep: conditional defer blocks preserve LIFO" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    defer if (typed) {
+        \\        context.deinit();
+        \\    };
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) {
+        \\        resolver.deinit();
+        \\    };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: reversed conditional defer blocks fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) {
+        \\        resolver.deinit();
+        \\    };
+        \\    defer if (typed) {
+        \\        context.deinit();
+        \\    };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: one defer keeps internal source order" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) {
+        \\        resolver.deinit();
+        \\        context.deinit();
+        \\    };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: reversed calls inside one defer fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) {
+        \\        context.deinit();
+        \\        resolver.deinit();
+        \\    };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: inner conditional defer runs first" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    {
+        \\        defer if (typed) resolver.deinit();
+        \\    }
+        \\    defer if (typed) context.deinit();
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: inner dependency defer runs too early" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) resolver.deinit();
+        \\    {
+        \\        defer if (typed) context.deinit();
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: nested defer preserves dependency" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) {
+        \\        defer context.deinit();
+        \\        resolver.deinit();
+        \\    };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: nested dependent defer runs too late" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn run(typed: bool) void {
+        \\    var context = Context.init();
+        \\    var resolver = Resolver.init(&context);
+        \\    defer if (typed) {
+        \\        defer resolver.deinit();
+        \\        context.deinit();
+        \\    };
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }

@@ -840,6 +840,9 @@ pub const Resolver = struct {
         if (span.first > span.last or span.last >= tags.len) return null;
         if (self.arrayLengthOf(span)) |length| {
             if (self.stripLenSuffix(length)) |expr| {
+                if (self.enumMetaFieldsTypeSpan(expr)) |type_span| {
+                    return .{ .number = self.enumFieldsCount(type_span, 0) orelse return null };
+                }
                 // `[<collection>.len]E` states its count by naming the
                 // collection, and there are exactly two ways that
                 // count can be established — each needs its own proof:
@@ -936,6 +939,118 @@ pub const Resolver = struct {
             extent.number = arrayLiteralElementCount(tree, spans.init);
         }
         return extent;
+    }
+
+    /// A runtime enumeration has the target's fixed count when the
+    /// immediately preceding statement is the real std.debug.assert
+    /// equating their lengths. No intervening statement, conditional
+    /// assertion, unrelated binding, or user-defined assert is evidence.
+    pub fn assertedEnumerationExtent(
+        self: *const Resolver,
+        loop: Ast.full.For,
+        target_name_tok: Ast.TokenIndex,
+        target: Extent,
+    ) file_cache.SummaryError!?Extent {
+        const count = target.number orelse return null;
+        if (loop.ast.inputs.len != 2) return null;
+        const tree = self.tree;
+        const previous = self.statementBeforeToken(loop.ast.for_token) orelse return null;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, previous) orelse return null;
+        if (call.ast.params.len != 1) return null;
+        const callee = TokenSpan{
+            .first = tree.firstToken(call.ast.fn_expr),
+            .last = tree.lastToken(call.ast.fn_expr),
+        };
+        const tags = tree.tokens.items(.tag);
+        if (callee.last != callee.first + 4 or tags[callee.first] != .identifier or
+            tags[callee.first + 1] != .period or tags[callee.first + 2] != .identifier or
+            tags[callee.first + 3] != .period or tags[callee.last] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(callee.first + 2), "debug") or
+            !std.mem.eql(u8, tree.tokenSlice(callee.last), "assert")) return null;
+        const namespace = self.visibleConstDecl(callee.first, tree.tokenSlice(callee.first)) orelse return null;
+        const initializer = namespace.spans.?.init;
+        if (initializer.last != initializer.first + 3 or tags[initializer.first] != .builtin or
+            !std.mem.eql(u8, tree.tokenSlice(initializer.first), "@import") or
+            tags[initializer.first + 1] != .l_paren or tags[initializer.first + 2] != .string_literal or
+            !std.mem.eql(u8, tree.tokenSlice(initializer.first + 2), "\"std\"") or
+            tags[initializer.last] != .r_paren) return null;
+
+        const condition = call.ast.params[0];
+        if (tree.nodeTag(condition) != .equal_equal) return null;
+        const pair = tree.nodeData(condition).node_and_node;
+        const input = loop.ast.inputs[0];
+        if (!(self.assertedLengthPair(pair[0], pair[1], input, target_name_tok) or
+            self.assertedLengthPair(pair[1], pair[0], input, target_name_tok))) return null;
+        const cache = self.cache orelse return null;
+        const actual = (try cache.actualCallSummaryAt(tree.nodeMainToken(call.ast.fn_expr), null)) orelse return null;
+        if (actual.callee.call_node != previous) return null;
+        const declaring_tree = actual.callee.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(declaring_tree, &proto_buffer, actual.callee.declaration) orelse return null;
+        const name_token = proto.name_token orelse return null;
+        if (!std.mem.eql(u8, declaring_tree.tokenSlice(name_token), "assert")) return null;
+        const resolver = if (actual.callee.caller_frame) |frame| frame.resolver else cache.zls orelse return null;
+        if (!try resolver.declaredInToolchainFile(actual.callee.handle, "/std/debug.zig")) return null;
+        return .{ .number = count };
+    }
+
+    fn assertedLengthPair(
+        self: *const Resolver,
+        input_length: Ast.Node.Index,
+        target_length: Ast.Node.Index,
+        input: Ast.Node.Index,
+        target_name_tok: Ast.TokenIndex,
+    ) bool {
+        const tree = self.tree;
+        const input_span = self.stripLenSuffix(.{
+            .first = tree.firstToken(input_length),
+            .last = tree.lastToken(input_length),
+        }) orelse return false;
+        const target_span = self.stripLenSuffix(.{
+            .first = tree.firstToken(target_length),
+            .last = tree.lastToken(target_length),
+        }) orelse return false;
+        if (target_span.first != target_span.last or tree.tokenTag(target_span.first) != .identifier) return false;
+        const target_binding = self.visibleDeclAt(target_span.first, tree.tokenSlice(target_span.first)) orelse return false;
+        if (target_binding.name_tok != target_name_tok) return false;
+
+        const enumeration_span = TokenSpan{ .first = tree.firstToken(input), .last = tree.lastToken(input) };
+        if (tree.tokenTag(input_span.first) != .identifier or tree.tokenTag(enumeration_span.first) != .identifier) return false;
+        const asserted_root = self.visibleDeclAt(input_span.first, tree.tokenSlice(input_span.first)) orelse return false;
+        const iterated_root = self.visibleDeclAt(enumeration_span.first, tree.tokenSlice(enumeration_span.first)) orelse return false;
+        if (asserted_root.name_tok != iterated_root.name_tok) return false;
+        const asserted_path = self.fieldPathOf(input_span, asserted_root) orelse return false;
+        const iterated_path = self.fieldPathOf(enumeration_span, iterated_root) orelse return false;
+        if (asserted_path.field_count != iterated_path.field_count) return false;
+        for (asserted_path.fields[0..asserted_path.field_count], iterated_path.fields[0..iterated_path.field_count]) |a, b| {
+            if (!std.mem.eql(u8, a, b)) return false;
+        }
+        return true;
+    }
+
+    /// Only a direct statement sibling can establish an immediate fact.
+    fn statementBeforeToken(self: *const Resolver, token: Ast.TokenIndex) ?Ast.Node.Index {
+        const tree = self.tree;
+        for (0..tree.nodes.len) |raw| {
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements: []const Ast.Node.Index = switch (tree.nodeTag(node)) {
+                .block, .block_semicolon => tree.extraDataSlice(tree.nodeData(node).extra_range, Ast.Node.Index),
+                .block_two, .block_two_semicolon => blk: {
+                    const data = tree.nodeData(node).opt_node_and_opt_node;
+                    buffer[0] = data[0].unwrap() orelse continue;
+                    buffer[1] = data[1].unwrap() orelse break :blk buffer[0..1];
+                    break :blk buffer[0..2];
+                },
+                else => continue,
+            };
+            for (statements, 0..) |statement, index_| {
+                if (tree.nodeMainToken(statement) != token) continue;
+                return if (index_ == 0) null else statements[index_ - 1];
+            }
+        }
+        return null;
     }
 
     /// How many times a single-input `for (X) |v| …` runs, when the
@@ -1172,16 +1287,25 @@ pub const Resolver = struct {
     /// `[N]E`.  Null for a slice (`[]E`, an empty span), for a
     /// sentinel (`[N:s]E`), for a nested bracket, and for a span with
     /// no element type after the closing bracket.
+    /// Balanced parentheses are extracted, not evaluated; the count resolver
+    /// still accepts only its authenticated constant-expression grammar.
     pub fn arrayLengthOf(self: *const Resolver, span: TokenSpan) ?TokenSpan {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         if (span.first > span.last or span.last >= tags.len) return null;
         if (tags[span.first] != .l_bracket) return null;
         var t: Ast.TokenIndex = span.first + 1;
+        var parentheses: u32 = 0;
         while (t <= span.last and t < tags.len) : (t += 1) {
             switch (tags[t]) {
-                .l_bracket, .l_paren, .l_brace, .colon => return null,
+                .l_bracket, .l_brace, .colon => return null,
+                .l_paren => parentheses += 1,
+                .r_paren => {
+                    if (parentheses == 0) return null;
+                    parentheses -= 1;
+                },
                 .r_bracket => {
+                    if (parentheses != 0) return null;
                     if (t == span.first + 1) return null;
                     if (t == span.last) return null;
                     return .{ .first = span.first + 1, .last = t - 1 };
@@ -1230,6 +1354,138 @@ pub const Resolver = struct {
         return value;
     }
 
+    /// Resolve only genuine `std.meta.fields(Type)`, not a lookalike call.
+    pub fn enumMetaFieldsTypeSpan(self: *const Resolver, span: TokenSpan) ?TokenSpan {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (span.first > span.last or span.last >= tags.len) return null;
+        const first = span.first;
+        if (span.last - first < 7 or tags[first] != .identifier or
+            tags[first + 1] != .period or tags[first + 2] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(first + 2), "meta") or
+            tags[first + 3] != .period or tags[first + 4] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(first + 4), "fields") or
+            tags[first + 5] != .l_paren or tags[span.last] != .r_paren) return null;
+        const root = self.visibleConstDecl(first, tree.tokenSlice(first)) orelse return null;
+        const initializer = root.spans.?.init;
+        if (initializer.last - initializer.first != 3 or tags[initializer.first] != .builtin or
+            !std.mem.eql(u8, tree.tokenSlice(initializer.first), "@import") or
+            tags[initializer.first + 1] != .l_paren or tags[initializer.first + 2] != .string_literal or
+            !std.mem.eql(u8, tree.tokenSlice(initializer.first + 2), "\"std\"") or
+            tags[initializer.last] != .r_paren) return null;
+        const arg = TokenSpan{ .first = first + 6, .last = span.last - 1 };
+        var token = arg.first;
+        while (token <= arg.last) {
+            if (tags[token] != .identifier) return null;
+            if (token == arg.last) break;
+            if (token + 2 > arg.last or tags[token + 1] != .period) return null;
+            token += 2;
+        }
+        return arg;
+    }
+
+    /// Reflection length remains the declared field count, not the tag maximum.
+    pub fn enumFieldsCount(self: *const Resolver, type_span: TokenSpan, depth: u32) ?u64 {
+        if (type_span.first == type_span.last)
+            return self.enumFieldCount(type_span.first, depth);
+        const declaration = self.enumContainerOf(type_span, depth) orelse return null;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const container = declaration.tree.fullContainerDecl(&buffer, declaration.node) orelse return null;
+        var count: u64 = 0;
+        for (container.ast.members) |member| {
+            if (declaration.tree.fullContainerField(member) == null) continue;
+            if (std.mem.eql(u8, declaration.tree.tokenSlice(
+                declaration.tree.nodeMainToken(member),
+            ), "_")) continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    const EnumContainer = struct {
+        tree: *const Ast,
+        node: Ast.Node.Index,
+    };
+
+    /// Chase the same lexical aliases and canonical imports used by enum counts.
+    fn enumContainerOf(self: *const Resolver, type_span: TokenSpan, depth: u32) ?EnumContainer {
+        if (depth > max_fill_eval_depth) return null;
+        const tree = self.tree;
+        if (type_span.first > type_span.last or type_span.last >= tree.tokens.len or
+            tree.tokenTag(type_span.first) != .identifier) return null;
+        if (type_span.first == type_span.last) {
+            const decl = self.visibleConstDecl(
+                type_span.first,
+                tree.tokenSlice(type_span.first),
+            ) orelse return null;
+            const initializer = decl.spans.?.init;
+            if (tree.tokenTag(initializer.first) != .keyword_enum)
+                return self.enumContainerOf(initializer, depth + 1);
+            for (0..tree.nodes.len) |raw| {
+                const node: Ast.Node.Index = @enumFromInt(raw);
+                if (tree.lastToken(node) == initializer.last and
+                    tree.tokenTag(tree.nodeMainToken(node)) == .keyword_enum)
+                    return .{ .tree = tree, .node = node };
+            }
+            return null;
+        }
+        const root = self.visibleConstDecl(
+            type_span.first,
+            tree.tokenSlice(type_span.first),
+        ) orelse return null;
+        if (root.scope_len != 0) return null;
+        var segments: [max_fill_path_fields][]const u8 = undefined;
+        var count: usize = 0;
+        var token = type_span.first;
+        while (token <= type_span.last) {
+            if (count == segments.len or tree.tokenTag(token) != .identifier) return null;
+            segments[count] = tree.tokenSlice(token);
+            count += 1;
+            if (token == type_span.last) break;
+            if (token + 2 > type_span.last or tree.tokenTag(token + 1) != .period) return null;
+            token += 2;
+        }
+        const cache = self.cache orelse return null;
+        const resolved = cache.importedTypeAcrossImports(segments[0..count]) orelse return null;
+        if (resolved.info.kind != .enum_) return null;
+        const enum_tree = resolved.model.tree;
+        for (0..enum_tree.nodes.len) |raw| {
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            if (enum_tree.lastToken(node) == resolved.info.body_last and
+                enum_tree.tokenTag(enum_tree.nodeMainToken(node)) == .keyword_enum)
+                return .{ .tree = enum_tree, .node = node };
+        }
+        return null;
+    }
+
+    /// Prove each tag's actual value equals its zero-based declaration ordinal.
+    /// This ordered bijection proves complete coverage without a guessed extent.
+    pub fn contiguousEnumValueCount(self: *const Resolver, type_span: TokenSpan) ?u64 {
+        const declaration = self.enumContainerOf(type_span, 0) orelse return null;
+        const tree = declaration.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const container = tree.fullContainerDecl(&buffer, declaration.node) orelse return null;
+        var foreign = Resolver.init(self.gpa, tree, null, null);
+        defer foreign.deinit();
+        const evaluator = if (tree == self.tree) self else &foreign;
+        var count: u64 = 0;
+        for (container.ast.members) |member| {
+            const field = tree.fullContainerField(member) orelse continue;
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(member)), "_")) return null;
+            if (field.ast.value_expr.unwrap()) |value| {
+                const actual = evaluator.comptimeIntTokens(.{
+                    .first = tree.firstToken(value),
+                    .last = tree.lastToken(value),
+                }, 0) orelse return null;
+                if (actual != count) return null;
+            }
+            // With every preceding explicit tag equal to its ordinal, implicit
+            // tags have exactly this next value; no hole or duplicate is possible.
+            count += 1;
+        }
+        return count;
+    }
+
     /// Value of the `const` a reference at `name_tok` resolves to,
     /// chased one binding at a time.
     fn constIntBinding(self: *const Resolver, name_tok: Ast.TokenIndex, depth: u32) ?u64 {
@@ -1237,6 +1493,56 @@ pub const Resolver = struct {
         const tree = self.tree;
         const decl = self.visibleConstDecl(name_tok, tree.tokenSlice(name_tok)) orelse return null;
         return self.comptimeIntTokens(decl.spans.?.init, depth);
+    }
+
+    /// Count declared enum fields, not tag values or an unrelated literal.
+    fn enumFieldCount(self: *const Resolver, name_tok: Ast.TokenIndex, depth: u32) ?u64 {
+        if (depth > max_fill_eval_depth) return null;
+        const tree = self.tree;
+        const decl = self.visibleConstDecl(name_tok, tree.tokenSlice(name_tok)) orelse return null;
+        const initializer = decl.spans.?.init;
+        if (initializer.first == initializer.last and tree.tokenTag(initializer.first) == .identifier)
+            return self.enumFieldCount(initializer.first, depth + 1);
+        var enum_tree = tree;
+        var enum_last = initializer.last;
+        if (tree.tokenTag(initializer.first) != .keyword_enum) {
+            // Resolve the exact qualified import path to its declaration.
+            // A local shadow of the root must never use a file-root import.
+            if (decl.scope_len != 0 or tree.tokenTag(initializer.first) != .identifier) return null;
+            const root = self.visibleConstDecl(initializer.first, tree.tokenSlice(initializer.first)) orelse return null;
+            if (root.scope_len != 0) return null;
+            var segments: [max_fill_path_fields][]const u8 = undefined;
+            var count: usize = 0;
+            var token = initializer.first;
+            while (token <= initializer.last) {
+                if (count == segments.len or tree.tokenTag(token) != .identifier) return null;
+                segments[count] = tree.tokenSlice(token);
+                count += 1;
+                if (token == initializer.last) break;
+                if (token + 2 > initializer.last or tree.tokenTag(token + 1) != .period) return null;
+                token += 2;
+            }
+            const cache = self.cache orelse return null;
+            const resolved = cache.importedTypeAcrossImports(segments[0..count]) orelse return null;
+            if (resolved.info.kind != .enum_) return null;
+            enum_tree = resolved.model.tree;
+            enum_last = resolved.info.body_last;
+        }
+        for (0..enum_tree.nodes.len) |raw| {
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            if (enum_tree.lastToken(node) != enum_last or
+                enum_tree.tokenTag(enum_tree.nodeMainToken(node)) != .keyword_enum) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const container = enum_tree.fullContainerDecl(&buffer, node) orelse continue;
+            var count: u64 = 0;
+            for (container.ast.members) |member| {
+                if (enum_tree.fullContainerField(member) == null) continue;
+                if (std.mem.eql(u8, enum_tree.tokenSlice(enum_tree.nodeMainToken(member)), "_")) continue;
+                count += 1;
+            }
+            return count;
+        }
+        return null;
     }
 
     /// Element count of the `const` a `<name>.len` reference reads,
@@ -1329,8 +1635,36 @@ const FillIntEval = struct {
                 self.pos += 1;
                 return value;
             },
+            .builtin => {
+                const first = self.pos;
+                // Exact @typeInfo(Name).@"enum".fields.len syntax.
+                if (first + 9 > self.end or
+                    !std.mem.eql(u8, self.tree.tokenSlice(first), "@typeInfo") or
+                    self.tags[first + 1] != .l_paren or self.tags[first + 2] != .identifier or
+                    self.tags[first + 3] != .r_paren or self.tags[first + 4] != .period or
+                    self.tags[first + 5] != .identifier or
+                    !std.mem.eql(u8, self.tree.tokenSlice(first + 5), "@\"enum\"") or
+                    self.tags[first + 6] != .period or
+                    !std.mem.eql(u8, self.tree.tokenSlice(first + 7), "fields") or
+                    self.tags[first + 8] != .period or
+                    !std.mem.eql(u8, self.tree.tokenSlice(first + 9), "len")) return null;
+                self.pos += 10;
+                return self.resolver.enumFieldCount(first + 2, self.depth + 1);
+            },
             .identifier => {
                 const name_tok = self.pos;
+                // A genuine std.meta.fields(Type).len counts the declaration
+                // selected by Type, including qualified imported enum types.
+                var close = name_tok;
+                while (close <= self.end and self.tags[close] != .r_paren) : (close += 1) {}
+                if (close + 2 <= self.end and self.tags[close + 1] == .period and
+                    std.mem.eql(u8, self.tree.tokenSlice(close + 2), "len"))
+                {
+                    if (self.resolver.enumMetaFieldsTypeSpan(.{ .first = name_tok, .last = close })) |type_span| {
+                        self.pos = close + 3;
+                        return self.resolver.enumFieldsCount(type_span, self.depth + 1);
+                    }
+                }
                 self.pos += 1;
                 // `<collection>.len` is a count written the way
                 // the language spells counts, and reading it is
@@ -1551,7 +1885,16 @@ fn braceLiteralOpen(tree: *const Ast, span: TokenSpan) ?Ast.TokenIndex {
                     if (depth != 0) return null;
                     return if (tokens.matchBrace(tags, open, span.last) == span.last) open else null;
                 },
-                .keyword_struct, .keyword_union, .keyword_enum => return null,
+                .keyword_struct, .keyword_union, .keyword_enum => {
+                    // An inline element type: skip its balanced body (and any
+                    // `(tag)` header) to reach the literal's own brace.
+                    var body = open + 1;
+                    if (body <= span.last and tags[body] == .l_paren) {
+                        body = (tokens.matchParen(tags, body, span.last) orelse return null) + 1;
+                    }
+                    if (body > span.last or tags[body] != .l_brace) return null;
+                    open = tokens.matchBrace(tags, body, span.last) orelse return null;
+                },
                 else => {},
             }
             open += 1;

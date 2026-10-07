@@ -27,6 +27,11 @@
 //!      addref sites are caught.
 //!   4. For each addref, check there's a later `try` in the fn body.
 //!   5. Fire at the addref call site.
+//!
+//! Callee rollback is not a lexical release defer. Storage-free summaries
+//! do not certify reference-count balance or ownership through erased handles,
+//! optional captures, and publication. Without that certificate a callee's
+//! release-named call cannot discharge the caller's acquired reference.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -172,8 +177,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "unreleased-refs-on-error",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, method_tok),
-        .end = Pos.fromTokenEnd(tree, method_tok),
+        .start = try Pos.fromTokenStart(tree, method_tok),
+        .end = try Pos.fromTokenEnd(tree, method_tok),
         .message = msg,
     });
 }
@@ -364,4 +369,78 @@ test "unreleased-refs-on-error: comptime type-builder fn skipped" {
     // The inner fn does have the bug — we should fire on it once, but
     // NOT double-count via the outer Wrap fn.
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "unreleased-refs-on-error: uncertified callee rollback remains conservative" {
+    // Safe at runtime, but no reference-count ownership certificate exists.
+    // Do not turn a cleanup-named call in a different function into proof.
+    try testing.expectFires(check, "unreleased-refs-on-error",
+        \\const Handle = struct { refs: *usize, fn release(self: Handle) void { self.refs.* -= 1; } };
+        \\const Session = struct {
+        \\    fn retain(_: *Session, h: Handle) !Handle { h.refs.* += 1; return h; }
+        \\};
+        \\fn install(h: Handle, fail: bool) !void {
+        \\    errdefer h.release();
+        \\    if (fail) return error.Failed;
+        \\    h.release();
+        \\}
+        \\pub fn replace(session: *Session, source: Handle, fail: bool) !void {
+        \\    const retained = try session.retain(source);
+        \\    try install(retained, fail);
+        \\}
+    );
+}
+
+test "unreleased-refs-on-error: rollback on unrelated parameter does not protect retained result" {
+    try testing.expectFires(check, "unreleased-refs-on-error",
+        \\const Handle = struct { refs: *usize, fn release(self: Handle) void { self.refs.* -= 1; } };
+        \\const Session = struct {
+        \\    fn retain(_: *Session, h: Handle) !Handle { h.refs.* += 1; return h; }
+        \\};
+        \\fn install(h: Handle, other: Handle, fail: bool) !void {
+        \\    errdefer other.release();
+        \\    if (fail) return error.Failed;
+        \\    h.release();
+        \\}
+        \\pub fn replace(session: *Session, source: Handle, other: Handle, fail: bool) !void {
+        \\    const retained = try session.retain(source);
+        \\    try install(retained, other, fail);
+        \\}
+    );
+}
+
+test "unreleased-refs-on-error: rollback installed after fallible action still fires" {
+    try testing.expectFires(check, "unreleased-refs-on-error",
+        \\const Handle = struct { refs: *usize, fn release(self: Handle) void { self.refs.* -= 1; } };
+        \\const Session = struct {
+        \\    fn retain(_: *Session, h: Handle) !Handle { h.refs.* += 1; return h; }
+        \\};
+        \\fn install(h: Handle, fail: bool) !void {
+        \\    if (fail) return error.Failed;
+        \\    errdefer h.release();
+        \\    h.release();
+        \\}
+        \\pub fn replace(session: *Session, source: Handle, fail: bool) !void {
+        \\    const retained = try session.retain(source);
+        \\    try install(retained, fail);
+        \\}
+    );
+}
+
+test "unreleased-refs-on-error: caller rollback protects retained result passed to borrower" {
+    try testing.expectNoFire(check,
+        \\const Handle = struct { refs: *usize, fn release(self: Handle) void { self.refs.* -= 1; } };
+        \\const Session = struct {
+        \\    fn retain(_: *Session, h: Handle) !Handle { h.refs.* += 1; return h; }
+        \\};
+        \\fn inspect(_: Handle, fail: bool) !void {
+        \\    if (fail) return error.Failed;
+        \\}
+        \\pub fn replace(session: *Session, source: Handle, fail: bool) !void {
+        \\    const retained = try session.retain(source);
+        \\    errdefer retained.release();
+        \\    try inspect(retained, fail);
+        \\    retained.release();
+        \\}
+    );
 }

@@ -64,8 +64,8 @@ pub fn check(
         try problems.append(gpa, .{
             .rule_id = R,
             .severity = .warning,
-            .start = Pos.fromTokenStart(tree, token),
-            .end = Pos.fromTokenEnd(tree, tree.lastToken(node)),
+            .start = try Pos.fromTokenStart(tree, token),
+            .end = try Pos.fromTokenEnd(tree, tree.lastToken(node)),
             .message = message,
         });
     }
@@ -399,6 +399,54 @@ test "midpoint-addition-overflow: #75c1 one caller fixes the count the exception
         \\}
         \\pub fn lookupSmall(key: usize) usize {
         \\    return exceptionLookup(std.math.maxInt(usize), key);
+        \\}
+    );
+}
+
+test "midpoint-addition-overflow: unrelated nested exports retain only closed caller bounds" {
+    try testing.expectNoFireTyped(check,
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn exceptionLookup(comptime n: usize, key: usize) usize {
+        \\            var a: usize = 0;
+        \\            const b: usize = n - 1;
+        \\            while (a + 1 < b) {
+        \\                const m = (a + b) / 2;
+        \\                if (key == m) return m;
+        \\                a = m;
+        \\            }
+        \\            return a;
+        \\        }
+        \\        fn unrelated(key: usize) callconv(.c) usize { return key; }
+        \\    };
+        \\    comptime { @export(&Native.unrelated, .{ .name = "unrelated" }); }
+        \\    _ = Native.exceptionLookup(5, 0);
+        \\    _ = Native.exceptionLookup(5, 3);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\test "native" {
+        \\    const Native = struct {
+        \\        fn exceptionLookup(comptime n: usize, key: usize) usize {
+        \\            var a: usize = 0;
+        \\            const b: usize = n - 1;
+        \\            while (a + 1 < b) {
+        \\                const m = (a + b) / 2;
+        \\                if (key == m) return m;
+        \\                a = m;
+        \\            }
+        \\            return a;
+        \\        }
+        \\        fn lookup(key: usize) callconv(.c) usize {
+        \\            return exceptionLookup(std.math.maxInt(usize), key);
+        \\        }
+        \\        fn unrelated(key: usize) callconv(.c) usize { return key; }
+        \\    };
+        \\    comptime {
+        \\        @export(&Native.unrelated, .{ .name = "unrelated" });
+        \\        @export(&Native.lookup, .{ .name = "lookup" });
+        \\    }
         \\}
     );
 }

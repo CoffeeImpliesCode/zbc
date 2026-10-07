@@ -29,6 +29,7 @@ const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 
+const project_cache_mod = @import("../../cache/project_cache.zig");
 const tokens = @import("../../ast/tokens.zig");
 const query = @import("../../ast/token_query.zig");
 const testing = @import("../../testing.zig");
@@ -119,19 +120,20 @@ fn xPtrFieldIsNonSentinel(
     const fn_decl = enclosingFnDecl(tree, x_token) orelse return false;
     const model = cache.fileModel() catch return false;
     const type_name = bindingTypeName(tree, model, fn_decl, x_name) orelse return false;
-    const ti = model.findType(type_name) orelse blk: {
-        break :blk cache.findTypeAcrossImports(type_name) orelse return false;
-    };
-    const ptr_field = ti.findField("ptr") orelse return false;
+    const resolved = cache.resolvedTypeAcrossImports(type_name) orelse return false;
+    const ptr_field = resolved.info.findField("ptr") orelse return false;
+    // `type_first`/`type_last` index the tree that owns the type, which
+    // is not this file's tree when the type came from an import.
+    const field_tags = resolved.model.tree.tokens.items(.tag);
     // Sentinel check: type tokens start with `[` `*`.  If the next
     // token is `:`, it's sentinel-terminated.  If it's `]`, it's
     // non-sentinel.  Anything else (numeric arrays etc.) doesn't
     // match the rule's pattern anyway — let the rule fire.
     const t = ptr_field.type_first;
     if (t + 2 > ptr_field.type_last) return false;
-    if (tags[t] != .l_bracket) return false;
-    if (tags[t + 1] != .asterisk) return false;
-    return tags[t + 2] == .r_bracket;
+    if (field_tags[t] != .l_bracket) return false;
+    if (field_tags[t + 1] != .asterisk) return false;
+    return field_tags[t + 2] == .r_bracket;
 }
 
 /// Find the fn_decl AST node enclosing a given token by walking
@@ -161,62 +163,50 @@ fn bindingTypeName(
     return null;
 }
 
-/// Walk a type AST node, strip `?`/`*`/`const`/`[N]`/`[*]` wrappers
-/// and return the LAST identifier in a dotted chain.  Resolves
-/// `Self` / `@This()` to the model's containing-type-of-node (when
-/// available).  Returns null when the chain can't be parsed.
+/// Strip `?`, `*`, `[]`, `[*]`, `[N]` and their sentinel/qualifier forms
+/// from a type node and return the element type node.  Bounded by the
+/// node count: a parsed AST has no cycles.
+fn peelTypeWrappers(tree: *const Ast, type_node: Ast.Node.Index) Ast.Node.Index {
+    var node = type_node;
+    for (0..tree.nodes.len) |_| {
+        if (tree.nodeTag(node) == .optional_type) {
+            node = tree.nodeData(node).node;
+        } else if (tree.fullPtrType(node)) |ptr| {
+            node = ptr.ast.child_type;
+        } else if (tree.fullArrayType(node)) |array| {
+            node = array.ast.elem_type;
+        } else return node;
+    }
+    unreachable; // Parsed AST edges cannot form a cycle.
+}
+
+/// Preserve the entire declared name and its lexical owner: `Self` and
+/// `@This()` resolve to the containing type's qualified name, and any
+/// other name resolves through the containing type's lexical scope so
+/// a nested type keeps its qualified name.  Optional, pointer, slice and
+/// array wrappers are peeled first.  Returns null when the element type
+/// is not a plain named type.
 fn baseTypeNameOfNode(
     tree: *const Ast,
     model: *const @import("../../model/file_model.zig").FileModel,
     type_node: Ast.Node.Index,
 ) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(type_node);
-    const last = tree.lastToken(type_node);
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .question_mark, .asterisk, .keyword_const => continue,
-            .l_bracket => {
-                var d: u32 = 1;
-                t += 1;
-                while (t <= last and d > 0) : (t += 1) {
-                    if (tags[t] == .l_bracket) d += 1;
-                    if (tags[t] == .r_bracket) d -= 1;
-                }
-                if (t > last) return null;
-                t -= 1;
-            },
-            .identifier, .builtin => break,
-            else => return null,
+    const element = peelTypeWrappers(tree, type_node);
+    const first = tree.firstToken(element);
+    const last = tree.lastToken(element);
+    const owner = model.containingTypeOf(type_node);
+    const name = tokens.typeNameFromTokens(tree, first, last) orelse {
+        if (owner) |scope| {
+            if (last >= first + 2 and tree.tokenTag(last - 2) == .builtin and
+                std.mem.eql(u8, tree.tokenSlice(last - 2), "@This")) return scope.qualified_name;
         }
+        return null;
+    };
+    if (owner) |scope| {
+        if (std.mem.eql(u8, name, "Self")) return scope.qualified_name;
+        if (model.resolveTypeNameInScope(name, scope)) |resolved| return resolved.qualified_name;
     }
-    if (t > last) return null;
-    var last_name: ?[]const u8 = null;
-    var expecting_ident: bool = true;
-    while (t <= last) : (t += 1) {
-        if (expecting_ident) {
-            if (tags[t] == .identifier) {
-                const n = tree.tokenSlice(t);
-                last_name = n;
-                expecting_ident = false;
-            } else if (tags[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@This")) {
-                // Resolve @This() to the containing type's name.
-                if (model.containingTypeOf(type_node)) |ti| last_name = ti.name;
-                expecting_ident = false;
-            } else return last_name;
-        } else {
-            if (tags[t] == .period) {
-                expecting_ident = true;
-            } else break;
-        }
-    }
-    if (last_name) |n| {
-        if (std.mem.eql(u8, n, "Self")) {
-            if (model.containingTypeOf(type_node)) |ti| return ti.name;
-        }
-    }
-    return last_name;
+    return name;
 }
 
 fn report(
@@ -235,8 +225,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "sentinel-strip-free-size-mismatch",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, free_tok),
-        .end = Pos.fromTokenEnd(tree, free_tok),
+        .start = try Pos.fromTokenStart(tree, free_tok),
+        .end = try Pos.fromTokenEnd(tree, free_tok),
         .message = msg,
     });
 }
@@ -320,4 +310,134 @@ test "sentinel-strip-free-size-mismatch: alloc.free(slice[0..N]) doesn't fire (n
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "sentinel-strip-free-size-mismatch: nested non-sentinel type resolves through its qualified name" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Outer = struct {
+        \\    pub const Str = struct {
+        \\        ptr: [*]u8,
+        \\        len: usize,
+        \\        pub fn byName(self: *Str, alloc: std.mem.Allocator) void {
+        \\            alloc.free(self.ptr[0..self.len]);
+        \\        }
+        \\        pub fn bySelf(self: *Self, alloc: std.mem.Allocator) void {
+        \\            alloc.free(self.ptr[0..self.len]);
+        \\        }
+        \\        pub fn byThis(self: *@This(), alloc: std.mem.Allocator) void {
+        \\            alloc.free(self.ptr[0..self.len]);
+        \\        }
+        \\        const Self = @This();
+        \\    };
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "sentinel-strip-free-size-mismatch: nested sentinel type still fires" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Outer = struct {
+        \\    pub const Str = struct {
+        \\        ptr: [*:0]u8,
+        \\        len: usize,
+        \\        pub fn release(self: *Str, alloc: std.mem.Allocator) void {
+        \\            alloc.free(self.ptr[0..self.len]);
+        \\        }
+        \\    };
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "sentinel-strip-free-size-mismatch: slice-wrapped nested type resolves through its element type" {
+    const gpa = std.testing.allocator;
+    var plain = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Outer = struct {
+        \\    pub const Str = struct { ptr: [*]u8, len: usize };
+        \\    pub fn release(items: []Str, alloc: std.mem.Allocator) void {
+        \\        alloc.free(items.ptr[0..items.len]);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.items.len);
+
+    var terminated = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Outer = struct {
+        \\    pub const Str = struct { ptr: [*:0]u8, len: usize };
+        \\    pub fn release(items: []Str, alloc: std.mem.Allocator) void {
+        \\        alloc.free(items.ptr[0..items.len]);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &terminated);
+    try std.testing.expectEqual(@as(usize, 1), terminated.items.len);
+}
+
+test "sentinel-strip-free-size-mismatch: imported type's ptr field is read from its own tree" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The `ptr` field's tokens sit at indices the importing file fills
+    // with other tokens; reading them from the importer's tree answers
+    // for the wrong declaration.
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.zig", .data =
+        \\pub const Str = struct { ptr: [*]u8, len: usize };
+        \\
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "terminated.zig", .data =
+        \\pub const Str = struct { ptr: [*:0]u8, len: usize };
+        \\
+    });
+    const sources = [_]struct { name: []const u8, import: []const u8, expected: usize }{
+        .{ .name = "use_plain.zig", .import = "plain.zig", .expected = 0 },
+        .{ .name = "use_terminated.zig", .import = "terminated.zig", .expected = 1 },
+    };
+    for (sources) |source| {
+        const text = try std.fmt.allocPrint(gpa,
+            \\const std = @import("std");
+            \\const lib = @import("{s}");
+            \\pub fn release(str: lib.Str, alloc: std.mem.Allocator) void {{
+            \\    alloc.free(str.ptr[0..str.len]);
+            \\}}
+            \\
+        , .{source.import});
+        defer gpa.free(text);
+        try tmp.dir.writeFile(io, .{ .sub_path = source.name, .data = text });
+    }
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    var project = project_cache_mod.ProjectCache.init(gpa, io, .{ .roots = &.{directory} });
+    defer project.deinit();
+    for (sources) |source| {
+        const path = try std.fs.path.join(gpa, &.{ directory, source.name });
+        defer gpa.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+        defer gpa.free(bytes);
+        const src_z = try gpa.dupeSentinel(u8, bytes, 0);
+        defer gpa.free(src_z);
+        var tree = try Ast.parse(gpa, src_z, .zig);
+        defer tree.deinit(gpa);
+        if (tree.errors.len != 0) return error.InvalidSyntax;
+        var cache = file_cache_mod.FileCache.init(gpa, &tree);
+        defer cache.deinit();
+        cache.setProject(&project, path);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        try check(gpa, &tree, &cache, &config_mod.Default, &problems);
+        try std.testing.expectEqual(source.expected, problems.items.len);
+    }
 }

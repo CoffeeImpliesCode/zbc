@@ -15,6 +15,20 @@ It reports unless both the negation and the destination conversion are proved in
 Resolved constants, types, dominating guards, and supported helper contracts can provide that proof.
 Compile-time-only expressions are not runtime conversion sites.
 A negative-sign guard alone does not exclude the signed minimum.
+Private integer-return helpers can carry their complete return domain through
+pure scalar call arguments, including a comptime shift width. For example,
+sign-extending a 12-bit immediate into `i32` gives `[-2048, 2047]`; negating
+the negative half cannot reach the signed minimum. A full-width `i32`
+decoder, an unbound width, or an incomplete return summary supplies no such
+proof. A forwarded call is supported only when its arguments run no code
+and carry no caller storage.
+
+For a private helper, the analysis can join argument ranges from a closed set
+of resolved direct callers. It rejects public entry points, escaped function
+values, and caller arguments it cannot bound. Scaling keeps a useful range only
+when the multiplication fits its source type. An exact resolved `@sizeOf`,
+including a packed struct with a supported explicit integer backing type, can
+provide that scale; unknown layouts do not provide a constant.
 
 ## Why it matters
 

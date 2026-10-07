@@ -572,10 +572,12 @@ fn rhsTypeViaZlsLacksDeinit(
     // FIRST matching node and try several end-token candidates.
     var end = b.rhs_last;
     while (end >= start) : (end -= 1) {
-        const name_opt = cache.typeNameOfExpr(start, end) catch null;
+        const name_opt = cache.typeReferenceOfExpr(start, end) catch null;
         if (name_opt) |name| {
-            // Locally resolvable?  Then the shared two-rung probe
-            // answers it; a name we can't see locally (cross-file)
+            // `name` is the spelling this file dispatches on, so a
+            // foreign declaration never collides with a local type of
+            // the same leaf name.  Locally declared?  Then the shared
+            // two-rung probe answers it; an imported type (`alias.Type`)
             // stays unrefuted so the rule keeps firing.
             if (localTypeHasDeinit(model, name)) |has_deinit| return !has_deinit;
             return false;
@@ -684,8 +686,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, b.name_token),
-        .end = Pos.fromTokenEnd(tree, b.name_token),
+        .start = try Pos.fromTokenStart(tree, b.name_token),
+        .end = try Pos.fromTokenEnd(tree, b.name_token),
         .message = msg,
     });
 }
@@ -877,4 +879,88 @@ test "non-fromJS method doesn't fire" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+/// Run the rule over `main_source` with `remote.zig` (holding
+/// `remote_source`) importable beside it, and return how many problems
+/// it reported.  Both files are real so the type engine can follow the
+/// import.
+fn reportsWithRemote(remote_source: []const u8, main_source: []const u8) !usize {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const type_engine = @import("type_engine");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "remote.zig", .data = remote_source });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    const main_source_z = try gpa.dupeZ(u8, main_source);
+    defer gpa.free(main_source_z);
+    var context: type_engine.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: type_engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, main_source_z);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    cache.setZls(&resolver);
+    defer cache.deinit();
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    try check(gpa, tree, &cache, &config_mod.Default, &problems);
+    for (problems.items) |problem| try std.testing.expectEqualStrings(R, problem.rule_id);
+    return problems.items.len;
+}
+
+test "imported type that has deinit is not judged by a same-named local type without one" {
+    // `Alias.fromJS` returns `remote.Foo`, which owns resources.  The
+    // local `Foo` is an unrelated type of the same leaf name and has no
+    // `deinit`; its leaf name must not refute the imported type.
+    try std.testing.expectEqual(@as(usize, 1), try reportsWithRemote(
+        \\pub const Foo = struct {
+        \\    pub fn fromJS(_: usize) !Foo { return .{}; }
+        \\    pub fn deinit(_: *Foo) void {}
+        \\};
+    ,
+        \\const remote = @import("remote.zig");
+        \\const Foo = struct {
+        \\    pub fn fromJS(_: usize) !Foo { return .{}; }
+        \\};
+        \\const Alias = remote.Foo;
+        \\fn later() !void { return error.Later; }
+        \\pub fn open() !void {
+        \\    const x = try Alias.fromJS(1);
+        \\    _ = x;
+        \\    try later();
+        \\}
+    ));
+}
+
+test "imported type without deinit is not judged by a same-named local type with one" {
+    // The local `Foo` has a `deinit` and the imported `remote.Foo` has
+    // none.  The imported type is a different declaration: the local
+    // `deinit` is not credited to it, and a foreign declaration stays
+    // unrefuted, so the rule still reports the unprotected `try`.
+    try std.testing.expectEqual(@as(usize, 1), try reportsWithRemote(
+        \\pub const Foo = struct {
+        \\    pub fn fromJS(_: usize) !Foo { return .{}; }
+        \\};
+    ,
+        \\const remote = @import("remote.zig");
+        \\const Foo = struct {
+        \\    pub fn fromJS(_: usize) !Foo { return .{}; }
+        \\    pub fn deinit(_: *Foo) void {}
+        \\};
+        \\fn later() !void { return error.Later; }
+        \\pub fn open() !void {
+        \\    const x = try remote.Foo.fromJS(1);
+        \\    _ = x;
+        \\    try later();
+        \\}
+    ));
 }

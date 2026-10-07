@@ -9,6 +9,7 @@ const engine = @import("type_engine");
 pub const TypeContext = engine.TypeContext;
 pub const TypeResolver = engine.TypeResolver;
 pub const Toolchain = engine.Toolchain;
+pub const ToolchainFailure = engine.ToolchainFailure;
 
 /// Owns a TypeContext that may or may not be initialized.
 /// Eliminates the `var ok = false; defer if (ok) x.deinit()` pattern.

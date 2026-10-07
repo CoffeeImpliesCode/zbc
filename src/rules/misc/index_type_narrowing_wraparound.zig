@@ -17,6 +17,9 @@
 //! already trapped in front of it — `raw = 256` into a three-element table
 //! still traps in the `@intCast`, and a capacity small enough to be reached
 //! never makes that conversion sound.
+//! Type-domain widening does not depend on interval encoding. Known result
+//! locations still require a sufficient source range; unresolved length
+//! conversions retain their warning rather than borrowing the operand's type.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const problem_mod = @import("../../problem.zig");
@@ -98,8 +101,8 @@ pub fn check(
         var proved = false;
         var failed: ?IndexUse = null;
         if (destinationOf(cache, &indexed, node)) |destination| {
-            if (cache.intInfoOf(params[0])) |source| {
-                if (value_range.NumericRange.integerType(source.bits, source.signed).fitsInteger(destination.bits, destination.signed)) proved = true;
+            if (try sourceOf(cache, tree, params[0])) |source| {
+                proved = integerTypeFits(source, destination);
             }
             if (!proved) {
                 // The range is what the ORACLE proves at the cast, taken whole.
@@ -120,13 +123,8 @@ pub fn check(
                 }
             }
         } else if (!length_cast) {
-            // Without a destination there is nothing to compare against, and
-            // inventing one is the guess this rule never makes.  This is also
-            // what keeps the widening that RESTORES a narrowed value back to
-            // subscript width (`array[@intCast(narrow)]`) quiet without a
-            // heuristic for recognising it: a subscript context is not a
-            // destination this type engine resolves.  A cast that NARROWS
-            // again is not skipped — it fails the range proof on its own.
+            // With no destination, an indexed value has no range to compare.
+            // Length conversions retain their existing unproved-range warning.
             continue;
         }
         if (proved) continue;
@@ -138,8 +136,8 @@ pub fn check(
         try problems.append(gpa, .{
             .rule_id = R,
             .severity = .warning,
-            .start = Pos.fromTokenStart(tree, token),
-            .end = Pos.fromTokenEnd(tree, tree.lastToken(node)),
+            .start = try Pos.fromTokenStart(tree, token),
+            .end = try Pos.fromTokenEnd(tree, tree.lastToken(node)),
             .message = message,
         });
     }
@@ -243,6 +241,33 @@ fn indexMessage(gpa: std.mem.Allocator, reported: IndexUse) ![]u8 {
 
 fn isIntCast(tree: *const Ast, node: Ast.Node.Index) bool {
     return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@intCast");
+}
+
+/// Compare type domains directly: the interval oracle deliberately cannot
+/// encode u128, but every u128 still fits u128 or a wider signed integer.
+fn integerTypeFits(source: type_resolver_mod.TypeResolver.IntInfo, destination: type_resolver_mod.TypeResolver.IntInfo) bool {
+    if (source.bits == 0) return true;
+    if (source.signed == destination.signed) return source.bits <= destination.bits;
+    return !source.signed and destination.signed and source.bits < destination.bits;
+}
+
+/// Only actual arrays and slice headers have a builtin usize length. A field
+/// named `len` on a user container, or an opaque receiver, has no such domain.
+fn sourceOf(cache: *file_cache_mod.FileCache, tree: *const Ast, original: Ast.Node.Index) anyerror!?type_resolver_mod.TypeResolver.IntInfo {
+    if (cache.intInfoOf(original)) |info| return info;
+    var node = original;
+    while (tree.nodeTag(node) == .grouped_expression) node = tree.nodeData(node).node_and_token[0];
+    if (tree.nodeTag(node) != .field_access) return null;
+    const receiver, const field = tree.nodeData(node).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(field), "len")) return null;
+    const resolver = cache.zls orelse return null;
+    var actual = (try resolver.resolutionFrame().typeOfNode(receiver)) orelse return null;
+    if (resolver.pointerSize(actual) == .one) {
+        actual = (try resolver.normalizedType(resolver.childType(actual) orelse return null)) orelse return null;
+    }
+    if (resolver.typeTag(actual) == .array or resolver.pointerSize(actual) == .slice)
+        return .{ .bits = @bitSizeOf(usize), .signed = false };
+    return null;
 }
 
 fn containsLength(tree: *const Ast, node: Ast.Node.Index, depth: u8) bool {
@@ -370,8 +395,13 @@ fn destinationOf(
     node: Ast.Node.Index,
 ) ?type_resolver_mod.TypeResolver.IntInfo {
     if (cache.coercedIntInfoOf(node)) |info| return info;
-    const type_node = indexed.coerced.get(node) orelse return null;
-    return cache.intInfoOf(type_node);
+    if (indexed.coerced.get(node)) |type_node| {
+        return cache.intInfoOf(type_node) orelse cache.optionalPayloadIntInfoOf(type_node);
+    }
+    // `target = @intCast(x)`: the cast takes the type of what it is stored
+    // into, and for an optional target that is the payload's integer.
+    const target = indexed.assigned.get(node) orelse return null;
+    return cache.intInfoOf(target) orelse cache.optionalPayloadIntInfoOf(target);
 }
 
 /// Which `@intCast`s in this file reach a collection subscript, and which
@@ -398,6 +428,9 @@ const IndexedUses = struct {
     /// engine's own `coercedIntInfoOf` — a parameter's type is written
     /// beside the call, not at the cast.
     coerced: std.AutoHashMapUnmanaged(Ast.Node.Index, Ast.Node.Index),
+    /// The target of a plain assignment whose whole right-hand side is the
+    /// cast, keyed by the cast.
+    assigned: std.AutoHashMapUnmanaged(Ast.Node.Index, Ast.Node.Index),
 
     fn init(gpa: std.mem.Allocator) IndexedUses {
         return .{
@@ -407,6 +440,7 @@ const IndexedUses = struct {
             .declarer = .empty,
             .bindings = .empty,
             .coerced = .empty,
+            .assigned = .empty,
         };
     }
 
@@ -420,6 +454,7 @@ const IndexedUses = struct {
         self.declarer.deinit(self.gpa);
         self.bindings.deinit(self.gpa);
         self.coerced.deinit(self.gpa);
+        self.assigned.deinit(self.gpa);
     }
 
     fn build(self: *IndexedUses, tree: *const Ast, cache: *file_cache_mod.FileCache) !void {
@@ -454,6 +489,10 @@ const IndexedUses = struct {
                 .@"return" => try contexts.append(self.gpa, returnCoercion(tree, node, contexts.items)),
                 .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
                     if (isIntCast(tree, node)) try casts.append(self.gpa, node);
+                },
+                .assign => {
+                    const target, const value = tree.nodeData(node).node_and_node;
+                    if (isIntCast(tree, value)) try self.assigned.put(self.gpa, value, target);
                 },
                 else => {},
             }
@@ -812,6 +851,119 @@ test "index-type-narrowing-wraparound: an assignment through an unlocatable targ
     );
 }
 
+test "index-type-narrowing-wraparound: a std capacity call keeps a copied length guard" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    paths: std.ArrayListUnmanaged([]const u8) = .empty,
+        \\    fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) !u32 {
+        \\        const length = self.paths.items.len;
+        \\        if (length > std.math.maxInt(u32)) return error.Overflow;
+        \\        try self.paths.ensureUnusedCapacity(gpa, 1);
+        \\        const id: u32 = @intCast(length);
+        \\        self.paths.appendAssumeCapacity(path);
+        \\        return id;
+        \\    }
+        \\};
+    );
+}
+
+test "index-type-narrowing-wraparound: a std append still drops the length guard" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    paths: std.ArrayListUnmanaged([]const u8) = .empty,
+        \\    fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) !u32 {
+        \\        if (self.paths.items.len > std.math.maxInt(u32)) return error.Overflow;
+        \\        try self.paths.append(gpa, path);
+        \\        const id: u32 = @intCast(self.paths.items.len);
+        \\        return id;
+        \\    }
+        \\};
+    );
+}
+
+test "index-type-narrowing-wraparound: a project method named like a capacity call still drops the length guard" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Paths = struct {
+        \\    items: []const u8 = &.{},
+        \\    fn ensureUnusedCapacity(self: *Paths, count: usize) void {
+        \\        self.items = self.items.ptr[0 .. self.items.len + count];
+        \\    }
+        \\};
+        \\const State = struct {
+        \\    paths: Paths = .{},
+        \\    fn intern(self: *State) u32 {
+        \\        if (self.paths.items.len > std.math.maxInt(u32)) return 0;
+        \\        self.paths.ensureUnusedCapacity(1);
+        \\        const id: u32 = @intCast(self.paths.items.len);
+        \\        return id;
+        \\    }
+        \\};
+    );
+}
+
+test "index-type-narrowing-wraparound: std sibling capacity calls keep a copied length guard" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    path_text: std.ArrayList([]const u8) = .empty,
+        \\    paths: std.StringHashMapUnmanaged(u32) = .empty,
+        \\    fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) !u32 {
+        \\        const length = self.path_text.items.len;
+        \\        if (length > std.math.maxInt(u32)) return error.Budget;
+        \\        try self.path_text.ensureUnusedCapacity(gpa, 1);
+        \\        try self.paths.ensureUnusedCapacity(gpa, 1);
+        \\        const id: u32 = @intCast(length);
+        \\        self.path_text.appendAssumeCapacity(path);
+        \\        self.paths.putAssumeCapacity(path, id);
+        \\        return id;
+        \\    }
+        \\};
+    );
+}
+
+test "index-type-narrowing-wraparound: a project method on a sibling field still drops the length guard" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Sibling = struct {
+        \\    n: usize = 0,
+        \\    fn reserve(self: *Sibling, count: usize) void {
+        \\        self.n += count;
+        \\    }
+        \\};
+        \\const State = struct {
+        \\    path_text: std.ArrayList([]const u8) = .empty,
+        \\    sibling: Sibling = .{},
+        \\    fn intern(self: *State, gpa: std.mem.Allocator) !u32 {
+        \\        if (self.path_text.items.len > std.math.maxInt(u32)) return error.Budget;
+        \\        self.sibling.reserve(1);
+        \\        const id: u32 = @intCast(self.path_text.items.len);
+        \\        _ = gpa;
+        \\        return id;
+        \\    }
+        \\};
+    );
+}
+
+test "index-type-narrowing-wraparound: a std append on the guarded field itself still drops the length guard" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    path_text: std.ArrayList([]const u8) = .empty,
+        \\    paths: std.StringHashMapUnmanaged(u32) = .empty,
+        \\    fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) !u32 {
+        \\        if (self.path_text.items.len > std.math.maxInt(u32)) return error.Budget;
+        \\        try self.paths.ensureUnusedCapacity(gpa, 1);
+        \\        try self.path_text.append(gpa, path);
+        \\        const id: u32 = @intCast(self.path_text.items.len);
+        \\        return id;
+        \\    }
+        \\};
+    );
+}
+
 // ── The destination a conversion is written into ──────────────────────────
 //
 // `@intCast(x)` has no type of its own: Zig gives it the type of the context
@@ -848,6 +1000,46 @@ test "index-type-narrowing-wraparound: a parameter narrower than the source stil
         \\    var sum: u64 = 0;
         \\    contract.mix(&sum, @intCast(document.tape.len));
         \\    return sum;
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: a cast stored into a wide field is not a narrowing" {
+    try testing.expectNoFireTyped(check,
+        \\const Info = struct { extent: u64 = 0 };
+        \\fn note(info: *Info, items: []const u32) void {
+        \\    info.extent = @intCast(items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: a cast stored into an optional wide field is not a narrowing" {
+    try testing.expectNoFireTyped(check,
+        \\const Info = struct { extent: ?u64 = null };
+        \\fn note(info: *Info, items: []const u32) void {
+        \\    info.extent = @intCast(items.len);
+        \\}
+        \\fn local(items: []const u32) ?u64 {
+        \\    const extent: ?u64 = @intCast(items.len);
+        \\    return extent;
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: a cast stored into a narrow field still reports" {
+    try testing.expectFiresTyped(check, R,
+        \\const Info = struct { extent: u8 = 0 };
+        \\fn note(info: *Info, items: []const u32) void {
+        \\    info.extent = @intCast(items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: a cast stored into an optional narrow field still reports" {
+    try testing.expectFiresTyped(check, R,
+        \\const Info = struct { extent: ?u8 = null };
+        \\fn note(info: *Info, items: []const u32) void {
+        \\    info.extent = @intCast(items.len);
         \\}
     );
 }
@@ -1010,9 +1202,9 @@ test "index-type-narrowing-wraparound: a receiver the caller never caps proves n
         \\        return len;
         \\    }
         \\};
-        \\fn build() u32 {
-        \\    var builder: Builder = .{ .max_text_bytes = 64 * 1024 * 1024 };
-        \\    return builder.store("a");
+        \\pub fn build(bytes: []const u8, ceiling: usize) u32 {
+        \\    var builder: Builder = .{ .max_text_bytes = ceiling };
+        \\    return builder.store(bytes);
         \\}
     );
 }
@@ -1029,14 +1221,14 @@ test "index-type-narrowing-wraparound: a ceiling only one of two callers writes 
         \\        return len;
         \\    }
         \\};
-        \\fn capped() u32 {
+        \\pub fn capped(bytes: []const u8) u32 {
         \\    var builder: Builder = .{ .max_text_bytes = 0 };
         \\    builder.max_text_bytes = @as(usize, max_u32);
-        \\    return builder.store("a");
+        \\    return builder.store(bytes);
         \\}
-        \\fn uncapped() u32 {
-        \\    var builder: Builder = .{ .max_text_bytes = 64 * 1024 * 1024 };
-        \\    return builder.store("a");
+        \\pub fn uncapped(bytes: []const u8, ceiling: usize) u32 {
+        \\    var builder: Builder = .{ .max_text_bytes = ceiling };
+        \\    return builder.store(bytes);
         \\}
     );
 }
@@ -1447,6 +1639,1582 @@ test "index-type-narrowing-wraparound: a length cast keeps its own proof beside 
         \\    if (index >= array.len) return width;
         \\    const narrow: i8 = @intCast(index);
         \\    return array[@intCast(narrow)] + width;
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: a by-value slice header survives calls and aliased element writes" {
+    try testing.expectNoFireTyped(check,
+        \\const Holder = struct { bytes: [32]u8 };
+        \\fn inspect(bytes: []const u8) void { _ = bytes; }
+        \\fn copy(holder: *Holder, bytes: []const u8) u8 {
+        \\    if (bytes.len > 32) return 0;
+        \\    inspect(bytes);
+        \\    holder.bytes[0] = 1;
+        \\    @memcpy(holder.bytes[0..bytes.len], bytes);
+        \\    return @intCast(bytes.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn resize(bytes: *[]const u8, replacement: []const u8) void {
+        \\    bytes.* = replacement;
+        \\}
+        \\fn copy(bytes: *[]const u8, replacement: []const u8) u8 {
+        \\    if (bytes.len > 32) return 0;
+        \\    resize(bytes, replacement);
+        \\    return @intCast(bytes.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: exhaustive enum tags bound an index conversion" {
+    try testing.expectNoFireTyped(check,
+        \\const Tag = enum(i32) { first = 0, last = 7 };
+        \\fn read(bytes: []const u8, tag: Tag) u8 {
+        \\    const index: u8 = @intCast(@intFromEnum(tag));
+        \\    return bytes[index];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Tag = enum(i32) { first = -1, last = 7 };
+        \\fn read(bytes: []const u8, tag: Tag) u8 {
+        \\    const index: u8 = @intCast(@intFromEnum(tag));
+        \\    return bytes[index];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Tag = enum(u32) { first = 0, last = 7, _ };
+        \\fn read(bytes: []const u8, tag: Tag) u8 {
+        \\    const index: u8 = @intCast(@intFromEnum(tag));
+        \\    return bytes[index];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Tag = enum(u32) { first = 0, last = 256 };
+        \\fn read(bytes: []const u8, tag: Tag) u8 {
+        \\    const index: u8 = @intCast(@intFromEnum(tag));
+        \\    return bytes[index];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: only returning selector arms bound a conversion" {
+    try testing.expectNoFireTyped(check,
+        \\const Kind = enum { buffer, sampler, absent };
+        \\fn descriptor(kind: Kind, dynamic: bool) i32 {
+        \\    return switch (kind) {
+        \\        .buffer => if (dynamic) 8 else 6,
+        \\        .sampler => 0,
+        \\        .absent => unreachable,
+        \\    };
+        \\}
+        \\pub fn read(bytes: []const u8, kind: Kind, dynamic: bool) u8 {
+        \\    const index: usize = @intCast(descriptor(kind, dynamic));
+        \\    return bytes[index];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Kind = enum { buffer, sampler, absent };
+        \\fn descriptor(kind: Kind, dynamic: bool) i32 {
+        \\    return switch (kind) {
+        \\        .buffer => if (dynamic) 8 else -1,
+        \\        .sampler => 0,
+        \\        .absent => unreachable,
+        \\    };
+        \\}
+        \\pub fn read(bytes: []const u8, kind: Kind, dynamic: bool) u8 {
+        \\    const index: usize = @intCast(descriptor(kind, dynamic));
+        \\    return bytes[index];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: selector return summaries retain wide and open arms" {
+    try testing.expectFiresTyped(check, R,
+        \\const Kind = enum { small, large, absent };
+        \\fn descriptor(kind: Kind) u16 {
+        \\    return switch (kind) {
+        \\        .small => 7,
+        \\        .large => 256,
+        \\        .absent => unreachable,
+        \\    };
+        \\}
+        \\pub fn read(bytes: []const u8, kind: Kind) u8 {
+        \\    const index: u8 = @intCast(descriptor(kind));
+        \\    return bytes[index];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Kind = enum { small, open, absent };
+        \\fn descriptor(kind: Kind, raw: i32) i32 {
+        \\    return switch (kind) {
+        \\        .small => 7,
+        \\        .open => raw,
+        \\        .absent => unreachable,
+        \\    };
+        \\}
+        \\pub fn read(bytes: []const u8, kind: Kind, raw: i32) u8 {
+        \\    const index: usize = @intCast(descriptor(kind, raw));
+        \\    return bytes[index];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: selector effects cannot reuse pre-return facts" {
+    try testing.expectFiresTyped(check, R,
+        \\fn rewrite(value: *i32) bool {
+        \\    value.* = -1;
+        \\    return true;
+        \\}
+        \\fn descriptor() i32 {
+        \\    var value: i32 = 0;
+        \\    return if (rewrite(&value)) value else unreachable;
+        \\}
+        \\pub fn read(bytes: []const u8) u8 {
+        \\    const index: usize = @intCast(descriptor());
+        \\    return bytes[index];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: selector captures retain their signed domain" {
+    try testing.expectFiresTyped(check, R,
+        \\fn descriptor(candidate: ?i32) i32 {
+        \\    return if (candidate) |value| value else 0;
+        \\}
+        \\pub fn read(bytes: []const u8, candidate: ?i32) u8 {
+        \\    const index: usize = @intCast(descriptor(candidate));
+        \\    return bytes[index];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Kind = union(enum) { candidate: i32, absent };
+        \\fn descriptor(kind: Kind) i32 {
+        \\    return switch (kind) {
+        \\        .candidate => |value| value,
+        \\        .absent => 0,
+        \\    };
+        \\}
+        \\pub fn read(bytes: []const u8, kind: Kind) u8 {
+        \\    const index: usize = @intCast(descriptor(kind));
+        \\    return bytes[index];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: unknown selector calls keep the declared range" {
+    try testing.expectFiresTyped(check, R,
+        \\extern fn unknown() i32;
+        \\const Kind = enum { known, unknown, absent };
+        \\fn descriptor(kind: Kind) i32 {
+        \\    return switch (kind) {
+        \\        .known => 0,
+        \\        .unknown => unknown(),
+        \\        .absent => unreachable,
+        \\    };
+        \\}
+        \\pub fn read(bytes: []const u8, kind: Kind) u8 {
+        \\    const index: usize = @intCast(descriptor(kind));
+        \\    return bytes[index];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: explicit as supplies only its own cast destination" {
+    try testing.expectNoFireTyped(check,
+        \\fn size(bytes: []const u8) u64 {
+        \\    return @as(u64, @intCast(bytes.len));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn size(bytes: []const u8) u64 {
+        \\    return @as(u64, @as(u8, @intCast(bytes.len)));
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: compound assignments supply integer destinations" {
+    try testing.expectNoFireTyped(check,
+        \\const Counts = struct { bytes: u64 = 0 };
+        \\fn size(bytes: []const u8) u64 {
+        \\    var counts: Counts = .{};
+        \\    counts.bytes += @intCast(bytes.len);
+        \\    counts.bytes ^= @intCast(bytes.len);
+        \\    return counts.bytes;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn size(bytes: []const u8) u8 {
+        \\    var count: u8 = 0;
+        \\    count += @intCast(bytes.len);
+        \\    return count;
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: aggregate call fields retain their integer domains" {
+    try testing.expectNoFireTyped(check,
+        \\const Charge = struct { nodes: u64 };
+        \\fn charge(_: Charge) void {}
+        \\fn size(bytes: []const u8) void {
+        \\    charge(.{ .nodes = @intCast(bytes.len) });
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const Op = union(enum) { push: u16 };
+        \\fn emit(_: Op) void {}
+        \\fn size(bytes: []const u8) void {
+        \\    if (bytes.len > 65535) return;
+        \\    emit(.{ .push = @intCast(bytes.len) });
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Op = union(enum) { push: u16 };
+        \\fn emit(_: Op) void {}
+        \\fn size(bytes: []const u8) void {
+        \\    emit(.{ .push = @intCast(bytes.len) });
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: asserted returned aggregate fields retain bounds" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Result = struct { count: u32 };
+        \\fn size(bytes: []const u8) Result {
+        \\    std.debug.assert(bytes.len <= std.math.maxInt(u32));
+        \\    return .{ .count = @intCast(bytes.len) };
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Result = struct { count: u32 };
+        \\fn size(bytes: []const u8) Result {
+        \\    return .{ .count = @intCast(bytes.len) };
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: nested length candidates do not make widening unsafe" {
+    try testing.expectNoFireTyped(check,
+        \\fn select(indexes: []const u32, index: usize) usize {
+        \\    return @as(usize, @intCast(indexes[@min(index, indexes.len - 1)]));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn select(indexes: []const u32, index: usize) u8 {
+        \\    return @as(u8, @intCast(indexes[@min(index, indexes.len - 1)]));
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: logarithm length results widen without a length bound" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn size(bytes: []const u8) u64 {
+        \\    return @as(u64, @intCast(std.math.log2_int_ceil(usize, bytes.len)));
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn size(bytes: []const u8) u7 {
+        \\    return @as(u7, @intCast(std.math.log2_int_ceil(usize, bytes.len)));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn size(bytes: []const u8) u1 {
+        \\    return @as(u1, @intCast(std.math.log2_int_ceil(usize, bytes.len)));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Math = struct {
+        \\    fn log2_int_ceil(comptime T: type, value: T) T { return value; }
+        \\};
+        \\fn size(bytes: []const u8) u7 {
+        \\    return @as(u7, @intCast(Math.log2_int_ceil(usize, bytes.len)));
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: closed fixture callers preserve literal slice extents" {
+    try testing.expectNoFireTyped(check,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\test "literal callers" {
+        \\    _ = fixture(&.{ 1, 2, 3 });
+        \\    _ = fixture("hello\n");
+        \\    const fixed = [_]u8{ 1, 2, 3, 4 };
+        \\    _ = fixture(&fixed);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\fn forward(values: []const u8) u8 {
+        \\    return fixture(values);
+        \\}
+        \\test "closed forwarding caller" {
+        \\    _ = forward(@as([]const u8, &.{ 1, 2, 3 }));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\test "one oversized caller" {
+        \\    _ = fixture("small");
+        \\    _ = fixture(&([_]u8{0} ** 256));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\pub fn open(values: []const u8) u8 {
+        \\    _ = fixture("small");
+        \\    return fixture(values);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: caller extents use the current slice header" {
+    try testing.expectFiresTyped(check, R,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\pub fn caller(input: []const u8) u8 {
+        \\    var values: []const u8 = "small";
+        \\    values = input;
+        \\    return fixture(values);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn fixture(values: []const u8, _: void) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\fn replace(values: *[]const u8, input: []const u8) void {
+        \\    values.* = input;
+        \\}
+        \\pub fn caller(input: []const u8) u8 {
+        \\    var values: []const u8 = "small";
+        \\    return fixture(values, replace(&values, input));
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: unrelated std allocation keeps a copied scalar length guard" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Process = struct { exported: std.ArrayList(u8) = .empty };
+        \\const State = struct { map: std.StringHashMapUnmanaged(u8) = .empty };
+        \\pub fn exported(process: *Process, alloc: std.mem.Allocator) !void {
+        \\    const length = process.exported.items.len;
+        \\    if (length > 1024) return error.Unsupported;
+        \\    const state = try alloc.create(State);
+        \\    defer alloc.destroy(state);
+        \\    state.* = .{};
+        \\    try state.map.ensureUnusedCapacity(alloc, @intCast(length));
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Holder = struct { items: []const u8 = &.{} };
+        \\pub fn count(holder: *Holder, alloc: std.mem.Allocator) !u8 {
+        \\    const length = holder.items.len;
+        \\    if (length > 255) return error.Unsupported;
+        \\    const other = try alloc.create(Holder);
+        \\    const alias = other;
+        \\    alias.* = .{};
+        \\    alias.items = &.{};
+        \\    return @intCast(length);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: custom and unknown factories cannot certify unrelated storage" {
+    try testing.expectFiresTyped(check, R,
+        \\const Holder = struct { items: []const u8 = &.{} };
+        \\const Factory = struct {
+        \\    target: *Holder,
+        \\    fn create(self: Factory, comptime T: type) !*T { return self.target; }
+        \\};
+        \\pub fn count(holder: *Holder, replacement: []const u8) !u8 {
+        \\    if (holder.items.len > 255) return error.Unsupported;
+        \\    const factory = Factory{ .target = holder };
+        \\    const other = try factory.create(Holder);
+        \\    other.* = .{ .items = replacement };
+        \\    return @intCast(holder.items.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Holder = struct { items: []const u8 = &.{} };
+        \\extern fn factory() *Holder;
+        \\pub fn count(holder: *Holder, replacement: []const u8) u8 {
+        \\    if (holder.items.len > 255) return 0;
+        \\    const other = factory();
+        \\    other.* = .{ .items = replacement };
+        \\    return @intCast(holder.items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: successful scalar helper bounds checked argument lengths" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(args: []const u8) !u32 {
+        \\    const nargs = std.math.add(usize, args.len, 1) catch return error.Overflow;
+        \\    try checkCount(nargs);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(args: []const u8) !u8 {
+        \\    const nargs = try std.math.add(usize, args.len, 1);
+        \\    try checkCount(nargs);
+        \\    return @intCast(args.len + 1);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn allocBlock(alloc: std.mem.Allocator, count: usize) ![]u8 {
+        \\    if (count == 0 or count > 255) return error.InvalidCount;
+        \\    return try alloc.alloc(u8, count);
+        \\}
+        \\pub fn count(args: []const u8, alloc: std.mem.Allocator) !u8 {
+        \\    const nargs = std.math.add(usize, args.len, 1) catch return error.Overflow;
+        \\    const block = try allocBlock(alloc, nargs);
+        \\    defer alloc.free(block);
+        \\    return @intCast(args.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: failed or unknown scalar helpers do not bound arguments" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(args: []const u8) !u32 {
+        \\    const nargs = std.math.add(usize, args.len, 1) catch return error.Overflow;
+        \\    checkCount(nargs) catch {};
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\extern fn checkCount(count: usize) anyerror!void;
+        \\pub fn count(args: []const u8) !u32 {
+        \\    const nargs = std.math.add(usize, args.len, 1) catch return error.Overflow;
+        \\    try checkCount(nargs);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(args: []const u8) !u32 {
+        \\    const nargs = std.math.add(usize, args.len, 1) catch 0;
+        \\    try checkCount(nargs);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\fn relay(count: usize) !void {
+        \\    try checkCount(count);
+        \\}
+        \\pub fn count(args: []const u8) u32 {
+        \\    const result = relay(args.len);
+        \\    result catch {};
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn checkCount(count: usize, skip: bool) !void {
+        \\    if (skip) return;
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(args: []const u8, skip: bool) !u32 {
+        \\    try checkCount(args.len, skip);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn checkCount(input: usize) !void {
+        \\    const count = @min(input, 255);
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(args: []const u8) !u32 {
+        \\    try checkCount(args.len);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(input: []const u8, replacement: []const u8) !u32 {
+        \\    var args = input;
+        \\    const nargs = try std.math.add(usize, args.len, 1);
+        \\    args = replacement;
+        \\    try checkCount(nargs);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checkCount(count: usize) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\}
+        \\pub fn count(input: []const u8, replacement: []const u8) !u32 {
+        \\    var args = input;
+        \\    const alias = &args;
+        \\    const nargs = try std.math.add(usize, args.len, 1);
+        \\    alias.* = replacement;
+        \\    try checkCount(nargs);
+        \\    return @intCast(args.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn checkCount(count: usize, args: *[]const u8, replacement: []const u8) !void {
+        \\    if (count > 255) return error.TooMany;
+        \\    args.* = replacement;
+        \\}
+        \\pub fn count(input: []const u8, replacement: []const u8) !u32 {
+        \\    var args = input;
+        \\    try checkCount(args.len, &args, replacement);
+        \\    return @intCast(args.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: successful aggregate returns bound their slice fields" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Event = struct { raw: []const u8 };
+        \\const Word = packed struct { kind: u8, payload: u24, offset: u32 };
+        \\fn emit(input: []const u8) !Event {
+        \\    if (input.len > std.math.maxInt(u24)) return error.TapeTooLarge;
+        \\    return .{ .raw = input };
+        \\}
+        \\pub fn word(input: []const u8) !Word {
+        \\    const value = try emit(input);
+        \\    return .{ .kind = 0, .payload = @intCast(value.raw.len), .offset = 0 };
+        \\}
+        \\pub fn length(input: []const u8, out: *u32) !void {
+        \\    const value = try emit(input);
+        \\    out.* = @intCast(value.raw.len);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const Event = struct { raw: []const u8 };
+        \\fn emit(input: []const u8, offset: usize, length: usize, empty: bool) !Event {
+        \\    if (length > 16777215) return error.TapeTooLarge;
+        \\    if (empty) return .{ .raw = input[0..0] };
+        \\    return .{ .raw = input[offset..offset + length] };
+        \\}
+        \\pub fn length(input: []const u8, offset: usize, count: usize, empty: bool) !u24 {
+        \\    const value = try emit(input, offset, count, empty);
+        \\    return @intCast(value.raw.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: opaque replaced and alternate returned slice fields remain unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 };
+        \\extern fn emit(input: []const u8) anyerror!Event;
+        \\pub fn length(input: []const u8) !u24 {
+        \\    const value = try emit(input);
+        \\    return @intCast(value.raw.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 };
+        \\fn emit(input: []const u8, other: []const u8, alternate: bool) !Event {
+        \\    if (input.len > 16777215) return error.TapeTooLarge;
+        \\    if (alternate) return .{ .raw = other };
+        \\    return .{ .raw = input };
+        \\}
+        \\pub fn length(input: []const u8, other: []const u8, alternate: bool) !u24 {
+        \\    const value = try emit(input, other, alternate);
+        \\    return @intCast(value.raw.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 };
+        \\fn emit(input: []const u8) !Event {
+        \\    if (input.len > 16777215) return error.TapeTooLarge;
+        \\    return .{ .raw = input };
+        \\}
+        \\pub fn length(input: []const u8, other: []const u8) !u24 {
+        \\    var value = try emit(input);
+        \\    value.raw = other;
+        \\    return @intCast(value.raw.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 };
+        \\fn emit(input: []const u8) !Event {
+        \\    if (input.len > 16777215) return error.TapeTooLarge;
+        \\    return .{ .raw = input };
+        \\}
+        \\pub fn length(input: []const u8, other: []const u8) u24 {
+        \\    const value = emit(input) catch Event{ .raw = other };
+        \\    return @intCast(value.raw.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: fixed shape helper callers preserve container extents" {
+    try testing.expectNoFireTyped(check,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\fn shape() [4]u8 {
+        \\    return .{ 1, 2, 3, 4 };
+        \\}
+        \\test "fixed array result" {
+        \\    _ = fixture(&shape());
+        \\    const values: []const u8 = @as([]const u8, "small");
+        \\    _ = fixture(values);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\extern fn shape() [256]u8;
+        \\test "oversized array result" {
+        \\    _ = fixture(&shape());
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn fixture(values: []const u8) u8 {
+        \\    return @intCast(values.len);
+        \\}
+        \\extern fn shape() []const u8;
+        \\test "dynamic result" {
+        \\    _ = fixture(shape());
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: relative embedded byte counts prove only fitting lengths" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "small.bin", .data = "hello" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.bin", .data = &([_]u8{0} ** 256) });
+    try tmp.dir.createDir(io, "directory", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const source_path = try std.fs.path.join(gpa, &.{ root, "main.zig" });
+    defer gpa.free(source_path);
+    const cases = [_]struct {
+        source: [:0]const u8,
+        count: usize,
+        excluded: bool = false,
+        source_error: ?file_cache_mod.SummaryError = null,
+    }{
+        .{ .source =
+        \\const bytes = @embedFile("./small\x2ebin");
+        \\pub fn rootLength() u8 { return @intCast(bytes.len); }
+        \\pub fn localLength() u8 {
+        \\    const original = @embedFile("small.bin");
+        \\    const alias = original;
+        \\    return @intCast(alias.len);
+        \\}
+        \\pub fn directLength() u8 { return @intCast(@embedFile("small.bin").len); }
+        , .count = 0 },
+        .{ .source =
+        \\const bytes = @embedFile("large.bin");
+        \\pub fn length() u8 { return @intCast(bytes.len); }
+        , .count = 1 },
+        .{ .source =
+        \\const bytes = @embedFile("missing.bin");
+        \\pub fn length() u8 { return @intCast(bytes.len); }
+        , .count = 0, .source_error = error.FileNotFound },
+        .{ .source =
+        \\const filename = "small.bin";
+        \\const bytes = @embedFile(filename);
+        \\pub fn length() u8 { return @intCast(bytes.len); }
+        , .count = 1 },
+        .{ .source =
+        \\const bytes = @embedFile("directory");
+        \\pub fn length() u8 { return @intCast(bytes.len); }
+        , .count = 1 },
+        .{ .source =
+        \\const bytes = @embedFile("small.bin");
+        \\pub fn length() u8 { return @intCast(bytes.len); }
+        , .count = 1, .excluded = true },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = case.source });
+        var context: type_resolver_mod.TypeContext = undefined;
+        try context.init(gpa, io);
+        defer context.deinit();
+        context.store.source_policy = .{
+            .roots = &.{root},
+            .excludes = if (case.excluded) &.{"small.bin"} else &.{},
+        };
+        var resolver: type_resolver_mod.TypeResolver = undefined;
+        try resolver.init(&context, gpa, source_path, case.source);
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        var cache = file_cache_mod.FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        cache.file_path = source_path;
+        cache.module_id = resolver.handle.module;
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer testing.freeProblems(gpa, &problems);
+        if (case.source_error) |err| {
+            try std.testing.expectError(err, check(gpa, tree, &cache, &config_mod.Default, &problems));
+            try std.testing.expectEqual(@as(usize, 0), cache.embedded_file_lengths.count());
+        } else {
+            try check(gpa, tree, &cache, &config_mod.Default, &problems);
+        }
+        try std.testing.expectEqual(case.count, problems.items.len);
+        for (problems.items) |finding| try std.testing.expectEqualStrings(R, finding.rule_id);
+    }
+}
+
+test "index-type-narrowing-wraparound: unproved embedded extents remain conservative" {
+    try testing.expectFiresTyped(check, R,
+        \\const bytes = @embedFile("unresolved_named_data");
+        \\pub fn length() u8 {
+        \\    return @intCast(bytes.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: writes to fresh allocation aliases still retire their guards" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Holder = struct { items: []const u8 = &.{} };
+        \\pub fn count(alloc: std.mem.Allocator, input: []const u8, replacement: []const u8) !u8 {
+        \\    const other = try alloc.create(Holder);
+        \\    other.* = .{ .items = input };
+        \\    const alias = other;
+        \\    if (alias.items.len > 255) return error.Unsupported;
+        \\    other.* = .{ .items = replacement };
+        \\    return @intCast(alias.items.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Holder = struct { items: []const u8 = &.{} };
+        \\pub fn count(alloc: std.mem.Allocator, input: []const u8, replacement: []const u8) !u8 {
+        \\    const other = try alloc.create(Holder);
+        \\    other.* = .{ .items = input };
+        \\    const alias = other;
+        \\    if (alias.items.len > 255) return error.Unsupported;
+        \\    other.items = replacement;
+        \\    return @intCast(alias.items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: opaque length fields do not imply usize" {
+    try testing.expectNoFireTyped(check,
+        \\fn size(bytes: []const u8) u64 {
+        \\    return @intCast(bytes.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn size(source: anytype) u64 {
+        \\    return @intCast(source.items.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Source = struct { items: struct { len: u128 } };
+        \\pub fn size(source: Source) u64 {
+        \\    return @intCast(source.items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: returned nested header copies keep their field extents" {
+    try testing.expectNoFireTyped(check,
+        \\const Event = struct { span: struct { slice: []const u8 }, tag: u8 };
+        \\fn emit(input: []const u8) !Event {
+        \\    if (input.len > 16777215) return error.TooLarge;
+        \\    const event = Event{ .span = .{ .slice = input }, .tag = 0 };
+        \\    const copy = event;
+        \\    return copy;
+        \\}
+        \\pub fn length(input: []const u8) !u24 {
+        \\    const event = try emit(input);
+        \\    const copy = event;
+        \\    return @intCast(copy.span.slice.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: returned headers reject stale missing or effectful extents" {
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 };
+        \\fn emit(input: []const u8, other: []const u8) !Event {
+        \\    if (input.len > 16777215) return error.TooLarge;
+        \\    var event = Event{ .raw = input };
+        \\    event.raw = other;
+        \\    return event;
+        \\}
+        \\pub fn length(input: []const u8, other: []const u8) !u24 {
+        \\    const event = try emit(input, other);
+        \\    return @intCast(event.raw.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 = undefined };
+        \\fn emit(input: []const u8, omitted: bool) !Event {
+        \\    if (input.len > 16777215) return error.TooLarge;
+        \\    if (omitted) return .{};
+        \\    return .{ .raw = input };
+        \\}
+        \\pub fn length(input: []const u8, omitted: bool) !u24 {
+        \\    const event = try emit(input, omitted);
+        \\    return @intCast(event.raw.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8, tag: u8 };
+        \\fn replace(input: *[]const u8, other: []const u8) u8 {
+        \\    input.* = other;
+        \\    return 0;
+        \\}
+        \\fn emit(input: []const u8, other: []const u8) !Event {
+        \\    if (input.len > 16777215) return error.TooLarge;
+        \\    var raw = input;
+        \\    return .{ .tag = replace(&raw, other), .raw = raw };
+        \\}
+        \\pub fn length(input: []const u8, other: []const u8) !u24 {
+        \\    const event = try emit(input, other);
+        \\    return @intCast(event.raw.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Event = struct { raw: []const u8 };
+        \\fn emit(input: []const u8) !Event {
+        \\    if (input.len > 16777215) return error.TooLarge;
+        \\    defer opaqueValue();
+        \\    return .{ .raw = input };
+        \\}
+        \\extern fn opaqueValue() void;
+        \\pub fn length(input: []const u8) !u24 {
+        \\    const event = try emit(input);
+        \\    return @intCast(event.raw.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean indexed headers and nested metrics use field destinations" {
+    try testing.expectNoFireTyped(check,
+        \\const Header = struct { size: u64 };
+        \\const Builder = struct { metrics: struct { bytes: u64 } };
+        \\pub fn write(headers: []Header, index: usize, bytes: []const u8) void {
+        \\    headers[index] = .{ .size = @intCast(bytes.len) };
+        \\}
+        \\pub fn init(bytes: []const u8) Builder {
+        \\    return .{ .metrics = .{ .bytes = @intCast(bytes.len) } };
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Header = struct { size: u32 };
+        \\pub fn write(headers: []Header, index: usize, bytes: []const u8) void {
+        \\    headers[index] = .{ .size = @intCast(bytes.len) };
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Builder = struct { metrics: struct { bytes: u32 } };
+        \\pub fn init(bytes: []const u8) Builder {
+        \\    return .{ .metrics = .{ .bytes = @intCast(bytes.len) } };
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn init(bytes: []const u8) MissingBuilder {
+        \\    return .{ .metrics = .{ .bytes = @intCast(bytes.len) } };
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean nested assignment keeps fixed input count bounds" {
+    try testing.expectNoFireTyped(check,
+        \\const Input = struct { id: u32 };
+        \\const SourceIdentity = struct { function_count: u32 };
+        \\const ModuleInput = struct { source_identity: SourceIdentity };
+        \\const Fixture = struct {
+        \\    inputs: [3]Input,
+        \\    module_input: ModuleInput,
+        \\    pub fn init(self: *Fixture) void {
+        \\        self.module_input = .{
+        \\            .source_identity = .{ .function_count = @intCast(self.inputs.len) },
+        \\        };
+        \\    }
+        \\};
+        \\pub fn fixtureCount(fixture: *Fixture) u32 {
+        \\    fixture.init();
+        \\    return fixture.module_input.source_identity.function_count;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Input = struct { id: u32 };
+        \\const SourceIdentity = struct { function_count: u32 };
+        \\const ModuleInput = struct { source_identity: SourceIdentity };
+        \\const Fixture = struct {
+        \\    inputs: []const Input,
+        \\    module_input: ModuleInput,
+        \\    pub fn init(self: *Fixture) void {
+        \\        self.module_input = .{
+        \\            .source_identity = .{ .function_count = @intCast(self.inputs.len) },
+        \\        };
+        \\    }
+        \\};
+        \\pub fn fixtureCount(fixture: *Fixture) u32 {
+        \\    fixture.init();
+        \\    return fixture.module_input.source_identity.function_count;
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean named error unions retain bounded and widening destinations" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Function = @This();
+        \\pub const CreateError = std.mem.Allocator.Error || error{ Full, Invalid };
+        \\const State = struct {
+        \\    pub fn count(ids: []const u32) Function.CreateError!u32 {
+        \\        if (ids.len > std.math.maxInt(u32)) return error.Full;
+        \\        return @intCast(ids.len);
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Function = @This();
+        \\pub const CreateError = std.mem.Allocator.Error || error{ Full, Invalid };
+        \\const State = struct {
+        \\    pub fn count(ids: []const u32) Function.CreateError!u32 {
+        \\        return @intCast(ids.len);
+        \\    }
+        \\};
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const EmitError = std.mem.Allocator.Error || error{InvalidInput};
+        \\pub fn preambleLength(allocator: std.mem.Allocator, source: []const u8) EmitError!u64 {
+        \\    var buf: std.ArrayList(u8) = .empty;
+        \\    defer buf.deinit(allocator);
+        \\    try buf.appendSlice(allocator, source);
+        \\    return @intCast(buf.items.len);
+        \\}
+        \\pub fn plainLength(bytes: []const u8) !u64 {
+        \\    return @intCast(bytes.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const EmitError = std.mem.Allocator.Error || error{InvalidInput};
+        \\pub fn preambleLength(allocator: std.mem.Allocator, source: []const u8) EmitError!u32 {
+        \\    var buf: std.ArrayList(u8) = .empty;
+        \\    defer buf.deinit(allocator);
+        \\    try buf.appendSlice(allocator, source);
+        \\    return @intCast(buf.items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean Token length field uses its declared integer width" {
+    try testing.expectNoFireTyped(check,
+        \\pub const Token = struct {
+        \\    start: u32,
+        \\    len: u16,
+        \\    pub fn span(self: Token, source: []const u8) []const u8 {
+        \\        return source[@intCast(self.start) .. @as(usize, @intCast(self.start)) + @as(usize, @intCast(self.len))];
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub const Token = struct {
+        \\    start: u32,
+        \\    len: u128,
+        \\    pub fn span(self: Token, source: []const u8) []const u8 {
+        \\        return source[@intCast(self.start) .. @as(usize, @intCast(self.start)) + @as(usize, @intCast(self.len))];
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn span(token: anytype, source: []const u8) []const u8 {
+        \\    return source[0 .. @as(usize, @intCast(token.len))];
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean unchecked SourceId file counts remain unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const SourceId = u16;
+        \\pub fn nextSourceId(files: *const std.ArrayList([]const u8)) SourceId {
+        \\    return @intCast(files.items.len);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const SourceId = u16;
+        \\pub fn nextSourceId(files: *const std.ArrayList([]const u8)) !SourceId {
+        \\    if (files.items.len > std.math.maxInt(SourceId)) return error.Full;
+        \\    return @intCast(files.items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean unchecked duration counts remain unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn durationCount(durations: []const u64) u32 {
+        \\    return @intCast(durations.len);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn durationCount(durations: []const u64) !u32 {
+        \\    if (durations.len > std.math.maxInt(u32)) return error.Full;
+        \\    return @intCast(durations.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: returned tagged union payloads keep fixed slice extents" {
+    try testing.expectNoFireTyped(check,
+        \\const Action = union(enum) { unchanged, replace: []const u32 };
+        \\fn hook(scratch: *[2]u32) Action {
+        \\    return .{ .replace = scratch[0..2] };
+        \\}
+        \\fn accepts(count: u16) bool { return count == 2; }
+        \\pub fn inspect() bool {
+        \\    var scratch = [2]u32{ 1, 2 };
+        \\    const action = hook(&scratch);
+        \\    switch (action) {
+        \\        .unchanged => return false,
+        \\        .replace => |inputs| return accepts(@intCast(inputs.len)),
+        \\    }
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const Action = union(enum) { unchanged, replace: []const u32 };
+        \\fn hook(scratch: *[3]u32, short: bool) Action {
+        \\    if (short) return .{ .replace = scratch[0..2] };
+        \\    const action = Action{ .replace = scratch[0..3] };
+        \\    const copy = action;
+        \\    return copy;
+        \\}
+        \\pub fn inspect(short: bool) u16 {
+        \\    var scratch = [3]u32{ 1, 2, 3 };
+        \\    const action = hook(&scratch, short);
+        \\    switch (action) {
+        \\        .unchanged => return 0,
+        \\        .replace => |inputs| return @intCast(inputs.len),
+        \\    }
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: returned union lengths reject unknown oversized and other variants" {
+    try testing.expectFiresTyped(check, R,
+        \\const Action = union(enum) { unchanged, replace: []const u32 };
+        \\fn hook(scratch: *[2]u32, unknown: []const u32, alternate: bool) Action {
+        \\    if (alternate) return .{ .replace = unknown };
+        \\    return .{ .replace = scratch[0..2] };
+        \\}
+        \\pub fn inspect(unknown: []const u32, alternate: bool) u16 {
+        \\    var scratch = [2]u32{ 1, 2 };
+        \\    const action = hook(&scratch, unknown, alternate);
+        \\    switch (action) {
+        \\        .unchanged => return 0,
+        \\        .replace => |inputs| return @intCast(inputs.len),
+        \\    }
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Action = union(enum) { unchanged, replace: []const u32 };
+        \\fn hook(scratch: *[65536]u32, alternate: bool) Action {
+        \\    if (alternate) return .{ .replace = scratch[0..65536] };
+        \\    return .{ .replace = scratch[0..2] };
+        \\}
+        \\pub fn inspect(scratch: *[65536]u32, alternate: bool) u16 {
+        \\    const action = hook(scratch, alternate);
+        \\    switch (action) {
+        \\        .unchanged => return 0,
+        \\        .replace => |inputs| return @intCast(inputs.len),
+        \\    }
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Action = union(enum) { replace: []const u32, append: []const u32 };
+        \\fn hook(scratch: *[2]u32, unknown: []const u32, alternate: bool) Action {
+        \\    if (alternate) return .{ .append = unknown };
+        \\    return .{ .replace = scratch[0..2] };
+        \\}
+        \\pub fn inspect(unknown: []const u32, alternate: bool) u16 {
+        \\    var scratch = [2]u32{ 1, 2 };
+        \\    const action = hook(&scratch, unknown, alternate);
+        \\    switch (action) {
+        \\        .replace => return 0,
+        \\        .append => |inputs| return @intCast(inputs.len),
+        \\    }
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Action = union(enum) { unchanged, replace: []const u32 };
+        \\fn hook(scratch: *[2]u32, alternate: bool) Action {
+        \\    if (alternate) return .unchanged;
+        \\    return .{ .replace = scratch[0..2] };
+        \\}
+        \\pub fn inspect(alternate: bool) u16 {
+        \\    var scratch = [2]u32{ 1, 2 };
+        \\    const action = hook(&scratch, alternate);
+        \\    switch (action) {
+        \\        .unchanged => return 0,
+        \\        .replace => |inputs| return @intCast(inputs.len),
+        \\    }
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: inferred fixed array modulo has a bounded result" {
+    try testing.expectNoFireTyped(check,
+        \\fn next(state: *u64) u64 {
+        \\    state.* = state.* *% 3 +% 1;
+        \\    return state.*;
+        \\}
+        \\pub fn choose(state: *u64) u8 {
+        \\    const operations = [_]u8{ 1, 2, 3 };
+        \\    return operations[@as(usize, @intCast(next(state) % operations.len))];
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\pub fn choose(raw: u64) u8 {
+        \\    const operations = [_]u8{ 1, 2, 3 };
+        \\    return @intCast(raw % operations.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn choose(raw: u64) u8 {
+        \\    const operations: [257]u8 = undefined;
+        \\    return @intCast(raw % operations.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn choose(raw: anytype) u8 {
+        \\    const operations = [_]u8{ 1, 2, 3 };
+        \\    return @intCast(raw % operations.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: opaque instruction imports retain conservative bounds" {
+    try testing.expectFiresTyped(check, R,
+        \\const Grammar = @import("spirv_grammar");
+        \\pub fn encode(words: []const u32, arities: []u8) !void {
+        \\    var cursor: usize = 0;
+        \\    while (cursor < words.len) {
+        \\        const instruction = Grammar.decodeInstruction(words, &cursor) catch {
+        \\            return error.InvalidInput;
+        \\        };
+        \\        if (instruction.words.len < 3 or instruction.words.len > 9) {
+        \\            return error.InvalidInput;
+        \\        }
+        \\        arities[0] = @intCast(instruction.words.len - 2);
+        \\    }
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const Instruction = struct { words: []const u32 };
+        \\pub fn encode(instruction: Instruction, arities: []u8) !void {
+        \\    if (instruction.words.len < 3 or instruction.words.len > 9) {
+        \\        return error.InvalidInput;
+        \\    }
+        \\    arities[0] = @intCast(instruction.words.len - 2);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: checked nonnegative totals bound each component" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u32 {
+        \\    const total = std.math.add(usize, base, pending.len) catch return error.Full;
+        \\    if (total > std.math.maxInt(u32)) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u8 {
+        \\    const total = try std.math.add(usize, base, pending.len);
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(base);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u32 {
+        \\    const total = std.math.add(usize, base, pending.len) catch {
+        \\        return error.Full;
+        \\    };
+        \\    if (total > std.math.maxInt(u32)) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn checkCount(total: usize) !void {
+        \\    if (total > 255) return error.Full;
+        \\}
+        \\pub fn count(base: usize, pending: []const u8) !u8 {
+        \\    const total = try std.math.add(usize, base, pending.len);
+        \\    try checkCount(total);
+        \\    return @intCast(pending.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: checked total components reject fallback signed and overshoot proofs" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u8 {
+        \\    const total = std.math.add(usize, base, pending.len) catch 0;
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u8 {
+        \\    const total = std.math.add(usize, base, pending.len) catch blk: {
+        \\        break :blk 0;
+        \\    };
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn count(base: i64, pending: []const u8) !u32 {
+        \\    if (pending.len > std.math.maxInt(i64)) return error.Full;
+        \\    const total = try std.math.add(i64, base, @intCast(pending.len));
+        \\    if (total > std.math.maxInt(u32)) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u8 {
+        \\    const total = try std.math.add(usize, base, pending.len);
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(pending.len + 1);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: component relations retire on rebind and alias writes" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8, replacement: []const u8) !u8 {
+        \\    var input = pending;
+        \\    const total = try std.math.add(usize, base, input.len);
+        \\    input = replacement;
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(input.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn count(base: usize, pending: []const u8) !u8 {
+        \\    var total = try std.math.add(usize, base, pending.len);
+        \\    total = 0;
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Holder = struct { items: []const u8 };
+        \\pub fn count(base: usize, holder: *Holder, replacement: []const u8) !u8 {
+        \\    const total = try std.math.add(usize, base, holder.items.len);
+        \\    const alias = holder;
+        \\    alias.items = replacement;
+        \\    if (total > 255) return error.Full;
+        \\    return @intCast(holder.items.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Holder = struct { items: []const u8 };
+        \\extern fn replace(holder: *Holder) void;
+        \\pub fn count(base: usize, holder: *Holder) !u8 {
+        \\    const total = try std.math.add(usize, base, holder.items.len);
+        \\    if (total > 255) return error.Full;
+        \\    replace(holder);
+        \\    return @intCast(holder.items.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: aggregate wrappers remain conservative without return relations" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checkedAdd(a: u64, b: u64) !u64 { return std.math.add(u64, a, b); }
+        \\fn checkedU64(a: usize) !u64 { return std.math.cast(u64, a) orelse error.Overflow; }
+        \\pub fn sectionIndex(sections: []const u8, relocation_count: u32) !u32 {
+        \\    const total = try checkedAdd(try checkedAdd(5, try checkedU64(sections.len)), relocation_count);
+        \\    if (total > std.math.maxInt(u16)) return error.TooMany;
+        \\    return @intCast(1 + sections.len + relocation_count);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn checkedAdd(a: u64, b: u64) !u64 { return std.math.add(u64, a, b); }
+        \\pub fn count(base: u64, pending: []const u8) !u32 {
+        \\    const total = checkedAdd(base, pending.len) catch 0;
+        \\    if (total > std.math.maxInt(u32)) return error.Full;
+        \\    return @intCast(pending.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: total preflight does not invent container loop progress" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn append(gpa: std.mem.Allocator, records: *std.ArrayList(u32), pending: []const u8) !void {
+        \\    const total = std.math.add(usize, records.items.len, pending.len) catch return error.Full;
+        \\    if (total > std.math.maxInt(u32)) return error.Full;
+        \\    try records.ensureUnusedCapacity(gpa, pending.len);
+        \\    for (pending) |_| {
+        \\        const id: u32 = @intCast(records.items.len + 1);
+        \\        records.appendAssumeCapacity(id);
+        \\    }
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn append(gpa: std.mem.Allocator, records: *std.ArrayList(u32), pending: []const u8) !void {
+        \\    const total = std.math.add(usize, records.items.len, pending.len) catch return error.Full;
+        \\    if (total > std.math.maxInt(u32)) return error.Full;
+        \\    try records.ensureUnusedCapacity(gpa, pending.len);
+        \\    for (pending) |_| {
+        \\        const id: u32 = @intCast(records.items.len + 1);
+        \\        records.appendAssumeCapacity(id);
+        \\        records.appendAssumeCapacity(id);
+        \\    }
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: Ocean capacity calls preserve copied guards but not mutable headers" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    path_text: std.ArrayList([]const u8) = .empty,
+        \\    paths: std.StringHashMapUnmanaged(u32) = .empty,
+        \\    pub fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) !u32 {
+        \\        const length = self.path_text.items.len;
+        \\        if (length > std.math.maxInt(u32)) return error.Budget;
+        \\        try self.path_text.ensureUnusedCapacity(gpa, 1);
+        \\        try self.paths.ensureUnusedCapacity(gpa, 1);
+        \\        const id: u32 = @intCast(length);
+        \\        self.path_text.appendAssumeCapacity(path);
+        \\        self.paths.putAssumeCapacity(path, id);
+        \\        return id;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    path_text: std.ArrayList([]const u8) = .empty,
+        \\    paths: std.StringHashMapUnmanaged(u32) = .empty,
+        \\    pub fn intern(self: *State, gpa: std.mem.Allocator, path: []const u8) !u32 {
+        \\        if (self.path_text.items.len > std.math.maxInt(u32)) return error.Budget;
+        \\        try self.path_text.ensureUnusedCapacity(gpa, 1);
+        \\        try self.paths.ensureUnusedCapacity(gpa, 1);
+        \\        self.path_text.appendAssumeCapacity(path);
+        \\        const id: u32 = @intCast(self.path_text.items.len);
+        \\        self.paths.putAssumeCapacity(path, id);
+        \\        return id;
+        \\    }
+        \\};
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const List = struct {
+        \\    items: []const []const u8,
+        \\    fn ensureUnusedCapacity(self: *List, replacement: []const []const u8) !void {
+        \\        self.items = replacement;
+        \\    }
+        \\};
+        \\const State = struct {
+        \\    path_text: List,
+        \\    pub fn intern(self: *State, replacement: []const []const u8) !u32 {
+        \\        if (self.path_text.items.len > std.math.maxInt(u32)) return error.Budget;
+        \\        try self.path_text.ensureUnusedCapacity(replacement);
+        \\        return @intCast(self.path_text.items.len);
+        \\    }
+        \\};
+    );
+}
+
+const allocatorCallbackMutationSource =
+    \\const std = @import("std");
+    \\const CallbackAllocator = struct {
+    \\    watched: *std.ArrayList(u8),
+    \\    backing: std.heap.FixedBufferAllocator,
+    \\    fn allocator(self: *CallbackAllocator) std.mem.Allocator {
+    \\        return .{ .ptr = self, .vtable = &.{
+    \\            .alloc = allocate, .resize = resize, .remap = remap, .free = free,
+    \\        } };
+    \\    }
+    \\    fn allocate(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    \\        const self: *CallbackAllocator = @ptrCast(@alignCast(context));
+    \\        std.debug.assert(self.watched.capacity >= 300);
+    \\        self.watched.items = self.watched.items.ptr[0..300];
+    \\        return self.backing.allocator().rawAlloc(len, alignment, ret_addr);
+    \\    }
+    \\    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    \\        const self: *CallbackAllocator = @ptrCast(@alignCast(context));
+    \\        return self.backing.allocator().rawResize(memory, alignment, new_len, ret_addr);
+    \\    }
+    \\    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    \\        const self: *CallbackAllocator = @ptrCast(@alignCast(context));
+    \\        return self.backing.allocator().rawRemap(memory, alignment, new_len, ret_addr);
+    \\    }
+    \\    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    \\        const self: *CallbackAllocator = @ptrCast(@alignCast(context));
+    \\        self.backing.allocator().rawFree(memory, alignment, ret_addr);
+    \\    }
+    \\};
+    \\
+;
+
+const allocatorSnapshotGuardSource =
+    \\pub fn copiedLengthAfterAllocation(watched: *std.ArrayList(u8), gpa: std.mem.Allocator) !u8 {
+    \\    const length = watched.items.len;
+    \\    if (length > 255) return error.Overflow;
+    \\    var sibling: std.ArrayList(u8) = .empty;
+    \\    defer sibling.deinit(gpa);
+    \\    try sibling.ensureUnusedCapacity(gpa, 1);
+    \\    return @intCast(length);
+    \\}
+    \\
+;
+
+test "index-type-narrowing-wraparound: an allocator callback can change a guarded header but not its copied length" {
+    try testing.expectFiresTyped(check, R, allocatorCallbackMutationSource ++
+        \\pub fn currentLengthAfterAllocation(watched: *std.ArrayList(u8), gpa: std.mem.Allocator) !u8 {
+        \\    if (watched.items.len > 255) return error.Overflow;
+        \\    var sibling: std.ArrayList(u8) = .empty;
+        \\    defer sibling.deinit(gpa);
+        \\    try sibling.ensureUnusedCapacity(gpa, 1);
+        \\    return @intCast(watched.items.len);
+        \\}
+        \\
+    );
+    try testing.expectNoFireTyped(check, allocatorCallbackMutationSource ++ allocatorSnapshotGuardSource);
+}
+
+test "index-type-narrowing-wraparound: full width integer domains widen without interval encoding" {
+    try testing.expectNoFireTyped(check,
+        \\const Header = struct { len: u128 };
+        \\pub fn same(header: Header) u128 { return @intCast(header.len); }
+        \\pub fn wide(header: Header) i129 { return @intCast(header.len); }
+        \\pub fn length(bytes: []const u8) i128 { return @intCast(bytes.len); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Header = struct { len: u128 };
+        \\pub fn signed(header: Header) i128 { return @intCast(header.len); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Header = struct { len: i128 };
+        \\pub fn unsigned(header: Header) u128 { return @intCast(header.len); }
+    );
+}
+
+test "index-type-narrowing-wraparound: capacity arguments retain identity widths" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Init = struct { ast: struct { fields: []const u32 } };
+        \\pub fn capacity(allocator: std.mem.Allocator, init: Init) !void {
+        \\    var items: std.ArrayList(u32) = .empty;
+        \\    defer items.deinit(allocator);
+        \\    try items.ensureTotalCapacity(allocator, @intCast(init.ast.fields.len));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn tokenEnd(tree: *const std.zig.Ast) std.zig.Ast.TokenIndex {
+        \\    return @intCast(tree.tokens.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: signed length fields need nonnegative value evidence" {
+    try testing.expectNoFireTyped(check,
+        \\const Header = struct { len: i128 };
+        \\pub fn count(header: Header) !u128 {
+        \\    if (header.len < 0) return error.Negative;
+        \\    return @intCast(header.len);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Header = struct { len: i64 };
+        \\pub fn count(header: Header) u128 {
+        \\    return @intCast(header.len);
+        \\}
+    );
+}
+
+test "index-type-narrowing-wraparound: AST initializer lengths widen into numeric constructors" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Range = union(enum) {
+        \\    unknown,
+        \\    integer: i128,
+        \\    fn constant(value: i128) Range { return .{ .integer = value }; }
+        \\};
+        \\pub fn count(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) Range {
+        \\    var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        \\    const array = tree.fullArrayInit(&buffer, node) orelse return .unknown;
+        \\    return Range.constant(@intCast(array.ast.elements.len));
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Range = union(enum) {
+        \\    unknown,
+        \\    integer: i16,
+        \\    fn constant(value: i16) Range { return .{ .integer = value }; }
+        \\};
+        \\pub fn count(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) Range {
+        \\    var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        \\    const array = tree.fullArrayInit(&buffer, node) orelse return .unknown;
+        \\    return Range.constant(@intCast(array.ast.elements.len));
         \\}
     );
 }

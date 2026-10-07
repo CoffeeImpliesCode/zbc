@@ -1,7 +1,7 @@
-//! Per-fn behavioral summary, inferred from the body (purely
-//! syntactic).  No annotations are read — the author overrides
-//! the tool's inferred belief via `// zbc-disable-line:` suppressions,
-//! not by asserting alternative semantics.
+//! Per-fn behavioral summary. Body-only facts are syntactic; independent
+//! self-allocation ownership also reads resolved allocator provenance.
+//! No annotations assert semantics — the author can suppress a finding
+//! via `// zbc-disable-line:`.
 //!
 //! Summary fields are deliberately COARSE.  Each one answers a
 //! specific question a downstream consumer asks:
@@ -62,9 +62,14 @@ const tokens = @import("../ast/tokens.zig");
 const receiver_mod = @import("method_names.zig");
 const local_bindings = @import("local_bindings.zig");
 const numeric_nodes = @import("numeric_nodes.zig");
+const budget_mod = @import("../budget.zig");
 const TokenIndex = tokens.TokenIndex;
 const TokenTag = tokens.TokenTag;
-
+/// Reject source offsets at the u32 limit before admitting the exclusive token bound.
+pub fn checkedTokenCount(source_len: usize, token_len: usize) error{SourceTooWide}!TokenIndex {
+    if (source_len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    return std.math.cast(TokenIndex, token_len) orelse return error.SourceTooWide;
+}
 
 /// Result-shape classification.
 pub const Returns = union(enum) {
@@ -111,6 +116,29 @@ pub const ParamPath = struct {
     param: u32,
     /// Dotted field path from that parameter (`""` = the whole).
     path: []const u8,
+};
+
+/// Ordered operations on one parameter payload. Alternatives retain branch
+/// correlation; two releases are not collapsed into one release.
+pub const StorageOperation = struct {
+    path: ParamPath,
+    /// Entry releases name the payload present on call entry, even after a
+    /// replace. Current releases name the latest published payload. Replace
+    /// is emitted only for a certified independent, live heap allocation.
+    kind: enum { release_entry, replace, release_current },
+    /// Formal allocator provenance for replace; null removes exact replay.
+    allocator: ?ParamPath = null,
+    /// Exact relative payload generation for a release. Zero is entry;
+    /// each replacement advances the generation of this path by one.
+    /// Null on a current release means the current generation at that step.
+    version: ?usize = null,
+    /// Positive identity evidence survives an opaque tail even when the
+    /// whole trace is incomplete. Ambiguous projections cannot supply it.
+    identity_proved: bool = true,
+};
+
+pub const StorageOutcome = struct {
+    operations: []const StorageOperation = &.{},
 };
 
 /// Where a value came from, as far as this file can prove.  Anything
@@ -172,7 +200,7 @@ pub const GrowPath = struct {
 /// Produced by `inferGrowEffects`, consumed by
 /// `FileCache.resolveGrowPathsOne` — never stored in an `FnSummary`.
 pub const GrowCall = struct {
-    /// Final callee token, for exact AST and declaration lookup in this snapshot.
+    /// Callee expression's main token, matching FileCache's call index.
     callee_token: Ast.TokenIndex,
     /// Free-fn name (`.bare` / `.qualified`) or method name
     /// (`.method` / `.unresolved`).
@@ -334,10 +362,11 @@ pub const FnSummary = struct {
     /// .heap_alloc)` so subsequent `local.X` reads see correct UAF
     /// state.  Slice is owned by the FnSummaryCache arena.
     result_heap_fields: []const []const u8 = &.{},
-    /// Body contains `<x>.create(<containing-type>)` or
-    /// `<x>.create(Self)` — i.e. allocates a heap instance of its
-    /// own type.  Filled when the containing type is known; null
-    /// when the fn is top-level (no containing type).
+    /// Body creates an instance of its own containing type through the
+    /// canonical SDK Allocator.create and may own the heap allocation.
+    /// Known arena/buffer backing borrows its owner's lifetime instead.
+    /// Pointer-bearing instance fields do not remove this obligation.
+    /// Filled by cache-aware inference; false for top-level functions.
     heap_allocates_self: bool = false,
     /// True only when the complete return-dependency scan saw a return
     /// and proved no parameter occurs in any return expression.
@@ -345,13 +374,19 @@ pub const FnSummary = struct {
     result_independent_of_args: bool = false,
     /// Positive parameter dependencies found in return expressions.
     /// Bit 31 records a return statement; bits 0–15 cover the bounded
-    /// formal-name scan. Absence of a bit is NOT proof unless
-    /// `result_params_complete` is true. Bits 16–30 are not inferred.
+    /// formal-name scan. Absence of a bit is NOT proof unless the return
+    /// scan is complete or that input has a separate no-use certificate.
+    /// Bits 16–30 are not inferred.
     result_params_in_return: u32 = 0,
     /// Every return expression and formal was understood by the bounded
     /// scan. False for untracked formals or unresolved provenance, even
     /// when some positive dependency bits are known.
     result_params_complete: bool = false,
+    /// Formals absent from the entire signature and body apart from their
+    /// declaration and direct discard statements. These inputs cannot feed
+    /// a result, even when another input has unresolved return provenance.
+    /// This is not purity: consumers still need canonical parameter effects.
+    result_params_unused: u16 = 0,
     /// True iff this fn (or any fn it transitively calls in the same
     /// file) directly invokes an ArrayList-grow method — i.e. a call
     /// that may reallocate the backing buffer and invalidate existing
@@ -436,13 +471,77 @@ pub const FnSummary = struct {
     /// retrieve it via FileCache.
     _resolved: bool = false,
 
+    /// === Normal-success cleanup certificates (positive authenticated effects) ===
+    ///
+    /// Definite effects hold on every successful return or fallthrough.
+    /// MAY effects include conditional cleanup, including catch and else
+    /// arms that rejoin a successful path. Errdefer runs only on error exits.
+    /// Unmodelled control or callees clear definite claims, not observed MAY.
+    ///
+    /// `*_definite_*` are intersected across ALL reachable successful
+    /// normal exits.  A path that is freed on one exit but not another
+    /// is NOT definite — it goes to `*_may_*` instead.  An empty
+    /// `*_definite_*` does NOT mean purity; it means no path could be
+    /// proven freed on every exit.
+    ///
+    /// `*_may_*` are the union of effects that MAY occur on some normal
+    /// exit.  A path in `*_may_*` but not `*_definite_*` means the
+    /// cleanup is conditional.  Consumers MUST NOT treat absence from
+    /// `*_may_*` as "never freed" — unmodelled control flow may still
+    /// execute it.
+    ///
+    /// Completeness requires a reachable normal exit and known effects on
+    /// every reachable path. Unknown control or callees make it false.
+    /// Source, allocation, and budget failures instead propagate as errors.
+    ///
+    /// `retained_owned_params` is the set of formal parameter indices
+    /// (0 = receiver) whose exact FIELD ownership is certified retained
+    /// across ALL successful normal exits.  A formal is retained when
+    /// the function returns an aggregate that owns the storage, or
+    /// assigns/returns it to a location whose lifetime outlives the
+    /// call, and FileCache's `retainedStorageAt` confirms the same-owner
+    /// cleanup relation.  Distinct from `takes_ownership_of` (immediate
+    /// consumption) — retention means the caller's storage is NOT
+    /// consumed and remains valid after the call.
+    ///
+    /// All arrays are owned by the `summary_arena` passed to the
+    /// inference function.  Nested path/field/method strings are also
+    /// arena-owned.  Inference MUST allocate in the supplied arena.
+    ///
+    /// SourceTooWide / OOM / AnalysisBudgetExceeded propagate; they are
+    /// NOT caught and turned into conservative answers.
+    normal_success_definite_freed_paths: []const ParamPath = &.{},
+    normal_success_may_freed_paths: []const ParamPath = &.{},
+    normal_success_definite_free_fields: []const FieldFree = &.{},
+    normal_success_may_free_fields: []const FieldFree = &.{},
+    normal_success_effects_complete: bool = false,
+    /// Complete ordered alternatives cover every reachable parameter release
+    /// and certified replacement. Identity consumers use these instead of
+    /// the current-field union above; unknown calls remove this certificate.
+    normal_success_storage_outcomes: []const StorageOutcome = &.{},
+    normal_success_storage_effects_complete: bool = false,
+    retained_owned_params: []const u32 = &.{},
+    /// Error exits use a separate intersection and union. They include prior
+    /// effects, normal defers, active errdefers, and error-outcome call effects.
+    /// With no reachable error exit, completeness is false and no proof exists.
+    error_definite_freed_paths: []const ParamPath = &.{},
+    error_may_freed_paths: []const ParamPath = &.{},
+    error_definite_free_fields: []const FieldFree = &.{},
+    error_may_free_fields: []const FieldFree = &.{},
+    error_effects_complete: bool = false,
+    /// Error alternatives are certified separately; a normal replacement
+    /// cannot appear on an allocation failure before publication.
+    error_storage_outcomes: []const StorageOutcome = &.{},
+    error_storage_effects_complete: bool = false,
     /// Whether this result may carry parameter `param`: known positive
     /// dependency, proved absence, or unknown. No return is not a proof.
     pub fn returnedParamDependency(self: *const FnSummary, param: u32) ?bool {
         if (param >= 31) return null;
-        if ((self.result_params_in_return & (@as(u32, 1) << @intCast(param))) != 0) return true;
-        if (param >= 16 or !self.result_params_complete or
-            (self.result_params_in_return & SAW_RETURN_BIT) == 0) return null;
+        const bit = @as(u32, 1) << @intCast(param);
+        if ((self.result_params_in_return & bit) != 0) return true;
+        if (param >= 16 or (self.result_params_in_return & SAW_RETURN_BIT) == 0) return null;
+        if ((self.result_params_unused & @as(u16, @intCast(bit))) != 0) return false;
+        if (!self.result_params_complete) return null;
         return false;
     }
 };
@@ -452,10 +551,10 @@ pub const FnSummary = struct {
 /// param list so `borrowed_from` can resolve to a param index.
 ///
 /// Body-only inference: only fills fields that can be determined
-/// from the proto + body alone.  `heap_allocates_self` requires the
-/// containing type's NAME (a contextual lookup) and `may_free_fields`
-/// / `result_heap_fields` need allocations to land somewhere stable —
-/// caller may want `inferFromBodyAlloc` for those.
+/// from the proto + body alone. `heap_allocates_self` requires the
+/// containing type and the cache's allocation-provenance proof.
+/// `may_free_fields` / `result_heap_fields` need allocations to land
+/// somewhere stable; the cache fills those separately.
 pub fn inferFromBody(
     tree: *const Ast,
     proto: Ast.full.FnProto,
@@ -570,6 +669,7 @@ pub fn inferFromBody(
     const ret = inferResultParamsInReturn(tree, proto, first, last);
     out.result_params_in_return = ret.mask;
     out.result_params_complete = ret.complete;
+    out.result_params_unused = inferUnusedResultParams(tree, proto, body);
     out.result_independent_of_args =
         ret.complete and (ret.mask & SAW_RETURN_BIT) != 0 and
         (ret.mask & ~SAW_RETURN_BIT) == 0;
@@ -652,6 +752,46 @@ fn inferResultParamsInReturn(
         }
     }
     return .{ .mask = result, .complete = complete and (result & SAW_RETURN_BIT) != 0 };
+}
+
+/// A bounded negative provenance certificate for inputs never read. The
+/// signature and body share this exact source AST. Nested control, types,
+/// captures, and method receivers are walked, not excluded by spelling.
+fn inferUnusedResultParams(tree: *const Ast, proto: Ast.full.FnProto, body: Ast.Node.Index) u16 {
+    if (tree.errors.len != 0) return 0;
+    var result: u16 = 0;
+    var remaining: u32 = 4096;
+    var iterator = proto.iterate(tree);
+    var parameter: usize = 0;
+    while (iterator.next()) |formal| : (parameter += 1) {
+        if (parameter >= 16 or remaining == 0) break;
+        const declaration = formal.name_token orelse continue;
+        const name = tree.tokenSlice(declaration);
+        if (nodeExcludesInput(tree, proto.ast.proto_node, name, &remaining, 0) and
+            nodeExcludesInput(tree, body, name, &remaining, 0))
+            result |= @as(u16, 1) << @intCast(parameter);
+    }
+    return result;
+}
+
+fn nodeExcludesInput(tree: *const Ast, node: Ast.Node.Index, name: []const u8, remaining: *u32, depth: u8) bool {
+    if (remaining.* == 0 or depth >= 64) return false;
+    remaining.* -= 1;
+    if (tree.nodeTag(node) == .identifier)
+        return !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name);
+    if (tree.nodeTag(node) == .assign) {
+        const operands = tree.nodeData(node).node_and_node;
+        // Only an AST-authenticated direct discard ignores an input read.
+        if (tree.nodeTag(operands[0]) == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operands[0])), "_") and
+            tree.nodeTag(operands[1]) == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operands[1])), name)) return true;
+    }
+    var children = CleanupIterator.init(tree, node);
+    while (children.next(tree)) |child| {
+        if (!nodeExcludesInput(tree, child, name, remaining, depth + 1)) return false;
+    }
+    return true;
 }
 
 /// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
@@ -1121,6 +1261,1202 @@ pub fn inferMayFreeFields(
     return out.toOwnedSlice(arena);
 }
 
+// An empty first exit must stay an empty intersection after later exits.
+test "cleanup exits do not reseed empty definite or retention sets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exits = CleanupState{ .present = true };
+    try exits.merge(arena.allocator(), .{
+        .present = true,
+        .definite_paths = &.{.{ .param = 0, .path = "" }},
+        .may_paths = &.{.{ .param = 0, .path = "" }},
+        .retained = &.{0},
+    });
+    try testing.expectEqual(@as(usize, 0), exits.definite_paths.len);
+    try testing.expectEqual(@as(usize, 1), exits.may_paths.len);
+    try testing.expectEqual(@as(usize, 0), exits.retained.len);
+}
+
+// Sequential effects accumulate, unlike effects on alternative exits.
+test "cleanup sequencing unions definite effects before exit intersection" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = CleanupState{ .present = true };
+    try state.addEffects(arena.allocator(), &.{.{ .param = 0, .path = "" }}, &.{}, &.{}, &.{}, true);
+    try state.addEffects(arena.allocator(), &.{.{ .param = 1, .path = "bytes" }}, &.{}, &.{}, &.{}, true);
+    try testing.expectEqual(@as(usize, 2), state.definite_paths.len);
+    try testing.expectEqual(@as(usize, 2), state.may_paths.len);
+    state.invalidate();
+    try testing.expectEqual(@as(usize, 0), state.definite_paths.len);
+    try testing.expectEqual(@as(usize, 2), state.may_paths.len);
+}
+
+const CleanupError = @import("../cache/file_cache.zig").SummaryError;
+const CleanupIterator = @import("type_engine").AstIterator;
+
+/// Arrays and callback text belong to the supplied arena, not to a foreign
+/// declaration's source snapshot.
+pub const NormalSuccessEffects = struct {
+    definite_freed_paths: []const ParamPath = &.{},
+    may_freed_paths: []const ParamPath = &.{},
+    definite_free_fields: []const FieldFree = &.{},
+    may_free_fields: []const FieldFree = &.{},
+    complete: bool = false,
+    retained_owned_params: []const u32 = &.{},
+    error_definite_freed_paths: []const ParamPath = &.{},
+    error_may_freed_paths: []const ParamPath = &.{},
+    error_definite_free_fields: []const FieldFree = &.{},
+    error_may_free_fields: []const FieldFree = &.{},
+    error_complete: bool = false,
+    storage_outcomes: []const StorageOutcome = &.{},
+    error_storage_outcomes: []const StorageOutcome = &.{},
+    storage_effects_complete: bool = false,
+    error_storage_effects_complete: bool = false,
+};
+
+fn cleanupOwnedPath(arena: std.mem.Allocator, work: ?CleanupWork, path: ParamPath) CleanupError!ParamPath {
+    try cleanupCharge(work, path.path.len);
+    return .{ .param = path.param, .path = if (path.path.len == 0) "" else try arena.dupe(u8, path.path) };
+}
+
+fn cleanupEqual(comptime T: type, a: T, b: T) bool {
+    if (T == ParamPath) {
+        return a.param == b.param and std.mem.eql(u8, a.path, b.path);
+    }
+    if (T == FieldFree) {
+        return a.param == b.param and std.mem.eql(u8, a.field, b.field) and
+            std.mem.eql(u8, a.method, b.method);
+    }
+    return a == b;
+}
+
+fn cleanupContains(comptime T: type, items: []const T, value: T) bool {
+    for (items) |item| if (cleanupEqual(T, item, value)) return true;
+    return false;
+}
+
+fn cleanupUnion(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    a: []const T,
+    b: []const T,
+) error{OutOfMemory}![]const T {
+    if (b.len == 0) return a;
+    if (a.len == 0) return b;
+    var changed = false;
+    for (b) |item| {
+        if (!cleanupContains(T, a, item)) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed) return a;
+    var out: std.ArrayListUnmanaged(T) = .empty;
+    errdefer out.deinit(arena);
+    try out.appendSlice(arena, a);
+    for (b) |item| {
+        if (!cleanupContains(T, out.items, item)) try out.append(arena, item);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn cleanupIntersection(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    a: []const T,
+    b: []const T,
+) error{OutOfMemory}![]const T {
+    if (a.len == 0 or b.len == 0) return &.{};
+    var changed = false;
+    for (a) |item| {
+        if (!cleanupContains(T, b, item)) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed) return a;
+    var out: std.ArrayListUnmanaged(T) = .empty;
+    errdefer out.deinit(arena);
+    for (a) |item| {
+        if (cleanupContains(T, b, item)) try out.append(arena, item);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// True when `released` is `stored` itself or lies below it.
+fn pathCoveredByStore(released: []const u8, stored: []const u8) bool {
+    // The empty path denotes the whole parameter, not a field prefix
+    // that requires a leading dot. Every member lies below that root.
+    if (stored.len == 0) return true;
+    if (!std.mem.startsWith(u8, released, stored)) return false;
+    return released.len == stored.len or released[stored.len] == '.';
+}
+
+test "cleanup root coverage includes stored descendants without merging siblings" {
+    try testing.expect(pathCoveredByStore("bytes", ""));
+    try testing.expect(pathCoveredByStore("inner.bytes", ""));
+    try testing.expect(pathCoveredByStore("", ""));
+    try testing.expect(!pathCoveredByStore("other.bytes", "inner"));
+    try testing.expect(!pathCoveredByStore("inner_bytes", "inner"));
+
+    const stores = [_]ParamPath{.{ .param = 0, .path = "bytes" }};
+    const after_store = CleanupAlternative{ .uncertain_stores = &stores };
+    try testing.expect(try after_store.uncertain(.{ .param = 0, .path = "" }));
+    try testing.expect(!try after_store.uncertain(.{ .param = 0, .path = "other" }));
+    try testing.expect(!try after_store.uncertain(.{ .param = 1, .path = "" }));
+}
+
+/// `items` without the releases that a store to `param.stored` replaced.
+fn withoutStored(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    items: []const T,
+    param: u32,
+    stored: []const u8,
+) error{OutOfMemory}![]const T {
+    var drops: usize = 0;
+    for (items) |item| {
+        const path = if (T == ParamPath) item.path else item.field;
+        if (item.param == param and pathCoveredByStore(path, stored)) drops += 1;
+    }
+    if (drops == 0) return items;
+    var kept: std.ArrayListUnmanaged(T) = .empty;
+    errdefer kept.deinit(arena);
+    for (items) |item| {
+        const path = if (T == ParamPath) item.path else item.field;
+        if (item.param == param and pathCoveredByStore(path, stored)) continue;
+        try kept.append(arena, item);
+    }
+    return kept.toOwnedSlice(arena);
+}
+
+/// Trace work shares the walker/callee allowance. The node pointer follows
+/// recursive walks, so array copying failures retain the active source site.
+const CleanupWork = struct {
+    context: *anyopaque,
+    node: *const Ast.Node.Index,
+    charge_fn: *const fn (*anyopaque, Ast.Node.Index, usize) CleanupError!void,
+
+    fn init(cache: anytype, node: *const Ast.Node.Index) CleanupWork {
+        const Adapter = struct {
+            fn charge(context: *anyopaque, at: Ast.Node.Index, units: usize) CleanupError!void {
+                const typed: @TypeOf(cache) = @ptrCast(@alignCast(context));
+                try typed.normalCleanupStorageWork(at, units);
+            }
+        };
+        return .{ .context = @ptrCast(cache), .node = node, .charge_fn = Adapter.charge };
+    }
+};
+
+fn cleanupCharge(work: ?CleanupWork, units: usize) CleanupError!void {
+    if (units == 0) return;
+    if (work) |budget| try budget.charge_fn(budget.context, budget.node.*, units);
+}
+
+fn cleanupAddStorageValue(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    work: ?CleanupWork,
+    items: []const T,
+    value: T,
+) CleanupError![]const T {
+    try cleanupCharge(work, items.len);
+    if (cleanupContains(T, items, value)) return items;
+    try cleanupCharge(work, items.len + 1);
+    const out = try arena.alloc(T, items.len + 1);
+    @memcpy(out[0..items.len], items);
+    out[items.len] = value;
+    return out;
+}
+
+const CleanupSnapshot = struct {
+    token: Ast.TokenIndex,
+    path: ?ParamPath,
+    version: usize = 0,
+    fresh_token: ?Ast.TokenIndex = null,
+    released: bool = false,
+    projection_current: bool = false,
+    projection_ambiguous: bool = false,
+    projection_operation_count: ?usize = null,
+    from_snapshot: bool = false,
+    identity_proved: bool = true,
+};
+
+const CleanupAlternative = struct {
+    operations: []const StorageOperation = &.{},
+    snapshots: []const CleanupSnapshot = &.{},
+    uncertain_stores: []const ParamPath = &.{},
+    work: ?CleanupWork = null,
+
+    fn uncertain(self: CleanupAlternative, path: ParamPath) CleanupError!bool {
+        try cleanupCharge(self.work, self.uncertain_stores.len);
+        for (self.uncertain_stores) |stored| {
+            if (stored.param == path.param and
+                (pathCoveredByStore(path.path, stored.path) or pathCoveredByStore(stored.path, path.path))) return true;
+        }
+        return false;
+    }
+
+    fn released(self: CleanupAlternative, path: ParamPath, payload_version: usize) CleanupError!bool {
+        try cleanupCharge(self.work, self.operations.len);
+        var current: usize = 0;
+        for (self.operations) |operation| {
+            if (!cleanupEqual(ParamPath, operation.path, path)) continue;
+            switch (operation.kind) {
+                .replace => current += 1,
+                .release_entry => if (payload_version == 0) return true,
+                .release_current => if (payload_version == (operation.version orelse current)) return true,
+            }
+        }
+        return false;
+    }
+
+    fn version(self: CleanupAlternative, path: ParamPath) CleanupError!usize {
+        try cleanupCharge(self.work, self.operations.len);
+        var result: usize = 0;
+        for (self.operations) |operation| {
+            if (operation.kind == .replace and cleanupEqual(ParamPath, operation.path, path)) result += 1;
+        }
+        return result;
+    }
+
+    fn append(self: *CleanupAlternative, arena: std.mem.Allocator, operation: StorageOperation) CleanupError!void {
+        try cleanupCharge(self.work, self.operations.len + 1);
+        const operations = try arena.alloc(StorageOperation, self.operations.len + 1);
+        @memcpy(operations[0..self.operations.len], self.operations);
+        operations[self.operations.len] = operation;
+        self.operations = operations;
+    }
+
+    fn snapshot(self: *CleanupAlternative, arena: std.mem.Allocator, value: CleanupSnapshot) CleanupError!void {
+        try cleanupCharge(self.work, self.snapshots.len + 1);
+        const snapshots = try arena.alloc(CleanupSnapshot, self.snapshots.len + 1);
+        @memcpy(snapshots[0..self.snapshots.len], self.snapshots);
+        snapshots[self.snapshots.len] = value;
+        self.snapshots = snapshots;
+    }
+};
+/// Presence is independent of an empty effect set: the first empty exit must
+/// still participate in every later intersection.
+const CleanupState = struct {
+    present: bool = false,
+    complete: bool = true,
+    definite_paths: []const ParamPath = &.{},
+    may_paths: []const ParamPath = &.{},
+    definite_fields: []const FieldFree = &.{},
+    may_fields: []const FieldFree = &.{},
+    retained: []const u32 = &.{},
+    storage_complete: bool = true,
+    alternatives: []const CleanupAlternative = &.{.{}},
+    work: ?CleanupWork = null,
+    observed_paths: []const ParamPath = &.{},
+    observed_fields: []const FieldFree = &.{},
+
+    fn observeReleases(self: *CleanupState, arena: std.mem.Allocator, paths: []const ParamPath, fields: []const FieldFree) CleanupError!void {
+        try cleanupCharge(self.work, paths.len + fields.len);
+        for (paths) |path| self.observed_paths = try cleanupAddStorageValue(ParamPath, arena, self.work, self.observed_paths, path);
+        for (fields) |field| self.observed_fields = try cleanupAddStorageValue(FieldFree, arena, self.work, self.observed_fields, field);
+    }
+
+    /// Exact traces distinguish old from current storage. If the trace cannot
+    /// be replayed, retain every observed release as conservative MAY evidence.
+    fn includeIncompleteReleases(self: *CleanupState, arena: std.mem.Allocator) CleanupError!void {
+        if (!self.present or self.storage_complete) return;
+        try cleanupCharge(self.work, self.observed_paths.len + self.observed_fields.len);
+        for (self.observed_paths) |path| self.may_paths = try cleanupAddStorageValue(ParamPath, arena, self.work, self.may_paths, path);
+        for (self.observed_fields) |field| self.may_fields = try cleanupAddStorageValue(FieldFree, arena, self.work, self.may_fields, field);
+        try self.filterRetention(arena);
+    }
+
+    fn invalidate(self: *CleanupState) void {
+        self.storage_complete = false;
+        self.invalidateLegacy();
+    }
+
+    fn invalidateLegacy(self: *CleanupState) void {
+        self.complete = false;
+        self.definite_paths = &.{};
+        self.definite_fields = &.{};
+        self.retained = &.{};
+    }
+
+    fn merge(self: *CleanupState, arena: std.mem.Allocator, other: CleanupState) CleanupError!void {
+        if (!other.present) return;
+        if (!self.present) {
+            self.* = other;
+            return;
+        }
+        if (self.alternatives.ptr != other.alternatives.ptr or self.alternatives.len != other.alternatives.len) {
+            try cleanupCharge(self.work, self.alternatives.len + other.alternatives.len);
+            const alternatives = try arena.alloc(CleanupAlternative, self.alternatives.len + other.alternatives.len);
+            @memcpy(alternatives[0..self.alternatives.len], self.alternatives);
+            @memcpy(alternatives[self.alternatives.len..], other.alternatives);
+            self.alternatives = alternatives;
+        }
+        self.storage_complete = self.storage_complete and other.storage_complete;
+        try self.observeReleases(arena, other.observed_paths, other.observed_fields);
+        self.definite_paths = try cleanupIntersection(
+            ParamPath,
+            arena,
+            self.definite_paths,
+            other.definite_paths,
+        );
+        self.definite_fields = try cleanupIntersection(
+            FieldFree,
+            arena,
+            self.definite_fields,
+            other.definite_fields,
+        );
+        self.retained = try cleanupIntersection(u32, arena, self.retained, other.retained);
+        self.may_paths = try cleanupUnion(ParamPath, arena, self.may_paths, other.may_paths);
+        self.may_fields = try cleanupUnion(FieldFree, arena, self.may_fields, other.may_fields);
+        if (!other.complete) self.invalidateLegacy();
+    }
+
+    fn isReleased(self: CleanupState, param: u32) bool {
+        for (self.may_paths) |path| if (path.param == param) return true;
+        for (self.may_fields) |field| if (field.param == param) return true;
+        return false;
+    }
+
+    /// A store to `param.path` replaces the value a release handed back, so
+    /// the storage at that path (or below it) is no longer the released
+    /// allocation on this path: `free(self.buf); self.buf = fresh;` leaves
+    /// the receiver holding live storage.  A release elsewhere on another
+    /// path is untouched, and joins still union the releases of the paths
+    /// that did not store.
+    fn reassign(
+        self: *CleanupState,
+        arena: std.mem.Allocator,
+        param: u32,
+        path: []const u8,
+    ) error{OutOfMemory}!void {
+        self.definite_paths = try withoutStored(ParamPath, arena, self.definite_paths, param, path);
+        self.may_paths = try withoutStored(ParamPath, arena, self.may_paths, param, path);
+        self.definite_fields = try withoutStored(FieldFree, arena, self.definite_fields, param, path);
+        self.may_fields = try withoutStored(FieldFree, arena, self.may_fields, param, path);
+    }
+
+    fn filterRetention(self: *CleanupState, arena: std.mem.Allocator) error{OutOfMemory}!void {
+        var changed = false;
+        for (self.retained) |param| {
+            if (self.isReleased(param)) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) return;
+        var kept: std.ArrayListUnmanaged(u32) = .empty;
+        defer kept.deinit(arena);
+        for (self.retained) |param| {
+            if (!self.isReleased(param)) try kept.append(arena, param);
+        }
+        self.retained = try kept.toOwnedSlice(arena);
+    }
+
+    fn addEffects(
+        self: *CleanupState,
+        arena: std.mem.Allocator,
+        definite_paths: []const ParamPath,
+        definite_fields: []const FieldFree,
+        may_paths: []const ParamPath,
+        may_fields: []const FieldFree,
+        complete: bool,
+    ) CleanupError!void {
+        if (!self.present) return;
+        try self.observeReleases(arena, definite_paths, definite_fields);
+        try self.observeReleases(arena, may_paths, may_fields);
+        self.may_paths = try cleanupUnion(ParamPath, arena, self.may_paths, may_paths);
+        self.may_paths = try cleanupUnion(ParamPath, arena, self.may_paths, definite_paths);
+        self.may_fields = try cleanupUnion(FieldFree, arena, self.may_fields, may_fields);
+        self.may_fields = try cleanupUnion(FieldFree, arena, self.may_fields, definite_fields);
+        if (self.complete and complete) {
+            self.definite_paths = try cleanupUnion(
+                ParamPath,
+                arena,
+                self.definite_paths,
+                definite_paths,
+            );
+            self.definite_fields = try cleanupUnion(
+                FieldFree,
+                arena,
+                self.definite_fields,
+                definite_fields,
+            );
+            try self.filterRetention(arena);
+        } else {
+            self.invalidateLegacy();
+        }
+    }
+
+    fn composeStorage(
+        self: *CleanupState,
+        arena: std.mem.Allocator,
+        outcomes: []const StorageOutcome,
+        complete: bool,
+    ) CleanupError!void {
+        if (!self.present) return;
+        self.storage_complete = self.storage_complete and complete;
+        if (!complete or outcomes.len == 0) return;
+        const product = @mulWithOverflow(self.alternatives.len, outcomes.len);
+        if (product[1] != 0) {
+            try cleanupCharge(self.work, std.math.maxInt(usize));
+            return error.AnalysisBudgetExceeded;
+        }
+        const count = product[0];
+        try cleanupCharge(self.work, count);
+        const alternatives = try arena.alloc(CleanupAlternative, count);
+        var index: usize = 0;
+        for (self.alternatives) |prefix| {
+            for (outcomes) |outcome| {
+                try cleanupCharge(self.work, outcome.operations.len);
+                var alternative = prefix;
+                for (outcome.operations) |operation| {
+                    var mapped = operation;
+                    if (try alternative.uncertain(operation.path)) self.storage_complete = false;
+                    if (operation.kind != .replace)
+                        mapped.identity_proved = mapped.identity_proved and self.storage_complete;
+                    const current_version = try alternative.version(operation.path);
+                    const entry_version = try prefix.version(operation.path);
+                    switch (operation.kind) {
+                        .replace => {
+                            if (operation.allocator == null) self.storage_complete = false;
+                        },
+                        .release_entry => {
+                            mapped.kind = if (entry_version == 0) .release_entry else .release_current;
+                            mapped.version = entry_version;
+                        },
+                        .release_current => {
+                            const version = if (operation.version) |relative|
+                                entry_version + relative
+                            else
+                                current_version;
+                            if (version > current_version) self.storage_complete = false;
+                            mapped.kind = if (version == 0) .release_entry else .release_current;
+                            mapped.version = version;
+                        },
+                    }
+                    try alternative.append(arena, mapped);
+                }
+                alternatives[index] = alternative;
+                index += 1;
+            }
+        }
+        self.alternatives = alternatives;
+    }
+
+    fn storageOutcomes(self: CleanupState, arena: std.mem.Allocator) CleanupError![]const StorageOutcome {
+        if (!self.present) return &.{};
+        try cleanupCharge(self.work, self.alternatives.len);
+        const outcomes = try arena.alloc(StorageOutcome, self.alternatives.len);
+        for (self.alternatives, outcomes) |alternative, *outcome| {
+            outcome.* = .{ .operations = alternative.operations };
+        }
+        return outcomes;
+    }
+};
+
+/// An error-valued expression is not an exit until return or try propagates it.
+/// Catch handles that value without running the enclosing scope's errdefers.
+const CleanupFlow = struct {
+    next: CleanupState = .{},
+    error_value: CleanupState = .{},
+    normal_exit: CleanupState = .{},
+    error_exit: CleanupState = .{},
+    value_known: bool = true,
+
+    fn merge(self: *CleanupFlow, arena: std.mem.Allocator, other: CleanupFlow) CleanupError!void {
+        try self.next.merge(arena, other.next);
+        try self.error_value.merge(arena, other.error_value);
+        try self.normal_exit.merge(arena, other.normal_exit);
+        try self.error_exit.merge(arena, other.error_exit);
+        self.value_known = self.value_known and other.value_known;
+    }
+
+    fn continuing(self: CleanupFlow, arena: std.mem.Allocator) CleanupError!CleanupState {
+        var state = self.next;
+        try state.merge(arena, self.error_value);
+        return state;
+    }
+};
+
+const CleanupDefer = struct {
+    body: Ast.Node.Index,
+    error_only: bool,
+};
+
+fn CleanupWalker(comptime Cache: type) type {
+    return struct {
+        const Self = @This();
+        cache: Cache,
+        arena: std.mem.Allocator,
+        tree: *const Ast,
+        proto: Ast.full.FnProto,
+        bindings: *const local_bindings.LocalBindings,
+        active_node: Ast.Node.Index,
+
+        fn classifyValue(self: *Self, node: Ast.Node.Index, flow: *CleanupFlow) CleanupError!void {
+            if (flow.value_known) return;
+            const state = try flow.continuing(self.arena);
+            if (!state.present) return;
+            const kind = try self.cache.normalCleanupReturnKind(node);
+            flow.next = .{};
+            flow.error_value = .{};
+            if (kind) |is_error| {
+                if (is_error) {
+                    flow.error_value = state;
+                } else {
+                    flow.next = state;
+                }
+            } else {
+                var unknown = state;
+                unknown.invalidate();
+                flow.next = unknown;
+                flow.error_value = unknown;
+            }
+            flow.value_known = true;
+        }
+
+        fn addRetention(self: *Self, state: *CleanupState, node: Ast.Node.Index) CleanupError!void {
+            if (!state.present or !state.complete) return;
+            const retained = try self.cache.retainedStorageAt(
+                self.arena,
+                self.proto,
+                self.bindings,
+                node,
+            );
+            state.retained = try cleanupUnion(u32, self.arena, state.retained, retained);
+            // Previously observed MAY releases also rule out retention proof.
+            try state.filterRetention(self.arena);
+        }
+
+        fn storageIdentity(self: *Self, node: Ast.Node.Index, alternative: CleanupAlternative) CleanupError!CleanupSnapshot {
+            var expression = node;
+            while (true) {
+                try self.cache.normalCleanupStorageWork(expression, 1);
+                switch (self.tree.nodeTag(expression)) {
+                    .grouped_expression => expression = self.tree.nodeData(expression).node_and_token[0],
+                    .address_of, .@"try" => expression = self.tree.nodeData(expression).node,
+                    else => break,
+                }
+            }
+            const first = self.tree.firstToken(expression);
+            const last = self.tree.lastToken(expression);
+            const token_count = try checkedTokenCount(self.tree.source.len, self.tree.tokens.len);
+            var projection_ambiguous = false;
+            var projected_snapshot: ?CleanupSnapshot = null;
+            if (self.tree.tokens.items(.tag)[first] == .identifier) {
+                if (nameAtUse(self.bindings, self.tree, self.proto, self.tree.tokenSlice(first), first, token_count)) |decl| {
+                    switch (decl) {
+                        .local => |binding| {
+                            try cleanupCharge(alternative.work, alternative.snapshots.len);
+                            var index = alternative.snapshots.len;
+                            while (index > 0) {
+                                index -= 1;
+                                var snapshot = alternative.snapshots[index];
+                                if (snapshot.token != binding.name_token) continue;
+                                if (first == last) {
+                                    if (snapshot.path) |path| snapshot.released = try alternative.released(path, snapshot.version);
+                                    return snapshot;
+                                }
+                                // Only an authenticated pointer alias projects
+                                // onto a current field. A copied aggregate's
+                                // field may still carry an entry payload.
+                                projection_ambiguous = !snapshot.projection_current;
+                                if (snapshot.path == null) return .{ .token = first, .path = null, .projection_ambiguous = true };
+                                if (snapshot.projection_operation_count != null)
+                                    projected_snapshot = snapshot;
+                                break;
+                            }
+                        },
+                        .clause => {},
+                    }
+                }
+            }
+            const owner = try ownerOfExpr(self.arena, self.tree, self.proto, self.bindings, first, last, 0);
+            return switch (owner) {
+                .param => |path| blk: {
+                    var version = try alternative.version(path);
+                    var from_snapshot = false;
+                    var identity_proved = true;
+                    if (projected_snapshot) |snapshot| {
+                        const source = snapshot.path.?;
+                        const suffix = if (source.path.len == 0)
+                            path.path
+                        else if (path.path.len > source.path.len and
+                            std.mem.startsWith(u8, path.path, source.path) and
+                            path.path[source.path.len] == '.')
+                            path.path[source.path.len + 1 ..]
+                        else
+                            "";
+                        // A direct member's header was copied with the
+                        // aggregate. Deeper projections may dereference a
+                        // pointer member, so they still require type proof.
+                        if (source.param == path.param and suffix.len != 0 and
+                            std.mem.indexOfScalar(u8, suffix, '.') == null)
+                        {
+                            var at_copy = alternative;
+                            at_copy.operations = alternative.operations[0..snapshot.projection_operation_count.?];
+                            version = try at_copy.version(path);
+                            from_snapshot = true;
+                            identity_proved = snapshot.identity_proved;
+                            projection_ambiguous = false;
+                        }
+                    }
+                    var projection_current = self.tree.nodeTag(node) == .address_of;
+                    if (self.tree.nodeTag(expression) == .identifier and path.path.len == 0) {
+                        var parameters = self.proto.iterate(self.tree);
+                        while (parameters.next()) |parameter| {
+                            try self.cache.normalCleanupStorageWork(expression, 1);
+                            const name = parameter.name_token orelse continue;
+                            if (!std.mem.eql(u8, self.tree.tokenSlice(name), self.tree.tokenSlice(first))) continue;
+                            const type_node = parameter.type_expr orelse break;
+                            const pointer = self.tree.fullPtrType(type_node) orelse break;
+                            projection_current = pointer.size == .one;
+                            break;
+                        }
+                    }
+                    break :blk .{
+                        .token = first,
+                        .path = try cleanupOwnedPath(self.arena, alternative.work, path),
+                        .version = version,
+                        .released = try alternative.released(path, version),
+                        .projection_current = projection_current,
+                        .projection_ambiguous = projection_ambiguous,
+                        .from_snapshot = from_snapshot,
+                        .identity_proved = identity_proved,
+                    };
+                },
+                .unknown => .{ .token = first, .path = null },
+            };
+        }
+
+        fn bindSnapshot(self: *Self, state: *CleanupState, token: Ast.TokenIndex, expression: Ast.Node.Index) CleanupError!void {
+            if (!state.present) return;
+            try cleanupCharge(state.work, state.alternatives.len * 2);
+            const alternatives = try self.arena.dupe(CleanupAlternative, state.alternatives);
+            for (alternatives) |*alternative| {
+                var identity = try self.storageIdentity(expression, alternative.*);
+                identity.token = token;
+                if (!identity.from_snapshot) {
+                    identity.identity_proved = identity.identity_proved and state.storage_complete;
+                    if (identity.path) |path|
+                        identity.identity_proved = identity.identity_proved and !try alternative.uncertain(path);
+                }
+                identity.from_snapshot = true;
+                if (!identity.projection_current and identity.path != null and
+                    identity.projection_operation_count == null)
+                    identity.projection_operation_count = alternative.operations.len;
+                if (identity.path == null and identity.fresh_token == null and try self.cache.normalCleanupFresh(expression))
+                    identity.fresh_token = token;
+                try alternative.snapshot(self.arena, identity);
+            }
+            state.alternatives = alternatives;
+        }
+
+        /// Only an exact fresh-storage certificate can revive a receiver path.
+        /// Reusing the saved old header must retain its observed release.
+        fn reassignOwned(self: *Self, node: Ast.Node.Index, state: *CleanupState) CleanupError!void {
+            if (!state.present) return;
+            const lhs, const rhs = self.tree.nodeData(node).node_and_node;
+            // An element or slice-payload write does not rebind its header.
+            // Keep observed release evidence, but do not invent a new owner.
+            if (self.tree.nodeTag(lhs) == .array_access) return;
+            if (self.tree.nodeTag(lhs) == .deref and
+                self.tree.fullSlice(self.tree.nodeData(lhs).node) != null) return;
+            if (self.tree.nodeTag(lhs) == .identifier) {
+                const first = self.tree.firstToken(lhs);
+                const token_count = try checkedTokenCount(self.tree.source.len, self.tree.tokens.len);
+                if (nameAtUse(self.bindings, self.tree, self.proto, self.tree.tokenSlice(first), first, token_count)) |decl| {
+                    switch (decl) {
+                        .local => |binding| {
+                            try self.bindSnapshot(state, binding.name_token, rhs);
+                            return;
+                        },
+                        .clause => {},
+                    }
+                }
+            }
+            const owner = try ownerOfExpr(self.arena, self.tree, self.proto, self.bindings, self.tree.firstToken(lhs), self.tree.lastToken(lhs), 0);
+            switch (owner) {
+                .param => |borrowed| {
+                    const stored = try cleanupOwnedPath(self.arena, state.work, borrowed);
+                    const certified = try self.cache.normalCleanupFresh(rhs);
+                    const allocator = if (certified) try self.cache.normalCleanupAllocator(rhs) else null;
+                    if (certified and allocator == null) state.storage_complete = false;
+                    const owned_allocator = if (allocator) |path| try cleanupOwnedPath(self.arena, state.work, path) else null;
+                    try cleanupCharge(state.work, state.alternatives.len * 2);
+                    const alternatives = try self.arena.dupe(CleanupAlternative, state.alternatives);
+                    var live_replacement = certified;
+                    var released_store = false;
+                    for (alternatives) |*alternative| {
+                        const identity = try self.storageIdentity(rhs, alternative.*);
+                        if (identity.released) {
+                            released_store = true;
+                            live_replacement = false;
+                        }
+                        if (identity.path != null) live_replacement = false;
+                        if (!certified or identity.released or identity.path != null) {
+                            alternative.uncertain_stores = try cleanupAddStorageValue(ParamPath, self.arena, state.work, alternative.uncertain_stores, stored);
+                            try cleanupCharge(state.work, alternative.operations.len + alternative.snapshots.len);
+                            for (alternative.operations) |operation| {
+                                if (operation.path.param == stored.param and
+                                    (pathCoveredByStore(operation.path.path, stored.path) or pathCoveredByStore(stored.path, operation.path.path)))
+                                    state.storage_complete = false;
+                            }
+                            for (alternative.snapshots) |snapshot| {
+                                if (snapshot.path) |path| {
+                                    if (path.param == stored.param and
+                                        (pathCoveredByStore(path.path, stored.path) or pathCoveredByStore(stored.path, path.path)))
+                                        state.storage_complete = false;
+                                }
+                            }
+                            if (identity.released) state.storage_complete = false;
+                            continue;
+                        }
+                        if (try alternative.uncertain(stored)) state.storage_complete = false;
+                        try alternative.append(self.arena, .{ .path = stored, .kind = .replace, .allocator = owned_allocator });
+                        if (identity.fresh_token) |fresh_token| {
+                            const previous = alternative.snapshots;
+                            try cleanupCharge(state.work, previous.len);
+                            for (previous) |snapshot| {
+                                if (snapshot.fresh_token != fresh_token) continue;
+                                var published = snapshot;
+                                published.path = stored;
+                                published.version = try alternative.version(stored);
+                                try alternative.snapshot(self.arena, published);
+                            }
+                        }
+                    }
+                    state.alternatives = alternatives;
+                    if (live_replacement) {
+                        try state.reassign(self.arena, stored.param, stored.path);
+                    } else if (released_store) {
+                        try state.addEffects(self.arena, &.{}, &.{}, &.{stored}, &.{}, true);
+                    }
+                },
+                .unknown => {},
+            }
+        }
+
+        fn releaseStorage(self: *Self, state: *CleanupState, argument: Ast.Node.Index) CleanupError!void {
+            try cleanupCharge(state.work, state.alternatives.len * 2);
+            const alternatives = try self.arena.dupe(CleanupAlternative, state.alternatives);
+            var current_paths: []const ParamPath = &.{};
+            var definite_current: ?ParamPath = null;
+            var definite_initialized = false;
+            for (alternatives) |*alternative| {
+                const identity = try self.storageIdentity(argument, alternative.*);
+                var released_current: ?ParamPath = null;
+                if (identity.path) |path| {
+                    try state.observeReleases(self.arena, &.{path}, &.{});
+                    if (identity.projection_ambiguous) state.storage_complete = false;
+                    if (try alternative.uncertain(path)) state.storage_complete = false;
+                    const current_version = try alternative.version(path);
+                    const current = !identity.projection_ambiguous and identity.version == current_version;
+                    if (current) {
+                        released_current = path;
+                        current_paths = try cleanupAddStorageValue(ParamPath, self.arena, state.work, current_paths, path);
+                    }
+                    try alternative.append(self.arena, .{
+                        .path = path,
+                        .kind = if (identity.version == 0) .release_entry else .release_current,
+                        .version = identity.version,
+                        .identity_proved = !identity.projection_ambiguous and
+                            if (identity.from_snapshot) identity.identity_proved else
+                            state.storage_complete and !try alternative.uncertain(path),
+                    });
+                } else {
+                    released_current = null;
+                    if (identity.fresh_token == null and !try self.cache.normalCleanupFresh(argument)) {
+                        state.storage_complete = false;
+                        state.invalidateLegacy();
+                    }
+                }
+                if (identity.fresh_token) |fresh_token| {
+                    const previous = alternative.snapshots;
+                    try cleanupCharge(state.work, previous.len);
+                    for (previous) |snapshot| {
+                        if (snapshot.fresh_token != fresh_token) continue;
+                        var released_snapshot = snapshot;
+                        released_snapshot.released = true;
+                        try alternative.snapshot(self.arena, released_snapshot);
+                    }
+                }
+                try cleanupCharge(state.work, 1);
+                if (!definite_initialized) {
+                    definite_current = released_current;
+                    definite_initialized = true;
+                } else if (definite_current) |previous| {
+                    if (released_current) |path| {
+                        if (!cleanupEqual(ParamPath, previous, path)) definite_current = null;
+                    } else {
+                        definite_current = null;
+                    }
+                }
+            }
+            state.alternatives = alternatives;
+            const definite_paths = if (definite_current) |path|
+                try cleanupAddStorageValue(ParamPath, self.arena, state.work, &.{}, path)
+            else
+                &.{};
+            try state.addEffects(self.arena, definite_paths, &.{}, current_paths, &.{}, true);
+        }
+
+        fn runDefers(
+            self: *Self,
+            initial: CleanupState,
+            registered: []const CleanupDefer,
+            error_exit: bool,
+        ) CleanupError!CleanupState {
+            var state = initial;
+            var index = registered.len;
+            while (index > 0 and state.present) {
+                index -= 1;
+                const cleanup = registered[index];
+                if (cleanup.error_only and !error_exit) continue;
+                const flow = try self.walk(cleanup.body, state);
+                state = try flow.continuing(self.arena);
+                // Zig disallows escaping a defer. Robustness input must not
+                // turn such an escape into a successful certificate.
+                if (flow.normal_exit.present or flow.error_exit.present) {
+                    try state.merge(self.arena, flow.normal_exit);
+                    try state.merge(self.arena, flow.error_exit);
+                    state.invalidate();
+                }
+            }
+            return state;
+        }
+
+        fn walkBlock(self: *Self, node: Ast.Node.Index, initial: CleanupState) CleanupError!CleanupFlow {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = self.tree.blockStatements(&buffer, node).?;
+            var registered: std.ArrayListUnmanaged(CleanupDefer) = .empty;
+            defer registered.deinit(self.arena);
+            var state = initial;
+            var out = CleanupFlow{};
+            for (statements) |statement| {
+                if (!state.present) break;
+                const tag = self.tree.nodeTag(statement);
+                if (tag == .@"defer" or tag == .@"errdefer") {
+                    try self.cache.enterNormalCleanup(statement);
+                    defer self.cache.leaveNormalCleanup();
+                    try self.cache.chargeNormalCleanup(statement);
+                    const body = if (tag == .@"defer")
+                        self.tree.nodeData(statement).node
+                    else
+                        self.tree.nodeData(statement).opt_token_and_node[1];
+                    try registered.append(self.arena, .{
+                        .body = body,
+                        .error_only = tag == .@"errdefer",
+                    });
+                    continue;
+                }
+                const flow = try self.walk(statement, state);
+                try out.normal_exit.merge(self.arena, try self.runDefers(
+                    flow.normal_exit,
+                    registered.items,
+                    false,
+                ));
+                try out.error_exit.merge(self.arena, try self.runDefers(
+                    flow.error_exit,
+                    registered.items,
+                    true,
+                ));
+                // Discarding an error union is not returning an error.
+                state = try flow.continuing(self.arena);
+            }
+            out.next = try self.runDefers(state, registered.items, false);
+            return out;
+        }
+
+        fn walkChildren(self: *Self, node: Ast.Node.Index, initial: CleanupState) CleanupError!CleanupFlow {
+            var out = CleanupFlow{ .next = initial };
+            var children = CleanupIterator.init(self.tree, node);
+            while (children.next(self.tree)) |child| {
+                const state = try out.continuing(self.arena);
+                if (!state.present) break;
+                const flow = try self.walk(child, state);
+                try out.normal_exit.merge(self.arena, flow.normal_exit);
+                try out.error_exit.merge(self.arena, flow.error_exit);
+                out.next = try flow.continuing(self.arena);
+                out.error_value = .{};
+            }
+            return out;
+        }
+
+        fn walkCall(self: *Self, node: Ast.Node.Index, initial: CleanupState) CleanupError!CleanupFlow {
+            // A failed try in an argument never invokes the outer call.
+            var out = try self.walkChildren(node, initial);
+            var prefix = out.next;
+            out.next = .{};
+            if (!prefix.present) return out;
+            // The callback has no retained-field preservation contract.
+            // A call can overwrite a destination established by an earlier store.
+            prefix.retained = &.{};
+            const call = try self.cache.normalCleanupCall(
+                self.arena,
+                self.proto,
+                self.bindings,
+                node,
+            );
+            if (call.can_normal and call.returns_error != true) {
+                out.next = prefix;
+                if (call.release_argument) |argument| {
+                    try self.releaseStorage(&out.next, argument);
+                    out.next.storage_complete = out.next.storage_complete and call.storage_complete;
+                } else {
+                    try out.next.addEffects(self.arena, call.definite_paths, call.definite_fields, call.may_paths, call.may_fields, call.complete);
+                    try out.next.composeStorage(self.arena, call.storage_outcomes, call.storage_complete);
+                }
+            }
+            if (call.can_error and call.returns_error != false) {
+                out.error_value = prefix;
+                try out.error_value.addEffects(self.arena, call.error_definite_paths, call.error_definite_fields, call.error_may_paths, call.error_may_fields, call.error_complete);
+                try out.error_value.composeStorage(self.arena, call.error_storage_outcomes, call.error_storage_complete);
+            }
+            return out;
+        }
+
+        fn walkIf(self: *Self, node: Ast.Node.Index, initial: CleanupState) CleanupError!CleanupFlow {
+            const branch = self.tree.fullIf(node).?;
+            var condition = try self.walk(branch.ast.cond_expr, initial);
+            const error_condition = branch.error_token != null;
+            if (error_condition) try self.classifyValue(branch.ast.cond_expr, &condition);
+            var out = CleanupFlow{
+                .normal_exit = condition.normal_exit,
+                .error_exit = condition.error_exit,
+            };
+            const state = if (error_condition)
+                condition.next
+            else
+                try condition.continuing(self.arena);
+            var known: ?bool = null;
+            if (branch.payload_token == null and
+                self.tree.nodeTag(branch.ast.cond_expr) == .identifier)
+            {
+                const text = self.tree.tokenSlice(
+                    self.tree.nodeMainToken(branch.ast.cond_expr),
+                );
+                if (std.mem.eql(u8, text, "true")) known = true;
+                if (std.mem.eql(u8, text, "false")) known = false;
+            }
+            if (known == null and branch.payload_token == null and !error_condition)
+                known = try self.cache.normalCleanupCondition(branch.ast.cond_expr);
+            if (known != false and state.present) {
+                try out.merge(self.arena, try self.walk(branch.ast.then_expr, state));
+            }
+            const else_state = if (error_condition) condition.error_value else state;
+            if (known != true and else_state.present) {
+                if (branch.ast.else_expr.unwrap()) |else_node| {
+                    try out.merge(self.arena, try self.walk(else_node, else_state));
+                } else {
+                    try out.next.merge(self.arena, else_state);
+                }
+            }
+            return out;
+        }
+
+        fn walkUnknown(self: *Self, node: Ast.Node.Index, initial: CleanupState) CleanupError!CleanupFlow {
+            // Independent children retain observed MAY effects without a
+            // claim that a loop iteration, switch arm, or jump always runs.
+            var state = initial;
+            state.invalidate();
+            var out = CleanupFlow{ .next = state, .value_known = false };
+            var children = CleanupIterator.init(self.tree, node);
+            while (children.next(self.tree)) |child| {
+                const flow = try self.walk(child, state);
+                try out.normal_exit.merge(self.arena, flow.normal_exit);
+                try out.error_exit.merge(self.arena, flow.error_exit);
+                var observed = try flow.continuing(self.arena);
+                try observed.merge(self.arena, flow.normal_exit);
+                try out.next.merge(self.arena, observed);
+            }
+            out.next.invalidate();
+            out.normal_exit.invalidate();
+            out.error_exit.invalidate();
+            return out;
+        }
+
+        fn walk(self: *Self, node: Ast.Node.Index, initial: CleanupState) CleanupError!CleanupFlow {
+            if (!initial.present) return .{};
+            const previous_node = self.active_node;
+            self.active_node = node;
+            defer self.active_node = previous_node;
+            try self.cache.enterNormalCleanup(node);
+            defer self.cache.leaveNormalCleanup();
+            try self.cache.chargeNormalCleanup(node);
+            const tag = self.tree.nodeTag(node);
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            if (self.tree.fullCall(&call_buffer, node) != null) {
+                return self.walkCall(node, initial);
+            }
+            switch (tag) {
+                .block, .block_semicolon, .block_two, .block_two_semicolon => return self.walkBlock(node, initial),
+                .@"if", .if_simple => return self.walkIf(node, initial),
+                .@"return" => {
+                    var flow = if (self.tree.nodeData(node).opt_node.unwrap()) |expression|
+                        try self.walk(expression, initial)
+                    else
+                        CleanupFlow{ .next = initial };
+                    if (self.tree.nodeData(node).opt_node.unwrap()) |expression| {
+                        try self.classifyValue(expression, &flow);
+                    }
+                    try self.addRetention(&flow.next, node);
+                    try flow.normal_exit.merge(self.arena, flow.next);
+                    try flow.error_exit.merge(self.arena, flow.error_value);
+                    flow.next = .{};
+                    flow.error_value = .{};
+                    return flow;
+                },
+                .@"try" => {
+                    const expression = self.tree.nodeData(node).node;
+                    var flow = try self.walk(expression, initial);
+                    try self.classifyValue(expression, &flow);
+                    try flow.error_exit.merge(self.arena, flow.error_value);
+                    flow.error_value = .{};
+                    return flow;
+                },
+                .@"catch" => {
+                    const lhs, const rhs = self.tree.nodeData(node).node_and_node;
+                    var flow = try self.walk(lhs, initial);
+                    try self.classifyValue(lhs, &flow);
+                    const failure = flow.error_value;
+                    flow.error_value = .{};
+                    if (failure.present) {
+                        try flow.merge(self.arena, try self.walk(rhs, failure));
+                    }
+                    return flow;
+                },
+                .grouped_expression => return self.walk(
+                    self.tree.nodeData(node).node_and_token[0],
+                    initial,
+                ),
+                .@"comptime", .@"nosuspend" => return self.walk(
+                    self.tree.nodeData(node).node,
+                    initial,
+                ),
+                .error_value => return .{ .error_value = initial },
+                .unreachable_literal => return .{},
+                .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing, .error_set_decl => return .{ .next = initial },
+                .bool_and, .bool_or => {
+                    const lhs, const rhs = self.tree.nodeData(node).node_and_node;
+                    var flow = try self.walk(lhs, initial);
+                    const state = try flow.continuing(self.arena);
+                    var known = try self.cache.normalCleanupCondition(lhs);
+                    if (known == null and self.tree.nodeTag(lhs) == .identifier) {
+                        const text = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
+                        if (std.mem.eql(u8, text, "true")) known = true;
+                        if (std.mem.eql(u8, text, "false")) known = false;
+                    }
+                    const short_circuit = if (tag == .bool_and) false else true;
+                    if (known != short_circuit) {
+                        const right = try self.walk(rhs, state);
+                        if (known == null) {
+                            try flow.merge(self.arena, right);
+                        } else {
+                            try flow.normal_exit.merge(self.arena, right.normal_exit);
+                            try flow.error_exit.merge(self.arena, right.error_exit);
+                            flow.next = right.next;
+                            flow.error_value = right.error_value;
+                        }
+                    }
+                    flow.value_known = true;
+                    return flow;
+                },
+                .@"while", .while_simple, .while_cont, .@"for", .for_simple, .@"switch", .switch_comma, .@"break", .@"continue", .@"defer", .@"errdefer", .@"suspend", .@"resume", .@"asm", .asm_simple, .@"orelse" => return self.walkUnknown(node, initial),
+                .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+                    const declaration = self.tree.fullVarDecl(node).?;
+                    var flow = if (declaration.ast.init_node.unwrap()) |expression|
+                        try self.walk(expression, initial)
+                    else
+                        CleanupFlow{ .next = initial };
+                    flow.next = try flow.continuing(self.arena);
+                    flow.error_value = .{};
+                    if (declaration.ast.init_node.unwrap()) |expression| {
+                        try self.bindSnapshot(&flow.next, declaration.ast.mut_token + 1, expression);
+                    }
+                    flow.value_known = true;
+                    return flow;
+                },
+                .assign, .assign_destructure => {
+                    var flow = try self.walkChildren(node, initial);
+                    try self.addRetention(&flow.next, node);
+                    if (tag == .assign) try self.reassignOwned(node, &flow.next);
+                    return flow;
+                },
+                .char_literal, .number_literal, .enum_literal, .string_literal, .multiline_string_literal => return .{ .next = initial },
+                else => {
+                    var flow = try self.walkChildren(node, initial);
+                    flow.value_known = switch (tag) {
+                        .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .array_init, .array_init_comma, .array_init_one, .array_init_one_comma, .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_not, .address_of => true,
+                        else => false,
+                    };
+                    // Indirect builtins can execute arbitrary code. Callbacks
+                    // authenticate fullCall nodes, never token spellings.
+                    switch (tag) {
+                        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => flow.next.invalidate(),
+                        else => {},
+                    }
+                    return flow;
+                },
+            }
+        }
+    };
+}
+
+/// The cache shares one node and nesting allowance across structural and
+/// callee recursion. Resource failures propagate; uncertainty removes positive
+/// claims but preserves observed MAY effects.
+pub fn inferNormalSuccessCleanup(
+    cache: anytype,
+    arena: std.mem.Allocator,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    body: Ast.Node.Index,
+) CleanupError!NormalSuccessEffects {
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    const tree = cache.tree;
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    _ = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    var walker = CleanupWalker(@TypeOf(cache)){
+        .cache = cache,
+        .arena = arena,
+        .tree = tree,
+        .proto = proto,
+        .bindings = bindings,
+        .active_node = body,
+    };
+    const work = CleanupWork.init(cache, &walker.active_node);
+    const initial_alternatives = [_]CleanupAlternative{.{ .work = work }};
+    var flow = try walker.walk(body, .{ .present = true, .work = work, .alternatives = &initial_alternatives });
+    // Blocks consume discarded error values themselves. A bare error-valued
+    // expression is not evidence of a successful function fallthrough.
+    try flow.normal_exit.merge(arena, flow.next);
+    var normal = flow.normal_exit;
+    var failure = flow.error_exit;
+    try normal.includeIncompleteReleases(arena);
+    try failure.includeIncompleteReleases(arena);
+    return .{
+        .definite_freed_paths = normal.definite_paths,
+        .may_freed_paths = normal.may_paths,
+        .definite_free_fields = normal.definite_fields,
+        .may_free_fields = normal.may_fields,
+        .complete = normal.present and normal.complete,
+        .retained_owned_params = normal.retained,
+        .error_definite_freed_paths = failure.definite_paths,
+        .error_may_freed_paths = failure.may_paths,
+        .error_definite_free_fields = failure.definite_fields,
+        .error_may_free_fields = failure.may_fields,
+        .error_complete = failure.present and failure.complete,
+        .storage_outcomes = try normal.storageOutcomes(arena),
+        .error_storage_outcomes = try failure.storageOutcomes(arena),
+        .storage_effects_complete = normal.present and normal.storage_complete,
+        .error_storage_effects_complete = failure.present and failure.storage_complete,
+    };
+}
+
 /// Derive the release and write paths this declaration's OWN body
 /// spells out.  `arena` owns the two result slices; their `path` texts
 /// borrow `tree`, so a consumer reading a FOREIGN declaration's answer
@@ -1154,6 +2490,7 @@ pub fn inferFieldEffects(
     bindings: *const local_bindings.LocalBindings,
     body: Ast.Node.Index,
 ) !FieldEffects {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
     var freed: std.ArrayListUnmanaged(ParamPath) = .empty;
     errdefer freed.deinit(arena);
     var written: std.ArrayListUnmanaged(ParamPath) = .empty;
@@ -1177,7 +2514,7 @@ pub fn inferFieldEffects(
         {
             const method = tree.tokenSlice(t + 1);
             if (std.mem.eql(u8, method, "free") or std.mem.eql(u8, method, "destroy")) {
-                const receiver: ?[]const u8 = if (t > first and tags[t - 1] == .identifier)
+                const receiver: ?[]const u8 = if (t > 0 and t > first and tags[t - 1] == .identifier)
                     tree.tokenSlice(t - 1)
                 else
                     null;
@@ -1185,7 +2522,16 @@ pub fn inferFieldEffects(
                     var arg = firstArgument(tags, t + 3, rp);
                     while (arg) |range| : (arg = nextArgument(tags, range.end, rp)) {
                         const path = paramPathFromOwner(
-                            try ownerOfExpr(arena, tree, proto, bindings, range.start, range.end, 0),
+                            try ownerOfExprWithTokenCount(
+                                arena,
+                                tree,
+                                proto,
+                                bindings,
+                                range.start,
+                                range.end,
+                                0,
+                                token_count,
+                            ),
                         ) orelse continue;
                         // A whole-value argument on an allocator-shaped
                         // receiver is the allocator being PASSED
@@ -1205,6 +2551,7 @@ pub fn inferFieldEffects(
             continue;
         }
         if (!isStoreOp(tags[t])) continue;
+        if (t == 0) continue;
         if (t == first) continue;
         // `self.* = other` names the parameter's whole storage, so the
         // range handed to the resolver stops before the `.*`.
@@ -1220,13 +2567,25 @@ pub fn inferFieldEffects(
         if (root > first and tags[root - 1] == .period) continue;
         const target_last = if (whole_object) root else t - 1;
         const path = paramPathFromOwner(
-            try ownerOfExpr(arena, tree, proto, bindings, root, target_last, 0),
+            try ownerOfExprWithTokenCount(
+                arena,
+                tree,
+                proto,
+                bindings,
+                root,
+                target_last,
+                0,
+                token_count,
+            ),
         ) orelse continue;
         try written.append(arena, if (whole_object) .{ .param = path.param, .path = "" } else path);
     }
+    const freed_paths = try freed.toOwnedSlice(arena);
+    errdefer arena.free(freed_paths);
+    const written_paths = try written.toOwnedSlice(arena);
     return .{
-        .freed_paths = try freed.toOwnedSlice(arena),
-        .written_paths = try written.toOwnedSlice(arena),
+        .freed_paths = freed_paths,
+        .written_paths = written_paths,
     };
 }
 
@@ -1339,24 +2698,11 @@ fn isStoreOp(tag: std.zig.Token.Tag) bool {
 /// self-referential binding.
 const max_owner_depth = 6;
 
-/// The error set the storage-rooting walks in this file carry, and the
-/// WHOLE of it: the one fallible step in them is `joinPath`, whose
-/// joined path has to be allocated, while every other question they
-/// ask is answered by reading the AST — a name this file cannot
-/// resolve is a `.unknown` charge, never an error.
-///
-/// It is spelled out because these walks are RECURSIVE: an alias chain
-/// is followed through what declared it and a callee reached through a
-/// call value chains too.  An inferred error set cannot be resolved
-/// through a cycle (langref, "Inferred Error Sets": inferred error sets
-/// are incompatible with recursion).  Two of them recurse BOTH ways —
-/// `ownerOfExpr` → `ownerOfBinding` → `ownerOfExpr`, and
-/// `placementOfExpr` → `placementOfCapture` → `placementOfExpr` — while
-/// `appendCalleeOperands` and `growOriginOfName` follow their own
-/// chains.  `anyerror` would compile and would claim nothing; this is
-/// the set `joinPath` really fails with, and the one every caller of
-/// these walks has always been handed.
-const WalkError = std.mem.Allocator.Error;
+/// The error set the storage-rooting walks in this file carry. AST-only
+/// questions return conservative answers; allocating joined paths can
+/// fail, and token-index admission can reject a source that is too wide.
+/// The explicit set is required because these walks recurse mutually.
+const WalkError = std.mem.Allocator.Error || error{SourceTooWide};
 
 /// Concatenate two dotted path segments.  `arena` owns the result; an
 /// empty side is returned unchanged (it is not copied).
@@ -1438,12 +2784,26 @@ pub fn ownerOfExpr(
     last: Ast.TokenIndex,
     depth: u8,
 ) WalkError!StorageOwner {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    return ownerOfExprWithTokenCount(arena, tree, proto, bindings, first, last, depth, token_count);
+}
+
+fn ownerOfExprWithTokenCount(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    depth: u8,
+    token_count: TokenIndex,
+) WalkError!StorageOwner {
     const tags = tree.tokens.items(.tag);
     if (first > last) return .unknown;
     // `&x` and `try x` wrap an expression without changing the storage
     // it names.
     switch (tags[first]) {
-        .ampersand, .keyword_try => return ownerOfExpr(
+        .ampersand, .keyword_try => return ownerOfExprWithTokenCount(
             arena,
             tree,
             proto,
@@ -1451,6 +2811,7 @@ pub fn ownerOfExpr(
             first + 1,
             last,
             depth,
+            token_count,
         ),
         else => {},
     }
@@ -1469,8 +2830,8 @@ pub fn ownerOfExpr(
     // parameter the value has stopped being.  `nameAtUse` also holds
     // an `else |e|` payload, which `bindings` never recorded and
     // which the parameter table must not answer for either.
-    if (nameAtUse(bindings, tree, proto, root, first)) |decl| {
-        return ownerOfBinding(arena, tree, proto, bindings, decl, fields, depth);
+    if (nameAtUse(bindings, tree, proto, root, first, token_count)) |decl| {
+        return ownerOfBinding(arena, tree, proto, bindings, decl, fields, depth, token_count);
     }
     if (paramIndex(tree, proto, root)) |idx| {
         return .{ .param = .{ .param = idx, .path = fields } };
@@ -1512,6 +2873,7 @@ fn nameAtUse(
     proto: Ast.full.FnProto,
     name: []const u8,
     use_token: TokenIndex,
+    token_count: TokenIndex,
 ) ?NameBinding {
     var best: ?NameBinding = null;
     var best_pos: TokenIndex = 0;
@@ -1521,7 +2883,7 @@ fn nameAtUse(
         if (b.origin == .param) continue;
         switch (b.origin) {
             .loop_capture => {
-                const body = captureBody(tree, proto, b.name_token) orelse continue;
+                const body = captureBody(tree, proto, b.name_token, token_count) orelse continue;
                 if (!body.contains(use_token)) continue;
             },
             else => if (use_token < b.scope_open or use_token > b.scope_close) continue,
@@ -1556,6 +2918,7 @@ fn ownerOfBinding(
     use: NameBinding,
     fields: []const u8,
     depth: u8,
+    token_count: TokenIndex,
 ) WalkError!StorageOwner {
     // Forwarding is what the alias rule exists for, and a chain this
     // long is charged rather than followed forever.
@@ -1574,7 +2937,7 @@ fn ownerOfBinding(
             // storage.  A clause the AST could not place is charged
             // the same way.
             if (b.origin == .loop_capture) {
-                const body = captureBody(tree, proto, b.name_token) orelse return .unknown;
+                const body = captureBody(tree, proto, b.name_token, token_count) orelse return .unknown;
                 if (!body.carries_scrutinee_storage) return .unknown;
             }
         },
@@ -1592,7 +2955,7 @@ fn ownerOfBinding(
         },
     }
     if (rhs_first > rhs_last) return .unknown;
-    const inner = try ownerOfExpr(
+    const inner = try ownerOfExprWithTokenCount(
         arena,
         tree,
         proto,
@@ -1600,6 +2963,7 @@ fn ownerOfBinding(
         rhs_first,
         rhs_last,
         depth + 1,
+        token_count,
     );
     return switch (inner) {
         .unknown => .unknown,
@@ -1667,11 +3031,11 @@ const BranchClause = struct {
 
 /// The block the capture whose identifier is at `name_token` is in
 /// scope in, or null when no node of this file places it.
-fn captureBody(tree: *const Ast, proto: Ast.full.FnProto, name_token: TokenIndex) ?BranchBody {
+fn captureBody(tree: *const Ast, proto: Ast.full.FnProto, name_token: TokenIndex, token_count: TokenIndex) ?BranchBody {
     if (nearestBranchClause(tree, proto, tree.tokenSlice(name_token), name_token, name_token)) |c| {
         return c.body;
     }
-    return catchClauseBody(tree, name_token);
+    return catchClauseBody(tree, name_token, token_count);
 }
 
 /// The token range a clause's payload was read out of, or null when
@@ -2000,9 +3364,9 @@ fn payloadNameToken(tree: *const Ast, payload: ?TokenIndex) ?TokenIndex {
 /// statement's.  A `catch` payload is a value the error path built,
 /// never the storage the expression beside it read from, so it is
 /// charged.
-fn catchClauseBody(tree: *const Ast, name_token: TokenIndex) ?BranchBody {
+fn catchClauseBody(tree: *const Ast, name_token: TokenIndex, token_count: TokenIndex) ?BranchBody {
     const tags = tree.tokens.items(.tag);
-    const end: TokenIndex = @intCast(tags.len);
+    const end = token_count;
     // Close the clause: the `|` in front of the body.
     var t: TokenIndex = name_token + 1;
     while (t < end and tags[t] != .pipe) {
@@ -2084,10 +3448,33 @@ pub fn placementOfExpr(
     last: Ast.TokenIndex,
     depth: u8,
 ) WalkError!Placement {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    return placementOfExprWithTokenCount(
+        arena,
+        tree,
+        proto,
+        bindings,
+        first,
+        last,
+        depth,
+        token_count,
+    );
+}
+
+fn placementOfExprWithTokenCount(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    depth: u8,
+    token_count: TokenIndex,
+) WalkError!Placement {
     const tags = tree.tokens.items(.tag);
     if (first > last) return .unknown;
     switch (tags[first]) {
-        .ampersand, .keyword_try => return placementOfExpr(
+        .ampersand, .keyword_try => return placementOfExprWithTokenCount(
             arena,
             tree,
             proto,
@@ -2095,6 +3482,7 @@ pub fn placementOfExpr(
             first + 1,
             last,
             depth,
+            token_count,
         ),
         else => {},
     }
@@ -2109,7 +3497,7 @@ pub fn placementOfExpr(
     // same name: `bindings.find` returned the FIRST binding of a
     // spelling, so `&item` after a sibling block had already declared
     // an `item` of its own reported an address inside THAT one.
-    const decl = nameAtUse(bindings, tree, proto, root, first) orelse
+    const decl = nameAtUse(bindings, tree, proto, root, first, token_count) orelse
         return paramPlacement(tree, proto, root, fields);
     if (depth >= max_owner_depth) return .unknown;
     return switch (decl) {
@@ -2120,7 +3508,7 @@ pub fn placementOfExpr(
             // iterable; neither is given an identity here.
             if (!c.body.carries_scrutinee_storage) break :blk .unknown;
             const span = scrutineeSpan(tree, c) orelse break :blk .unknown;
-            const inner = try placementOfExpr(
+            const inner = try placementOfExprWithTokenCount(
                 arena,
                 tree,
                 proto,
@@ -2128,12 +3516,13 @@ pub fn placementOfExpr(
                 span[0],
                 span[1],
                 depth + 1,
+                token_count,
             );
             break :blk withFields(arena, inner, fields);
         },
         .local => |b| {
             if (b.origin == .loop_capture) {
-                const body = captureBody(tree, proto, b.name_token) orelse return .unknown;
+                const body = captureBody(tree, proto, b.name_token, token_count) orelse return .unknown;
                 if (body.is_iterable_element) return .element;
                 return placementOfCapture(
                     arena,
@@ -2144,6 +3533,7 @@ pub fn placementOfExpr(
                     b.name_token,
                     fields,
                     depth,
+                    token_count,
                 );
             }
             const rhs = b.rhsFirstAfterTry(tags);
@@ -2155,7 +3545,16 @@ pub fn placementOfExpr(
             }
             // A header copy (`const copy = list;`) shares the buffer it
             // names, so the question it raises is the source's question.
-            return placementOfExpr(arena, tree, proto, bindings, rhs, b.rhs_last, depth + 1);
+            return placementOfExprWithTokenCount(
+                arena,
+                tree,
+                proto,
+                bindings,
+                rhs,
+                b.rhs_last,
+                depth + 1,
+                token_count,
+            );
         },
     };
 }
@@ -2189,12 +3588,13 @@ fn placementOfCapture(
     name_token: TokenIndex,
     fields: []const u8,
     depth: u8,
+    token_count: TokenIndex,
 ) WalkError!Placement {
     if (depth >= max_owner_depth) return .unknown;
     const c = nearestBranchClause(tree, proto, name, name_token, name_token) orelse return .unknown;
     if (!c.body.carries_scrutinee_storage) return .unknown;
     const span = scrutineeSpan(tree, c) orelse return .unknown;
-    const inner = try placementOfExpr(
+    const inner = try placementOfExprWithTokenCount(
         arena,
         tree,
         proto,
@@ -2202,6 +3602,7 @@ fn placementOfCapture(
         span[0],
         span[1],
         depth + 1,
+        token_count,
     );
     return withFields(arena, inner, fields);
 }
@@ -2269,6 +3670,19 @@ pub fn growBaseOfExpr(
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
 ) !GrowBase {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    return growBaseOfExprWithTokenCount(arena, tree, proto, bindings, first, last, token_count);
+}
+
+fn growBaseOfExprWithTokenCount(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    token_count: TokenIndex,
+) !GrowBase {
     const tags = tree.tokens.items(.tag);
     var root_tok = first;
     while (root_tok <= last and (tags[root_tok] == .keyword_try or tags[root_tok] == .ampersand)) {
@@ -2285,6 +3699,7 @@ pub fn growBaseOfExpr(
         tree.tokenSlice(root_tok),
         root_tok,
         0,
+        token_count,
     );
     return switch (origin) {
         // The claim names an initializer, not a field of it, so the
@@ -2320,11 +3735,11 @@ fn growOriginOfName(
     name: []const u8,
     use_token: TokenIndex,
     depth: u8,
+    token_count: TokenIndex,
 ) WalkError!GrowBase {
     if (depth >= max_owner_depth) return .{ .storage = .unknown };
-    const binding = switch (nameAtUse(bindings, tree, proto, name, use_token) orelse
-        return paramGrowBase(tree, proto, name))
-    {
+    const binding = switch (nameAtUse(bindings, tree, proto, name, use_token, token_count) orelse
+        return paramGrowBase(tree, proto, name)) {
         // A pipe capture is charged: a `for` element is a value copied
         // out of a buffer, an optional's payload names storage this
         // walk has not proved it can grow, and a prong's `|v|` is a
@@ -2353,7 +3768,7 @@ fn growOriginOfName(
     // and treating it as borrowed would throw away every constructor
     // the resolver CAN read — so it is a claim like any other.
     if (paramIndex(tree, proto, base_name) == null and
-        nameAtUse(bindings, tree, proto, base_name, base_tok) == null)
+        nameAtUse(bindings, tree, proto, base_name, base_tok, token_count) == null)
     {
         return .{ .unproven = claimFor(tree, binding) };
     }
@@ -2365,6 +3780,7 @@ fn growOriginOfName(
         base_name,
         base_tok,
         depth + 1,
+        token_count,
     )) {
         .unproven => |claim| .{ .unproven = claim },
         .storage => |s| switch (s) {
@@ -2469,8 +3885,9 @@ fn operandOwner(
     proto: Ast.full.FnProto,
     bindings: *const local_bindings.LocalBindings,
     node: Ast.Node.Index,
-) !StorageOwner {
-    return ownerOfExpr(
+    token_count: TokenIndex,
+) WalkError!StorageOwner {
+    return ownerOfExprWithTokenCount(
         arena,
         tree,
         proto,
@@ -2478,6 +3895,7 @@ fn operandOwner(
         tree.firstToken(node),
         tree.lastToken(node),
         0,
+        token_count,
     );
 }
 
@@ -2504,6 +3922,7 @@ fn appendCalleeOperands(
     callee: Ast.Node.Index,
     out: *std.ArrayListUnmanaged(StorageOwner),
     depth: u8,
+    token_count: TokenIndex,
 ) WalkError!void {
     if (depth >= max_owner_depth) {
         try out.append(arena, .unknown);
@@ -2514,21 +3933,20 @@ fn appendCalleeOperands(
     if (first == tree.lastToken(callee) and tags[first] == .identifier) return;
     var call_buf: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buf, callee)) |sub| {
-        try appendCalleeOperands(arena, tree, proto, bindings, sub.ast.fn_expr, out, depth + 1);
-        for (sub.ast.params) |p| try out.append(arena, try operandOwner(arena, tree, proto, bindings, p));
+        try appendCalleeOperands(arena, tree, proto, bindings, sub.ast.fn_expr, out, depth + 1, token_count);
+        for (sub.ast.params) |p| try out.append(arena, try operandOwner(arena, tree, proto, bindings, p, token_count));
         return;
     }
     var params_buf: [2]Ast.Node.Index = undefined;
     if (tree.builtinCallParams(&params_buf, callee)) |params| {
-        for (params) |p| try out.append(arena, try operandOwner(arena, tree, proto, bindings, p));
+        for (params) |p| try out.append(arena, try operandOwner(arena, tree, proto, bindings, p, token_count));
         return;
     }
     // A grouped or computed callee — `(cb)`, `xs[i].replace` — is
     // rooted as the expression it is, which is what the operand rules
     // make of it: whatever it names, or `.unknown`.
-    try out.append(arena, try operandOwner(arena, tree, proto, bindings, callee));
+    try out.append(arena, try operandOwner(arena, tree, proto, bindings, callee, token_count));
 }
-
 /// The argument slots of an `@call` tuple, when the third argument is
 /// the literal `@call`'s grammar puts there: `.{ … }`, which the AST
 /// holds as an anonymous struct- or array-init, whose fields (or
@@ -2645,6 +4063,7 @@ fn collectIndirectInvocations(
     nested: []const TokenRange,
     calls: *std.ArrayListUnmanaged(GrowCall),
     unknown: *bool,
+    token_count: TokenIndex,
 ) !void {
     const tags = tree.tokens.items(.tag);
     var idx: u32 = 1;
@@ -2664,9 +4083,8 @@ fn collectIndirectInvocations(
                 var call_buf: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&call_buf, node) orelse continue;
                 const callee = call.ast.fn_expr;
-                // The token the call's `(` follows: what a call index
-                // keys on, and what the token pass's adjacency rule
-                // reads.
+                // Adjacency and the display name use the final token; the
+                // canonical call query uses the expression's main token.
                 const callee_tok = tree.lastToken(callee);
                 if (adjacencyPassReadIt(tags, callee_tok)) continue;
                 // A grow-vocabulary method is attributed by the grow
@@ -2675,12 +4093,12 @@ fn collectIndirectInvocations(
                 // from a second, weaker reading.
                 if (receiver_mod.isArrayListGrowMethodName(tree.tokenSlice(callee_tok))) continue;
                 var args: std.ArrayListUnmanaged(StorageOwner) = .empty;
-                try appendCalleeOperands(arena, tree, proto, bindings, callee, &args, 0);
+                try appendCalleeOperands(arena, tree, proto, bindings, callee, &args, 0, token_count);
                 for (call.ast.params) |p| {
-                    try args.append(arena, try operandOwner(arena, tree, proto, bindings, p));
+                    try args.append(arena, try operandOwner(arena, tree, proto, bindings, p, token_count));
                 }
                 try calls.append(arena, .{
-                    .callee_token = callee_tok,
+                    .callee_token = tree.nodeMainToken(callee),
                     // A computed callee (`xs[i].push`, `(cb)`) names
                     // nothing this file could dispatch on, and must
                     // never be mistaken for a declaration sharing it.
@@ -2712,7 +4130,7 @@ fn collectIndirectInvocations(
                 // moving.
                 unknown.* = true;
                 var args: std.ArrayListUnmanaged(StorageOwner) = .empty;
-                try appendCalleeOperands(arena, tree, proto, bindings, params[1], &args, 0);
+                try appendCalleeOperands(arena, tree, proto, bindings, params[1], &args, 0, token_count);
                 var slots_buf: [2]Ast.Node.Index = undefined;
                 if (tupleArgumentSlots(tree, &slots_buf, params[2])) |slots| {
                     // The literal IS `@call`'s argument list, so each
@@ -2720,7 +4138,7 @@ fn collectIndirectInvocations(
                     // over nothing, and leaves the invocation itself
                     // as the only thing it proves.
                     for (slots) |slot| {
-                        try args.append(arena, try operandOwner(arena, tree, proto, bindings, slot));
+                        try args.append(arena, try operandOwner(arena, tree, proto, bindings, slot, token_count));
                     }
                 } else {
                     // A tuple named, forwarded or computed elsewhere.
@@ -2728,7 +4146,7 @@ fn collectIndirectInvocations(
                     // still handed to something that may reallocate
                     // what it names, so it is charged as the whole
                     // value it is — never as "no arguments".
-                    try args.append(arena, try operandOwner(arena, tree, proto, bindings, params[2]));
+                    try args.append(arena, try operandOwner(arena, tree, proto, bindings, params[2], token_count));
                 }
                 try calls.append(arena, .{
                     .callee_token = at,
@@ -2756,6 +4174,20 @@ pub fn argOwners(
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
 ) ![]const StorageOwner {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    return argOwnersWithTokenCount(arena, tree, proto, bindings, receiver, start, end, token_count);
+}
+
+fn argOwnersWithTokenCount(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    receiver: ?StorageOwner,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    token_count: TokenIndex,
+) ![]const StorageOwner {
     var out: std.ArrayListUnmanaged(StorageOwner) = .empty;
     if (receiver) |r| try out.append(arena, r);
     if (start > end) return out.toOwnedSlice(arena);
@@ -2768,13 +4200,31 @@ pub fn argOwners(
             .l_paren, .l_bracket, .l_brace => depth += 1,
             .r_paren, .r_bracket, .r_brace => depth -= 1,
             .comma => if (depth == 0) {
-                try out.append(arena, try ownerOfExpr(arena, tree, proto, bindings, arg_start, t - 1, 0));
+                try out.append(arena, try ownerOfExprWithTokenCount(
+                    arena,
+                    tree,
+                    proto,
+                    bindings,
+                    arg_start,
+                    t - 1,
+                    0,
+                    token_count,
+                ));
                 arg_start = t + 1;
             },
             else => {},
         }
     }
-    try out.append(arena, try ownerOfExpr(arena, tree, proto, bindings, arg_start, end, 0));
+    try out.append(arena, try ownerOfExprWithTokenCount(
+        arena,
+        tree,
+        proto,
+        bindings,
+        arg_start,
+        end,
+        0,
+        token_count,
+    ));
     return out.toOwnedSlice(arena);
 }
 
@@ -2812,6 +4262,18 @@ pub fn inferGrowEffects(
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     bindings: *const local_bindings.LocalBindings,
+) !GrowEffects {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    return inferGrowEffectsWithTokenCount(arena, tree, proto, body, bindings, token_count);
+}
+
+fn inferGrowEffectsWithTokenCount(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    bindings: *const local_bindings.LocalBindings,
+    token_count: TokenIndex,
 ) !GrowEffects {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -2860,7 +4322,7 @@ pub fn inferGrowEffects(
         if (tags[t] == .period and tags[t + 1] == .identifier and tags[t + 2] == .l_paren and
             receiver_mod.isArrayListGrowMethodName(tree.tokenSlice(t + 1)))
         {
-            switch (try growBaseOfExpr(arena, tree, proto, bindings, receiverStart(tags, t, first), t - 1)) {
+            switch (try growBaseOfExprWithTokenCount(arena, tree, proto, bindings, receiverStart(tags, t, first), t - 1, token_count)) {
                 // Storage this fn may have built for itself: the
                 // resolver decides, and a claim it cannot prove is
                 // charged as unattributed storage below.
@@ -2885,13 +4347,14 @@ pub fn inferGrowEffects(
             // site above, from the storage its receiver names.
             if (receiver_mod.isArrayListGrowMethodName(name)) continue;
             const recv_first = receiverStart(tags, t - 1, first);
-            const base = try growBaseOfExpr(
+            const base = try growBaseOfExprWithTokenCount(
                 arena,
                 tree,
                 proto,
                 bindings,
                 recv_first,
                 t - 2,
+                token_count,
             );
             switch (base) {
                 // A receiver this fn may have built for itself moves
@@ -2937,33 +4400,43 @@ pub fn inferGrowEffects(
             }
         }
         try calls.append(arena, .{
-            .callee_token = t,
+            .callee_token = if (t > first and tags[t - 1] == .period) t - 1 else t,
             .name = name,
             .kind = kind,
             .qualifier = qualifier,
-            .args = try argOwners(arena, tree, proto, bindings, receiver, t + 2, call_end - 1),
+            .args = try argOwnersWithTokenCount(arena, tree, proto, bindings, receiver, t + 2, call_end - 1, token_count),
         });
     }
     if (needs_ast_pass) {
-        try collectIndirectInvocations(arena, tree, proto, bindings, first, last, nested.items, &calls, &unknown);
+        try collectIndirectInvocations(arena, tree, proto, bindings, first, last, nested.items, &calls, &unknown, token_count);
     }
+    const owned_paths = try paths.toOwnedSlice(arena);
+    errdefer arena.free(owned_paths);
+    const owned_calls = try calls.toOwnedSlice(arena);
+    errdefer arena.free(owned_calls);
+    const owned_claims = try claims.toOwnedSlice(arena);
     return .{
-        .paths = try paths.toOwnedSlice(arena),
+        .paths = owned_paths,
         .unknown = unknown,
-        .calls = try calls.toOwnedSlice(arena),
-        .claims = try claims.toOwnedSlice(arena),
+        .calls = owned_calls,
+        .claims = owned_claims,
     };
 }
 
-/// True iff the body contains `<x>.create(<type_name>)` or
-/// `<x>.create(Self)`.  Returns false when `type_name` is null
-/// (top-level fns have no containing type).
+/// True iff a canonical SDK Allocator.create of the containing type can
+/// impose an allocator.destroy(self) obligation on its destructor.
+/// Spelling locates candidates; the shared allocator-provenance query
+/// resolves the allocator and follows aliases/accessor returns. Known
+/// arena/buffer backing belongs to that backing owner. The instance's own
+/// pointer or slice fields do not decide who must free the instance.
 pub fn inferHeapAllocatesSelf(
-    tree: *const Ast,
+    cache: *@import("../cache/file_cache.zig").FileCache,
     body: Ast.Node.Index,
     type_name: ?[]const u8,
-) bool {
+) @import("../cache/file_cache.zig").SummaryError!bool {
+    const freshness = @import("../cache/fresh_storage.zig");
     const tn = type_name orelse return false;
+    const tree = cache.tree;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -2977,20 +4450,21 @@ pub fn inferHeapAllocatesSelf(
         if (tags[t + 1] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 1), "create")) continue;
         if (tags[t + 2] != .l_paren) continue;
-        // Walk the call's arg list (single arg expected, possibly
-        // namespaced like `ns.Type`) and check the LAST identifier
-        // against `tn` / `Self`.
-        var k = t + 3;
-        var last_ident: ?Ast.TokenIndex = null;
-        while (k <= last) : (k += 1) {
-            if (tags[k] == .r_paren or tags[k] == .comma) break;
-            if (tags[k] == .identifier) last_ident = k;
-        }
-        if (last_ident) |li| {
-            const text = tree.tokenSlice(li);
-            if (std.mem.eql(u8, text, tn)) return true;
-            if (std.mem.eql(u8, text, "Self")) return true;
-        }
+        const index = try cache.getCallIndex();
+        const node = index.by_callee_token.get(t) orelse continue;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node) orelse continue;
+        if (call.ast.params.len != 1) continue;
+        const allocated_type = call.ast.params[0];
+        const type_token = tree.lastToken(allocated_type);
+        if (tree.tokenTag(type_token) != .identifier) continue;
+        const text = tree.tokenSlice(type_token);
+        if (!std.mem.eql(u8, text, tn) and !std.mem.eql(u8, text, "Self")) continue;
+        const canonical = (try cache.actualCallSummaryAt(freshness.calleeQueryToken(tree, call), cache.cleanup_frame)) orelse continue;
+        if (try freshness.sdkCreateMayOwnHeap(cache, canonical, freshness.FreshWalk.root(.{
+            .first = tree.firstToken(node),
+            .last = tree.lastToken(node),
+        }))) return true;
     }
     return false;
 }
@@ -3093,8 +4567,20 @@ fn rhsTextLooksAlloc(text: []const u8) bool {
 }
 
 // ── Tests ──────────────────────────────────────────────────
-
 const testing = std.testing;
+
+test "checked token count rejects counts outside TokenIndex" {
+    const max_count: usize = @as(usize, @intCast(std.math.maxInt(TokenIndex)));
+    try testing.expectEqual(
+        std.math.maxInt(TokenIndex),
+        try checkedTokenCount(0, max_count),
+    );
+    try testing.expectError(error.SourceTooWide, checkedTokenCount(0, max_count + 1));
+    try testing.expectError(
+        error.SourceTooWide,
+        checkedTokenCount(std.math.maxInt(u32), 0),
+    );
+}
 
 fn parse(src: [:0]const u8) !Ast {
     var tree = try Ast.parse(testing.allocator, src, .zig);
@@ -3117,6 +4603,30 @@ fn inferFirstFn(tree: *const Ast, proto_buf: *[1]Ast.Node.Index) FnSummary {
         return inferFromBody(tree, proto, body);
     }
     unreachable;
+}
+
+test "result dependence proves unused inputs without trusting scalar builtin spelling" {
+    const Case = struct { source: [:0]const u8, dependency: ?bool };
+    const cases = [_]Case{
+        .{ .source = "fn f(ignored: Allocator, n: usize) Packet { _ = ignored; return .{ .bytes = &[_]u8{1}, .level = @intCast(n) }; }", .dependency = false },
+        .{ .source = "fn f(allocator: Allocator, n: usize) Packet { return .{ .bytes = allocator.alloc(u8, n), .level = @intCast(n) }; }", .dependency = true },
+        .{ .source = "fn f(allocator: Allocator, n: usize) Packet { const alias = allocator; return make(alias, @intCast(n)); }", .dependency = null },
+        .{ .source = "fn f(callback: anytype, n: usize) Packet { publish(callback); return .{ .bytes = &[_]u8{1}, .level = @intCast(n) }; }", .dependency = null },
+        .{ .source = "fn f(input: Allocator, n: usize) Packet { if (n != 0) { input.observe(); } return .{ .bytes = &[_]u8{1}, .level = @intCast(n) }; }", .dependency = null },
+        .{ .source = "fn f(input: ?Allocator, n: usize) Packet { if (input) |value| { publish(value); } return .{ .bytes = &[_]u8{1}, .level = @intCast(n) }; }", .dependency = null },
+        .{ .source = "fn f(input: anytype, n: usize) Packet { const Local = struct { const Type = @TypeOf(input); }; _ = Local; return .{ .bytes = &[_]u8{1}, .level = @intCast(n) }; }", .dependency = null },
+        .{ .source = "fn f(comptime input: anytype, n: usize) @TypeOf(input) { _ = input; return @intCast(n); }", .dependency = null },
+        .{ .source = "fn f(input: usize) *u8 { return @ptrFromInt(input); }", .dependency = true },
+        .{ .source = "fn f(input: usize) void { _ = input; }", .dependency = null },
+    };
+    for (cases) |case| {
+        var tree = try parse(case.source);
+        defer tree.deinit(testing.allocator);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const summary = inferFirstFn(&tree, &buffer);
+        try testing.expectEqual(case.dependency, summary.returnedParamDependency(0));
+        try testing.expect(!summary.result_params_complete);
+    }
 }
 
 test "infer: noreturn return type sets is_noreturn" {
@@ -3372,30 +4882,176 @@ test "inferMayFreeFields: ignores non-deallocating methods" {
     try testing.expectEqual(@as(usize, 0), ff.len);
 }
 
-test "inferHeapAllocatesSelf: <x>.create(<TypeName>) hits" {
-    var tree = try parse(
-        \\fn factory(gpa: std.mem.Allocator) !*Foo {
-        \\    return try gpa.create(Foo);
+test "inferHeapAllocatesSelf: allocation provenance distinguishes heap and backing owners" {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Pool = struct {
+        \\    memory: std.heap.ArenaAllocator,
+        \\    fn init(child: std.mem.Allocator) Pool {
+        \\        return .{ .memory = std.heap.ArenaAllocator.init(child) };
+        \\    }
+        \\    fn allocator(self: *Pool) std.mem.Allocator {
+        \\        return self.memory.allocator();
+        \\    }
+        \\    fn aliasedAllocator(self: *Pool) std.mem.Allocator {
+        \\        const allocator = self.memory.allocator();
+        \\        return allocator;
+        \\    }
+        \\    fn selectedAllocator(self: *Pool, use_alias: bool) std.mem.Allocator {
+        \\        if (use_alias) return self.aliasedAllocator();
+        \\        return self.memory.allocator();
+        \\    }
+        \\    fn deinit(self: *Pool) void {
+        \\        std.debug.assert(self.memory.reset(.free_all));
+        \\        self.* = undefined;
+        \\    }
+        \\};
+        \\const BufferPool = struct {
+        \\    memory: std.heap.FixedBufferAllocator,
+        \\    fn allocator(self: *BufferPool) std.mem.Allocator {
+        \\        return self.memory.allocator();
+        \\    }
+        \\};
+        \\const MixedPool = struct {
+        \\    memory: std.heap.ArenaAllocator,
+        \\    gpa: std.mem.Allocator,
+        \\    fn allocator(self: *MixedPool, use_pool: bool) std.mem.Allocator {
+        \\        if (use_pool) return self.memory.allocator();
+        \\        return self.gpa;
+        \\    }
+        \\};
+        \\const FakeAllocator = struct {
+        \\    fn create(_: *FakeAllocator, comptime T: type) !*T { return error.NotAllocator; }
+        \\};
+        \\const HeapSource = struct { gpa: std.mem.Allocator };
+        \\fn forward(gpa: std.mem.Allocator) std.mem.Allocator { return gpa; }
+        \\const Object = struct {
+        \\    const Self = @This();
+        \\    bytes: []u8,
+        \\    fn heap(gpa: std.mem.Allocator) !*Object {
+        \\        const object = try gpa.create(Object);
+        \\        object.bytes = try gpa.alloc(u8, 8);
+        \\        return object;
+        \\    }
+        \\    fn privateHeap(gpa: std.mem.Allocator) !*Self {
+        \\        const allocator = gpa;
+        \\        return try allocator.create(Self);
+        \\    }
+        \\    fn privateForward(gpa: std.mem.Allocator) !*Self {
+        \\        return try forward(gpa).create(Self);
+        \\    }
+        \\    fn heapField(source: *HeapSource) !*Self {
+        \\        return try source.gpa.create(Self);
+        \\    }
+        \\    fn processHeap() !*Self {
+        \\        return try std.heap.page_allocator.create(Self);
+        \\    }
+        \\    fn wrapped(dev: *Pool) !*Object {
+        \\        const object = try dev.allocator().create(Object);
+        \\        object.bytes = try dev.allocator().alloc(u8, 8);
+        \\        return object;
+        \\    }
+        \\    fn direct(dev: *std.heap.ArenaAllocator) !*Self {
+        \\        return try dev.allocator().create(Self);
+        \\    }
+        \\    fn arenaAlias(dev: *Pool) !*Self {
+        \\        const allocator = dev.allocator();
+        \\        return try allocator.create(Self);
+        \\    }
+        \\    fn forwardedArena(dev: *Pool) !*Self {
+        \\        const allocator = forward(dev.allocator());
+        \\        return try allocator.create(Self);
+        \\    }
+        \\    fn accessorAlias(dev: *Pool) !*Self {
+        \\        return try dev.aliasedAllocator().create(Self);
+        \\    }
+        \\    fn knownReturns(dev: *Pool, use_alias: bool) !*Self {
+        \\        return try dev.selectedAllocator(use_alias).create(Self);
+        \\    }
+        \\    fn buffered(dev: *std.heap.FixedBufferAllocator) !*Self {
+        \\        return try dev.allocator().create(Self);
+        \\    }
+        \\    fn wrappedBuffer(dev: *BufferPool) !*Self {
+        \\        return try dev.allocator().create(Self);
+        \\    }
+        \\    fn bufferAlias(dev: *BufferPool) !*Self {
+        \\        const allocator = dev.allocator();
+        \\        return try allocator.create(Self);
+        \\    }
+        \\    fn forwardedBuffer(dev: *BufferPool) !*Self {
+        \\        const allocator = forward(dev.allocator());
+        \\        return try allocator.create(Self);
+        \\    }
+        \\    fn custom(source: *FakeAllocator) !*Self {
+        \\        return try source.create(Self);
+        \\    }
+        \\    fn mixed(dev: *Pool, gpa: std.mem.Allocator, use_pool: bool) !*Self {
+        \\        if (use_pool) return try dev.allocator().create(Self);
+        \\        return try gpa.create(Self);
+        \\    }
+        \\    fn mixedWrapped(dev: *MixedPool, use_pool: bool) !*Self {
+        \\        return try dev.allocator(use_pool).create(Self);
+        \\    }
+        \\    fn destroy(self: *Object) void { self.bytes = &.{}; }
+        \\};
+        \\test "pool lifetime owns its objects" {
+        \\    var pool = Pool.init(std.testing.allocator);
+        \\    const object = try Object.wrapped(&pool);
+        \\    object.destroy();
+        \\    pool.deinit();
         \\}
-    );
-    defer tree.deinit(testing.allocator);
-    var buf: [1]Ast.Node.Index = undefined;
-    const pb = firstFnProtoAndBody(&tree, &buf);
-    try testing.expect(inferHeapAllocatesSelf(&tree, pb[1], "Foo"));
-    try testing.expect(!inferHeapAllocatesSelf(&tree, pb[1], "Bar"));
-    try testing.expect(!inferHeapAllocatesSelf(&tree, pb[1], null));
-}
-
-test "inferHeapAllocatesSelf: <x>.create(Self) hits" {
-    var tree = try parse(
-        \\fn factory(gpa: std.mem.Allocator) !*Foo {
-        \\    return try gpa.create(Self);
-        \\}
-    );
-    defer tree.deinit(testing.allocator);
-    var buf: [1]Ast.Node.Index = undefined;
-    const pb = firstFnProtoAndBody(&tree, &buf);
-    try testing.expect(inferHeapAllocatesSelf(&tree, pb[1], "AnyType"));
+    ;
+    const engine = @import("type_engine");
+    const FileCache = @import("../cache/file_cache.zig").FileCache;
+    var context: engine.TypeContext = undefined;
+    try context.init(testing.allocator, std.testing.io);
+    defer context.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{ cwd, "zbc-self-allocation-test.zig" });
+    defer testing.allocator.free(path);
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, testing.allocator, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    try testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var cache = FileCache.init(testing.allocator, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const model = try cache.fileModel();
+    const object = model.findType("Object").?;
+    const Case = struct { name: []const u8, owns_self: bool };
+    for ([_]Case{
+        .{ .name = "heap", .owns_self = true },
+        .{ .name = "privateHeap", .owns_self = true },
+        .{ .name = "privateForward", .owns_self = true },
+        .{ .name = "heapField", .owns_self = true },
+        .{ .name = "processHeap", .owns_self = true },
+        .{ .name = "wrapped", .owns_self = false },
+        .{ .name = "direct", .owns_self = false },
+        .{ .name = "arenaAlias", .owns_self = false },
+        .{ .name = "forwardedArena", .owns_self = false },
+        .{ .name = "accessorAlias", .owns_self = false },
+        .{ .name = "knownReturns", .owns_self = false },
+        .{ .name = "buffered", .owns_self = false },
+        .{ .name = "wrappedBuffer", .owns_self = false },
+        .{ .name = "bufferAlias", .owns_self = false },
+        .{ .name = "forwardedBuffer", .owns_self = false },
+        .{ .name = "custom", .owns_self = false },
+        .{ .name = "mixed", .owns_self = true },
+        .{ .name = "mixedWrapped", .owns_self = true },
+    }) |case| {
+        const body = tokens.bodyOf(tree, object.findMethod(case.name).?.fn_decl).?;
+        const owns_self = try inferHeapAllocatesSelf(&cache, body, "Object");
+        try testing.expectEqual(case.owns_self, owns_self);
+        try testing.expect(!try inferHeapAllocatesSelf(&cache, body, null));
+    }
+    const heap_body = tokens.bodyOf(tree, object.findMethod("heap").?.fn_decl).?;
+    try testing.expect(!try inferHeapAllocatesSelf(&cache, heap_body, "Other"));
+    var untyped_cache = FileCache.init(testing.allocator, tree);
+    defer untyped_cache.deinit();
+    try testing.expect(!try inferHeapAllocatesSelf(&untyped_cache, heap_body, "Object"));
 }
 
 test "inferResultHeapFields: collects alloc-RHS fields from struct-literal return" {
@@ -3762,12 +5418,12 @@ fn firstFnPlacementAt(
 }
 
 /// Token of the `n`th identifier spelled `name` in `tree`, 0-based.
-fn nthIdentifier(tree: *const Ast, name: []const u8, n: usize) ?Ast.TokenIndex {
+fn nthIdentifier(tree: *const Ast, name: []const u8, n: usize) !?Ast.TokenIndex {
+    const token_count = try checkedTokenCount(tree.source.len, tree.tokens.len);
     const tags = tree.tokens.items(.tag);
-    const end: Ast.TokenIndex = @intCast(tags.len);
     var seen: usize = 0;
     var t: Ast.TokenIndex = 0;
-    while (t < end) : (t += 1) {
+    while (t < token_count) : (t += 1) {
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
         if (seen == n) return t;
@@ -3808,8 +5464,8 @@ test "placementOfExpr: &local names the declaration in scope at the use, not the
     var buf: [1]Ast.Node.Index = undefined;
     // `item` occurrences: 0 the first declaration, 1 its `_ = item`,
     // 2 the second declaration, 3 the `&item` handed to `sink`.
-    const declared = nthIdentifier(&tree, "item", 2).?;
-    const use = nthIdentifier(&tree, "item", 3).?;
+    const declared = (try nthIdentifier(&tree, "item", 2)).?;
+    const use = (try nthIdentifier(&tree, "item", 3)).?;
     const got = try firstFnPlacementAt(arena.allocator(), &tree, &buf, use, use);
     try expectLocalToken(got, declared);
 }
@@ -3826,7 +5482,7 @@ test "placementOfExpr: an optional capture is the placement of the field it was 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var buf: [1]Ast.Node.Index = undefined;
-    const use = nthIdentifier(&tree, "image", 1).?;
+    const use = (try nthIdentifier(&tree, "image", 1)).?;
     const got = try firstFnPlacementAt(arena.allocator(), &tree, &buf, use, use);
     // The payload is held IN `self.slot`, so the address is an address
     // inside the caller's own object — never a disjoint element.
@@ -3854,7 +5510,7 @@ test "placementOfExpr: a for capture stays an element, not the iterable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var buf: [1]Ast.Node.Index = undefined;
-    const use = nthIdentifier(&tree, "item", 1).?;
+    const use = (try nthIdentifier(&tree, "item", 1)).?;
     const got = try firstFnPlacementAt(arena.allocator(), &tree, &buf, use, use);
     try testing.expect(got == .element);
 }
@@ -3873,7 +5529,7 @@ test "placementOfExpr: an else payload is charged, never given an identity" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var buf: [1]Ast.Node.Index = undefined;
-    const use = nthIdentifier(&tree, "failure", 1).?;
+    const use = (try nthIdentifier(&tree, "failure", 1)).?;
     const got = try firstFnPlacementAt(arena.allocator(), &tree, &buf, use, use);
     try testing.expect(got == .unknown);
 }
@@ -4053,8 +5709,8 @@ test "placementOfExpr: a prong payload is charged, never an element or shared st
     var buf: [1]Ast.Node.Index = undefined;
     // `&value` in the braced prong, then the bare name in the
     // braceless one — both spell the payload, neither is a placement.
-    const amp = nthIdentifier(&tree, "value", 1).?;
-    const bare = nthIdentifier(&tree, "value", 4).?;
+    const amp = (try nthIdentifier(&tree, "value", 1)).?;
+    const bare = (try nthIdentifier(&tree, "value", 4)).?;
     try testing.expectEqual(TokenTag.ampersand, tree.tokenTag(amp - 1));
     try testing.expect(try firstFnPlacementAt(arena.allocator(), &tree, &buf, amp - 1, amp) == .unknown);
     try testing.expect(try firstFnPlacementAt(arena.allocator(), &tree, &buf, bare, bare) == .unknown);
@@ -4065,11 +5721,11 @@ test "nearestBranchClause: sibling prongs keep separate identities and scopes" {
     defer tree.deinit(testing.allocator);
     var buf: [1]Ast.Node.Index = undefined;
     const proto = firstFnProtoAndBody(&tree, &buf)[0];
-    const capture_a = nthIdentifier(&tree, "value", 0).?;
-    const use_a = nthIdentifier(&tree, "value", 1).?;
-    const use_nested = nthIdentifier(&tree, "value", 2).?;
-    const capture_b = nthIdentifier(&tree, "value", 3).?;
-    const use_b = nthIdentifier(&tree, "value", 4).?;
+    const capture_a = (try nthIdentifier(&tree, "value", 0)).?;
+    const use_a = (try nthIdentifier(&tree, "value", 1)).?;
+    const use_nested = (try nthIdentifier(&tree, "value", 2)).?;
+    const capture_b = (try nthIdentifier(&tree, "value", 3)).?;
+    const use_b = (try nthIdentifier(&tree, "value", 4)).?;
 
     // Each use names ITS OWN prong's capture.  The two `|value|` are
     // two declarations with two scopes — a walk that resolved the
@@ -4149,4 +5805,811 @@ test "inferGrowEffects: a prong payload sharing a parameter's name is never grow
     try testing.expectEqual(@as(usize, 0), eff.paths.len);
     try testing.expect(!hasGrowPath(eff.paths, 1, ""));
     try testing.expect(eff.unknown);
+}
+
+/// These fixtures exercise control flow over parsed nodes. Call certificates
+/// are explicit inputs; authentication of them is FileCache's separate job.
+const CleanupTestCache = struct {
+    const Call = struct {
+        node: Ast.Node.Index,
+        effects: @import("../cache/file_cache.zig").FileCache.NormalCleanupCall,
+    };
+
+    tree: *const Ast,
+    calls: []const Call,
+    retained_at: ?Ast.Node.Index = null,
+    fresh_nodes: []const Ast.Node.Index = &.{},
+    allocator_path: ?ParamPath = .{ .param = 0, .path = "allocator" },
+    resource_error: ?CleanupError = null,
+    queries: u32 = 0,
+    depth: u32 = 0,
+    visited: u32 = 0,
+    storage_work: usize = 0,
+
+    fn beginNormalCleanup(self: *@This()) void {
+        self.queries += 1;
+    }
+
+    fn endNormalCleanup(self: *@This()) void {
+        std.debug.assert(self.queries > 0);
+        self.queries -= 1;
+    }
+
+    fn enterNormalCleanup(self: *@This(), node: Ast.Node.Index) CleanupError!void {
+        std.debug.assert(@intFromEnum(node) < self.tree.nodes.len);
+        if (self.depth == 64) return budget_mod.fail(.{ .limit = .normal_cleanup_depth, .limit_value = 64, .reached = 64 });
+        self.depth += 1;
+    }
+
+    fn leaveNormalCleanup(self: *@This()) void {
+        std.debug.assert(self.depth > 0);
+        self.depth -= 1;
+    }
+
+    fn chargeNormalCleanup(self: *@This(), node: Ast.Node.Index) CleanupError!void {
+        std.debug.assert(@intFromEnum(node) < self.tree.nodes.len);
+        if (self.visited == 50_000) return budget_mod.fail(.{ .limit = .normal_cleanup_nodes, .limit_value = 50_000, .reached = 50_000 });
+        self.visited += 1;
+    }
+
+    fn normalCleanupStorageWork(self: *@This(), node: Ast.Node.Index, units: usize) CleanupError!void {
+        std.debug.assert(@intFromEnum(node) < self.tree.nodes.len);
+        if (units > 50_000 - self.visited) {
+            return budget_mod.fail(.{ .limit = .normal_cleanup_nodes, .limit_value = 50_000, .reached = 50_000 });
+        }
+        self.visited += @intCast(units);
+        self.storage_work += units;
+    }
+
+    fn normalCleanupCall(
+        self: *@This(),
+        _: std.mem.Allocator,
+        _: Ast.full.FnProto,
+        _: *const local_bindings.LocalBindings,
+        node: Ast.Node.Index,
+    ) CleanupError!@import("../cache/file_cache.zig").FileCache.NormalCleanupCall {
+        if (self.resource_error) |err| return err;
+        for (self.calls) |call| if (call.node == node) return call.effects;
+        return .{};
+    }
+
+    fn normalCleanupReturnKind(_: *@This(), _: Ast.Node.Index) CleanupError!?bool {
+        return false;
+    }
+
+    fn normalCleanupCondition(_: *@This(), _: Ast.Node.Index) CleanupError!?bool {
+        return null;
+    }
+
+    fn normalCleanupFresh(self: *@This(), node: Ast.Node.Index) CleanupError!bool {
+        for (self.fresh_nodes) |fresh| if (fresh == node) return true;
+        return false;
+    }
+
+    fn normalCleanupAllocator(self: *@This(), _: Ast.Node.Index) CleanupError!?ParamPath {
+        return self.allocator_path;
+    }
+
+    fn retainedStorageAt(
+        self: *@This(),
+        _: std.mem.Allocator,
+        _: Ast.full.FnProto,
+        _: *const local_bindings.LocalBindings,
+        node: Ast.Node.Index,
+    ) CleanupError![]const u32 {
+        if (self.retained_at == node) return &.{7};
+        return &.{};
+    }
+};
+
+fn cleanupTestCall(tree: *const Ast, name: []const u8) ?Ast.Node.Index {
+    for (1..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        const token = tree.nodeMainToken(call.ast.fn_expr);
+        if (std.mem.eql(u8, tree.tokenSlice(token), name)) return node;
+    }
+    return null;
+}
+
+test "cleanup structural exits distinguish normal error defer catch and try" {
+    const Case = struct {
+        source: [:0]const u8,
+        normal_definite: usize,
+        normal_may: usize,
+        error_definite: usize,
+        error_may: usize,
+        complete: bool = true,
+        error_complete: bool = false,
+    };
+    const cases = [_]Case{
+        .{
+            .source = "fn f(flag: bool) void { if (flag) release(); }",
+            .normal_definite = 0,
+            .normal_may = 1,
+            .error_definite = 0,
+            .error_may = 0,
+        },
+        .{
+            .source = "fn f() void { if (true) release() else onError(); }",
+            .normal_definite = 1,
+            .normal_may = 1,
+            .error_definite = 0,
+            .error_may = 0,
+        },
+        .{
+            .source = "fn f() void { if (false) release(); }",
+            .normal_definite = 0,
+            .normal_may = 0,
+            .error_definite = 0,
+            .error_may = 0,
+        },
+        .{
+            .source = "fn f(flag: bool) void { if (flag) { release(); return; } }",
+            .normal_definite = 0,
+            .normal_may = 1,
+            .error_definite = 0,
+            .error_may = 0,
+        },
+        .{
+            .source = "fn f() !void { release(); return error.Fail; }",
+            .normal_definite = 0,
+            .normal_may = 0,
+            .error_definite = 1,
+            .error_may = 1,
+            .complete = false,
+            .error_complete = true,
+        },
+        .{
+            .source = "fn f(flag: bool) !void { defer release(); " ++
+                "errdefer onError(); if (flag) return error.Fail; }",
+            .normal_definite = 1,
+            .normal_may = 1,
+            .error_definite = 2,
+            .error_may = 2,
+            .error_complete = true,
+        },
+        .{
+            .source = "fn f() !void { try attempt(); defer release(); }",
+            .normal_definite = 1,
+            .normal_may = 1,
+            .error_definite = 1,
+            .error_may = 1,
+            .error_complete = true,
+        },
+        .{
+            .source = "fn f() void { attempt() catch release(); }",
+            .normal_definite = 0,
+            .normal_may = 2,
+            .error_definite = 0,
+            .error_may = 0,
+        },
+        .{
+            .source = "fn f() !void { release(try fail()); }",
+            .normal_definite = 0,
+            .normal_may = 0,
+            .error_definite = 1,
+            .error_may = 1,
+            .complete = false,
+            .error_complete = true,
+        },
+        .{
+            .source = "fn f(flag: bool) void { while (flag) release(); }",
+            .normal_definite = 0,
+            .normal_may = 1,
+            .error_definite = 0,
+            .error_may = 0,
+            .complete = false,
+        },
+        .{
+            .source = "fn f(flag: bool) !void { " ++
+                "while (flag) { release(); return error.Fail; } }",
+            .normal_definite = 0,
+            .normal_may = 0,
+            .error_definite = 0,
+            .error_may = 1,
+            .complete = false,
+        },
+        .{
+            .source = "fn f() noreturn { unreachable; }",
+            .normal_definite = 0,
+            .normal_may = 0,
+            .error_definite = 0,
+            .error_may = 0,
+            .complete = false,
+        },
+    };
+    for (cases) |case| {
+        var tree = try parse(case.source);
+        defer tree.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto, const body = firstFnProtoAndBody(&tree, &proto_buffer);
+        const bindings = try local_bindings.build(allocator, &tree, proto, body);
+        var calls: std.ArrayListUnmanaged(CleanupTestCache.Call) = .empty;
+        defer calls.deinit(allocator);
+        const names = [_][]const u8{ "release", "onError", "attempt", "fail" };
+        for (names, 0..) |name, index| {
+            const node = cleanupTestCall(&tree, name) orelse continue;
+            const paths = try allocator.alloc(ParamPath, 1);
+            paths[0] = .{ .param = @intCast(index), .path = "" };
+            try calls.append(allocator, .{ .node = node, .effects = switch (index) {
+                0, 1 => .{
+                    .definite_paths = paths,
+                    .may_paths = paths,
+                    .complete = true,
+                    .error_complete = true,
+                    .can_normal = true,
+                    .can_error = false,
+                    .returns_error = false,
+                },
+                2 => .{
+                    .complete = true,
+                    .error_complete = true,
+                    .error_definite_paths = paths,
+                    .error_may_paths = paths,
+                    .can_normal = true,
+                    .can_error = true,
+                    .returns_error = null,
+                },
+                3 => .{
+                    .complete = true,
+                    .error_complete = true,
+                    .error_definite_paths = paths,
+                    .error_may_paths = paths,
+                    .can_normal = false,
+                    .can_error = true,
+                    .returns_error = true,
+                },
+                else => unreachable,
+            } });
+        }
+        var cache = CleanupTestCache{ .tree = &tree, .calls = calls.items };
+        const effects = try inferNormalSuccessCleanup(
+            &cache,
+            allocator,
+            proto,
+            &bindings,
+            body,
+        );
+        try testing.expectEqual(case.normal_definite, effects.definite_freed_paths.len);
+        try testing.expectEqual(case.normal_may, effects.may_freed_paths.len);
+        try testing.expectEqual(case.error_definite, effects.error_definite_freed_paths.len);
+        try testing.expectEqual(case.error_may, effects.error_may_freed_paths.len);
+        try testing.expectEqual(case.complete, effects.complete);
+        try testing.expectEqual(case.error_complete, effects.error_complete);
+        try testing.expectEqual(@as(u32, 0), cache.depth);
+        try testing.expectEqual(@as(u32, 0), cache.queries);
+        try testing.expect(cache.visited > 0);
+    }
+}
+
+test "cleanup resource errors propagate and unwind shared work hooks" {
+    var tree = try parse("fn f() void { release(); }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &proto_buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    const failures = [_]CleanupError{
+        error.OutOfMemory,   error.SourceTooWide,  error.AnalysisBudgetExceeded,
+        error.InvalidSyntax, error.SourceExcluded, error.Canceled,
+    };
+    for (failures) |failure| {
+        var cache = CleanupTestCache{
+            .tree = &tree,
+            .calls = &.{},
+            .resource_error = failure,
+        };
+        try testing.expectError(failure, inferNormalSuccessCleanup(
+            &cache,
+            arena.allocator(),
+            proto,
+            &bindings,
+            body,
+        ));
+        try testing.expectEqual(@as(u32, 0), cache.depth);
+        try testing.expectEqual(@as(u32, 0), cache.queries);
+    }
+}
+
+test "cleanup sibling defers do not consume nesting depth" {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    try source.appendSlice(testing.allocator, "fn f() void {");
+    for (0..96) |_| try source.appendSlice(testing.allocator, "defer release();");
+    try source.appendSlice(testing.allocator, "}");
+    const text = try testing.allocator.dupeZ(u8, source.items);
+    defer testing.allocator.free(text);
+    var tree = try parse(text);
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &proto_buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &.{} };
+    _ = try inferNormalSuccessCleanup(&cache, arena.allocator(), proto, &bindings, body);
+    try testing.expectEqual(@as(u32, 0), cache.depth);
+    try testing.expectEqual(@as(u32, 0), cache.queries);
+}
+
+test "cleanup genuine nested syntax still exhausts the depth budget" {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    try source.appendSlice(testing.allocator, "fn f() void {");
+    for (0..80) |_| try source.appendSlice(testing.allocator, "{");
+    try source.appendSlice(testing.allocator, "release();");
+    for (0..80) |_| try source.appendSlice(testing.allocator, "}");
+    try source.appendSlice(testing.allocator, "}");
+    const text = try testing.allocator.dupeZ(u8, source.items);
+    defer testing.allocator.free(text);
+    var tree = try parse(text);
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &proto_buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &.{} };
+    try testing.expectError(error.AnalysisBudgetExceeded, inferNormalSuccessCleanup(
+        &cache,
+        arena.allocator(),
+        proto,
+        &bindings,
+        body,
+    ));
+    // The mock reports the bound the way the real cache does, so the CLI can
+    // name it instead of saying the limit is unknown.
+    const stop = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(budget_mod.Limit.normal_cleanup_depth, stop.limit);
+    try testing.expectEqual(@as(u32, 64), stop.limit_value);
+    try testing.expectEqual(@as(u32, 0), cache.depth);
+    try testing.expectEqual(@as(u32, 0), cache.queries);
+}
+
+test "cleanup retention intersects explicit return and bare fallthrough" {
+    var tree = try parse("fn f(flag: bool) void { if (flag) return; }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &proto_buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    var retained_at: ?Ast.Node.Index = null;
+    for (1..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.nodeTag(node) == .@"return") retained_at = node;
+    }
+    try testing.expect(retained_at != null);
+    var cache = CleanupTestCache{
+        .tree = &tree,
+        .calls = &.{},
+        .retained_at = retained_at,
+    };
+    const effects = try inferNormalSuccessCleanup(
+        &cache,
+        arena.allocator(),
+        proto,
+        &bindings,
+        body,
+    );
+    try testing.expect(effects.complete);
+    try testing.expectEqual(@as(usize, 0), effects.retained_owned_params.len);
+}
+
+// Path and field certificates have distinct keys, including the field method.
+test "cleanup field joins retain MAY without mixing path certificates" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = CleanupState{ .present = true };
+    const fields = [_]FieldFree{
+        .{ .param = 0, .field = "slot", .method = "close" },
+        .{ .param = 0, .field = "slot", .method = "deinit" },
+    };
+    try state.addEffects(arena.allocator(), &.{}, &fields, &.{}, &fields, true);
+    try state.merge(arena.allocator(), .{ .present = true });
+    try testing.expectEqual(@as(usize, 0), state.definite_fields.len);
+    try testing.expectEqual(@as(usize, 2), state.may_fields.len);
+    try testing.expectEqual(@as(usize, 0), state.may_paths.len);
+}
+
+test "cleanup unknown call cannot certify empty purity" {
+    var tree = try parse("fn f() void { unknownCall(); }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &.{} };
+    const effects = try inferNormalSuccessCleanup(&cache, arena.allocator(), proto, &bindings, body);
+    try testing.expect(!effects.complete);
+    try testing.expect(!effects.error_complete);
+    try testing.expectEqual(@as(usize, 0), effects.definite_freed_paths.len);
+    try testing.expectEqual(@as(usize, 0), effects.retained_owned_params.len);
+}
+
+test "cleanup rejects invalid syntax instead of publishing unknown purity" {
+    var tree = try Ast.parse(testing.allocator, "fn f() void { release(); } fn broken(", .zig);
+    defer tree.deinit(testing.allocator);
+    try testing.expect(tree.errors.len != 0);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &.{} };
+    try testing.expectError(error.InvalidSyntax, inferNormalSuccessCleanup(
+        &cache,
+        arena.allocator(),
+        proto,
+        &bindings,
+        body,
+    ));
+    try testing.expectEqual(@as(u32, 0), cache.queries);
+    try testing.expectEqual(@as(u32, 0), cache.depth);
+}
+
+test "cleanup storage outcomes preserve replacement snapshots and empty exits" {
+    const Case = struct {
+        source: [:0]const u8,
+        kinds: []const @FieldType(StorageOperation, "kind"),
+        empty_exit: bool = false,
+        error_empty: bool = false,
+        complete: bool = true,
+        released_store: bool = false,
+        legacy_may: ?usize = null,
+        allocator_known: bool = true,
+    };
+    const cases = [_]Case{
+        .{
+            .source = "fn f(self: *Owner, flag: bool) void { if (flag and self.inner.bytes.len != 0) return; const old = self.inner.bytes; const next = fresh(); self.inner.bytes = next; release(old); }",
+            .kinds = &.{ .replace, .release_entry },
+            .empty_exit = true,
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const next = fresh(); self.inner.bytes = next; const current = self.inner.bytes; release(current); }",
+            .kinds = &.{ .replace, .release_current },
+        },
+        .{
+            .source = "fn f(self: *Owner) !void { const old = self.inner.bytes; const next = try fresh(); self.inner.bytes = next; release(old); }",
+            .kinds = &.{ .replace, .release_entry },
+            .error_empty = true,
+        },
+        .{
+            .source = "fn f(self: *Owner, other: []u8) void { self.inner.bytes = other; release(self.inner.bytes); }",
+            .kinds = &.{},
+            .complete = false,
+        },
+        .{
+            .source = "fn f(self: *Owner, size: usize) void { const old = self.inner.bytes; const next = fresh(); self.inner.bytes = next; self.capacity = size; release(old); }",
+            .kinds = &.{ .replace, .release_entry },
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const next = fresh(); release(next); self.inner.bytes = next; }",
+            .kinds = &.{},
+            .complete = false,
+            .released_store = true,
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const old = self.inner.bytes; release(old); self.inner.bytes = old; }",
+            .kinds = &.{},
+            .complete = false,
+            .released_store = true,
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const next = fresh(); self.inner.bytes = next; release(next); release(next); }",
+            .kinds = &.{ .replace, .release_current, .release_current },
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const old = self.*; const next = fresh(); self.inner.bytes = next; release(old.inner.bytes); }",
+            .kinds = &.{},
+            .complete = false,
+            .legacy_may = 1,
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const old = self.inner.bytes; const next = fresh(); self.inner.bytes = next; release(old); opaqueValue(); }",
+            .kinds = &.{},
+            .complete = false,
+            .legacy_may = 1,
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const old = self.inner.bytes; const next = fresh(); self.inner.bytes = next; release(old); }",
+            .kinds = &.{ .replace, .release_entry },
+            .legacy_may = 0,
+        },
+        .{
+            .source = "fn f(self: *Owner) void { const old = self.inner.bytes; const next = fresh(); self.inner.bytes = next; release(old); }",
+            .kinds = &.{},
+            .complete = false,
+            .legacy_may = 1,
+            .allocator_known = false,
+        },
+    };
+    for (cases) |case| {
+        var tree = try parse(case.source);
+        defer tree.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+        const bindings = try local_bindings.build(allocator, &tree, proto, body);
+        var calls: std.ArrayListUnmanaged(CleanupTestCache.Call) = .empty;
+        for (1..tree.nodes.len) |index| {
+            const candidate: Ast.Node.Index = @enumFromInt(index);
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&call_buffer, candidate) orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr)), "release")) continue;
+            try calls.append(allocator, .{ .node = candidate, .effects = .{
+                .complete = true,
+                .can_normal = true,
+                .can_error = false,
+                .returns_error = false,
+                .storage_complete = true,
+                .release_argument = call.ast.params[0],
+            } });
+        }
+        if (cleanupTestCall(&tree, "fresh")) |fresh| {
+            try calls.append(allocator, .{ .node = fresh, .effects = .{
+                .complete = true,
+                .error_complete = true,
+                .can_normal = true,
+                .can_error = case.error_empty,
+                .returns_error = if (case.error_empty) null else false,
+                .storage_complete = true,
+                .error_storage_complete = true,
+            } });
+        }
+        var fresh_nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
+        const fresh_call = cleanupTestCall(&tree, "fresh");
+        for (1..tree.nodes.len) |index| {
+            const candidate: Ast.Node.Index = @enumFromInt(index);
+            const tag = tree.nodeTag(candidate);
+            if (tag == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(candidate)), "next"))
+                try fresh_nodes.append(allocator, candidate);
+            if (tag == .@"try") try fresh_nodes.append(allocator, candidate);
+            if (fresh_call) |fresh| {
+                if (candidate == fresh) try fresh_nodes.append(allocator, candidate);
+            }
+        }
+        var cache = CleanupTestCache{
+            .tree = &tree,
+            .calls = calls.items,
+            .fresh_nodes = fresh_nodes.items,
+            .allocator_path = if (case.allocator_known) .{ .param = 0, .path = "allocator" } else null,
+        };
+        const effects = try inferNormalSuccessCleanup(&cache, allocator, proto, &bindings, body);
+        try testing.expectEqual(case.complete, effects.storage_effects_complete);
+        if (case.legacy_may) |count| try testing.expectEqual(count, effects.may_freed_paths.len);
+        if (case.released_store) try testing.expect(namesPath(effects.may_freed_paths, 0, "inner.bytes"));
+        if (!case.complete) continue;
+        try testing.expectEqual(@as(usize, if (case.empty_exit) 2 else 1), effects.storage_outcomes.len);
+        var found = false;
+        for (effects.storage_outcomes) |outcome| {
+            if (outcome.operations.len == 0) continue;
+            found = true;
+            try testing.expectEqual(case.kinds.len, outcome.operations.len);
+            for (outcome.operations, case.kinds) |operation, kind| {
+                try testing.expectEqual(kind, operation.kind);
+                try testing.expectEqual(@as(u32, 0), operation.path.param);
+                try testing.expectEqualStrings("inner.bytes", operation.path.path);
+                if (operation.kind == .replace) {
+                    try testing.expectEqual(@as(u32, 0), operation.allocator.?.param);
+                    try testing.expectEqualStrings("allocator", operation.allocator.?.path);
+                }
+            }
+        }
+        try testing.expect(found);
+        if (case.error_empty) {
+            try testing.expect(effects.error_storage_effects_complete);
+            try testing.expectEqual(@as(usize, 1), effects.error_storage_outcomes.len);
+            try testing.expectEqual(@as(usize, 0), effects.error_storage_outcomes[0].operations.len);
+        }
+    }
+}
+
+test "cleanup storage child entry release composes with active replacement" {
+    var tree = try parse("fn f(self: *Owner) void { self.inner.bytes = fresh(); child(); }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(allocator, &tree, proto, body);
+    const operations = [_]StorageOperation{.{ .path = .{ .param = 0, .path = "inner.bytes" }, .kind = .release_entry }};
+    const outcomes = [_]StorageOutcome{.{ .operations = &operations }};
+    const calls = [_]CleanupTestCache.Call{
+        .{ .node = cleanupTestCall(&tree, "fresh").?, .effects = .{
+            .complete = true,
+            .can_normal = true,
+            .can_error = false,
+            .returns_error = false,
+            .storage_complete = true,
+        } },
+        .{ .node = cleanupTestCall(&tree, "child").?, .effects = .{
+            .complete = true,
+            .can_normal = true,
+            .can_error = false,
+            .returns_error = false,
+            .storage_complete = true,
+            .storage_outcomes = &outcomes,
+        } },
+    };
+    const fresh_nodes = [_]Ast.Node.Index{cleanupTestCall(&tree, "fresh").?};
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &calls, .fresh_nodes = &fresh_nodes };
+    const effects = try inferNormalSuccessCleanup(&cache, allocator, proto, &bindings, body);
+    try testing.expect(effects.storage_effects_complete);
+    try testing.expectEqual(@as(usize, 1), effects.storage_outcomes.len);
+    try testing.expectEqual(@as(usize, 2), effects.storage_outcomes[0].operations.len);
+    try testing.expectEqual(.replace, effects.storage_outcomes[0].operations[0].kind);
+    try testing.expectEqual(.release_current, effects.storage_outcomes[0].operations[1].kind);
+}
+
+test "cleanup errdefer of unpublished fresh local has empty receiver outcome" {
+    var tree = try parse("fn f(self: *Owner) !void { const next = fresh(); errdefer release(next); return error.Fail; }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(allocator, &tree, proto, body);
+    const fresh = cleanupTestCall(&tree, "fresh").?;
+    const release = cleanupTestCall(&tree, "release").?;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const calls = [_]CleanupTestCache.Call{
+        .{ .node = fresh, .effects = .{
+            .complete = true,
+            .storage_complete = true,
+            .can_normal = true,
+            .can_error = false,
+            .returns_error = false,
+        } },
+        .{ .node = release, .effects = .{
+            .complete = true,
+            .storage_complete = true,
+            .can_normal = true,
+            .can_error = false,
+            .returns_error = false,
+            .release_argument = tree.fullCall(&call_buffer, release).?.ast.params[0],
+        } },
+    };
+    const fresh_nodes = [_]Ast.Node.Index{fresh};
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &calls, .fresh_nodes = &fresh_nodes };
+    const effects = try inferNormalSuccessCleanup(&cache, allocator, proto, &bindings, body);
+    try testing.expect(!effects.storage_effects_complete);
+    try testing.expect(effects.error_storage_effects_complete);
+    try testing.expectEqual(@as(usize, 1), effects.error_storage_outcomes.len);
+    try testing.expectEqual(@as(usize, 0), effects.error_storage_outcomes[0].operations.len);
+    try testing.expectEqual(@as(usize, 0), effects.error_may_freed_paths.len);
+}
+
+test "cleanup correlated child products consume the existing node allowance" {
+    var tree = try parse("fn f() void { child(); child(); child(); }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(allocator, &tree, proto, body);
+    const outcomes = [_]StorageOutcome{.{}} ** 8;
+    var calls: std.ArrayListUnmanaged(CleanupTestCache.Call) = .empty;
+    for (1..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&call_buffer, node) == null) continue;
+        try calls.append(allocator, .{ .node = node, .effects = .{
+            .complete = true,
+            .storage_complete = true,
+            .storage_outcomes = &outcomes,
+            .can_normal = true,
+            .can_error = false,
+            .returns_error = false,
+        } });
+    }
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    var cache = CleanupTestCache{ .tree = &tree, .calls = calls.items, .visited = 49_950 };
+    try testing.expectError(error.AnalysisBudgetExceeded, inferNormalSuccessCleanup(
+        &cache,
+        allocator,
+        proto,
+        &bindings,
+        body,
+    ));
+    const stop = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(budget_mod.Limit.normal_cleanup_nodes, stop.limit);
+    try testing.expectEqual(@as(u32, 50_000), stop.limit_value);
+    try testing.expect(cache.storage_work > 0);
+    try testing.expect(cache.visited < 50_000);
+    try testing.expectEqual(@as(u32, 0), cache.depth);
+    try testing.expectEqual(@as(u32, 0), cache.queries);
+}
+
+test "cleanup current release guarantees intersect correlated local snapshots" {
+    var tree = try parse("fn f(self: *Owner, flag: bool) void { var old: []u8 = undefined; if (flag) old = self.a else old = self.b; release(old); }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(allocator, &tree, proto, body);
+    const release = cleanupTestCall(&tree, "release").?;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const calls = [_]CleanupTestCache.Call{.{ .node = release, .effects = .{
+        .complete = true,
+        .storage_complete = true,
+        .can_normal = true,
+        .can_error = false,
+        .returns_error = false,
+        .release_argument = tree.fullCall(&call_buffer, release).?.ast.params[0],
+    } }};
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &calls };
+    const effects = try inferNormalSuccessCleanup(&cache, allocator, proto, &bindings, body);
+    try testing.expect(effects.complete);
+    try testing.expect(effects.storage_effects_complete);
+    try testing.expectEqual(@as(usize, 0), effects.definite_freed_paths.len);
+    try testing.expectEqual(@as(usize, 2), effects.may_freed_paths.len);
+    try testing.expect(namesPath(effects.may_freed_paths, 0, "a"));
+    try testing.expect(namesPath(effects.may_freed_paths, 0, "b"));
+    try testing.expectEqual(@as(usize, 2), effects.storage_outcomes.len);
+}
+
+test "cleanup child replacement without allocator provenance removes exact replay" {
+    var tree = try parse("fn f(self: *Owner) void { child(); }");
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(allocator, &tree, proto, body);
+    const operations = [_]StorageOperation{.{ .path = .{ .param = 0, .path = "inner.bytes" }, .kind = .replace }};
+    const outcomes = [_]StorageOutcome{.{ .operations = &operations }};
+    const calls = [_]CleanupTestCache.Call{.{ .node = cleanupTestCall(&tree, "child").?, .effects = .{
+        .complete = true,
+        .storage_complete = true,
+        .storage_outcomes = &outcomes,
+        .can_normal = true,
+        .can_error = false,
+        .returns_error = false,
+    } }};
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &calls };
+    const effects = try inferNormalSuccessCleanup(&cache, allocator, proto, &bindings, body);
+    try testing.expect(!effects.storage_effects_complete);
+}
+
+test "cleanup child replacement retains the intermediate payload identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path: ParamPath = .{ .param = 0, .path = "bytes" };
+    const replacement: StorageOperation = .{
+        .path = path,
+        .kind = .replace,
+        .allocator = .{ .param = 0, .path = "allocator" },
+    };
+    var state: CleanupState = .{ .present = true };
+    const first = [_]StorageOutcome{.{ .operations = &.{replacement} }};
+    try state.composeStorage(allocator, &first, true);
+    const child = [_]StorageOutcome{.{ .operations = &.{
+        replacement,
+        .{ .path = path, .kind = .release_entry },
+    } }};
+    try state.composeStorage(allocator, &child, true);
+    try testing.expect(state.storage_complete);
+    const trace = state.alternatives[0];
+    try testing.expect(try trace.released(path, 1));
+    try testing.expect(!try trace.released(path, 2));
 }

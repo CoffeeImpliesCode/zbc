@@ -138,8 +138,8 @@ fn reportA(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, base_tok),
-        .end = Pos.fromTokenEnd(tree, base_tok + 5),
+        .start = try Pos.fromTokenStart(tree, base_tok),
+        .end = try Pos.fromTokenEnd(tree, base_tok + 5),
         .message = msg,
     });
 }
@@ -161,8 +161,8 @@ fn reportB(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, base_tok),
-        .end = Pos.fromTokenEnd(tree, base_tok + 9),
+        .start = try Pos.fromTokenStart(tree, base_tok),
+        .end = try Pos.fromTokenEnd(tree, base_tok + 9),
         .message = msg,
     });
 }

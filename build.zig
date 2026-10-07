@@ -9,11 +9,15 @@
 //!     });
 //!     exe.root_module.addImport("zbc", zbc_dep.module("zbc"));
 //!
-//! Then in their Zig code:
+//!     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+//!     const root_len = try std.Io.Dir.cwd().realPathFile(io, ".", &root_buffer);
+//!     const roots = [_][]const u8{root_buffer[0..root_len]};
+//!     var session: zbc.Session = undefined;
+//!     try session.init(gpa, io, .{ .roots = &roots });
+//!     defer session.deinit();
+//!     const analysis = try zbc.analyzeEscape(&session, path, &zbc.DefaultConfig);
+//!     defer zbc.freeAnalysis(gpa, analysis);
 //!
-//!     const zbc = @import("zbc");
-//!     const problems = try zbc.analyzeEscape(gpa, io, path, &cache, &zbc.DefaultConfig);
-
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -29,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    engine_mod.link_libc = true; // engine filesystem tests use realpath
 
     // ── Public library module ───────────────────────────────
     // Importable by downstream consumers as `@import("zbc")`.
@@ -52,21 +57,64 @@ pub fn build(b: *std.Build) void {
         .name = "zbc",
         .root_module = exe_mod,
     });
-
     exe_mod.link_libc = true; // project_cache.zig uses std.c.realpath on non-absolute paths
     b.installArtifact(exe);
 
+    // ── CLI contract tests: runs the emitted exe against fixtures ─────
+    const cli_contract_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli_contract_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_contract_mod.addImport("type_engine", engine_mod);
+    cli_contract_mod.link_libc = true; // project_cache.zig uses std.c.realpath
+
+    // The options module points at the executable artifact itself. The
+    // path dependency makes the contract-test run build that artifact
+    // without requiring the install step or a fixed zig-out location.
+    const cli_contract_options = b.addOptions();
+    cli_contract_options.addOptionPath("zbc_exe", exe.getEmittedBin());
+    cli_contract_mod.addOptions("cli_contract_options", cli_contract_options);
+
+    const test_step = b.step("test", "Run zbc tests");
+    const cli_contract_tests = b.addTest(.{ .root_module = cli_contract_mod });
+    test_step.dependOn(&b.addRunArtifact(cli_contract_tests).step);
+
+    // Root the artifact at engine.zig so its own test blocks are discovered.
+    const engine_tests = b.addTest(.{ .root_module = engine_mod });
+    test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+
     // ── Dogfood: self-check on every `zig build` ────────────
-    const self_check = b.addRunArtifact(exe);
+    // The self-check analyses all of src/, and a Debug zbc is roughly ten
+    // times slower than ReleaseSafe on that tree, so a Debug build checks
+    // itself with a ReleaseSafe copy.  Safety checks stay on.
+    const self_check_exe = if (optimize == .Debug) blk: {
+        const fast_engine = b.createModule(.{
+            .root_source_file = b.path("src/type_engine/engine.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        });
+        fast_engine.link_libc = true;
+        const fast_mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        });
+        fast_mod.addImport("type_engine", fast_engine);
+        fast_mod.link_libc = true;
+        break :blk b.addExecutable(.{ .name = "zbc-self-check", .root_module = fast_mod });
+    } else exe;
+    const self_check = b.addRunArtifact(self_check_exe);
     self_check.addDirectoryArg(b.path("src/"));
+    // build.zig is an input so its named modules (`@import("type_engine")`)
+    // resolve; without it every call into the engine is opaque.
+    self_check.addFileArg(b.path("build.zig"));
     b.default_step.dependOn(&self_check.step);
 
     const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run zbc CLI");
     run_step.dependOn(&run_cmd.step);
-
-    // ── Tests ───────────────────────────────────────────────
-    const test_step = b.step("test", "Run zbc tests");
 
     // Library tests (lib.zig refAllDecls every submodule).
     lib_mod.link_libc = true; // project_cache.zig uses std.c.realpath

@@ -42,6 +42,23 @@ query_string.* = ZigString.init(try alloc.dupe(u8, result.query_string));
   - `<out>.<field> = <RHS>` (field assignment through pointer)
 - The RHS must mention a deferred name as an identifier
   somewhere — not necessarily as a direct argument.
+- With typed analysis, copied values are not reported when the complete
+  retained type graph is proved address-free. The proof reads fields in
+  their declaring resolution frame, including imported types and aliases.
+  Optional and array elements must also be address-free. A union is safe
+  only when **every** payload is address-free; payloadless members carry
+  no address. For example, `out.range = state.rangeOf("") orelse .unknown`
+  is safe after `defer state.deinit()` when the returned union contains
+  only numeric ranges. Adding a slice to any payload prevents that proof.
+  Unknown types, pointers, and slices do not qualify. Explicit address-bit
+  operations such as `@intFromPtr` also prevent this exemption.
+- A write is **not** reported when a later `defer <same place> = <literal>;`
+  clears it before the cleanup runs.  Defers unwind last-in-first-out, so a
+  clearing defer in the cleanup's own scope and registered after it fires
+  first (`defer exits.deinit(); o.capture = &exits; defer o.capture = null;`).
+  The clearing defer must be registered before the write, or be the
+  statement right after it (nothing can exit in between), and its value
+  must be a literal (`null`, `.{}`, `&.{}`, a number or string).
 
 ## Limitations (deliberate)
 

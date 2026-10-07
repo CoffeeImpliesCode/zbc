@@ -355,8 +355,10 @@ const ScopeContext = struct {
                 .kind = kind,
             });
             if (gop.found_existing) return;
+            errdefer doc_scope.declaration_lookup_map.swapRemoveAt(gop.index);
 
             try doc_scope.declarations.append(allocator, declaration);
+            errdefer _ = doc_scope.declarations.pop();
             const declaration_index: Declaration.Index = @enumFromInt(doc_scope.declarations.len - 1);
 
             const data = &doc_scope.scopes.items(.data)[@intFromEnum(pushed.scope)];
@@ -373,9 +375,8 @@ const ScopeContext = struct {
                     break;
                 }
             } else {
-                data.is_child_decls_small = false;
-
                 try context.child_declarations_scratch.ensureUnusedCapacity(allocator, Scope.ChildDeclarations.small_size + 1);
+                data.is_child_decls_small = false;
                 context.child_declarations_scratch.appendSliceAssumeCapacity(@ptrCast(&child_declarations.small));
                 context.child_declarations_scratch.appendAssumeCapacity(declaration_index);
             }

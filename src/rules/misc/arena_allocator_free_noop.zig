@@ -277,21 +277,24 @@ fn arenaCallAt(
     arena_last: Ast.TokenIndex,
 ) ?ArenaCall {
     if (arena_last < arena_first or start > limit) return null;
-    // Both paths are `identifier ( . identifier )*`, so they are walked
-    // two tokens at a time and have to be the same length.  The whole
-    // shape is inside `limit` before a token of it is read.
-    const segments: Ast.TokenIndex = (arena_last - arena_first) / 2 + 1;
-    if (start + 2 * segments + 6 > limit) return null;
+    // Both paths are `identifier ( . identifier )*`. The suffix starts
+    // one token after the final receiver identifier, not two.
+    const receiver_span = arena_last - arena_first;
+    if (receiver_span % 2 != 0 or limit - start < receiver_span + 7) return null;
+    const suffix = start + receiver_span + 1;
     var x = start;
     var y = arena_first;
-    for (0..segments) |_| {
-        if (tags[x] != .identifier or tags[y] != .identifier) return null;
-        if (!std.mem.eql(u8, tree.tokenSlice(x), tree.tokenSlice(y))) return null;
+    while (y <= arena_last) : ({
         x += 2;
         y += 2;
+    }) {
+        if (tags[x] != .identifier or tags[y] != .identifier) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(x), tree.tokenSlice(y))) return null;
+        if (y < arena_last and (tags[x + 1] != .period or tags[y + 1] != .period)) return null;
     }
+    x = suffix;
     if (tags[x] != .period) return null;
-    if (!std.mem.eql(u8, tree.tokenSlice(x + 1), "allocator")) return null;
+    if (tags[x + 1] != .identifier or !std.mem.eql(u8, tree.tokenSlice(x + 1), "allocator")) return null;
     if (tags[x + 2] != .l_paren or tags[x + 3] != .r_paren) return null;
     if (tags[x + 4] != .period or tags[x + 5] != .identifier) return null;
     if (tags[x + 6] != .l_paren) return null;
@@ -504,8 +507,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, allocator_tok),
-        .end = Pos.fromTokenEnd(tree, allocator_tok + 4),
+        .start = try Pos.fromTokenStart(tree, allocator_tok),
+        .end = try Pos.fromTokenEnd(tree, allocator_tok + 4),
         .message = msg,
     });
 }

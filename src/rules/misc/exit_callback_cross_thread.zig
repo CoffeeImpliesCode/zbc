@@ -23,6 +23,7 @@ const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const method_names = @import("../../model/method_names.zig");
+const budget_mod = @import("../../budget.zig");
 
 const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
@@ -84,8 +85,11 @@ fn checkFn(
         const callback_name = tree.tokenSlice(t + 2);
 
         // Look up callback_name as a top-level fn in this file.
-        // If not present we can't inspect — skip.
-        _ = (cache.summaryByName(callback_name) catch null) orelse continue;
+        // If not present we can't inspect — skip.  A summary that ran out of
+        // budget is not an absent one: it propagates, so a callback the
+        // analysis could not finish reading never reads as one that was
+        // cleared.
+        _ = (try cache.summaryByName(callback_name)) orelse continue;
 
         // Find the actual fn body of callback_name to inspect.
         const cb_body = findFnBody(tree, callback_name) orelse continue;
@@ -187,8 +191,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, call_tok),
-        .end = Pos.fromTokenEnd(tree, call_tok),
+        .start = try Pos.fromTokenStart(tree, call_tok),
+        .end = try Pos.fromTokenEnd(tree, call_tok),
         .message = msg,
     });
 }
@@ -268,4 +272,23 @@ test "exit-callback-cross-thread: isMainThread guard doesn't fire" {
         \\}
         \\
     );
+}
+
+test "exit-callback-cross-thread: a callback summary that exhausts its budget is an error, not a clean pass" {
+    const gpa = std.testing.allocator;
+    // The callback body nests deeper than one normal-cleanup proof may follow,
+    // so reading its summary gives up.  Treating that as "no summary" would
+    // clear a callback the analysis never finished reading.
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "fn cleanup(self: *State) void {\n");
+    for (0..80) |_| try source.appendSlice(gpa, "{");
+    try source.appendSlice(gpa, "self.context = 0;");
+    for (0..80) |_| try source.appendSlice(gpa, "}");
+    try source.appendSlice(gpa, "\n}\npub fn setup(self: *State) void {\n    add_exit_callback(cleanup);\n}\n");
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, testing.runRule(gpa, check, source.items));
+    const diagnostic = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_depth, diagnostic.limit);
 }

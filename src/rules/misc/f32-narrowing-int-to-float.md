@@ -54,9 +54,14 @@ Clipping a value changes it; use clipping only when the application permits that
 - When the destination width cannot be read, the rule does not assume `f32`. It emits a warning unless the input is proved exact in every supported float format. A destination the resolver reads as a non-float type is not reported. The warning states that the conversion exactness remains unknown. It does not claim that the conversion rounds or fails.
 - A run without a typed resolver reports nothing. No finding is not a proof of exact conversion.
 - A named import needs proved build-module membership. An adjacent file with the same name does not establish that destination's type.
-- Resolved integer types, constants, masks, and dominating guards can prove exactness.
+- Resolved integer types, including indexed elements of imported slice fields, constants, masks, and dominating guards can prove exactness. A local nonnegative remainder with a positive bounded divisor retains its bound.
 - The proof applies before later division or multiplication. Scaling after conversion cannot repair rounding.
 - Closed private helpers use the bounds of every proven caller. An exported or unresolved caller does not prove a small input domain.
+- Bounded `for` loops can preserve a local counter's exit range when its only write is one literal `+= 1` per iteration. The proof uses the iterable's range, slice endpoint, or fixed extent. Unknown iteration counts, other writes, nested loops, and escaped counters do not establish this bound.
+- A tag stored separately from a wide integer payload does not prove the payload's byte range. This needs a checked tag/payload relation or a source-backed return-range certificate; an accessor's name is not such a certificate.
+- Closed local generic conversions are checked in each resolved instantiation. The input mask and destination format must come from the same instance; a wide-format caller cannot certify an inexact `f32` caller. Captured container constants use that instance's bindings. Open, escaped, or unresolved instances still need a universal exactness proof.
+- When every closed instance supplies a resolved destination and at least one uses `f32`, an unproved conversion gets the `f32` precision warning, not an unresolved-destination advisory. Distinct unsafe conversion sites each get a finding, even when they read the same payload.
+- A float-to-integer round trip needs representability provenance, not only an integer interval. A bounded exponent returned by an unresolved helper also needs a source-backed range proof.
 - Field names such as `color`, and helper names such as `clamp`, do not establish a range.
 - Mutation or conflicting paths can remove a proof. Compile-time-only expressions are not runtime conversion sites.
 - Analysis budget exhaustion is incomplete analysis, not a clean result.

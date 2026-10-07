@@ -326,8 +326,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "union-deinit-without-inert-reset",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, tag_tok),
-        .end = Pos.fromTokenEnd(tree, tag_tok),
+        .start = try Pos.fromTokenStart(tree, tag_tok),
+        .end = try Pos.fromTokenEnd(tree, tag_tok),
         .message = msg,
     });
 }

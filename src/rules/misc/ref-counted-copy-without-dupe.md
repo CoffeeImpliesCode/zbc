@@ -68,8 +68,9 @@ const Shared = struct {
     }
 };
 
-pub fn copy(source: Shared) Shared {
-    // BUG: `source.ref` is handed back by BOTH values on drop.
+pub fn copy(source: Shared, gpa: std.mem.Allocator) Shared {
+    defer @constCast(&source).deref(gpa);
+    // BUG: explicit cleanup releases the returned handle's reference.
     return source;
 }
 ```
@@ -89,6 +90,23 @@ itself built has one owner, and returning one is a move.  A ref-acquire
 that reaches the field *before* the copy keeps the verdict quiet,
 because that is the fix.
 
+Zig has no automatic destructors. A bare `return source;` without another
+use of the source transfers ownership and is quiet. A local binding can
+also transfer ownership: `var usage = source; errdefer usage.deinit();`
+followed by a single handoff cleans up if the operation fails. Before
+another fallible operation, the local must be reset so that a later
+failure cannot release the transferred payload. The reset is checked
+through its declaration: a static constructor accepts only the standard
+allocator capability and returns a literal built from that capability
+and other proved constructors. Unknown methods, conditional resets,
+and resets after another fallible operation do not prove a transfer.
+This does not require an extra reference.
+
+Repeated cleanup or unconditional cleanup together with a handoff stays
+reported. An additional alias or an unresolved use cannot prove a
+single-owner transfer and also stays reported. The proof does not depend
+on type names or file paths.
+
 The acquire has to be one the copy cannot be reached *without*: it runs
 on every path that makes the copy.  An acquire written inside a branch
 that ends before the copy adds a reference on the paths that took that
@@ -97,7 +115,8 @@ branch and none on the rest, so it balances nothing —
 ```zig
 // BUG: on the paths where `keep` is false, nothing was acquired and the
 // returned handle is a second owner of the one reference `ref` holds.
-pub fn copy(source: Shared, keep: bool) Shared {
+pub fn copy(source: Shared, keep: bool, gpa: std.mem.Allocator) Shared {
+    defer @constCast(&source).deref(gpa);
     if (keep) source.ref.retain();
     return source;
 }
@@ -109,7 +128,8 @@ that copy, because every path that makes the copy has run it first:
 ```zig
 // QUIET: each arm's copy is reached only through that arm's acquire, and
 // neither arm's acquire answers for the other.
-pub fn copy(source: Shared, keep: bool) Shared {
+pub fn copy(source: Shared, keep: bool, gpa: std.mem.Allocator) Shared {
+    defer @constCast(&source).deref(gpa);
     if (keep) {
         source.ref.retain();
         return source;

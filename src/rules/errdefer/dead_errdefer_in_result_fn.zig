@@ -28,6 +28,7 @@ const skipFnDecl = tokens.skipFnDecl;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
+/// Returns `SourceTooWide` if the source, token count, or node count exceeds the AST position domain.
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -38,8 +39,13 @@ pub fn check(
     if (!config_mod.isEnabled(config, .dead_errdefer_in_result_fn)) return;
     _ = cache;
 
+    if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
+    const node_count = std.math.cast(u32, tree.nodes.len) orelse return error.SourceTooWide;
+    const last_tok: Ast.TokenIndex = tok_count -| 1;
+
     var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+    while (node_idx < node_count) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         var buf: [1]Ast.Node.Index = undefined;
@@ -50,7 +56,7 @@ pub fn check(
         // The FnProto.return_type field points PAST the `!` (it's
         // the payload type), so walking the type node's own tokens
         // misses the marker.
-        if (fnReturnIsErrorUnion(tree, fp, rt)) continue;
+        if (fnReturnIsErrorUnion(tree, fp, rt, last_tok)) continue;
         if (!returnTypeIsParameterizedTaggedUnion(tree, rt)) continue;
         const body = bodyOf(tree, node) orelse continue;
         try walkBodyForErrdefer(gpa, tree, body, problems);
@@ -62,12 +68,16 @@ pub fn check(
 /// from the matching `)` of `fp.ast.lparen` to `firstToken(rt) - 1`,
 /// tracking paren depth so a `!` inside a callconv arg (e.g.
 /// `callconv(.{ .foo = X!Y })`) doesn't falsely match.
-fn fnReturnIsErrorUnion(tree: *const Ast, fp: Ast.full.FnProto, type_node: Ast.Node.Index) bool {
+fn fnReturnIsErrorUnion(
+    tree: *const Ast,
+    fp: Ast.full.FnProto,
+    type_node: Ast.Node.Index,
+    max_t: Ast.TokenIndex,
+) bool {
     const tags = tree.tokens.items(.tag);
     // Find the params' close paren by walking forward from lparen.
     var depth: u32 = 1;
     var t: Ast.TokenIndex = fp.lparen + 1;
-    const max_t: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
     while (t <= max_t and depth > 0) : (t += 1) {
         switch (tags[t]) {
             .l_paren => depth += 1,
@@ -129,13 +139,13 @@ fn returnTypeIsParameterizedTaggedUnion(tree: *const Ast, type_node: Ast.Node.In
     if (t > last) return false;
     if (tags[t] != .identifier) return false;
     // Skip past `<ident>.<ident>...` chains (`bun.css.Result`).
-    while (t + 1 <= last and tags[t + 1] == .period) {
+    while (t < last and tags[t + 1] == .period) {
         t += 2;
         if (t > last or tags[t] != .identifier) return false;
     }
     // Final token must be followed by `(` for the parameterized
     // tagged-union shape we're looking for.
-    if (t + 1 > last) return false;
+    if (t >= last) return false;
     return tags[t + 1] == .l_paren;
 }
 
@@ -179,8 +189,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "dead-errdefer-in-result-fn",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, errdefer_tok),
-        .end = Pos.fromTokenEnd(tree, errdefer_tok),
+        .start = try Pos.fromTokenStart(tree, errdefer_tok),
+        .end = try Pos.fromTokenEnd(tree, errdefer_tok),
         .message = msg,
     });
 }

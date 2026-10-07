@@ -228,16 +228,16 @@ fn report(
     var notes = try gpa.alloc(problem_mod.Note, 1);
     errdefer gpa.free(notes);
     notes[0] = .{
-        .start = Pos.fromTokenStart(tree, b.name_token),
-        .end = Pos.fromTokenEnd(tree, b.name_token),
+        .start = try Pos.fromTokenStart(tree, b.name_token),
+        .end = try Pos.fromTokenEnd(tree, b.name_token),
         .label = note_label,
     };
 
     try problems.append(gpa, .{
         .rule_id = "hashmap-getptr-rehash",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, use_tok),
-        .end = Pos.fromTokenEnd(tree, use_tok),
+        .start = try Pos.fromTokenStart(tree, use_tok),
+        .end = try Pos.fromTokenEnd(tree, use_tok),
         .message = msg,
         .notes = notes,
     });

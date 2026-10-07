@@ -114,6 +114,42 @@ const stack_escape_line5 =
     \\
 ;
 
+/// One function whose flow check exhausts the per-block path-state limit
+/// (ten independent conditions leave 2^10 states at the join, the limit is
+/// 64), next to a function with a real finding. `many` also double-frees
+/// early; the exhausted function must report nothing, not even that.
+/// `many` starts on line 2; the stack escape in `bad` is on line 27.
+const exhausted_function_src =
+    \\const std = @import("std");
+    \\fn many(a: std.mem.Allocator, f0: bool, f1: bool, f2: bool, f3: bool, f4: bool, f5: bool, f6: bool, f7: bool, f8: bool, f9: bool) void {
+    \\    const q = a.alloc(u8, 1) catch return;
+    \\    a.free(q);
+    \\    a.free(q);
+    \\    const p0 = a.alloc(u8, 1) catch return;
+    \\    const p1 = a.alloc(u8, 1) catch return;
+    \\    const p2 = a.alloc(u8, 1) catch return;
+    \\    const p3 = a.alloc(u8, 1) catch return;
+    \\    const p4 = a.alloc(u8, 1) catch return;
+    \\    const p5 = a.alloc(u8, 1) catch return;
+    \\    const p6 = a.alloc(u8, 1) catch return;
+    \\    const p7 = a.alloc(u8, 1) catch return;
+    \\    const p8 = a.alloc(u8, 1) catch return;
+    \\    const p9 = a.alloc(u8, 1) catch return;
+    \\    if (f0) a.free(p0);
+    \\    if (f1) a.free(p1);
+    \\    if (f2) a.free(p2);
+    \\    if (f3) a.free(p3);
+    \\    if (f4) a.free(p4);
+    \\    if (f5) a.free(p5);
+    \\    if (f6) a.free(p6);
+    \\    if (f7) a.free(p7);
+    \\    if (f8) a.free(p8);
+    \\    if (f9) a.free(p9);
+    \\}
+    \\pub fn bad() *u8 { var x: u8 = 1; return &x; }
+    \\
+;
+
 /// A filename carrying both a space and a percent sign. `std.Uri`'s path
 /// component escapes neither, so the SARIF URI for this file has to come
 /// back percent-encoded.
@@ -137,10 +173,15 @@ const Run = struct {
 /// A child that ended on a signal never produced the contract these tests
 /// assert, so that is an error here rather than a fabricated exit code.
 fn zbc(cwd: []const u8, args: []const []const u8) !Run {
+    // Build-cache artifact paths can be relative to the test process.
+    // Resolve before the child switches to the fixture's working directory.
+    const exe_path = try std.Io.Dir.cwd().realPathFileAlloc(io, cli_contract_options.zbc_exe, gpa);
+    defer gpa.free(exe_path);
+
     // Test argv storage. Sized for the widest invocation in this file.
     var argv: [16][]const u8 = undefined;
     std.debug.assert(args.len < argv.len);
-    argv[0] = cli_contract_options.zbc_exe;
+    argv[0] = exe_path;
     @memcpy(argv[1..][0..args.len], args);
 
     const result = try std.process.run(gpa, io, .{
@@ -291,7 +332,6 @@ fn lineCount(text: []const u8) usize {
     return if (text[text.len - 1] == '\n') n - 1 else n;
 }
 
-
 fn expectContains(text: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, text, needle) == null) {
         std.debug.print("`{s}` absent from:\n{s}", .{ needle, text });
@@ -309,13 +349,15 @@ fn expectAbsent(text: []const u8, needle: []const u8) !void {
 /// Asserts the coverage summary reports exactly these counts, together
 /// with the parser version the run used. The counts are written out
 /// separately because none stands in for another: a refused input is
-/// selected and never analyzed, and a file whose analysis failed is
-/// counted as selected but never as analyzed either.
-fn expectSummary(run: *const Run, selected: usize, analyzed: usize, failed: usize, findings: usize) !void {
+/// selected and never analyzed, a file whose analysis failed is counted
+/// as selected but never as analyzed either, and a partial file (some
+/// part gave up on a budget, the rest reported) is neither analyzed nor
+/// failed.
+fn expectSummary(run: *const Run, selected: usize, analyzed: usize, partial: usize, failed: usize, findings: usize) !void {
     const needle = try std.fmt.allocPrint(
         gpa,
-        "zbc: selected={d} analyzed={d} failed={d} findings={d} parser=Zig-{s} unresolved-import-lookups=",
-        .{ selected, analyzed, failed, findings, builtin.zig_version_string },
+        "zbc: selected={d} analyzed={d} partial={d} failed={d} findings={d} parser=Zig-{s} unresolved-import-lookups=",
+        .{ selected, analyzed, partial, failed, findings, builtin.zig_version_string },
     );
     defer gpa.free(needle);
     if (std.mem.indexOf(u8, run.stderr, needle) == null) {
@@ -447,7 +489,7 @@ test "cli json: a clean source exits 0 and reports an empty bare array" {
 
     try std.testing.expectEqual(@as(u8, 0), run.code);
     try expectEmptyBareArray(&run);
-    try expectSummary(&run, 1, 1, 0, 0);
+    try expectSummary(&run, 1, 1, 0, 0, 0);
 }
 
 test "cli json: the version-compatibility consumer analyses clean on the compiled parser" {
@@ -460,7 +502,7 @@ test "cli json: the version-compatibility consumer analyses clean on the compile
 
     try std.testing.expectEqual(@as(u8, 0), run.code);
     try expectEmptyBareArray(&run);
-    try expectSummary(&run, 1, 1, 0, 0);
+    try expectSummary(&run, 1, 1, 0, 0, 0);
 }
 
 // ── Findings ─────────────────────────────────────────────────
@@ -492,7 +534,7 @@ test "cli json: a finding exits 1 and reports rule, severity, span and canonical
     // The canonical path of the file the CLI opened.
     try std.testing.expectEqualStrings(abs, finding.path);
 
-    try expectSummary(&run, 1, 1, 0, 1);
+    try expectSummary(&run, 1, 1, 0, 0, 1);
 }
 
 test "cli json: the default arena patterns let a real arena allocation escape" {
@@ -520,7 +562,7 @@ test "cli json: the default arena patterns let a real arena allocation escape" {
     try std.testing.expectEqualStrings(abs, finding.path);
     try std.testing.expectEqual(@as(u32, 6), finding.start.line);
 
-    try expectSummary(&run, 1, 1, 0, 1);
+    try expectSummary(&run, 1, 1, 0, 0, 1);
 }
 
 test "cli json: --arena-init that names no arena removes the finding" {
@@ -542,7 +584,7 @@ test "cli json: --arena-init that names no arena removes the finding" {
 
     try std.testing.expectEqual(@as(u8, 0), run.code);
     try expectEmptyBareArray(&run);
-    try expectSummary(&run, 1, 1, 0, 0);
+    try expectSummary(&run, 1, 1, 0, 0, 0);
 }
 
 test "cli json: reading a real arena allocation after its deinit is reported" {
@@ -573,7 +615,7 @@ test "cli json: reading a real arena allocation after its deinit is reported" {
     try std.testing.expectEqual(@as(u32, 6), finding.start.line);
     try std.testing.expect(finding.start.column > 0);
 
-    try expectSummary(&run, 1, 1, 0, 1);
+    try expectSummary(&run, 1, 1, 0, 0, 1);
 }
 
 test "cli json: --arena-kill that names no deinit leaves the arena live" {
@@ -596,7 +638,7 @@ test "cli json: --arena-kill that names no deinit leaves the arena live" {
 
     try std.testing.expectEqual(@as(u8, 0), run.code);
     try expectEmptyBareArray(&run);
-    try expectSummary(&run, 1, 1, 0, 0);
+    try expectSummary(&run, 1, 1, 0, 0, 0);
 }
 
 // ── Selection and parse failures ─────────────────────────────
@@ -615,7 +657,83 @@ test "cli json: a missing input exits 2 and still reports a bare array" {
     // run could not select it.
     const refusal = try lineContaining(run.stderr, "cannot select");
     try expectContains(refusal, "missing.zig");
-    try expectSummary(&run, 1, 0, 1, 0);
+    try expectSummary(&run, 1, 0, 0, 1, 0);
+}
+
+/// A toolchain failure belongs to the run, not to a file: it is reported
+/// on one line before analysis, names the command and what it said, and
+/// is not repeated as a per-file `cannot analyze` line.
+fn expectSingleToolchainDiagnostic(run: *const Run, command: []const u8, reason: []const u8) !void {
+    try std.testing.expectEqual(@as(u8, 2), run.code);
+    const line = try lineContaining(run.stderr, "cannot discover the Zig toolchain");
+    try expectContains(line, "ZigToolchainUnavailable");
+    try expectContains(line, command);
+    try expectContains(line, reason);
+    try expectAbsent(run.stderr, "cannot analyze");
+    try expectAbsent(run.stderr, ": NotFound");
+    try expectContains(run.stderr, "--zig=<path>");
+    try expectSummary(run, 1, 0, 0, 1, 0);
+}
+
+test "cli json: a missing zig executable is one toolchain error and a bare array" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("clean.zig", "pub fn f() void {}\n");
+
+    var run = try zbc(fx.dir, &.{ "--format=json", "--zig=/nonexistent/zbc-test-zig", "clean.zig", "clean.zig" });
+    defer run.deinit();
+
+    try expectEmptyBareArray(&run);
+    try expectSingleToolchainDiagnostic(&run, "`/nonexistent/zbc-test-zig env`", "could not be started: FileNotFound");
+}
+
+test "cli sarif: a missing zig executable reports an unsuccessful invocation" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("clean.zig", "pub fn f() void {}\n");
+
+    var run = try zbc(fx.dir, &.{ "--format=sarif", "--zig=/nonexistent/zbc-test-zig", "clean.zig" });
+    defer run.deinit();
+
+    const log = try parseSarif(run.stdout);
+    defer log.deinit();
+    try std.testing.expect(!log.value.runs[0].invocations[0].executionSuccessful);
+    try std.testing.expectEqual(@as(usize, 0), log.value.runs[0].results.len);
+    try expectSingleToolchainDiagnostic(&run, "`/nonexistent/zbc-test-zig env`", "could not be started");
+}
+
+test "cli json: a zig that exits nonzero reports its status and first stderr line once" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("clean.zig", "pub fn f() void {}\n");
+    try fx.tmp.dir.writeFile(io, .{
+        .sub_path = "fake-zig",
+        .data = "#!/bin/sh\necho 'error: no build.zig.zon found' >&2\necho 'second line' >&2\nexit 3\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const fake = try fx.pathOf("fake-zig");
+    defer gpa.free(fake);
+    const flag = try std.fmt.allocPrint(gpa, "--zig={s}", .{fake});
+    defer gpa.free(flag);
+
+    var run = try zbc(fx.dir, &.{ "--format=json", flag, "clean.zig" });
+    defer run.deinit();
+
+    try expectEmptyBareArray(&run);
+    try expectSingleToolchainDiagnostic(&run, fake, "exited with status 3: error: no build.zig.zon found");
+    try expectAbsent(run.stderr, "second line");
+}
+
+test "cli: an empty --zig value answers once and accounts for nothing" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("clean.zig", "pub fn f() void {}\n");
+
+    var run = try zbc(fx.dir, &.{ "--zig=", "clean.zig" });
+    defer run.deinit();
+
+    try expectSingleFlagDiagnostic(&run, "--zig", &.{ "--zig", "non-empty" }, &.{});
 }
 
 test "cli json: malformed root source is attributed to the root with no imported hint" {
@@ -638,7 +756,7 @@ test "cli json: malformed root source is attributed to the root with no imported
     // own name for the failure — not a line that merely exists.
     try expectParseError(diagnostic, abs, malformed_root);
 
-    try expectSummary(&run, 1, 0, 1, 0);
+    try expectSummary(&run, 1, 0, 0, 1, 0);
 }
 
 test "cli json: a malformed import is attributed to the imported path" {
@@ -675,7 +793,7 @@ test "cli json: a malformed import is attributed to the imported path" {
     // the offending token, names a different site and fails here.
     try expectParseError(diagnostic, dep_uri, malformed_dep);
 
-    try expectSummary(&run, 1, 0, 1, 0);
+    try expectSummary(&run, 1, 0, 0, 1, 0);
 }
 
 test "cli json: a mixed run reports its findings and counts each input separately" {
@@ -704,7 +822,7 @@ test "cli json: a mixed run reports its findings and counts each input separatel
     try std.testing.expectEqual(@as(u32, 3), parsed.value[0].start.line);
 
     // Four counts, none standing in for another.
-    try expectSummary(&run, 4, 2, 2, 1);
+    try expectSummary(&run, 4, 2, 0, 2, 1);
 
     const refusal = try lineContaining(run.stderr, "cannot select");
     try expectContains(refusal, "missing.zig");
@@ -736,7 +854,7 @@ test "cli sarif: a clean run reports a successful invocation and no results" {
     try std.testing.expectEqual(@as(usize, 0), sarif_run.results.len);
     try std.testing.expectEqual(@as(usize, 0), sarif_run.tool.driver.rules.len);
 
-    try expectSummary(&run, 1, 1, 0, 0);
+    try expectSummary(&run, 1, 1, 0, 0, 0);
 }
 
 test "cli sarif: a finding reports rule, region and a percent-encoded file uri" {
@@ -784,7 +902,7 @@ test "cli sarif: a finding reports rule, region and a percent-encoded file uri" 
     try std.testing.expectEqual(@as(usize, 1), sarif_run.tool.driver.rules.len);
     try std.testing.expectEqualStrings("stack-escape", sarif_run.tool.driver.rules[0].id);
 
-    try expectSummary(&run, 1, 1, 0, 1);
+    try expectSummary(&run, 1, 1, 0, 0, 1);
 }
 
 test "cli sarif: every result keeps its own file's uri and position" {
@@ -848,7 +966,7 @@ test "cli sarif: every result keeps its own file's uri and position" {
     try std.testing.expectEqual(@as(usize, 1), sarif_run.tool.driver.rules.len);
     try std.testing.expectEqualStrings("stack-escape", sarif_run.tool.driver.rules[0].id);
 
-    try expectSummary(&run, 3, 3, 0, 3);
+    try expectSummary(&run, 3, 3, 0, 0, 3);
 }
 
 test "cli sarif: a missing input reports an unsuccessful invocation" {
@@ -870,7 +988,7 @@ test "cli sarif: a missing input reports an unsuccessful invocation" {
 
     const refusal = try lineContaining(run.stderr, "cannot select");
     try expectContains(refusal, "missing.zig");
-    try expectSummary(&run, 1, 0, 1, 0);
+    try expectSummary(&run, 1, 0, 0, 1, 0);
 }
 
 test "cli sarif: malformed root source is attributed to the root with no imported hint" {
@@ -897,7 +1015,7 @@ test "cli sarif: malformed root source is attributed to the root with no importe
     // site the parser reports for these bytes.
     try expectParseError(diagnostic, abs, malformed_root);
 
-    try expectSummary(&run, 1, 0, 1, 0);
+    try expectSummary(&run, 1, 0, 0, 1, 0);
 }
 
 test "cli sarif: a malformed import is attributed to the imported path" {
@@ -930,7 +1048,7 @@ test "cli sarif: a malformed import is attributed to the imported path" {
     // compared against is the one the parser gave that document.
     try expectParseError(diagnostic, dep_uri, malformed_dep);
 
-    try expectSummary(&run, 1, 0, 1, 0);
+    try expectSummary(&run, 1, 0, 0, 1, 0);
 }
 
 test "cli sarif: a mixed run keeps results while the invocation is unsuccessful" {
@@ -955,7 +1073,80 @@ test "cli sarif: a mixed run keeps results while the invocation is unsuccessful"
     try std.testing.expectEqual(@as(usize, 1), sarif_run.results.len);
     try std.testing.expectEqualStrings("stack-escape", sarif_run.results[0].ruleId);
 
-    try expectSummary(&run, 4, 2, 2, 1);
+    try expectSummary(&run, 4, 2, 0, 2, 1);
+}
+
+// ── Partial analysis ─────────────────────────────────────────
+
+test "cli json: an exhausted function keeps the others' findings, is listed, and exits 2" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("partial.zig", exhausted_function_src);
+    const partial_abs = try fx.pathOf("partial.zig");
+    defer gpa.free(partial_abs);
+
+    var run = try zbc(fx.dir, &.{ "--format=json", "partial.zig" });
+    defer run.deinit();
+
+    // Incomplete outranks a finding: the run did not finish the file.
+    try std.testing.expectEqual(@as(u8, 2), run.code);
+
+    // stdout stays a bare array holding exactly the finished function's finding.
+    const parsed = try parseProblems(run.stdout);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.len);
+    try std.testing.expectEqualStrings(partial_abs, parsed.value[0].path);
+    try std.testing.expectEqualStrings("stack-escape", parsed.value[0].rule_id);
+    try std.testing.expectEqual(@as(u32, 27), parsed.value[0].start.line);
+    try expectAbsent(run.stdout, "heap-double-free");
+
+    // One stderr line names the file, the function and the limit that tripped.
+    const incomplete = try lineContaining(run.stderr, "zbc: incomplete");
+    try expectContains(incomplete, partial_abs);
+    try expectContains(incomplete, "fn many");
+    try expectContains(incomplete, "path states per block limit 64 reached 64");
+    try expectContains(incomplete, " at ");
+    try expectAbsent(run.stderr, "cannot analyze");
+
+    // Neither analyzed nor failed: its own bucket.
+    try expectSummary(&run, 1, 0, 1, 0, 1);
+}
+
+test "cli sarif: a partial file keeps its results and the invocation is unsuccessful" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("partial.zig", exhausted_function_src);
+
+    var run = try zbc(fx.dir, &.{ "--format=sarif", "partial.zig" });
+    defer run.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), run.code);
+    const log = try parseSarif(run.stdout);
+    defer log.deinit();
+    const sarif_run = log.value.runs[0];
+    try std.testing.expect(!sarif_run.invocations[0].executionSuccessful);
+    try std.testing.expectEqual(@as(usize, 1), sarif_run.results.len);
+    try std.testing.expectEqualStrings("stack-escape", sarif_run.results[0].ruleId);
+    try expectSummary(&run, 1, 0, 1, 0, 1);
+}
+
+test "cli json: partial, failed and complete files are counted apart" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("clean.zig", clean_value);
+    try fx.write("partial.zig", exhausted_function_src);
+    try fx.write("broken.zig", malformed_root);
+
+    var run = try zbc(fx.dir, &.{ "--format=json", "." });
+    defer run.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), run.code);
+    const parsed = try parseProblems(run.stdout);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.len);
+    // selected = analyzed + partial + failed.
+    try expectSummary(&run, 3, 1, 1, 1, 1);
+    try expectContains(run.stderr, "zbc: incomplete");
 }
 
 // ── Flags ────────────────────────────────────────────────────
@@ -1029,24 +1220,23 @@ test "cli: no operand prints usage and accounts for nothing" {
 test "cli json: a named pruned-tree input is refused by the default rule" {
     var fx = try Fixture.init();
     defer fx.deinit();
-    try fx.write("vendor/hidden.zig", stack_escape_one_line);
+    try fx.write("vendor/hidden.zig", malformed_root);
+    try fx.write("keep.zig", stack_escape_one_line);
 
-    // An input the operator named is answered with the rule that refused
-    // it, never silently dropped. `vendor` is one of the shipped pruned
-    // names, so the refusal names it and does not blame an exclusion the
-    // operator configured.
-    var run = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "vendor/hidden.zig" });
+    // A named excluded source is a failed selection, not a parse attempt.
+    // Its allowed peer must still be analyzed and reported.
+    var run = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "vendor/hidden.zig", "keep.zig" });
     defer run.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), run.code);
-    try expectEmptyBareArray(&run);
-
-    const refusal = try lineContaining(run.stderr, "cannot select");
-    try expectContains(refusal, "vendor/hidden.zig");
-    try expectContains(refusal, "vendor");
-    try expectAbsent(refusal, "--exclude");
-
-    try expectSummary(&run, 1, 0, 1, 0);
+    const parsed = try parseProblems(run.stdout);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.len);
+    const kept = try fx.pathOf("keep.zig");
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings(kept, parsed.value[0].path);
+    try expectAbsent(run.stderr, "parse error:");
+    try expectSummary(&run, 2, 1, 0, 1, 1);
 }
 
 test "cli json: a named --exclude input is refused by the configured rule" {
@@ -1054,8 +1244,18 @@ test "cli json: a named --exclude input is refused by the configured rule" {
     defer fx.deinit();
     try fx.write("skipme/hidden.zig", stack_escape_one_line);
 
-    // Same shape, a different rule: the diagnostic names the configured
-    // exclusion rather than a shipped default.
+    // Prove the source is analyzable without the configured exclusion.
+    var included = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "skipme/hidden.zig" });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u8, 1), included.code);
+    const included_problems = try parseProblems(included.stdout);
+    defer included_problems.deinit();
+    try std.testing.expectEqual(@as(usize, 1), included_problems.value.len);
+    const hidden = try fx.pathOf("skipme/hidden.zig");
+    defer gpa.free(hidden);
+    try std.testing.expectEqualStrings(hidden, included_problems.value[0].path);
+    try expectSummary(&included, 1, 1, 0, 0, 1);
+
     var run = try zbc(fx.dir, &.{
         "--format=json",
         only_stack_escape,
@@ -1067,24 +1267,49 @@ test "cli json: a named --exclude input is refused by the configured rule" {
     try std.testing.expectEqual(@as(u8, 2), run.code);
     try expectEmptyBareArray(&run);
 
-    const refusal = try lineContaining(run.stderr, "cannot select");
-    try expectContains(refusal, "skipme/hidden.zig");
-    try expectContains(refusal, "--exclude");
-    try expectContains(refusal, "skipme");
+    try expectSummary(&run, 1, 0, 0, 1, 0);
 
-    try expectSummary(&run, 1, 0, 1, 0);
+    var directory = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "--exclude=skipme", "skipme" });
+    defer directory.deinit();
+    try std.testing.expectEqual(@as(u8, 2), directory.code);
+    try expectEmptyBareArray(&directory);
+    try expectSummary(&directory, 1, 0, 0, 1, 0);
+
+    if (builtin.os.tag != .windows) {
+        try fx.tmp.dir.symLink(io, "skipme/hidden.zig", "alias.zig", .{});
+        var alias = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "--exclude=skipme", "alias.zig" });
+        defer alias.deinit();
+        try std.testing.expectEqual(@as(u8, 2), alias.code);
+        try expectEmptyBareArray(&alias);
+        try expectSummary(&alias, 1, 0, 0, 1, 0);
+
+        var outside = try Fixture.init();
+        defer outside.deinit();
+        try outside.write("broken.zig", malformed_root);
+        const target = try outside.pathOf("broken.zig");
+        defer gpa.free(target);
+        try fx.tmp.dir.symLink(io, target, "outside.zig", .{});
+        try fx.tmp.dir.symLink(io, outside.dir, "outside", .{ .is_directory = true });
+        var escaped = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "outside.zig", "outside" });
+        defer escaped.deinit();
+        try std.testing.expectEqual(@as(u8, 2), escaped.code);
+        try expectEmptyBareArray(&escaped);
+        try expectAbsent(escaped.stderr, "parse error:");
+        try expectSummary(&escaped, 2, 0, 0, 2, 0);
+    }
 }
 
 test "cli json: a pruned child of a requested walk is silent" {
     var fx = try Fixture.init();
     defer fx.deinit();
     try fx.write("keep/hidden.zig", stack_escape_one_line);
-    try fx.write("vendor/hidden.zig", stack_escape_one_line);
+    try fx.write("vendor/hidden.zig", malformed_root);
+    try fx.write("skipme/deep/broken.zig", malformed_root);
+    try fx.write("skipme/live.zig", clean_value);
 
-    // The same file the previous test had to answer by name is, inside a
-    // requested walk, a child the operator never named — so the walk
-    // filters it before opening it and says nothing at all.
-    var run = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "." });
+    // Prune default and configured subtrees without losing an allowed sibling.
+    // A malformed pruned source must never become a parse failure.
+    var run = try zbc(fx.dir, &.{ "--format=json", only_stack_escape, "--exclude=skipme/deep", "." });
     defer run.deinit();
 
     try std.testing.expectEqual(@as(u8, 1), run.code);
@@ -1101,7 +1326,8 @@ test "cli json: a pruned child of a requested walk is silent" {
     // on no channel, and the counts describe only what the walk yielded.
     try expectAbsent(run.stderr, "vendor");
     try expectAbsent(run.stderr, "cannot select");
-    try expectSummary(&run, 1, 1, 0, 1);
+    try expectAbsent(run.stderr, "parse error:");
+    try expectSummary(&run, 2, 2, 0, 0, 1);
 }
 
 // ── Determinism ──────────────────────────────────────────────
@@ -1149,8 +1375,8 @@ test "cli json: operand order and --jobs do not change the report" {
         try std.testing.expect(std.mem.lessThan(u8, earlier.path, later.path));
     }
 
-    try expectSummary(&one, 3, 3, 0, 3);
-    try expectSummary(&many, 3, 3, 0, 3);
+    try expectSummary(&one, 3, 3, 0, 0, 3);
+    try expectSummary(&many, 3, 3, 0, 0, 3);
 }
 
 // ── Channels ─────────────────────────────────────────────────
@@ -1180,5 +1406,5 @@ test "cli: the report and the summary never share a channel" {
     try std.testing.expect(std.mem.startsWith(u8, run.stderr, "zbc: "));
     try expectAbsent(run.stderr, "[{");
 
-    try expectSummary(&run, 1, 1, 0, 1);
+    try expectSummary(&run, 1, 1, 0, 0, 1);
 }

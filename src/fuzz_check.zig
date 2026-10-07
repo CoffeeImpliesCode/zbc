@@ -1,6 +1,6 @@
 //! Fuzz harness for the full AST + CFG + pattern-rule pipeline.
 //!
-//! Three entry points, all backed by the same `analyzeBytes` core:
+//! Three entry points, all backed by `analyzeBytes`:
 //!
 //!   1. `test "fuzz smoke"` — runs each seed once under `zig build test`.
 //!      No server, no instrumentation, just crash-free confirmation.
@@ -13,18 +13,18 @@
 //!      Build:  zig build fuzz-libfuzzer   (links -fsanitize=fuzzer)
 //!      Run:    ./fuzz-zbc-libfuzzer corpus/
 //!
-//! The harness omits the ZLS type engine (needs a file path + project
-//! context) and falls through to AST-only analysis — the dominant path.
+//! The harness omits the file-backed type engine and keeps the AST-only
+//! pipeline in memory. Malformed original source is rejected before lowering.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
-
 const cfg_builder = @import("flow/cfg_builder.zig");
 const worklist = @import("flow/worklist.zig");
 const rule_catalog = @import("rule_catalog.zig");
 const config_mod = @import("config.zig");
 const file_cache_mod = @import("cache/file_cache.zig");
 const problem_mod = @import("problem.zig");
+const SourcePolicy = @import("type_engine").SourcePolicy;
 
 // ── Seeds ─────────────────────────────────────────────────────────────
 // Representative Zig snippets covering the major rule classes.
@@ -68,51 +68,79 @@ pub const seeds: []const []const u8 = &.{
 };
 
 // ── Core ───────────────────────────────────────────────────────────────
-/// Run the full analysis pipeline on `raw` bytes.  Returns without
-/// reporting findings — caller only cares whether the pipeline crashes.
+/// Run the AST pipeline on original bytes without reporting findings.
+/// Refuse `SourceTooWide` before allocation, reading bytes, or parsing.
 pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
+    if (!SourcePolicy.admitsSourceLength(raw.len)) return error.SourceTooWide;
     if (raw.len == 0) return;
-
-    // Ast.parse requires a null-terminated sentinel string.
     const src = try gpa.allocSentinel(u8, raw.len, 0);
     defer gpa.free(src);
     @memcpy(src[0..raw.len], raw);
-
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
+    if (tree.errors.len != 0) return error.InvalidSyntax;
 
     const config = &config_mod.Default;
     var problems: std.ArrayListUnmanaged(problem_mod.Problem) = .empty;
-
+    defer {
+        for (problems.items) |*problem| problem.deinit(gpa);
+        problems.deinit(gpa);
+    }
     var cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer cache.deinit();
-
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        const cfg = (try cfg_builder.lowerFunctionFull(
-            gpa, &tree, node, config, &cache,
+        var cfg = (try cfg_builder.lowerFunctionFull(
+            gpa,
+            &tree,
+            node,
+            config,
+            &cache,
         )) orelse continue;
-        var cfg_mut = cfg;
-        defer cfg_mut.deinit(gpa);
-        try worklist.check(gpa, &cfg_mut, .{ .path = "<fuzz>", .config = config }, &problems);
+        defer cfg.deinit(gpa);
+        try worklist.check(gpa, &cfg, .{ .path = "<fuzz>", .config = config }, &problems);
     }
+    // A rule that gives up on a budget is not a crash; the fuzzer looks for crashes.
+    var incomplete: std.ArrayListUnmanaged(problem_mod.Incomplete) = .empty;
+    defer {
+        for (incomplete.items) |*part| part.deinit(gpa);
+        incomplete.deinit(gpa);
+    }
+    try rule_catalog.runEscape(gpa, &tree, &cache, config, &problems, &incomplete);
+}
 
-    try rule_catalog.runEscape(gpa, &tree, &cache, config, &problems);
+test "raw source width refusal precedes allocation and parsing" {
+    const bound = SourcePolicy.max_source_bytes;
+    for ([_]usize{ bound, std.math.maxInt(usize) }) |length| {
+        // This pointer must never be read: only the declared length is admitted.
+        const raw = @as([*]const u8, @ptrFromInt(1))[0..length];
+        var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.SourceTooWide, analyzeBytes(failing.allocator(), raw));
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+}
 
-    for (problems.items) |*p| p.deinit(gpa);
-    problems.deinit(gpa);
+test "libfuzzer refuses too-wide input without reading bytes" {
+    const bound = SourcePolicy.max_source_bytes;
+    for ([_]usize{ bound, std.math.maxInt(usize) }) |length| {
+        try std.testing.expectEqual(@as(i32, 0), LLVMFuzzerTestOneInput(@ptrFromInt(1), length));
+    }
 }
 
 // ── Entry point 1: smoke test ──────────────────────────────────────────
 test "fuzz smoke: seeds do not crash the analysis pipeline" {
     const gpa = std.testing.allocator;
+
     for (seeds) |seed| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         analyzeBytes(arena.allocator(), seed) catch |err| switch (err) {
             error.OutOfMemory => {}, // OOM on a seed is not a logic crash
+            error.InvalidSyntax => {}, // malformed source is rejected
+            error.SourceTooWide => {}, // input outside the source offset domain is rejected
+            error.AnalysisBudgetExceeded => {}, // a bounded walk gave up; not a crash
             else => return err,
         };
     }
@@ -136,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(raw);
 
     analyzeBytes(gpa, raw) catch |err| switch (err) {
-        error.OutOfMemory => return,
+        error.OutOfMemory, error.InvalidSyntax, error.SourceTooWide, error.AnalysisBudgetExceeded => return,
         else => return err,
     };
 }
@@ -148,6 +176,9 @@ pub fn main(init: std.process.Init) !void {
 export fn LLVMFuzzerTestOneInput(data: [*]const u8, size: usize) callconv(.c) i32 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    analyzeBytes(arena.allocator(), data[0..size]) catch {};
+    analyzeBytes(arena.allocator(), data[0..size]) catch |err| switch (err) {
+        error.OutOfMemory, error.InvalidSyntax, error.SourceTooWide, error.AnalysisBudgetExceeded => return 0,
+        else => std.debug.panic("unexpected fuzz analysis failure: {s}", .{@errorName(err)}),
+    };
     return 0;
 }

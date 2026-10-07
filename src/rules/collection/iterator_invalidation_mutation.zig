@@ -92,11 +92,17 @@ fn checkBody(
         // makes `x` the capture, not the field).
         var k: Ast.TokenIndex = cp + 1;
         var capture_shadows: bool = false;
+        var capture_by_value: bool = false;
         if (k <= last and tags[k] == .pipe) {
             const recv_last_seg = tree.tokenSlice(recv_range.last);
             k += 1;
+            var first_capture = true;
             while (k <= last and tags[k] != .pipe) : (k += 1) {
                 if (tags[k] != .identifier) continue;
+                if (first_capture) {
+                    capture_by_value = k == 0 or tags[k - 1] != .asterisk;
+                    first_capture = false;
+                }
                 if (std.mem.eql(u8, tree.tokenSlice(k), recv_last_seg)) {
                     capture_shadows = true;
                 }
@@ -117,6 +123,10 @@ fn checkBody(
         // body_last].  recv_range is a token range that may be
         // multi-segment (`this.ltr` → 3 tokens: `this . ltr`).
         const mutate_tok = findReceiverMutate(tree, body_first, body_last, recv_range) orelse continue;
+        if (capture_by_value and mutationImmediatelyReturns(tree, mutate_tok, body_last)) {
+            t = body_last;
+            continue;
+        }
         const recv_display = displayReceiver(tree, recv_range);
         try report(gpa, problems, tree, t, recv_display, mutate_tok);
         // Skip past this loop's body so we don't re-find the same
@@ -285,6 +295,23 @@ fn findReceiverMutate(
     return null;
 }
 
+/// True when the mutator call is followed only by an optional semicolon
+/// and `return`. A by-value capture is detached, and this control-flow
+/// shape performs no iterator read after the mutation.
+fn mutationImmediatelyReturns(
+    tree: *const Ast,
+    mutate_tok: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    const lp = mutate_tok + 1;
+    if (lp > body_last or tags[lp] != .l_paren) return false;
+    const rp = matchParen(tags, lp, body_last) orelse return false;
+    var next = rp + 1;
+    if (next <= body_last and tags[next] == .semicolon) next += 1;
+    return next <= body_last and tags[next] == .keyword_return;
+}
+
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -302,15 +329,16 @@ fn report(
     errdefer gpa.free(msg);
     const note_label = try std.fmt.allocPrint(gpa, "iterating over `{s}.items` here", .{recv});
     errdefer gpa.free(note_label);
-    const for_pos = Pos.fromTokenStart(tree, for_tok);
-    const for_end = Pos.fromTokenEnd(tree, for_tok);
+    const for_pos = try Pos.fromTokenStart(tree, for_tok);
+    const for_end = try Pos.fromTokenEnd(tree, for_tok);
     const notes_slice = try gpa.alloc(problem_mod.Note, 1);
+    errdefer gpa.free(notes_slice);
     notes_slice[0] = .{ .start = for_pos, .end = for_end, .label = note_label };
     try problems.append(gpa, .{
         .rule_id = "iterator-invalidation-mutation",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, mutate_tok),
-        .end = Pos.fromTokenEnd(tree, mutate_tok),
+        .start = try Pos.fromTokenStart(tree, mutate_tok),
+        .end = try Pos.fromTokenEnd(tree, mutate_tok),
         .message = msg,
         .notes = notes_slice,
     });
@@ -400,4 +428,32 @@ test "iterator-invalidation: mutate on DIFFERENT list doesn't fire" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "skript regression: by-value iterator capture returns after mutation" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\pub fn take(list: *std.ArrayList(u32)) !u32 {
+        \\    for (list.items) |candidate| {
+        \\        try list.append(candidate);
+        \\        return candidate;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "skript regression: pointer iterator capture remains unsafe after mutation" {
+    try testing.expectFires(check, "iterator-invalidation-mutation",
+        \\const std = @import("std");
+        \\pub fn take(list: *std.ArrayList(u32)) !u32 {
+        \\    for (list.items) |*candidate| {
+        \\        try list.append(candidate.*);
+        \\        return candidate.*;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
 }

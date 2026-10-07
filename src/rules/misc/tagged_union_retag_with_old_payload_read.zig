@@ -244,8 +244,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "tagged-union-retag-with-old-payload-read",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, old_tag_tok),
-        .end = Pos.fromTokenEnd(tree, old_tag_tok),
+        .start = try Pos.fromTokenStart(tree, old_tag_tok),
+        .end = try Pos.fromTokenEnd(tree, old_tag_tok),
         .message = msg,
     });
 }

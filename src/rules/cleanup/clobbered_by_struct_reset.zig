@@ -335,8 +335,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "clobbered-by-struct-reset",
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, a.obj_token),
-        .end = Pos.fromTokenEnd(tree, a.obj_token + 2),
+        .start = try Pos.fromTokenStart(tree, a.obj_token),
+        .end = try Pos.fromTokenEnd(tree, a.obj_token + 2),
         .message = msg,
     });
 }

@@ -43,6 +43,7 @@ const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "resize-result-discarded";
 
+/// Returns `SourceTooWide` if the source or token count exceeds the AST position domain.
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -53,11 +54,13 @@ pub fn check(
     if (!config_mod.isEnabled(config, .resize_result_discarded)) return;
     _ = cache;
 
+    if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
+    const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const last_tok: Ast.TokenIndex = tok_count -| 1;
 
     var t: Ast.TokenIndex = 0;
-    while (t + 5 <= last_tok) : (t += 1) {
+    while (t < last_tok and last_tok - t >= 5) : (t += 1) {
         // Pattern: `_ = identifier.resize(`
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) continue;
@@ -88,8 +91,8 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = Pos.fromTokenStart(tree, eq_tok),
-        .end = Pos.fromTokenEnd(tree, eq_tok),
+        .start = try Pos.fromTokenStart(tree, eq_tok),
+        .end = try Pos.fromTokenEnd(tree, eq_tok),
         .message = msg,
     });
 }

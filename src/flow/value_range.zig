@@ -26,6 +26,7 @@ const numeric_loops = @import("numeric_loops.zig");
 const numbers = @import("numeric_range.zig");
 const numeric_eval = @import("numeric_eval.zig");
 const budget_mod = @import("../budget.zig");
+const TypeResolver = @import("../type_resolver.zig").TypeResolver;
 pub const NumericRange = numbers.Range;
 
 /// Analysis steps one query may spend.  This is a property of the oracle,
@@ -54,7 +55,9 @@ const alias_fold_rounds = 32;
 /// exists here".  Failing keeps the two apart: an unproven site is
 /// still a plain `false` / `.unknown`, a walk that gave up is an
 /// incomplete analysis the CLI has to say so.
-pub const QueryError = error{ OutOfMemory, AnalysisBudgetExceeded };
+/// Source loading, cancellation, and census failures retain their exact
+/// shared summary error instead of becoming a missing numeric proof.
+pub const QueryError = file_cache_mod.SummaryError;
 
 /// A set of string keys (source slices, stable for the tree's lifetime).
 const KeySet = struct {
@@ -107,14 +110,17 @@ const DiffAlias = struct {
     sub_node: Ast.Node.Index, // AST node of the subtrahend (for provablyNonneg check)
 };
 
-/// A `const LOCAL = <field-path>` binding (e.g. `const bit_length = self.bit_length`):
-/// LOCAL and the path hold the same value.  Lets a guard on the simple local
-/// (`if (bit_length == 0) return;`) establish that a later use of the path
-/// (`numMasks(self.bit_length)`) sees a non-zero argument.  Dropped when LOCAL is
-/// rebound or anything touches the path's root.
+/// A local snapshot of a path, optionally plus a checked constant offset.
+/// With another nonnegative path, the relation supplies only an upper bound
+/// on this component. Writes to any dependency retire the relation.
 const ValueAlias = struct {
     local: []const u8,
     path: []const u8,
+    /// A successfully checked sum holds `local == path + offset`.
+    offset: u64 = 0,
+    /// For a variable sum, `local == path + other_path`; neither component
+    /// inherits the total's lower bound or its nonzero fact.
+    other_path: ?[]const u8 = null,
 };
 
 /// A local scalar is known to be at least `n` on this path.  Bounds of zero
@@ -139,6 +145,14 @@ const ScalarVal = struct {
 const MinLen = struct {
     path: []const u8,
     n: u64,
+};
+
+/// A copied header's true-branch extent while its bare bool selector is stable.
+/// The producer proves the selector's type before publishing this relation.
+pub const ConditionalLength = struct {
+    header: []const u8,
+    selector: []const u8,
+    value: NumericRange,
 };
 
 /// A factor of a checked or plain integer product.  Container factors are
@@ -226,6 +240,7 @@ pub const State = struct {
     /// all.  A slice header lives in the local's own frame slot, so a callee
     /// that receives the slice by value cannot resize it.
     len_bounds: std.ArrayListUnmanaged(numeric_eval.Fact) = .empty,
+    conditional_lengths: std.ArrayListUnmanaged(ConditionalLength) = .empty,
     product_aliases: std.ArrayListUnmanaged(ProductAlias) = .empty,
     predicates: std.ArrayListUnmanaged(Predicate) = .empty,
     numeric: std.ArrayListUnmanaged(numeric_eval.Fact) = .empty,
@@ -256,6 +271,7 @@ pub const State = struct {
         self.scalar_vals.deinit(gpa);
         self.min_lens.deinit(gpa);
         self.len_bounds.deinit(gpa);
+        self.conditional_lengths.deinit(gpa);
         self.product_aliases.deinit(gpa);
         self.predicates.deinit(gpa);
         self.numeric.deinit(gpa);
@@ -274,6 +290,7 @@ pub const State = struct {
         try out.scalar_vals.appendSlice(gpa, self.scalar_vals.items);
         try out.min_lens.appendSlice(gpa, self.min_lens.items);
         try out.len_bounds.appendSlice(gpa, self.len_bounds.items);
+        try out.conditional_lengths.appendSlice(gpa, self.conditional_lengths.items);
         try out.product_aliases.appendSlice(gpa, self.product_aliases.items);
         try out.predicates.appendSlice(gpa, self.predicates.items);
         try out.numeric.appendSlice(gpa, self.numeric.items);
@@ -348,8 +365,7 @@ pub const State = struct {
         // come apart.
         var s: usize = 0;
         while (s < self.unsettled.items.len) {
-            if (other.hasPredicate(self.unsettled.items[s].predicate)) s += 1
-            else _ = self.unsettled.swapRemove(s);
+            if (other.hasPredicate(self.unsettled.items[s].predicate)) s += 1 else _ = self.unsettled.swapRemove(s);
         }
         // min_lens: keep paths present in BOTH branches; the proven minimum
         // after a join is the WEAKER (smaller) of the two branch bounds.
@@ -369,12 +385,20 @@ pub const State = struct {
         var b: usize = 0;
         while (b < self.len_bounds.items.len) {
             const e = self.len_bounds.items[b];
-            const joined = e.value.join(other.lenBoundOf(e.name) orelse .unknown);
+            const joined = e.value.join(other.baselineLenBoundOf(e.name) orelse .unknown);
             if (joined == .unknown) {
                 _ = self.len_bounds.swapRemove(b);
             } else {
                 self.len_bounds.items[b].value = joined;
                 b += 1;
+            }
+        }
+        var conditional: usize = 0;
+        while (conditional < self.conditional_lengths.items.len) {
+            if (other.hasConditionalLength(self.conditional_lengths.items[conditional])) {
+                conditional += 1;
+            } else {
+                _ = self.conditional_lengths.swapRemove(conditional);
             }
         }
     }
@@ -388,6 +412,7 @@ pub const State = struct {
         self.scalar_vals.clearRetainingCapacity();
         self.min_lens.clearRetainingCapacity();
         self.len_bounds.clearRetainingCapacity();
+        self.conditional_lengths.clearRetainingCapacity();
         self.product_aliases.clearRetainingCapacity();
         self.predicates.clearRetainingCapacity();
         self.numeric.clearRetainingCapacity();
@@ -402,6 +427,7 @@ pub const State = struct {
         try self.scalar_vals.appendSlice(gpa, src.scalar_vals.items);
         try self.min_lens.appendSlice(gpa, src.min_lens.items);
         try self.len_bounds.appendSlice(gpa, src.len_bounds.items);
+        try self.conditional_lengths.appendSlice(gpa, src.conditional_lengths.items);
         try self.product_aliases.appendSlice(gpa, src.product_aliases.items);
         try self.predicates.appendSlice(gpa, src.predicates.items);
         try self.numeric.appendSlice(gpa, src.numeric.items);
@@ -522,24 +548,25 @@ pub const State = struct {
         }
     }
     fn hasValueAlias(self: *const State, va: ValueAlias) bool {
-        for (self.value_aliases.items) |e|
-            if (std.mem.eql(u8, e.local, va.local) and std.mem.eql(u8, e.path, va.path)) return true;
+        for (self.value_aliases.items) |e| {
+            if ((e.other_path == null) != (va.other_path == null)) continue;
+            if (e.other_path) |other|
+                if (!std.mem.eql(u8, other, va.other_path.?)) continue;
+            if (e.offset == va.offset and std.mem.eql(u8, e.local, va.local) and std.mem.eql(u8, e.path, va.path)) return true;
+        }
         return false;
     }
     fn addValueAlias(self: *State, gpa: std.mem.Allocator, va: ValueAlias) !void {
         if (self.hasValueAlias(va)) return;
         try self.value_aliases.append(gpa, va);
     }
-    /// Drop value_aliases whose local or whose path *starts with* `root` (so a
-    /// rebind of the local, or a mutation of the path's root identifier,
-    /// invalidates the equality).
+    /// Retire relations when a write reaches the result or either source.
     fn dropValueAliasesByRoot(self: *State, root: []const u8) void {
         var i: usize = 0;
         while (i < self.value_aliases.items.len) {
             const va = self.value_aliases.items[i];
-            const path_root_match = std.mem.startsWith(u8, va.path, root) and
-                (va.path.len == root.len or va.path[root.len] == '.' or va.path[root.len] == '[');
-            if (std.mem.eql(u8, va.local, root) or path_root_match) {
+            const other_root_match = if (va.other_path) |other| pathRootedAt(other, root) else false;
+            if (pathRootedAt(va.local, root) or pathRootedAt(va.path, root) or other_root_match) {
                 _ = self.value_aliases.swapRemove(i);
             } else i += 1;
         }
@@ -644,12 +671,54 @@ pub const State = struct {
         }
     }
 
-    /// The snapshot recorded for `name`'s length, if this state carries one.
+    /// Read the snapshot, narrowed only by a still-stable true bool selector.
     fn lenBoundOf(self: *const State, name: []const u8) ?NumericRange {
+        var bound = self.baselineLenBoundOf(name);
+        for (self.conditional_lengths.items) |entry| {
+            if (!std.mem.eql(u8, entry.header, name)) continue;
+            if (!self.scalars.contains(entry.selector)) continue;
+            const held: NumericRange = bound orelse .unknown;
+            bound = held.intersect(entry.value);
+        }
+        return bound;
+    }
+
+    /// Joins must not promote a selected branch into the unconditional snapshot.
+    fn baselineLenBoundOf(self: *const State, name: []const u8) ?NumericRange {
         for (self.len_bounds.items) |fact| {
             if (std.mem.eql(u8, fact.name, name)) return fact.value;
         }
         return null;
+    }
+
+    fn hasConditionalLength(self: *const State, entry: ConditionalLength) bool {
+        for (self.conditional_lengths.items) |other| {
+            if (std.mem.eql(u8, entry.header, other.header) and
+                std.mem.eql(u8, entry.selector, other.selector) and
+                std.meta.eql(entry.value, other.value)) return true;
+        }
+        return false;
+    }
+
+    /// Publish a type-proved true-branch extent after assigning its baseline.
+    pub fn addConditionalLength(
+        self: *State,
+        gpa: std.mem.Allocator,
+        entry: ConditionalLength,
+    ) !void {
+        if (entry.value == .unknown or self.hasConditionalLength(entry)) return;
+        try self.conditional_lengths.append(gpa, entry);
+    }
+
+    /// Changing the selector retires the relation, not the copied header's extent.
+    fn dropConditionalLengthsRootedAt(self: *State, root: []const u8) void {
+        var index: usize = 0;
+        while (index < self.conditional_lengths.items.len) {
+            const entry = self.conditional_lengths.items[index];
+            if (pathRootedAt(entry.header, root) or pathRootedAt(entry.selector, root)) {
+                _ = self.conditional_lengths.swapRemove(index);
+            } else index += 1;
+        }
     }
 
     /// Record the range a binding's length was proved to hold.  A second
@@ -780,7 +849,7 @@ const PredicateCapture = struct {
         if (self.state) |*state| state.deinit(self.gpa);
     }
 
-    fn record(self: *PredicateCapture, o: *Oracle, expression: Ast.Node.Index, source: *const State) error{OutOfMemory}!void {
+    fn record(self: *PredicateCapture, o: *Oracle, expression: Ast.Node.Index, source: *const State) QueryError!void {
         const node = unwrapGrouped(o.tree, expression);
         var literal: ?bool = null;
         if (o.tree.nodeTag(node) == .identifier) {
@@ -843,6 +912,69 @@ const PredicateMemo = struct {
     gpa: std.mem.Allocator,
     walked: std.ArrayListUnmanaged(Key) = .empty,
     rows: std.ArrayListUnmanaged(PredicateFact) = .empty,
+    aggregate_returns: std.ArrayListUnmanaged(AggregateReturn) = .empty,
+    // Integer-only return summaries depend on the whole actual argument
+    // vector as well as the call's identity and remaining recursion depth.
+    // Store only complete walks; a failed walk never publishes a row.
+    numeric_returns: std.ArrayListUnmanaged(NumericReturn) = .empty,
+    numeric_arguments: std.ArrayListUnmanaged(numbers.Integer) = .empty,
+
+    /// Root-query keys borrow only root-owned spellings and resolver types.
+    /// Nested/inherited contexts compute uncached until their complete entry
+    /// context and spelling lifetime can be represented by this owner.
+    const AggregateReturn = struct {
+        reference: TypeResolver.FunctionReference,
+        call: Ast.Node.Index,
+        depth: u8,
+        numeric: []const numeric_eval.Fact,
+        lengths: []const numeric_eval.Fact,
+        /// Full mapped actual snapshots distinguish selected branch walks
+        /// from the joined interval at the same call node.
+        inputs: []const numeric_eval.Fact,
+        input_lengths: []const numeric_eval.Fact,
+        /// An empty projection names a returned slice itself.
+        fields: []numeric_eval.Fact = &.{},
+        visiting: bool = true,
+
+        fn matches(self: *const AggregateReturn, reference: TypeResolver.FunctionReference, call: Ast.Node.Index, depth: u8, st: *const State, inputs: []const numeric_eval.Fact, input_lengths: []const numeric_eval.Fact) bool {
+            return self.call == call and self.depth == depth and
+                self.reference.tree == reference.tree and
+                self.reference.fn_token == reference.fn_token and
+                self.reference.handle.eql(reference.handle) and
+                self.reference.actual_type.eql(reference.actual_type) and
+                factsEqual(self.numeric, st.numeric.items) and
+                factsEqual(self.lengths, st.len_bounds.items) and
+                factsEqual(self.inputs, inputs) and
+                factsEqual(self.input_lengths, input_lengths);
+        }
+
+        fn factsEqual(a: []const numeric_eval.Fact, b: []const numeric_eval.Fact) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |left, right| {
+                if (!std.mem.eql(u8, left.name, right.name) or
+                    !std.meta.eql(left.value, right.value)) return false;
+            }
+            return true;
+        }
+
+        fn deinit(self: *AggregateReturn, gpa: std.mem.Allocator) void {
+            gpa.free(self.numeric);
+            gpa.free(self.lengths);
+            gpa.free(self.inputs);
+            gpa.free(self.input_lengths);
+            gpa.free(self.fields);
+        }
+    };
+
+    const NumericReturn = struct {
+        reference: TypeResolver.FunctionReference,
+        caller: TypeResolver.ResolutionFrame,
+        call: Ast.Node.Index,
+        depth: u8,
+        start: usize,
+        count: usize,
+        value: NumericRange,
+    };
 
     const Key = struct {
         declaration: Ast.Node.Index,
@@ -854,6 +986,10 @@ const PredicateMemo = struct {
     fn deinit(self: *PredicateMemo) void {
         self.walked.deinit(self.gpa);
         self.rows.deinit(self.gpa);
+        for (self.aggregate_returns.items) |*entry| entry.deinit(self.gpa);
+        self.aggregate_returns.deinit(self.gpa);
+        self.numeric_returns.deinit(self.gpa);
+        self.numeric_arguments.deinit(self.gpa);
     }
 
     fn find(self: *const PredicateMemo, declaration: Ast.Node.Index, truth: bool) ?[]const PredicateFact {
@@ -879,6 +1015,61 @@ const PredicateMemo = struct {
             return err;
         };
     }
+
+    fn findNumericReturn(
+        self: *const PredicateMemo,
+        reference: TypeResolver.FunctionReference,
+        caller: TypeResolver.ResolutionFrame,
+        call: Ast.Node.Index,
+        depth: u8,
+        arguments: []const numeric_eval.Fact,
+    ) ?NumericRange {
+        for (self.numeric_returns.items) |row| {
+            if (row.call != call or row.depth != depth or row.count != arguments.len or
+                row.reference.tree != reference.tree or row.reference.fn_token != reference.fn_token or
+                !row.reference.handle.eql(reference.handle) or !row.reference.actual_type.eql(reference.actual_type) or
+                row.caller.resolver != caller.resolver or !row.caller.handle.eql(caller.handle) or
+                !optionalActualTypeEqual(row.caller.actual_type, caller.actual_type) or
+                !optionalActualTypeEqual(row.caller.container_type, caller.container_type)) continue;
+            var matches = true;
+            for (self.numeric_arguments.items[row.start..][0..row.count], arguments) |known, actual| {
+                if (actual.value != .integer or known.min != actual.value.integer.min or known.max != actual.value.integer.max) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return row.value;
+        }
+        return null;
+    }
+
+    fn recordNumericReturn(
+        self: *PredicateMemo,
+        reference: TypeResolver.FunctionReference,
+        caller: TypeResolver.ResolutionFrame,
+        call: Ast.Node.Index,
+        depth: u8,
+        arguments: []const numeric_eval.Fact,
+        value: NumericRange,
+    ) error{OutOfMemory}!void {
+        const start = self.numeric_arguments.items.len;
+        errdefer self.numeric_arguments.shrinkRetainingCapacity(start);
+        for (arguments) |argument| try self.numeric_arguments.append(self.gpa, argument.value.integer);
+        try self.numeric_returns.append(self.gpa, .{
+            .reference = reference,
+            .caller = caller,
+            .call = call,
+            .depth = depth,
+            .start = start,
+            .count = arguments.len,
+            .value = value,
+        });
+    }
+
+    fn optionalActualTypeEqual(a: ?TypeResolver.ActualType, b: ?TypeResolver.ActualType) bool {
+        if (a) |left| return if (b) |right| left.eql(right) else false;
+        return b == null;
+    }
 };
 
 /// What every `return` of one body produces, joined into a single range.
@@ -902,19 +1093,99 @@ const PredicateMemo = struct {
 const ReturnSummary = struct {
     value: ?NumericRange = null,
     complete: bool = true,
+    /// In aggregate mode, retain only slice projections present on every
+    /// successful return. Error exits do not produce a returned header.
+    aggregate: ?*State = null,
+    bare_slice: bool = false,
+    success_only: bool = false,
+    saw_success: bool = false,
 
-    fn record(self: *ReturnSummary, o: *Oracle, expression: Ast.Node.Index, st: *const State) void {
-        // Whether the operand runs no code is asked of the WHOLE expression,
-        // node by node, and not of the call it may contain: the call is one
-        // operand among the arithmetic and branches that read what it wrote,
-        // and the joined result of THOSE is the claim about this exit.  A
-        // callee's spelling says nothing here — an arbitrary name is exactly
-        // the one this cannot vouch for.
-        if (!pureIntegerExpression(o, expression, 0)) {
-            self.complete = false;
+    fn record(self: *ReturnSummary, o: *Oracle, expression: Ast.Node.Index, st: *const State) QueryError!void {
+        if (self.success_only and o.tree.nodeTag(unwrapGrouped(o.tree, expression)) == .error_value) return;
+        if (self.aggregate) |aggregate| {
+            const node = unwrapGrouped(o.tree, expression);
+            if (!pureAggregateExpression(o, node, 0)) {
+                self.complete = false;
+                return;
+            }
+            if (self.bare_slice) {
+                if (o.tree.fullSwitch(node)) |selection| {
+                    // Join every returned header, not the selector's type.
+                    // Purity above rules out effects between those snapshots.
+                    for (selection.ast.cases) |case_node| {
+                        const case = o.tree.fullSwitchCase(case_node) orelse {
+                            self.complete = false;
+                            return;
+                        };
+                        const target = unwrapGrouped(o.tree, case.ast.target_expr);
+                        if (o.tree.nodeTag(target) == .unreachable_literal) continue;
+                        try self.record(o, target, st);
+                    }
+                    return;
+                }
+            }
+            var returned: State = .{};
+            defer returned.deinit(o.gpa);
+            if (self.bare_slice) {
+                var evaluation = evaluator(o, st);
+                const length: NumericRange = blk: {
+                    // Zig parses the ambiguous empty `.{}` as a struct
+                    // initializer. This summary already proved a slice
+                    // return type, so its anonymous address initializer
+                    // describes the zero-element array, not a struct.
+                    if (o.tree.nodeTag(node) == .address_of) {
+                        const child = unwrapGrouped(o.tree, o.tree.nodeData(node).node);
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        if (o.tree.fullStructInit(&buffer, child)) |initializer| {
+                            if (initializer.ast.type_expr == .none and initializer.ast.fields.len == 0)
+                                break :blk NumericRange.constant(0);
+                        }
+                    }
+                    break :blk evaluation.containerLength(node);
+                };
+                if (length != .unknown) try returned.setLenBound(o.gpa, "", length);
+            } else {
+                try recordAggregateLengths(o, st, &returned, node, "", 0);
+            }
+            if (self.saw_success) {
+                aggregate.intersectWith(&returned);
+            } else {
+                aggregate.* = returned;
+                returned = .{};
+                self.saw_success = true;
+            }
             return;
         }
-        const bound = numericValue(o, st, expression);
+        // A compound operand must run no code: later operands could read
+        // state an earlier call changed. A whole forwarded scalar call is
+        // different: its own complete return summary accounts for its body,
+        // and no caller operand is read after it returns.
+        const node = unwrapGrouped(o.tree, expression);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const bound = if (o.tree.fullCall(&buffer, node) != null)
+            // A whole forwarded call has no later operand that could read
+            // state it changed. Its scalar arguments must be pure, and its
+            // own complete body summary is the only value exported.
+            try forwardedReturnRange(o, st, node)
+        else blk: {
+            if (!pureIntegerExpression(o, expression, 0)) {
+                self.complete = false;
+                return;
+            }
+            var value = numericValue(o, st, expression);
+            // A successful append or guard can prove a length floor without
+            // supplying its upper endpoint. Export that same proven floor
+            // with the scalar return, including transparent value casts.
+            if (value == .integer) {
+                if (exprMin(o, st, expression)) |minimum| {
+                    value = value.intersect(.{ .integer = .{
+                        .min = @intCast(minimum),
+                        .max = value.integer.max,
+                    } });
+                }
+            }
+            break :blk value;
+        };
         if (bound == .unknown) {
             self.complete = false;
             return;
@@ -936,6 +1207,9 @@ const Capture = struct {
     gpa: std.mem.Allocator,
     mode: Mode,
     state: ?State = null,
+    /// Explicit error returns do not reach a propagated call's success edge.
+    success_only: bool = false,
+    complete: bool = true,
 
     const Mode = enum { point, exit };
 
@@ -986,10 +1260,16 @@ pub const Oracle = struct {
     /// incomplete analysis rather than the `false` it would otherwise return.
     /// A missing-safety proof must never come out of a failed allocation.
     out_of_memory: bool = false,
+    /// Nonthrowing format callbacks retain the first exact census failure.
+    /// Throwing walk boundaries return it before publishing a result.
+    summary_error: ?QueryError = null,
     addressed: KeySet = .{},
     walk_depth: u8 = 0,
     expression_depth: u8 = 0,
     numeric_answer: NumericRange = .unknown,
+    /// Extent of the exact queried `call(...).len`, captured before that
+    /// call's effects. It describes the returned header, not caller storage.
+    queried_return_length: NumericRange = .unknown,
     std_valid: ?bool = null,
     /// The `fn_decl` whose body this walk analyzes, resolved ONCE per query.
     /// Every walk of this file's node array to answer it made the cost of a
@@ -1054,8 +1334,15 @@ pub const Oracle = struct {
     /// so the key is what the question can be phrased in.  Minted by the
     /// asking step and owned by that oracle, so it outlives the child.
     length_query: ?[]const u8 = null,
+    /// Evaluate the argument's extent at the same point, including literals
+    /// that have no pathname under which a `.len` guard could be recorded.
+    length_expression: bool = false,
     caller_parent: ?*const Oracle = null,
+    /// Exact actual callable context for nested return-summary resolution.
+    resolution_frame: ?TypeResolver.ResolutionFrame = null,
     infer_callers: bool = true,
+    /// The exact call whose error edge the current `try` propagates.
+    successful_call: ?Ast.Node.Index = null,
     predicate_capture: ?*PredicateCapture = null,
     /// Where a walk records what every `return` of the body it is walking
     /// produces.  Set only by the step that asks a callee what its exits say;
@@ -1079,6 +1366,8 @@ pub const Oracle = struct {
     /// once.  A walk with none of them below still asks, and takes whatever
     /// the receiver contract proves over its declared domain.
     entry_facts: []const numeric_eval.Fact = &.{},
+    /// Copied slice headers at the exact call entry, in parameter spelling.
+    entry_lengths: []const numeric_eval.Fact = &.{},
     /// Non-zero while the walk is inside an expression whose call has NOT
     /// run yet — the failing side of `catch`/`orelse`, and the body of a
     /// `defer`/`errdefer`.  A callee's exit contract says what is true
@@ -1224,17 +1513,38 @@ pub const Oracle = struct {
         }
         return switch (self.query) {
             .numeric_range => {
-                // A LENGTH question reads a minted `<path>.len` key the state
-                // carries, not an expression: the call site's argument is a
-                // slice, and no node in the file spells `.len` on it.  The
-                // key is minted by the asking step and borrowed here.
-                // A private relay may have inherited its header's bound rather
-                // than checked `.len` itself. Both channels describe this same
-                // argument length; neither describes the slice's numeric value.
-                self.numeric_answer = if (self.length_query) |key|
-                    self.lengthValueAt(st, key)
-                else
-                    numericValue(self, st, self.expression.?);
+                // A length question evaluates the actual container at this point.
+                // A named header additionally reads its guards and scalar aliases.
+                self.numeric_answer = if (self.length_expression) blk: {
+                    var evaluation = evaluator(self, st);
+                    var length = evaluation.containerLength(self.expression.?);
+                    if (self.length_query) |key|
+                        length = length.intersect(self.lengthValueAt(st, key));
+                    break :blk length;
+                } else blk: {
+                    const expression = self.expression.?;
+                    const spelled = numericValue(self, st, expression);
+                    // A callee summary narrows a known integer domain. It
+                    // cannot establish the value kind of an unknown operand.
+                    if (spelled != .integer) break :blk spelled;
+                    const returned = callReturnRange(self, st, expression) catch |err| {
+                        self.summary_error = self.summary_error orelse err;
+                        return false;
+                    };
+                    var result = spelled.intersect(returned).intersect(self.queried_return_length);
+                    // Lower-bound and numeric facts describe the same value.
+                    // Checked addition can retain a floor even when its full
+                    // interval was widened for possible overflow.
+                    if (result == .integer) {
+                        if (exprMin(self, st, expression)) |floor| {
+                            result = result.intersect(.{ .integer = .{
+                                .min = @intCast(floor),
+                                .max = result.integer.max,
+                            } });
+                        }
+                    }
+                    break :blk result;
+                };
                 if (self.upper_expression) |upper| return strictlyLessAt(self, st, upper);
                 return true;
             },
@@ -1242,12 +1552,14 @@ pub const Oracle = struct {
             .nonzero_scalar => st.scalars.contains(self.target) or
                 (st.scalarMinOf(self.target) orelse 0) >= 1,
             .nonempty_container => containerProvenNonEmpty(self.tree, st, self.target),
-            // `target.len >= min_n`: proven via a slice-length alias (`target
-            // = base[0..S]` ⟹ `target.len == S`) whose scalar has a known
-            // value >= min_n (e.g. from a `switch (scalar)` arm).
+            // Minimum extents read the same initializer/return snapshots as
+            // numeric length queries, not a live scalar endpoint after a write.
             .min_len_container => {
                 // (a) a `target.len >= N` guard refinement (N >= min_n).
                 if (st.minLenOf(self.target)) |v| if (v >= self.min_n) return true;
+                if (st.lenBoundOf(self.target)) |bound| {
+                    if (bound == .integer and bound.integer.min >= self.min_n) return true;
+                }
                 // min_n <= 1 is just "non-empty" — honor a plain nonempty fact.
                 if (self.min_n <= 1 and st.containers.contains(self.target)) return true;
                 // (b) a slice-length alias (`target.len == scalar`) whose
@@ -1327,10 +1639,10 @@ pub fn provesNonempty(
     return run(gpa, tree, body_node, .nonempty_container, target, use_token, 0, cache, null);
 }
 
-/// Is container `target` provably of length >= `n` at `use_token`?  Proven via a
-/// slice-length alias (`target = base[0..S]` ⟹ `target.len == S`) whose scalar
-/// `S` has a known constant value >= n (e.g. from an enclosing `switch (S)` arm).
-/// Covers the wyhash-style `switch (rem_len) { K => rem_key[N..] }` family.
+/// Is container `target` provably of length >= `n` at `use_token`?
+/// Reads guard minima, fixed/static extents, and initializer/return length
+/// intervals. Slice extents are snapshots: later endpoint writes cannot
+/// enlarge an old slice, and header writes retire the old extent.
 pub fn provesMinLen(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -1356,6 +1668,9 @@ pub fn provesPositive(
 }
 
 /// Numeric bounds on every path reaching the expression. Unknown is not safe.
+///
+/// A direct call with a known integer kind intersects its declared domain
+/// with the canonical callee return summary. Unknown value kinds stay unknown.
 pub fn boundsAt(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -1363,6 +1678,23 @@ pub fn boundsAt(
     expression: Ast.Node.Index,
     use_token: Ast.TokenIndex,
     cache: ?*file_cache_mod.FileCache,
+) QueryError!NumericRange {
+    var remaining: u32 = step_budget;
+    return boundsAtFrame(gpa, tree, body, expression, use_token, cache, null, &remaining);
+}
+
+/// Bounds in one concrete generic instance. All instances of one conversion
+/// share the ordinary query allowance; contextual walks do not borrow facts
+/// computed in the uninstantiated declaration.
+fn boundsAtFrame(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    expression: Ast.Node.Index,
+    use_token: Ast.TokenIndex,
+    cache: ?*file_cache_mod.FileCache,
+    frame: ?TypeResolver.ResolutionFrame,
+    remaining: *u32,
 ) QueryError!NumericRange {
     var memo: PredicateMemo = .{ .gpa = gpa };
     defer memo.deinit();
@@ -1376,8 +1708,12 @@ pub fn boundsAt(
         .memo = &memo,
         .expression = expression,
         .cache = cache,
+        .resolution_frame = frame,
+        .infer_callers = frame == null,
+        .budget = remaining.*,
     };
     defer oracle.deinit();
+    defer remaining.* = oracle.budget;
     const flow = try analyzeBody(&oracle);
     if (oracle.out_of_memory) return error.OutOfMemory;
     // A bound that stopped the walk outranks whatever the walk had reached:
@@ -1388,6 +1724,127 @@ pub fn boundsAt(
     if (oracle.stoppedShort()) return reportGiveUp(&oracle);
     if (flow.answer == null) return .unknown;
     return oracle.numeric_answer;
+}
+
+/// Classify a generic float conversion only when every closed local call
+/// supplies a resolved destination. A mixed set still includes an f32 site
+/// when any instance uses f32; other formats remain outside this rule's scope.
+pub fn closedFloatConversionUsesF32(
+    tree: *const Ast,
+    declaration: Ast.Node.Index,
+    conversion: Ast.Node.Index,
+    cache: *file_cache_mod.FileCache,
+) QueryError!?bool {
+    const resolver = cache.zls orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return null;
+    if (proto.visib_token != null or proto.extern_export_inline_token != null) return null;
+    const calls = (try cache.closedLocalCalls(declaration)) orelse return null;
+    if (calls.len == 0) return null;
+    const token = tree.nodeMainToken(conversion);
+    if (calls.len > max_contract_calls)
+        return file_cache_mod.tokenBudgetFailure(tree, token, .numeric_oracle_callers, max_contract_calls);
+    var uses_f32 = false;
+    for (calls) |call| {
+        const reference = switch (resolver.functionReferenceOfCall(call) catch |err| {
+            if (strictQueryError(err)) |failure| return failure;
+            return null;
+        }) {
+            .function => |found| found,
+            else => return null,
+        };
+        if (reference.tree != tree or reference.fn_token != proto.ast.fn_token) return null;
+        const bits = (resolver.frameForFunction(reference).floatBits(conversion) catch |err| {
+            if (strictQueryError(err)) |failure| return failure;
+            return null;
+        }) orelse return null;
+        uses_f32 = uses_f32 or bits == 32;
+    }
+    return uses_f32;
+}
+
+/// Prove a conversion for every closed local instantiation. Integer
+/// destinations need an in-range source; f32 destinations need exact integers.
+/// Each range and destination come from the same actual frame.
+pub fn instantiatedConversionFits(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    declaration: Ast.Node.Index,
+    conversion: Ast.Node.Index,
+    expression: Ast.Node.Index,
+    cache: *file_cache_mod.FileCache,
+) QueryError!bool {
+    const resolver = cache.zls orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return false;
+    if (proto.visib_token != null or proto.extern_export_inline_token != null) return false;
+    const builtin = tree.tokenSlice(tree.nodeMainToken(conversion));
+    const to_float = std.mem.eql(u8, builtin, "@floatFromInt");
+    if (!to_float and !std.mem.eql(u8, builtin, "@intFromFloat")) return false;
+    var parameters = proto.iterate(tree);
+    var generic = false;
+    while (parameters.next()) |parameter| {
+        if (parameter.type_expr == null or
+            (parameter.comptime_noalias != null and tree.tokenTag(parameter.comptime_noalias.?) == .keyword_comptime))
+            generic = true;
+    }
+    // A nongeneric method can still capture a generic container's format.
+    if (!generic and !to_float) return false;
+    const calls = (try cache.closedLocalCalls(declaration)) orelse return false;
+    if (calls.len == 0) return false;
+    const token = tree.nodeMainToken(conversion);
+    if (calls.len > max_contract_calls)
+        return file_cache_mod.tokenBudgetFailure(tree, token, .numeric_oracle_callers, max_contract_calls);
+    var remaining: u32 = step_budget;
+    var instances_remaining: usize = max_contract_calls;
+    for (calls) |call| {
+        var single: [1]TypeResolver.FunctionReference = undefined;
+        const references = (resolver.resolutionFrame().inlineTupleCallReferences(call, &remaining, &instances_remaining) catch |err| {
+            if (err == error.InlineTupleStepsExceeded)
+                return file_cache_mod.tokenBudgetFailure(tree, token, .numeric_oracle_steps, step_budget);
+            if (err == error.InlineTupleCallersExceeded)
+                return file_cache_mod.tokenBudgetFailure(tree, token, .numeric_oracle_callers, max_contract_calls);
+            if (strictQueryError(err)) |failure| return failure;
+            return false;
+        }) orelse blk: {
+            if (instances_remaining == 0)
+                return file_cache_mod.tokenBudgetFailure(tree, token, .numeric_oracle_callers, max_contract_calls);
+            instances_remaining -= 1;
+            single[0] = switch (resolver.functionReferenceOfCall(call) catch |err| {
+                if (strictQueryError(err)) |failure| return failure;
+                return false;
+            }) {
+                .function => |found| found,
+                else => return false,
+            };
+            break :blk &single;
+        };
+        for (references) |reference| {
+            if (remaining == 0)
+                return file_cache_mod.tokenBudgetFailure(tree, token, .numeric_oracle_steps, step_budget);
+            remaining -= 1;
+            if (reference.tree != tree or reference.fn_token != proto.ast.fn_token) return false;
+            const frame = resolver.frameForFunction(reference);
+            if (to_float) {
+                const bits = (frame.floatBits(conversion) catch |err| {
+                    if (strictQueryError(err)) |failure| return failure;
+                    return false;
+                }) orelse return false;
+                // Other resolved float widths are outside the f32 rule's scope.
+                if (bits != 32) continue;
+                const bounds = try boundsAtFrame(gpa, tree, tokens.bodyOf(tree, declaration).?, expression, token, cache, frame, &remaining);
+                if (!bounds.exactInF32()) return false;
+            } else {
+                const destination = (frame.contextIntInfo(conversion) catch |err| {
+                    if (strictQueryError(err)) |failure| return failure;
+                    return false;
+                }) orelse return false;
+                const bounds = try boundsAtFrame(gpa, tree, tokens.bodyOf(tree, declaration).?, expression, token, cache, frame, &remaining);
+                if (!bounds.fitsInteger(destination.bits, destination.signed)) return false;
+            }
+        }
+    }
+    return true;
 }
 
 /// Is `lower < upper` true on every path reaching `use_token`?
@@ -1513,14 +1970,30 @@ fn evaluator(o: *Oracle, st: *const State) numeric_eval.Evaluator {
     return .{
         .tree = o.tree,
         .cache = o.cache,
+        .resolution_frame = o.resolution_frame,
         .facts = st.numeric.items,
         .budget = &o.budget,
         .budget_cap = o.budget_cap,
         .stopped = &o.stopped,
+        .query_error = &o.summary_error,
         .std_valid = o.std_valid.?,
         .container_consts = o.file_consts,
         .len_bounds = st.len_bounds.items,
+        .length_bounds = .{ .context = st, .bound = stateLengthBound },
+        .float_formats = .{ .context = o, .bounds = genericFloatFormats },
     };
+}
+
+fn stateLengthBound(context: *const anyopaque, name: []const u8) ?NumericRange {
+    const st: *const State = @ptrCast(@alignCast(context));
+    return st.lenBoundOf(name);
+}
+
+fn genericFloatFormats(context: *anyopaque, node: Ast.Node.Index) ?numeric_eval.Evaluator.FloatFormats {
+    const o: *Oracle = @ptrCast(@alignCast(context));
+    const minimum = computedFloatBitsAtDepth(o, node, 0, .minimum) orelse return null;
+    const maximum = computedFloatBitsAtDepth(o, node, 0, .maximum) orelse return null;
+    return .{ .minimum = minimum, .maximum = maximum };
 }
 
 fn numericValue(o: *Oracle, st: *const State, node: Ast.Node.Index) NumericRange {
@@ -1528,16 +2001,24 @@ fn numericValue(o: *Oracle, st: *const State, node: Ast.Node.Index) NumericRange
     return evaluation.evaluate(node);
 }
 
-fn numericAssignment(o: *Oracle, st: *const State, source: Ast.Node.Index, destination: Ast.Node.Index) error{OutOfMemory}!NumericRange {
-    if (o.query != .numeric_range) return .unknown;
+fn numericAssignment(o: *Oracle, st: *const State, source: Ast.Node.Index, destination: Ast.Node.Index) QueryError!NumericRange {
+    if (o.query != .numeric_range and o.query != .min_len_container) return .unknown;
     var evaluation = evaluator(o, st);
-    // What the source spells is what the destination type admits; what the
-    // callee actually returns is narrower than the type it declared, and both
-    // are claims about the same value, so the tighter one is taken only when
-    // there is one.
-    const spelled = evaluation.evaluate(source);
+    // The outer @floatCast takes its format from the store. Its own node
+    // may have no resolved result location in a generic body, so evaluate
+    // its operand here and round once at the actual destination. Inner
+    // casts still go through the evaluator and keep their own rounding.
+    var operand = unwrapGrouped(o.tree, source);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (o.tree.builtinCallParams(&buffer, operand)) |arguments| {
+        if (arguments.len == 1 and
+            std.mem.eql(u8, o.tree.tokenSlice(o.tree.nodeMainToken(operand)), "@floatCast"))
+            operand = arguments[0];
+    }
+    // A returned range and the spelled range describe the same value.
+    const spelled = evaluation.evaluate(operand);
     const returned = try callReturnRange(o, st, source);
-    return evaluation.coerce(spelled.intersect(returned), source, destination);
+    return evaluation.coerce(spelled.intersect(returned), operand, destination);
 }
 
 /// The range a binding is left with once a store has landed on it.
@@ -1677,14 +2158,27 @@ fn propagateNumericAliases(o: *Oracle, st: *State) error{OutOfMemory}!void {
             if (!o.spend()) return;
             const local = st.numericValue(alias.local);
             const source = st.numericValue(alias.path);
-            const common = local.intersect(source);
+            if (alias.other_path != null) {
+                if (local != .integer or local.integer.max < 0) continue;
+                const underlying = source.intersect(.{ .integer = .{
+                    .min = 0,
+                    .max = local.integer.max,
+                } });
+                if (!std.meta.eql(source, underlying)) {
+                    try st.setNumeric(o.gpa, alias.path, underlying);
+                    changed = true;
+                }
+                continue;
+            }
+            const common = local.intersect(offsetRange(source, @intCast(alias.offset)));
             if (common == .unknown) continue;
             if (!std.meta.eql(local, common)) {
                 try st.setNumeric(o.gpa, alias.local, common);
                 changed = true;
             }
-            if (!std.meta.eql(source, common)) {
-                try st.setNumeric(o.gpa, alias.path, common);
+            const underlying = source.intersect(offsetRange(common, -@as(i128, alias.offset)));
+            if (!std.meta.eql(source, underlying)) {
+                try st.setNumeric(o.gpa, alias.path, underlying);
                 changed = true;
             }
         }
@@ -1693,13 +2187,22 @@ fn propagateNumericAliases(o: *Oracle, st: *State) error{OutOfMemory}!void {
     o.giveUp(.{ .limit = .numeric_oracle_fold, .cap = alias_fold_rounds });
 }
 
+fn offsetRange(value: NumericRange, offset: i128) NumericRange {
+    if (offset == 0) return value;
+    if (value != .integer) return .unknown;
+    return .{ .integer = .{
+        .min = std.math.add(i128, value.integer.min, offset) catch return .unknown,
+        .max = std.math.add(i128, value.integer.max, offset) catch return .unknown,
+    } };
+}
+
 fn pureCallInputs(o: *Oracle, call: Ast.full.Call) bool {
     if (!pureIntegerExpression(o, call.ast.fn_expr, 0)) return false;
     for (call.ast.params) |argument| if (!pureIntegerExpression(o, argument, 0)) return false;
     return true;
 }
 
-fn refinePredicateOutcome(o: *Oracle, st: *State, original: Predicate, depth: u8) error{OutOfMemory}!void {
+fn refinePredicateOutcome(o: *Oracle, st: *State, original: Predicate, depth: u8) QueryError!void {
     if (depth == walk_depth_cap) {
         o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
         return;
@@ -1750,7 +2253,7 @@ fn purePredicateBody(o: *Oracle, node: Ast.Node.Index, depth: u8) bool {
     return true;
 }
 
-fn refinePredicateCall(o: *Oracle, st: *State, node: Ast.Node.Index, truth: bool) error{OutOfMemory}!void {
+fn refinePredicateCall(o: *Oracle, st: *State, node: Ast.Node.Index, truth: bool) QueryError!void {
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = o.tree.fullCall(&call_buffer, node) orelse return;
     if (!pureCallInputs(o, call)) return;
@@ -1768,8 +2271,7 @@ fn refinePredicateCall(o: *Oracle, st: *State, node: Ast.Node.Index, truth: bool
     if ((resolver.isBoolType(return_type) catch null) != true) return;
     const body = tokens.bodyOf(o.tree, declaration) orelse return;
     if (!o.spend()) return;
-    const allowance = @min(o.budget, max_contract_steps);
-    if (allowance == 0) return;
+    const allowance = contractAllowance(o) orelse return;
 
     // The walk this is about to take is a walk of the CALLEE's body, and what
     // it exports depends on that body and on the truth the site assumed — not
@@ -1804,6 +2306,10 @@ fn refinePredicateCall(o: *Oracle, st: *State, node: Ast.Node.Index, truth: bool
         .memo = o.memo,
     };
     defer child.deinit();
+    // A bound the helper hit is the asking query's to report: an unread
+    // contract leaves the walk to answer from less than the body proves, and
+    // an answer drawn from less is not a finished one.
+    defer inheritStop(o, &child);
     // Charge consumed work even when the helper cannot finish.
     // An incomplete helper exports no facts.
     defer {
@@ -1908,19 +2414,48 @@ fn applyPredicateFacts(
 /// the second would be a claim, and every consumer here takes its
 /// conservative branch on a missing fact.
 fn maxFloatBitsOf(o: *Oracle, node: Ast.Node.Index) ?u16 {
-    return maxFloatBitsAtDepth(o, node, 0);
+    return computedFloatBitsAtDepth(o, node, 0, .maximum);
 }
 
-fn maxFloatBitsAtDepth(o: *Oracle, node: Ast.Node.Index, depth: u8) ?u16 {
-    if (depth == 8 or o.budget == 0) return null;
-    o.budget -= 1;
+/// A bit view needs one arithmetic format, not only a precision ceiling.
+/// Both bounds use the same canonical parameter identity and closed census;
+/// an open edge or an unknown argument prevents either bound from completing.
+fn exactFloatBitsOf(o: *Oracle, node: Ast.Node.Index) ?u16 {
+    const minimum = computedFloatBitsAtDepth(o, node, 0, .minimum) orelse return null;
+    const maximum = maxFloatBitsOf(o, node) orelse return null;
+    return if (minimum == maximum) minimum else null;
+}
+
+const FloatWidthBound = enum { minimum, maximum };
+
+/// Frames of generic-parameter indirection one float-width proof may follow
+/// before it stops looking.
+const float_width_depth_cap: u8 = 8;
+
+fn computedFloatBitsAtDepth(o: *Oracle, node: Ast.Node.Index, depth: u8, bound: FloatWidthBound) ?u16 {
+    if (o.summary_error != null) return null;
+    if (depth == float_width_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = float_width_depth_cap });
+        return null;
+    }
+    if (!o.spend()) return null;
     const cache = o.cache orelse return null;
     const resolver = cache.zls orelse return null;
-    if (resolver.floatBits(node) catch null) |bits| return if (bits == 0) null else bits;
-    const reference = (resolver.typeParameterReference(node) catch return null) orelse return null;
+    const direct = resolver.floatBits(node) catch |err| blk: {
+        if (strictQueryError(err)) |failure|
+            o.summary_error = o.summary_error orelse failure;
+        break :blk null;
+    };
+    if (direct) |bits| return if (bits == 0) null else bits;
+    const reference = (resolver.typeParameterReference(node) catch |err| {
+        if (strictQueryError(err)) |failure|
+            o.summary_error = o.summary_error orelse failure;
+        return null;
+    }) orelse return null;
     if (reference.tree != o.tree) return null;
-    if (o.max_float_bits.get(reference.token)) |bits| return bits;
+    if (bound == .maximum) if (o.max_float_bits.get(reference.token)) |bits| return bits;
     const declaration = tokens.enclosingFnDecl(o.tree, reference.token) orelse return null;
+    if (externallyReachable(o, declaration)) return null;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tokens.fnProto(o.tree, &buffer, declaration) orelse return null;
     var parameters = proto.iterate(o.tree);
@@ -1934,22 +2469,34 @@ fn maxFloatBitsAtDepth(o: *Oracle, node: Ast.Node.Index, depth: u8) ?u16 {
         parameter_index += 1;
     }
     if (!found) return null;
-    const calls = (cache.closedLocalCalls(declaration) catch return null) orelse return null;
-    var maximum: u16 = 0;
-    for (calls) |call| {
-        const argument = (resolver.callArgument(call, parameter_index) catch return null) orelse return null;
-        const bits = maxFloatBitsAtDepth(o, argument, depth + 1) orelse return null;
-        maximum = @max(maximum, bits);
+    const calls = (cache.closedLocalCalls(declaration) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return null;
+    }) orelse return null;
+    if (calls.len == 0) return null;
+    if (calls.len > max_contract_calls) {
+        o.giveUp(.{ .limit = .numeric_oracle_callers, .cap = max_contract_calls });
+        return null;
     }
-    if (maximum == 0) return null;
+    var result: u16 = if (bound == .maximum) 0 else std.math.maxInt(u16);
+    for (calls) |call| {
+        const argument = (resolver.callArgument(call, parameter_index) catch |err| {
+            if (strictQueryError(err)) |failure|
+                o.summary_error = o.summary_error orelse failure;
+            return null;
+        }) orelse return null;
+        const bits = computedFloatBitsAtDepth(o, argument, depth + 1, bound) orelse return null;
+        result = if (bound == .maximum) @max(result, bits) else @min(result, bits);
+    }
+    if (result == 0) return null;
     // The memo is an ACCELERATOR, never the answer: the maximum is already
     // proved by the time this line runs, and failing to file it changes how
     // long the next question takes, not what any of them is told.  Laundering
     // the allocation failure into a null would answer "no float-bits ceiling
     // is known" about a declaration whose width this walk just established,
     // and every consumer would take its conservative branch on a proved fact.
-    o.max_float_bits.put(o.gpa, reference.token, maximum) catch {};
-    return maximum;
+    if (bound == .maximum) o.max_float_bits.put(o.gpa, reference.token, result) catch {};
+    return result;
 }
 
 fn predicateArgumentUnchanged(o: *Oracle, call: Ast.Node.Index, declaration: Ast.Node.Index, type_node: ?Ast.Node.Index, argument: Ast.Node.Index) bool {
@@ -1962,8 +2509,11 @@ fn predicateArgumentUnchanged(o: *Oracle, call: Ast.Node.Index, declaration: Ast
         }
     }
     const source_bits = maxFloatBitsOf(o, argument) orelse return false;
-    const destination_bits = (resolver.floatBits(expected) catch null) orelse return false;
-    return destination_bits != 0 and source_bits <= destination_bits;
+    // A destination ceiling is insufficient: one instantiation can be wider
+    // than the source while another narrows it. Compare the source ceiling
+    // with the destination floor unless both name the same bound parameter.
+    const destination_bits = computedFloatBitsAtDepth(o, expected, 0, .minimum) orelse return false;
+    return source_bits <= destination_bits;
 }
 
 fn actualParameterType(o: *Oracle, call: Ast.Node.Index, declaration: Ast.Node.Index, type_node: Ast.Node.Index) ?Ast.Node.Index {
@@ -1981,8 +2531,16 @@ fn actualParameterType(o: *Oracle, call: Ast.Node.Index, declaration: Ast.Node.I
     return null;
 }
 
+/// Frames of nested expression one bit-alias read may unwrap before it stops
+/// looking.
+const bit_alias_depth_cap: u8 = 32;
+
 fn bitAliasOf(o: *Oracle, st: *const State, node: Ast.Node.Index, depth: u8) ?BitAlias {
-    if (depth == 32 or !o.spend()) return null;
+    if (depth == bit_alias_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = bit_alias_depth_cap });
+        return null;
+    }
+    if (!o.spend()) return null;
     const tree = o.tree;
     if (numeric_eval.path(tree, node)) |name| if (st.bitAlias(name)) |alias| return alias;
     switch (tree.nodeTag(node)) {
@@ -2001,7 +2559,8 @@ fn bitAliasOf(o: *Oracle, st: *const State, node: Ast.Node.Index, depth: u8) ?Bi
             var buffer: [2]Ast.Node.Index = undefined;
             const arguments = tree.builtinCallParams(&buffer, node).?;
             const name = tree.tokenSlice(tree.nodeMainToken(node));
-            const info = (o.cache orelse return null).intInfoOf(node) orelse return null;
+            const cache = o.cache orelse return null;
+            const info = cache.intInfoOf(node) orelse return null;
             if (info.signed) return null;
             if (std.mem.eql(u8, name, "@as")) {
                 if (arguments.len != 2) return null;
@@ -2012,9 +2571,9 @@ fn bitAliasOf(o: *Oracle, st: *const State, node: Ast.Node.Index, depth: u8) ?Bi
                 return bitAliasOf(o, st, arguments[0], depth + 1);
             }
             if (!std.mem.eql(u8, name, "@bitCast") or arguments.len != 1) return null;
-            var evaluation = evaluator(o, st);
-            if (evaluation.floatBits(arguments[0]) != info.bits) return null;
-            return floatBitSource(o, st, arguments[0], info.bits);
+            const input_bits = exactFloatBitsOf(o, arguments[0]);
+            if (input_bits != info.bits) return null;
+            return floatBitSource(o, st, arguments[0], info.bits, null);
         },
         else => return unionBitAlias(o, st, node),
     }
@@ -2035,21 +2594,41 @@ fn maskedBitAlias(o: *Oracle, st: *const State, node: Ast.Node.Index, depth: u8)
     return null;
 }
 
-fn floatBitSource(o: *Oracle, st: *const State, original: Ast.Node.Index, width: u16) ?BitAlias {
+fn floatBitSource(o: *Oracle, st: *const State, original: Ast.Node.Index, width: u16, destination: ?Ast.Node.Index) ?BitAlias {
     if (width != 16 and width != 32 and width != 64) return null;
     var evaluation = evaluator(o, st);
-    const source_width = maxFloatBitsOf(o, original) orelse return null;
-    if (source_width == 0 or source_width > width) return null;
+    // `width` is the declared width of the value receiving this expression.
+    // The outer cast can have no independently resolved result location in a
+    // generic body; its destination is nevertheless known at this binding.
     var node = original;
     var absolute = false;
+    var destination_width = width;
+    var contextual_width: ?u16 = width;
+    var contextual_type = destination;
+    const generic_destination = if (destination) |target|
+        evaluation.sameTypeParameter(target, target)
+    else
+        false;
+    // A matching parameter does not narrow itself. Other intermediate
+    // formats still need to retain every possible source value.
+    var independent_width: ?u16 = if (generic_destination) null else width;
     for (0..32) |_| {
         if (!o.spend()) return null;
-        if (numeric_eval.path(o.tree, node)) |name| return .{
-            .source = name,
-            .float_bits = @intCast(width),
-            .absolute = absolute,
-            .mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(64 - width)),
-        };
+        if (numeric_eval.path(o.tree, node)) |name| {
+            const bits = maxFloatBitsOf(o, node) orelse return null;
+            const same_parameter = if (destination) |target|
+                evaluation.sameTypeParameter(node, target)
+            else
+                false;
+            const required_width: ?u16 = if (same_parameter) independent_width else destination_width;
+            if (required_width) |limit| if (bits > limit) return null;
+            return .{
+                .source = name,
+                .float_bits = @intCast(width),
+                .absolute = absolute,
+                .mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(64 - width)),
+            };
+        }
         if (o.tree.nodeTag(node) == .grouped_expression) {
             node = o.tree.nodeData(node).node_and_token[0];
             continue;
@@ -2061,15 +2640,39 @@ fn floatBitSource(o: *Oracle, st: *const State, original: Ast.Node.Index, width:
             absolute = true;
             node = arguments[0];
         } else {
-            const input = if (std.mem.eql(u8, name, "@floatCast") and arguments.len == 1)
-                arguments[0]
-            else if (std.mem.eql(u8, name, "@as") and arguments.len == 2)
-                arguments[1]
+            const float_cast = std.mem.eql(u8, name, "@floatCast") and arguments.len == 1;
+            const explicit_cast = std.mem.eql(u8, name, "@as") and arguments.len == 2;
+            if (!float_cast and !explicit_cast) return null;
+            const input = arguments[if (explicit_cast) @as(usize, 1) else 0];
+            const resolved_output_width = if (float_cast) evaluation.floatBits(node) else null;
+            const output_width = if (explicit_cast)
+                computedFloatBitsAtDepth(o, arguments[0], 0, .minimum) orelse return null
             else
-                return null;
-            const input_width = maxFloatBitsOf(o, input) orelse return null;
-            const output_width = evaluation.floatBits(node) orelse return null;
-            if (input_width == 0 or input_width > output_width) return null;
+                resolved_output_width orelse contextual_width orelse
+                    computedFloatBitsAtDepth(o, node, 0, .minimum) orelse return null;
+            // Every intermediate format must retain the original value. A
+            // final widening cannot repair an earlier narrowing. Taking the
+            // minimum also handles a contextual cast whose generic output
+            // varies between lossless widths at different closed call sites.
+            destination_width = @min(destination_width, output_width);
+            const output_type: ?Ast.Node.Index = if (explicit_cast)
+                arguments[0]
+            else if (resolved_output_width == null and contextual_width != null)
+                contextual_type
+            else
+                node;
+            const same_parameter = if (destination) |target|
+                if (output_type) |output| evaluation.sameTypeParameter(output, target) else false
+            else
+                false;
+            if (!same_parameter) {
+                independent_width = if (independent_width) |limit|
+                    @min(limit, output_width)
+                else
+                    output_width;
+            }
+            contextual_width = if (explicit_cast) output_width else null;
+            contextual_type = if (explicit_cast) arguments[0] else null;
             node = input;
         }
     }
@@ -2086,7 +2689,7 @@ fn unionBitAlias(o: *Oracle, st: *const State, node: Ast.Node.Index) ?BitAlias {
     if (first < 2 or o.tree.tokenTag(first - 2) != .identifier) return null;
     const field = o.tree.tokenSlice(first - 2);
     const width = (resolver.externUnionFloatFieldBits(node, field) catch return null) orelse return null;
-    var alias = floatBitSource(o, st, value, width) orelse return null;
+    var alias = floatBitSource(o, st, value, width, null) orelse return null;
     alias.union_view = true;
     return alias;
 }
@@ -2124,17 +2727,25 @@ fn run(
     const flow = try analyzeBody(&oracle);
     if (oracle.out_of_memory) return error.OutOfMemory;
     if (oracle.stoppedShort()) return reportGiveUp(&oracle);
+    if (oracle.summary_error) |err| return err;
     return flow.answer orelse false;
 }
 
-fn analyzeBody(o: *Oracle) error{OutOfMemory}!Flow {
+fn analyzeBody(o: *Oracle) QueryError!Flow {
+    if (o.summary_error) |err| return err;
     var owned_bindings: ?local_bindings.LocalBindings = null;
     defer if (owned_bindings) |*bindings| bindings.deinit();
-    defer o.locals = &.{};
+    // Cached bindings outlive this walk and are needed by the later contract
+    // effect phase. Only locally owned tables must be retired at this exit.
+    defer if (owned_bindings != null) {
+        o.locals = &.{};
+        o.file_consts = null;
+    };
     try numeric_escape.collectEscapeRoots(o);
     var st: State = .{};
     defer st.deinit(o.gpa);
     try seedParameters(o, &st, &owned_bindings);
+    if (o.summary_error) |err| return err;
     // What the call site held about this receiver, over whatever the
     // receiver contract proved about it.  It is applied BEFORE the snapshot
     // below so that an exit leaving before the body writes a path is filled
@@ -2144,6 +2755,7 @@ fn analyzeBody(o: *Oracle) error{OutOfMemory}!Flow {
     for (o.entry_facts) |fact| {
         try st.setNumeric(o.gpa, fact.name, st.numericValue(fact.name).intersect(fact.value));
     }
+    for (o.entry_lengths) |fact| try st.setLenBound(o.gpa, fact.name, fact.value);
     // Every path into this body starts from what the seeding established, so
     // that is what an exit which leaves BEFORE a later write still holds.  The
     // snapshot is read only for that, and only by a walk that is collecting
@@ -2203,7 +2815,67 @@ fn walkBindsName(o: *const Oracle, name: []const u8) bool {
     return false;
 }
 
-fn seedParameters(o: *Oracle, st: *State, owned: *?local_bindings.LocalBindings) error{OutOfMemory}!void {
+/// A scalar projection of an immutable file constant. Do not follow pointers:
+/// a const pointer can still refer to mutable storage. Local names shadow the
+/// file declaration, and field selection requires a concrete struct value.
+fn fileScalarInitializer(o: *Oracle, original: Ast.Node.Index, depth: u8) QueryError!?Ast.Node.Index {
+    if (depth >= walk_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
+        return null;
+    }
+    if (!o.spend()) return null;
+    const tree = o.tree;
+    const node = unwrapGrouped(tree, original);
+    if (tree.nodeTag(node) == .identifier) {
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        for (o.locals) |binding| if (std.mem.eql(u8, binding.name, name)) return null;
+        return (o.cache orelse return null).fileConstInitializer(name);
+    }
+    if (tree.nodeTag(node) != .field_access) return null;
+    const owner, const field = tree.nodeData(node).node_and_token;
+    const resolver = (o.cache orelse return null).zls orelse return null;
+    const frame = o.resolution_frame orelse resolver.resolutionFrame();
+    const actual = (frame.typeOfNode(owner) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return null;
+    }) orelse return null;
+    if (resolver.typeTag(actual) != .@"struct") return null;
+    const initializer = (try fileScalarInitializer(o, owner, depth + 1)) orelse return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const fields = (tree.fullStructInit(&buffer, unwrapGrouped(tree, initializer)) orelse return null).ast.fields;
+    for (fields) |value| {
+        if (!o.spend()) return null;
+        const token = tree.firstToken(value);
+        if (token < 2 or tree.tokenTag(token - 2) != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(token - 2), tree.tokenSlice(field))) return value;
+    }
+    return null;
+}
+
+fn seedFileScalarFacts(o: *Oracle, st: *State, node: Ast.Node.Index, depth: u8) QueryError!void {
+    if (depth >= walk_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
+        return;
+    }
+    if (!o.spend()) return;
+    if (numeric_eval.path(o.tree, node)) |name| {
+        if (try fileScalarInitializer(o, node, 0)) |initializer| {
+            var evaluation = evaluator(o, st);
+            // Coerce at the stored field's actual format, not at f128:
+            // 4294967295 stored in f32 rounds to the unsafe 2^32 boundary.
+            const raw = evaluation.evaluate(initializer);
+            const value = if (evaluation.floatBits(node)) |bits|
+                raw.asFloat(bits)
+            else
+                evaluation.coerce(raw, initializer, node);
+            if (value != .unknown) try st.setNumeric(o.gpa, name, value);
+        }
+    }
+    var children = @import("type_engine").AstIterator.init(o.tree, node);
+    while (children.next(o.tree)) |child| try seedFileScalarFacts(o, st, child, depth + 1);
+}
+
+fn seedParameters(o: *Oracle, st: *State, owned: *?local_bindings.LocalBindings) QueryError!void {
     const tree = o.tree;
     const declaration = enclosingFnDecl(o);
     var buffer: [1]Ast.Node.Index = undefined;
@@ -2225,13 +2897,15 @@ fn seedParameters(o: *Oracle, st: *State, owned: *?local_bindings.LocalBindings)
     // After `o.locals` is set: the table is exactly the names this walk does
     // NOT bind, so it can only be read once the walk knows its own.
     buildContainerConsts(o);
+    if (o.query == .numeric_range) if (o.expression) |expression|
+        try seedFileScalarFacts(o, st, expression, 0);
     var parameters = (proto orelse return).iterate(tree);
     var parameter_index: usize = 0;
     while (parameters.next()) |parameter| {
         const current_parameter = parameter_index;
         parameter_index += 1;
         const token = parameter.name_token orelse continue;
-        if (o.query == .numeric_range) {
+        if (o.query == .numeric_range or o.query == .min_len_container) {
             var evaluation = evaluator(o, st);
             const declared = if (parameter.type_expr) |type_node|
                 evaluation.typeRange(type_node)
@@ -2261,6 +2935,11 @@ fn seedParameters(o: *Oracle, st: *State, owned: *?local_bindings.LocalBindings)
                         try st.setLenBound(o.gpa, tree.tokenSlice(token), length);
                     }
                 }
+            }
+            if (parameter.type_expr) |type_node| {
+                const fixed = evaluation.containerLength(type_node);
+                if (fixed != .unknown)
+                    try st.setLenBound(o.gpa, tree.tokenSlice(token), fixed.intersect(st.lenBoundOf(tree.tokenSlice(token)) orelse .unknown));
             }
         }
         if (parameterNonnegative(o, parameter.type_expr)) {
@@ -2346,7 +3025,7 @@ fn recordAbsentExitFact(o: *Oracle, name: []const u8, target: Ast.Node.Index) er
 /// until the step counter stops it and is then reported as
 /// `numeric_oracle_steps`.  The bound the diagnostic owes is the caller
 /// allowance, so this names it, and the cap itself stays where it was declared.
-fn callerParameterBounds(o: *Oracle, declaration: Ast.Node.Index, parameter: usize, destination: ?Ast.Node.Index) error{OutOfMemory}!NumericRange {
+fn callerParameterBounds(o: *Oracle, declaration: Ast.Node.Index, parameter: usize, destination: ?Ast.Node.Index) QueryError!NumericRange {
     if (!callersMayBeAsked(o)) return .unknown;
     const cache = o.cache orelse return .unknown;
     // A declaration the file does not own is entered through callers this
@@ -2417,17 +3096,10 @@ fn callersMayBeAsked(o: *Oracle) bool {
 /// this tree already carries is about.  Whether a completed enumeration is
 /// the whole caller set is a property of the CONSUMER's claim — the same
 /// census is a sound basis for one question and not another — so the check
-/// belongs with the questions that make the "every caller" claim.  Both
-/// `callerParameterBounds` and `callerParameterLengthBounds` make it, and
-/// both are guarded below.
-///
-/// NOT guarded, and deliberately so: `maxFloatBitsAtDepth` reads the same
-/// census to take a MAXIMUM over callers.  It has the same hole — an
-/// external `f64` caller of a `pub` generic would leave the ceiling at the
-/// in-file `f32` — but fixing it narrows float ranges across every rule that
-/// reads this oracle, which is a wider claim than a change to the two
-/// caller-bound questions needs to rest on.  It belongs to whoever next
-/// revisits this census.
+/// belongs with the questions that make the "every caller" claim. Numeric
+/// parameter bounds, length bounds, and generic float-width ceilings all
+/// require that complete caller set. Function-value escapes are rejected by
+/// `closedLocalCalls` using resolved declaration identity.
 ///
 /// The conservative direction is the only one available: refusing can only
 /// remove a proof, never invent one.
@@ -2461,7 +3133,7 @@ fn callerParameterLengthBounds(
     o: *Oracle,
     declaration: Ast.Node.Index,
     parameter: usize,
-) error{OutOfMemory}!NumericRange {
+) QueryError!NumericRange {
     if (!callersMayBeAsked(o)) return .unknown;
     const cache = o.cache orelse return .unknown;
     // The same closure the value twin above requires: a `pub` or `export`
@@ -2493,19 +3165,18 @@ fn callerParameterLengthBounds(
 
 /// The range one call site held about `<argument>.len` at the call.
 ///
-/// The key is the caller's own spelling of `<argument>.len`, which is what the
-/// caller's walk recorded its guard under; the child walk reads that key
-/// rather than evaluating an expression, because no node spells `.len` on an
-/// argument.  The child is walked to the ARGUMENT's own token, so a write
-/// between the guard and the call has already withdrawn the fact here — which
-/// is what makes "mutated before the call" keep its report.
+/// Named arguments also read the caller's `.len` guards. Literal containers
+/// have no such key, but their static extent still holds at the call point.
+/// Walking to the argument retires facts invalidated before it is copied.
 fn callerArgumentLength(
     o: *Oracle,
     call_node: Ast.Node.Index,
     argument: Ast.Node.Index,
-) error{OutOfMemory}!NumericRange {
-    const spelling = numeric_eval.path(o.tree, argument) orelse return .unknown;
-    const key = try internPath(o, spelling, ".len");
+) QueryError!NumericRange {
+    const key = if (numeric_eval.path(o.tree, argument)) |spelling|
+        try internPath(o, spelling, ".len")
+    else
+        null;
     const body = callerBody(o, call_node);
     var child: Oracle = .{
         .gpa = o.gpa,
@@ -2520,6 +3191,7 @@ fn callerArgumentLength(
         .budget_cap = o.budget_cap,
         .caller_parent = o,
         .length_query = key,
+        .length_expression = true,
         .memo = o.memo,
     };
     defer child.deinit();
@@ -2527,14 +3199,20 @@ fn callerArgumentLength(
     defer o.stopped = o.stopped orelse child.stopped;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = o.tree.fullCall(&buffer, call_node) orelse return .unknown;
-    // Impure sibling arguments can change guarded values before they are copied.
-    if (body == null or !pureCallInputs(&child, call)) return .unknown;
+    // Impure sibling arguments can replace a slice header. Static extents,
+    // unlike guarded headers, still hold without any caller-state evidence.
+    if (body == null or !pureCallInputs(&child, call)) {
+        var evaluation = evaluator(&child, &.{});
+        const length = evaluation.containerLength(argument);
+        if (child.summary_error) |err| return err;
+        return length;
+    }
     const flow = try analyzeBody(&child);
     if (flow.answer == null or child.stoppedShort()) return .unknown;
     return child.numeric_answer;
 }
 
-fn callerArgumentBounds(o: *Oracle, call_node: Ast.Node.Index, argument: Ast.Node.Index) error{OutOfMemory}!NumericRange {
+fn callerArgumentBounds(o: *Oracle, call_node: Ast.Node.Index, argument: Ast.Node.Index) QueryError!NumericRange {
     const body = callerBody(o, call_node);
     var child: Oracle = .{
         .gpa = o.gpa,
@@ -2556,7 +3234,11 @@ fn callerArgumentBounds(o: *Oracle, call_node: Ast.Node.Index, argument: Ast.Nod
     var buffer: [1]Ast.Node.Index = undefined;
     const call = o.tree.fullCall(&buffer, call_node).?;
     // Impure sibling arguments can change guarded values before they are copied.
-    if (body == null or !pureCallInputs(&child, call)) return numericValue(&child, &.{}, argument);
+    if (body == null or !pureCallInputs(&child, call)) {
+        const value = numericValue(&child, &.{}, argument);
+        if (child.summary_error) |err| return err;
+        return value;
+    }
     const flow = try analyzeBody(&child);
     // The spent steps and the bound that spent them go back to the
     // parent (above), so the query that started the walk is the one
@@ -2681,6 +3363,30 @@ pub fn bodyDefers(tree: *const Ast, body: Ast.Node.Index) bool {
     return false;
 }
 
+/// A function-level `errdefer` cannot run on a successful call. Nested
+/// error-only scopes remain conservative: they can fail and be caught.
+fn contractBodyDefers(tree: *const Ast, body: Ast.Node.Index, success_only: bool) bool {
+    if (!success_only) return bodyDefers(tree, body);
+    const tags = tree.tokens.items(.tag);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = blockStmts(tree, body, &buffer);
+    var token = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    while (token <= last) : (token += 1) {
+        if (tags[token] == .keyword_defer) return true;
+        if (tags[token] != .keyword_errdefer) continue;
+        var direct = false;
+        for (statements) |statement| {
+            if (tree.nodeTag(statement) == .@"errdefer" and tree.nodeMainToken(statement) == token) {
+                direct = true;
+                break;
+            }
+        }
+        if (!direct) return true;
+    }
+    return false;
+}
+
 /// Whether the query can name the storage `path` reaches.  A callee's
 /// contract is a statement about its receiver and its arguments, so a
 /// query about some other path gains nothing from it.  Skipping is a COST
@@ -2701,7 +3407,7 @@ fn contractRelevant(o: *Oracle, path: []const u8) bool {
 /// chain of pointer parameters carries the fact from where it is written
 /// down to where it is read.  A body reached through one call site is not
 /// asked: it is handed that site's facts directly (see the gate below).
-fn seedReceiverContracts(o: *Oracle, st: *State) error{OutOfMemory}!void {
+fn seedReceiverContracts(o: *Oracle, st: *State) QueryError!void {
     if (!o.infer_callers or o.contract_depth >= max_contract_depth) return;
     // A walk reached through a call site already holds what that site hands
     // it: `applyCallContracts` mints the call site's own facts under this
@@ -2904,11 +3610,10 @@ const ContractCeiling = struct {
 };
 
 /// The facts in force at one call site in the caller's own walk.
-fn captureCallerFacts(o: *Oracle, call: Ast.Node.Index) error{OutOfMemory}!?State {
+fn captureCallerFacts(o: *Oracle, call: Ast.Node.Index) QueryError!?State {
     if (o.contract_depth >= max_contract_depth) return null;
     const body = callerBody(o, call) orelse return null;
-    const allowance = @min(o.budget, max_contract_steps);
-    if (allowance == 0) return null;
+    const allowance = contractAllowance(o) orelse return null;
     var capture: Capture = .{ .gpa = o.gpa, .mode = .point };
     defer capture.deinit();
     var child: Oracle = .{
@@ -2928,10 +3633,11 @@ fn captureCallerFacts(o: *Oracle, call: Ast.Node.Index) error{OutOfMemory}!?Stat
         .memo = o.memo,
     };
     defer child.deinit();
+    defer inheritStop(o, &child);
     defer o.budget -= chargeContractSteps(allowance, &child);
-    // The bound this step hit is deliberately NOT handed back: a contract
-    // that could not be read says nothing, and must not turn the caller's
-    // own answered query into "this file was not finished".
+    // The bound this step hit goes back to the caller: a contract that could
+    // not be read leaves the caller's own answer drawn from less than the
+    // callee proves, and that answer is not a finished one.
     const flow = try analyzeBody(&child);
     if (flow.answer == null or child.stoppedShort()) return null;
     const captured = capture.state orelse return null;
@@ -2951,6 +3657,25 @@ fn captureCallerFacts(o: *Oracle, call: Ast.Node.Index) error{OutOfMemory}!?Stat
 /// Completion and exported facts do not change the work already spent.
 pub fn chargeContractSteps(allowance: u32, child: *const Oracle) u32 {
     return if (child.budget < allowance) allowance - child.budget else 0;
+}
+
+/// The steps a helper walk may spend: whatever the asking walk has left,
+/// capped at one contract's share.  A caller with none left is out of steps,
+/// not out of ideas, so the helper is not run and the bound is recorded —
+/// skipping it silently would read as a helper that proved nothing.
+pub fn contractAllowance(o: *Oracle) ?u32 {
+    const allowance = @min(o.budget, max_contract_steps);
+    if (allowance != 0) return allowance;
+    o.giveUp(.{ .limit = .numeric_oracle_steps, .cap = o.budget_cap });
+    return null;
+}
+
+/// Hand the bound a helper walk hit back to the walk that asked for it.
+/// First stop wins, as in `giveUp`.  The step counter is left alone: the
+/// caller settles the helper's cost itself and must not underflow it.
+pub fn inheritStop(o: *Oracle, helper: *const Oracle) void {
+    const stop = helper.stopped orelse return;
+    if (o.stopped == null) o.stopped = stop;
 }
 
 /// A path spelled partly in one frame and partly in another.  The spelling
@@ -2997,35 +3722,65 @@ fn holdNumericFacts(st: *const State, out: *[max_contract_entry_facts]numeric_ev
 /// Install, in the caller's naming, what the callee establishes on the way
 /// out.
 ///
-/// The capture intersects every state that LEAVES the callee, so what
-/// survives is a fact holding on every path the call can take out of it —
-/// the only thing a caller may rely on.  The state the caller's walk is in
-/// when it reaches the next statement is the success edge, which is where
-/// this is applied; the failure edge is reached through `try`/`catch`, and
-/// `contract_effects_pending` keeps this off it.
+/// A propagated call intersects only successful exits: explicit errors and
+/// errors propagated by nested `try` never reach that continuation. Raw calls
+/// retain explicit error exits too and refuse a contract when propagated
+/// errors were not walked. Unknown return outcomes remain in the join, which
+/// can weaken a bound but cannot strengthen it. Handler walks suppress this
+/// transfer through `contract_effects_pending`.
 fn applyCallContracts(
     o: *Oracle,
     st: *State,
     node: Ast.Node.Index,
     held: []const numeric_eval.Fact,
-) error{OutOfMemory}!void {
-    if (o.query != .numeric_range or o.contract_effects_pending != 0) return;
+) QueryError!void {
+    if ((o.query != .numeric_range and o.query != .min_len_container and o.query != .positive_expression) or o.contract_effects_pending != 0) return;
+    // Receiver contracts still use root-frame lookup and argument mapping.
+    // A contextual numeric-return walk cannot borrow those root answers.
+    if (o.resolution_frame != null) return;
     if (o.contract_depth >= max_contract_depth) return;
     const cache = o.cache orelse return;
     const resolver = cache.zls orelse return;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = o.tree.fullCall(&buffer, node) orelse return;
-    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch return) {
+    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return;
+    }) {
         .function => |reference| reference,
         .unknown, .not_callable => return,
     };
-    if (reference.tree != o.tree) return;
-    const declaration = tokens.enclosingFnDecl(o.tree, reference.fn_token) orelse return;
+    const callee_tree = reference.tree;
+    const declaration = tokens.enclosingFnDecl(callee_tree, reference.fn_token) orelse return;
     var pbuf: [1]Ast.Node.Index = undefined;
-    const proto = tokens.fnProto(o.tree, &pbuf, declaration) orelse return;
+    const proto = tokens.fnProto(callee_tree, &pbuf, declaration) orelse return;
     if (proto.ast.fn_token != reference.fn_token) return;
-    const body = tokens.bodyOf(o.tree, declaration) orelse return;
-    if (body == o.body or bodyDefers(o.tree, body)) return;
+    const body = tokens.bodyOf(callee_tree, declaration) orelse return;
+    if ((callee_tree == o.tree and body == o.body) or
+        contractBodyDefers(callee_tree, body, o.successful_call == node)) return;
+    var callee_cache = cache;
+    var foreign_memo: PredicateMemo = .{ .gpa = o.gpa };
+    defer foreign_memo.deinit();
+    if (callee_tree != o.tree) {
+        // A borrowed source resolver does not carry generic instantiations.
+        // Only concrete declarations outside a type-producing function may
+        // cross this boundary; every contextual body remains unknown.
+        var parameters = proto.iterate(callee_tree);
+        while (parameters.next()) |parameter| {
+            if (parameter.anytype_ellipsis3 != null) return;
+            if (parameter.comptime_noalias) |modifier| {
+                if (callee_tree.tokenTag(modifier) == .keyword_comptime) return;
+            }
+        }
+        const first = callee_tree.firstToken(declaration);
+        if (first > 0) {
+            if (tokens.enclosingFnDecl(callee_tree, first - 1)) |outer| {
+                if (callee_tree.lastToken(outer) >= callee_tree.lastToken(declaration)) return;
+            }
+        }
+        const document = try cache.sourceDocument(reference.handle);
+        callee_cache = &document.cache;
+    }
     var bound: [max_contract_bindings]?Binding = .{null} ** max_contract_bindings;
     var bound_count: usize = 0;
     // What the callee is ENTERED with is read off every parameter this call
@@ -3037,20 +3792,26 @@ fn applyCallContracts(
     // decision about this query, not about the callee's own reasoning.
     var entered: [max_contract_bindings]Binding = undefined;
     var entered_count: usize = 0;
-    var entries = proto.iterate(o.tree);
+    var entries = proto.iterate(callee_tree);
     var index: usize = 0;
     while (entries.next()) |entry| {
         const current = index;
         index += 1;
         if (bound_count == bound.len and entered_count == entered.len) break;
-        const name = o.tree.tokenSlice(entry.name_token orelse continue);
-        const argument = (resolver.callArgument(node, current) catch null) orelse continue;
+        const name = callee_tree.tokenSlice(entry.name_token orelse continue);
+        const argument = (resolver.callArgument(node, current) catch |err| {
+            if (strictQueryError(err)) |failure| return failure;
+            return;
+        }) orelse continue;
         const path = storagePath(o.tree, argument) orelse continue;
         if (entered_count < entered.len) {
             entered[entered_count] = .{ .name = name, .caller_path = path, .through_pointer = true };
             entered_count += 1;
         }
-        if (bound_count == bound.len or !contractRelevant(o, path)) continue;
+        // A scalar guard can constrain a checked local whose source, rather
+        // than the local itself, is what this query reads.
+        const scalar_argument = cache.intInfoOf(argument) != null;
+        if (bound_count == bound.len or (!scalar_argument and !contractRelevant(o, path))) continue;
         bound[bound_count] = .{ .name = name, .caller_path = path, .through_pointer = false };
         bound_count += 1;
     }
@@ -3081,47 +3842,176 @@ fn applyCallContracts(
         }
     }
     if (!o.spend()) return;
-    const allowance = @min(o.budget, max_contract_steps);
-    if (allowance == 0) return;
-    var capture: Capture = .{ .gpa = o.gpa, .mode = .exit };
+    const allowance = contractAllowance(o) orelse return;
+    var capture: Capture = .{ .gpa = o.gpa, .mode = .exit, .success_only = o.successful_call == node };
     defer capture.deinit();
     var child: Oracle = .{
         .gpa = o.gpa,
-        .tree = o.tree,
+        .tree = callee_tree,
         .body = body,
         .query = .numeric_range,
         .target = "",
         .use_token = std.math.maxInt(Ast.TokenIndex),
-        // The callee is asked the same question the caller is, so a
-        // contract about ITS own receiver reaches its callers only where
-        // their own walks would have found it relevant.
-        .expression = o.expression,
-        .cache = o.cache,
+        // Nested helpers refer to this body's parameter names, not the
+        // caller's expression. Only captured receiver facts seed this call.
+        .expression = body,
+        .cache = callee_cache,
         .budget = allowance,
         .budget_cap = o.budget_cap,
         .caller_parent = o,
+        .infer_callers = false,
         .contract_depth = o.contract_depth + 1,
         .capture = &capture,
         .entry_facts = entry[0..entry_count],
-        .memo = o.memo,
+        .memo = if (callee_tree == o.tree) o.memo else &foreign_memo,
     };
     defer child.deinit();
-    defer o.budget -= chargeContractSteps(allowance, &child);
-    // Same as the caller-side step: a bound hit while reading the callee
-    // exports nothing and is not the caller's verdict to report.
+    defer inheritStop(o, &child);
+    var child_charged = false;
+    defer if (!child_charged) {
+        o.budget -= chargeContractSteps(allowance, &child);
+    };
+    // Same as the caller-side step: a bound hit while reading the callee goes
+    // back to the caller, whose answer would otherwise rest on an unread
+    // contract.
     _ = try analyzeBody(&child);
-    if (child.stoppedShort()) return;
+    // Caller-side filters spend the same allowance. Settle this phase before
+    // running them; later child effect work is charged separately below.
+    o.budget -= chargeContractSteps(allowance, &child);
+    child_charged = true;
+    if (child.stoppedShort() or !capture.complete) return;
     const exported = capture.state orelse return;
+    var scalar_effects: ?numeric_escape.EffectScan = null;
     for (exported.numeric.items) |fact| {
         for (bound[0..bound_count]) |maybe| {
             const binding = maybe.?;
             const through = child.pointer_roots.contains(binding.name);
             const suffix = suffixUnder(fact.name, binding.name, through) orelse continue;
             if (suffix.len == 0 and through) continue;
+            if (suffix.len == 0) {
+                // Other arguments (and their evaluation) can rewrite the
+                // caller's storage after this argument's value was copied.
+                if (!numeric_escape.scalarSurvivesCall(o, binding.caller_path, .{ .subtree = node })) continue;
+                // A copied scalar's exit value constrains its entry argument
+                // only while the parameter remains unchanged. Address-taken,
+                // written, or unmodeled storage cannot establish that equality.
+                if (child.addressed.contains(binding.name)) continue;
+                const unchanged = try contractScalarUnchanged(o, &child, body, binding.name, &scalar_effects);
+                if (child.stoppedShort()) return;
+                if (!unchanged) continue;
+            }
             const name = try internPath(o, binding.caller_path, suffix);
             try st.setNumeric(o.gpa, name, st.numericValue(name).intersect(fact.value));
         }
     }
+    for (bound[0..bound_count]) |maybe| {
+        const binding = maybe.?;
+        const through = child.pointer_roots.contains(binding.name);
+        for (exported.scalar_mins.items) |fact| {
+            const suffix = suffixUnder(fact.name, binding.name, through) orelse continue;
+            if (suffix.len == 0 and through) continue;
+            if (suffix.len == 0) {
+                if (!numeric_escape.scalarSurvivesCall(o, binding.caller_path, .{ .subtree = node })) continue;
+                if (child.addressed.contains(binding.name)) continue;
+                const unchanged = try contractScalarUnchanged(o, &child, body, binding.name, &scalar_effects);
+                if (child.stoppedShort()) return;
+                if (!unchanged) continue;
+            }
+            const name = try internPath(o, binding.caller_path, suffix);
+            try st.setScalarMin(o.gpa, name, fact.n);
+            if (fact.n > 0) try st.scalars.add(o.gpa, name);
+        }
+        for (exported.min_lens.items) |fact| {
+            const suffix = suffixUnder(fact.path, binding.name, through) orelse continue;
+            if (suffix.len == 0 and through) continue;
+            const path = try internPath(o, binding.caller_path, suffix);
+            try st.setMinLen(o.gpa, path, fact.n);
+            if (fact.n > 0) try st.containers.add(o.gpa, path);
+        }
+    }
+    try propagateNumericAliases(o, st);
+}
+
+/// A completed contract child can still spend steps scanning its effects.
+/// Its old remainder is not a reservation: caller filters may have spent it.
+/// Clip each phase to both remainders and settle it before the caller resumes.
+fn contractScalarUnchanged(
+    o: *Oracle,
+    child: *Oracle,
+    body: Ast.Node.Index,
+    name: []const u8,
+    effects: *?numeric_escape.EffectScan,
+) QueryError!bool {
+    child.budget = @min(child.budget, o.budget);
+    const allowance = child.budget;
+    defer o.budget -= chargeContractSteps(allowance, child);
+    if (effects.* == null) {
+        effects.* = .{};
+        numeric_escape.scanEffects(child, body, &effects.*.?, 0);
+    }
+    if (child.stoppedShort()) return false;
+    const unchanged = !effects.*.?.reaches(child, name);
+    if (child.summary_error) |err| return err;
+    return unchanged and !child.stoppedShort();
+}
+
+fn strictQueryError(err: anyerror) ?QueryError {
+    inline for (@typeInfo(QueryError).error_set.?) |member| {
+        const query_error = @field(QueryError, member.name);
+        if (err == query_error) return query_error;
+    }
+    return null;
+}
+
+/// Bind only an entirely scalar call whose arguments run no code. Reading
+/// all arguments from one incoming state is then valid, including a
+/// comptime integer width. Unsupported signatures retain declared domains.
+fn numericCallArguments(
+    o: *Oracle,
+    st: *const State,
+    call: Ast.full.Call,
+    proto: Ast.full.FnProto,
+    out: *[max_contract_entry_facts]numeric_eval.Fact,
+) QueryError!?usize {
+    var parameters = proto.iterate(o.tree);
+    var count: usize = 0;
+    var evaluation = evaluator(o, st);
+    while (parameters.next()) |parameter| {
+        if (count == out.len or count == call.ast.params.len) return null;
+        const name = parameter.name_token orelse return null;
+        const destination = parameter.type_expr orelse return null;
+        const declared = evaluation.typeRange(destination);
+        if (declared != .integer) return null;
+        const argument = call.ast.params[count];
+        if (!pureIntegerExpression(o, argument, 0)) {
+            if (o.summary_error) |err| return err;
+            return null;
+        }
+        const actual = evaluation.evaluate(argument).intersect(declared);
+        if (actual != .integer) return null;
+        out[count] = .{ .name = o.tree.tokenSlice(name), .value = actual };
+        count += 1;
+    }
+    if (count != call.ast.params.len) return null;
+    if (o.summary_error) |err| return err;
+    return count;
+}
+
+fn forwardedReturnRange(o: *Oracle, st: *const State, node: Ast.Node.Index) QueryError!NumericRange {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = o.tree.fullCall(&buffer, node) orelse return .unknown;
+    var evaluation = evaluator(o, st);
+    // No argument may carry caller storage or execute a mutation before a
+    // later argument is read. The callee may run code; its own walk accounts
+    // for that code before recording the value it returns.
+    for (call.ast.params) |argument| {
+        if (!pureIntegerExpression(o, argument, 0)) {
+            if (o.summary_error) |err| return err;
+            return .unknown;
+        }
+        if (evaluation.evaluate(argument) != .integer) return .unknown;
+    }
+    return callReturnRange(o, st, node);
 }
 
 /// The range of values a call in this body can produce, or unknown.
@@ -3137,52 +4027,78 @@ fn applyCallContracts(
 /// narrower than the receiver contract above: there is no name to translate
 /// between the two scopes, so nothing here can collide with a caller's own
 /// spelling of a local.  The walk runs in the callee's own scope — its
-/// parameters seeded from their declared types, its locals recorded under its
-/// own names — and only the joined range comes back out.
+/// parameters seeded from declared types and pure scalar actual arguments,
+/// its locals recorded under its own names — and only the joined range
+/// comes back out.
 ///
 /// Everything that would make the claim a claim about something other than
 /// what the callee returns is declined rather than approximated: a result the
 /// declared type does not pin to an integer, a body that schedules a `defer`
 /// to run where the walk stops, a body that can run off its end, an exit the
-/// walk could not evaluate, a return whose operand runs code the walk reads
-/// before that code ran (see `ReturnSummary`), and a body that runs past its
-/// own step allowance.
-fn callReturnRange(o: *Oracle, st: *const State, node: Ast.Node.Index) error{OutOfMemory}!NumericRange {
-    if (o.query != .numeric_range) return .unknown;
+/// walk could not evaluate, and a return whose operand runs code the walk
+/// reads before that code ran (see `ReturnSummary`). Resource, semantic-query,
+/// cancellation, and walk-budget failures propagate instead of answering unknown.
+fn callReturnRange(o: *Oracle, st: *const State, node: Ast.Node.Index) QueryError!NumericRange {
+    if (o.query != .numeric_range and o.query != .min_len_container) return .unknown;
     if (o.contract_depth >= max_contract_depth) return .unknown;
     const cache = o.cache orelse return .unknown;
     const resolver = cache.zls orelse return .unknown;
+    var call_node = unwrapGrouped(o.tree, node);
+    var propagating = o.tree.nodeTag(call_node) == .@"try";
+    if (propagating) {
+        call_node = unwrapGrouped(o.tree, o.tree.nodeData(call_node).node);
+    } else if (o.tree.nodeTag(call_node) == .@"catch") {
+        const caught = o.tree.nodeData(call_node).node_and_node;
+        if (o.tree.nodeTag(unwrapGrouped(o.tree, caught[1])) != .@"return") return .unknown;
+        propagating = true;
+        call_node = unwrapGrouped(o.tree, caught[0]);
+    }
     var buffer: [1]Ast.Node.Index = undefined;
-    const call = o.tree.fullCall(&buffer, unwrapGrouped(o.tree, node)) orelse return .unknown;
-    // A computed callee (`table.fns[i](x)`) has no declaration this can find,
-    // and a method call names one through its receiver, which is the receiver
-    // contract's question rather than this one.
-    if (o.tree.nodeTag(call.ast.fn_expr) != .identifier) return .unknown;
-    const reference = switch (resolver.functionReference(call.ast.fn_expr) catch |err| switch (err) {
-        // Allocation failure is an error, not a verdict about this callee.
-        error.OutOfMemory => return error.OutOfMemory,
+    const call = o.tree.fullCall(&buffer, call_node) orelse return .unknown;
+    // Resolve methods and plain calls through the canonical call record.
+    // Computed callees still carry no supported stable declaration.
+    switch (o.tree.nodeTag(call.ast.fn_expr)) {
+        .identifier, .field_access => {},
         else => return .unknown,
-    }) {
-        .function => |reference| reference,
-        .unknown, .not_callable => return .unknown,
-    };
+    }
+    const caller_frame = o.resolution_frame orelse resolver.resolutionFrame();
+    const actual = (cache.actualCallSummaryAt(o.tree.nodeMainToken(call.ast.fn_expr), caller_frame) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return .unknown;
+    }) orelse return .unknown;
+    if (actual.callee.call_node != call_node) return .unknown;
+    const reference = actual.callee.reference;
     if (reference.tree != o.tree) return .unknown;
     const declaration = tokens.enclosingFnDecl(o.tree, reference.fn_token) orelse return .unknown;
     var pbuf: [1]Ast.Node.Index = undefined;
     const proto = tokens.fnProto(o.tree, &pbuf, declaration) orelse return .unknown;
     if (proto.ast.fn_token != reference.fn_token) return .unknown;
-    const return_type = proto.ast.return_type.unwrap() orelse return .unknown;
-    // Only an integer result is summarised.  A float, an optional, an error
-    // union and a void all have exits this cannot join into one number, and a
-    // declared range for any of them would be a claim the body never made.
-    var declared = evaluator(o, st);
-    if (declared.typeRange(return_type) != .integer) return .unknown;
+    var returned_type = (resolver.normalizedType(reference.actual_type.data.function.return_value.*) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return .unknown;
+    }) orelse return .unknown;
+    const fallible = resolver.typeTag(returned_type) == .error_union;
+    if (fallible) {
+        if (!propagating) return .unknown;
+        returned_type = resolver.childType(returned_type) orelse return .unknown;
+    }
+    // Only integer success values are joined. Optional and float results
+    // remain outside this contract; caught failures cannot borrow success.
+    if (resolver.typeTag(returned_type) != .int) return .unknown;
     const body = tokens.bodyOf(o.tree, declaration) orelse return .unknown;
     if (body == o.body or bodyDefers(o.tree, body)) return .unknown;
+    var ancestor = o.caller_parent;
+    while (ancestor) |parent| : (ancestor = parent.caller_parent) {
+        if (parent.body == body) return .unknown;
+    }
+    var arguments: [max_contract_entry_facts]numeric_eval.Fact = undefined;
+    const argument_count = try numericCallArguments(o, st, call, proto, &arguments);
     if (!o.spend()) return .unknown;
-    const allowance = @min(o.budget, max_contract_steps);
-    if (allowance == 0) return .unknown;
-    var summary = ReturnSummary{};
+    if (argument_count) |count| if (o.memo) |memo| {
+        if (memo.findNumericReturn(reference, caller_frame, node, o.contract_depth, arguments[0..count])) |value| return value;
+    };
+    const allowance = contractAllowance(o) orelse return .unknown;
+    var summary = ReturnSummary{ .success_only = fallible };
     var child: Oracle = .{
         .gpa = o.gpa,
         .tree = o.tree,
@@ -3198,17 +4114,355 @@ fn callReturnRange(o: *Oracle, st: *const State, node: Ast.Node.Index) error{Out
         .contract_depth = o.contract_depth + 1,
         .return_summary = &summary,
         .memo = o.memo,
+        .entry_facts = if (argument_count) |count| arguments[0..count] else &.{},
+        .resolution_frame = resolver.frameForFunction(reference),
     };
     defer child.deinit();
     defer o.budget -= chargeContractSteps(allowance, &child);
     // A body that does not diverge ran off its end somewhere, and the value
     // handed to the caller there is not one of its returns.
     const flow = try analyzeBody(&child);
-    // As at the other contract steps, a bound hit while reading the callee
-    // answers nothing and is not this query's cost problem to report.
-    if (!flow.diverged or child.stoppedShort()) return .unknown;
+    if (child.out_of_memory) return error.OutOfMemory;
+    if (child.stoppedShort()) return reportGiveUp(&child);
+    if (child.summary_error) |err| return err;
+    if (!flow.diverged) return .unknown;
     if (!summary.complete) return .unknown;
-    return summary.value orelse .unknown;
+    const value = summary.value orelse return .unknown;
+    if (argument_count) |count| if (o.memo) |memo| {
+        try memo.recordNumericReturn(reference, caller_frame, node, o.contract_depth, arguments[0..count], value);
+    };
+    return value;
+}
+
+/// Header extents share the returned-field walk and its success/memo gates.
+/// A terminating catch, unlike a value-producing fallback, keeps success.
+/// Inputs are captured before the call runs. A pure bare bool selector can
+/// retain its true-arm header extent, separately from the joined baseline;
+/// changing either binding or reaching it through effects drops that link.
+fn callReturnLengths(o: *Oracle, source: *const State, expression: Ast.Node.Index, output: *State, prefix: []const u8) QueryError!void {
+    // A framed caller requires canonical frame resolution and a frame key.
+    if (o.resolution_frame != null) return;
+    if ((o.query != .numeric_range and o.query != .min_len_container) or o.contract_depth >= max_contract_depth) return;
+    var node = unwrapGrouped(o.tree, expression);
+    var propagating = o.tree.nodeTag(node) == .@"try";
+    if (propagating) {
+        node = unwrapGrouped(o.tree, o.tree.nodeData(node).node);
+    } else if (o.tree.nodeTag(node) == .@"catch") {
+        const caught = o.tree.nodeData(node).node_and_node;
+        if (o.tree.nodeTag(unwrapGrouped(o.tree, caught[1])) != .@"return") return;
+        propagating = true;
+        node = unwrapGrouped(o.tree, caught[0]);
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = o.tree.fullCall(&buffer, node) orelse return;
+    const resolver = (o.cache orelse return).zls orelse return;
+    const reference = switch (resolver.functionReferenceOfCall(node) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return;
+    }) {
+        .function => |reference| reference,
+        else => return,
+    };
+    if (reference.tree != o.tree) return;
+    const declaration = tokens.enclosingFnDecl(o.tree, reference.fn_token) orelse return;
+    var pbuf: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(o.tree, &pbuf, declaration) orelse return;
+    if (proto.ast.fn_token != reference.fn_token) return;
+    var returned_type = (resolver.normalizedType(reference.actual_type.data.function.return_value.*) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return;
+    }) orelse return;
+    const fallible = resolver.typeTag(returned_type) == .error_union;
+    if (fallible) {
+        if (!propagating) return;
+        returned_type = resolver.childType(returned_type) orelse return;
+    }
+    // A pointer to an aggregate shares mutable fields, unlike a copied
+    // aggregate's slice headers. Optional/unknown results also carry no fact.
+    const returned_tag = resolver.typeTag(returned_type);
+    const bare_slice = returned_tag == .pointer and resolver.pointerSize(returned_type) == .slice;
+    if (!bare_slice and returned_tag != .@"struct" and returned_tag != .@"union") return;
+    const body = tokens.bodyOf(o.tree, declaration) orelse return;
+    if (bodyDefers(o.tree, body)) return;
+    var ancestor: ?*const Oracle = o;
+    while (ancestor) |parent| : (ancestor = parent.caller_parent) {
+        if (body == parent.body) return;
+    }
+    var inputs: ReturnLengthInputs = .{};
+    if (bare_slice) {
+        const recorded = try inputs.record(o, source, call, proto);
+        if (o.summary_error) |err| return err;
+        if (!recorded) return;
+    }
+    try summarizeReturnedLengths(o, source, reference, node, body, fallible, bare_slice, inputs.numeric[0..inputs.numeric_count], inputs.lengths[0..inputs.length_count], output, prefix);
+    const selector = inputs.selector orelse return;
+    if (!numeric_escape.scalarSurvivesCall(o, selector, .{ .subtree = expression })) return;
+    var selected: State = .{};
+    defer selected.deinit(o.gpa);
+    try summarizeReturnedLengths(o, source, reference, node, body, fallible, bare_slice, inputs.true_numeric[0..inputs.numeric_count], inputs.lengths[0..inputs.length_count], &selected, prefix);
+    if (selected.lenBoundOf(prefix)) |length|
+        try output.addConditionalLength(o.gpa, .{ .header = prefix, .selector = selector, .value = length });
+}
+
+/// Input snapshots are bounded by the existing call-contract limit, and are
+/// part of the same memo key as the returned aggregate fields.
+const ReturnLengthInputs = struct {
+    numeric: [max_contract_entry_facts]numeric_eval.Fact = undefined,
+    true_numeric: [max_contract_entry_facts]numeric_eval.Fact = undefined,
+    lengths: [max_contract_entry_facts]numeric_eval.Fact = undefined,
+    numeric_count: usize = 0,
+    length_count: usize = 0,
+    selector: ?[]const u8 = null,
+
+    fn record(self: *ReturnLengthInputs, o: *Oracle, source: *const State, call: Ast.full.Call, proto: Ast.full.FnProto) QueryError!bool {
+        // Sibling operands must not change an earlier argument before entry.
+        for (call.ast.params) |actual| if (!pureAggregateExpression(o, actual, 0)) return false;
+        var parameters = proto.iterate(o.tree);
+        var index: usize = 0;
+        while (parameters.next()) |parameter| {
+            if (!o.spend()) return false;
+            if (index >= call.ast.params.len) return false;
+            const actual = call.ast.params[index];
+            index += 1;
+            const token = parameter.name_token orelse return false;
+            const type_node = parameter.type_expr orelse return false;
+            const name = o.tree.tokenSlice(token);
+            var evaluation = evaluator(o, source);
+            const declared = evaluation.typeRange(type_node);
+            if (declared == .integer) {
+                const value = evaluation.evaluate(actual).intersect(declared);
+                if (value != .integer or self.numeric_count == self.numeric.len) return false;
+                const slot = self.numeric_count;
+                self.numeric_count += 1;
+                self.numeric[slot] = .{ .name = name, .value = value };
+                self.true_numeric[slot] = self.numeric[slot];
+                if (o.tree.fullIf(unwrapGrouped(o.tree, actual))) |conditional| {
+                    if (conditional.payload_token != null or conditional.ast.else_expr.unwrap() == null) continue;
+                    const condition = unwrapGrouped(o.tree, conditional.ast.cond_expr);
+                    const flag = identName(o.tree, condition) orelse continue;
+                    const resolver = (o.cache orelse continue).zls orelse continue;
+                    const boolean = resolver.isBoolType(condition) catch |err| {
+                        if (strictQueryError(err)) |failure| return failure;
+                        continue;
+                    };
+                    if (boolean != true) continue;
+                    if (self.selector) |previous| {
+                        if (!std.mem.eql(u8, previous, flag)) return false;
+                    }
+                    const selected = evaluation.evaluate(conditional.ast.then_expr).intersect(declared);
+                    if (selected != .integer) continue;
+                    self.selector = flag;
+                    self.true_numeric[slot].value = selected;
+                }
+            } else {
+                const length = evaluation.containerLength(actual);
+                if (length == .unknown) continue;
+                if (self.length_count == self.lengths.len) return false;
+                self.lengths[self.length_count] = .{ .name = name, .value = length };
+                self.length_count += 1;
+            }
+        }
+        return index == call.ast.params.len;
+    }
+};
+
+fn summarizeReturnedLengths(o: *Oracle, source: *const State, reference: TypeResolver.FunctionReference, node: Ast.Node.Index, body: Ast.Node.Index, fallible: bool, bare_slice: bool, inputs: []const numeric_eval.Fact, input_lengths: []const numeric_eval.Fact, output: *State, prefix: []const u8) QueryError!void {
+    if (o.resolution_frame != null) return;
+    const memo = if (o.resolution_frame == null and o.contract_depth == 0 and o.caller_parent == null and o.entry_facts.len == 0 and o.entry_lengths.len == 0)
+        o.memo
+    else
+        null;
+    var cache_index: ?usize = null;
+    var published = false;
+    defer if (!published) {
+        if (cache_index) |index| {
+            var removed = memo.?.aggregate_returns.swapRemove(index);
+            removed.deinit(o.gpa);
+        }
+    };
+    if (memo) |owner| {
+        for (owner.aggregate_returns.items) |*entry| {
+            if (!o.spend()) return;
+            if (!entry.matches(reference, node, o.contract_depth, source, inputs, input_lengths)) continue;
+            if (entry.visiting) return;
+            try applyReturnedLengths(o, entry.fields, output, prefix);
+            return;
+        }
+        const numeric = try o.gpa.dupe(numeric_eval.Fact, source.numeric.items);
+        errdefer o.gpa.free(numeric);
+        const lengths = try o.gpa.dupe(numeric_eval.Fact, source.len_bounds.items);
+        errdefer o.gpa.free(lengths);
+        const saved_inputs = try o.gpa.dupe(numeric_eval.Fact, inputs);
+        errdefer o.gpa.free(saved_inputs);
+        const saved_lengths = try o.gpa.dupe(numeric_eval.Fact, input_lengths);
+        errdefer o.gpa.free(saved_lengths);
+        const index = owner.aggregate_returns.items.len;
+        try owner.aggregate_returns.append(o.gpa, .{
+            .reference = reference,
+            .call = node,
+            .depth = o.contract_depth,
+            .numeric = numeric,
+            .lengths = lengths,
+            .inputs = saved_inputs,
+            .input_lengths = saved_lengths,
+        });
+        cache_index = index;
+    }
+    if (!o.spend()) return;
+    const allowance = contractAllowance(o) orelse return;
+    var fields: State = .{};
+    defer fields.deinit(o.gpa);
+    var summary: ReturnSummary = .{ .aggregate = &fields, .bare_slice = bare_slice, .success_only = fallible };
+    var child: Oracle = .{
+        .gpa = o.gpa,
+        .tree = o.tree,
+        .body = body,
+        .query = .numeric_range,
+        .target = "",
+        .use_token = std.math.maxInt(Ast.TokenIndex),
+        .cache = o.cache,
+        .budget = allowance,
+        .budget_cap = o.budget_cap,
+        .infer_callers = false,
+        .caller_parent = o,
+        .contract_depth = o.contract_depth + 1,
+        .return_summary = &summary,
+        .memo = o.memo,
+        .entry_facts = inputs,
+        .entry_lengths = input_lengths,
+    };
+    defer child.deinit();
+    defer inheritStop(o, &child);
+    var child_charged = false;
+    defer if (!child_charged) {
+        o.budget -= chargeContractSteps(allowance, &child);
+    };
+    const flow = try analyzeBody(&child);
+    // Exporting a returned field spends the parent's budget. Settle this
+    // child's completed walk before any parent export can spend those steps.
+    o.budget -= chargeContractSteps(allowance, &child);
+    child_charged = true;
+    if (child.out_of_memory) return error.OutOfMemory;
+    if (child.stoppedShort()) return reportGiveUp(&child);
+    if (child.summary_error) |err| return err;
+    if (!flow.diverged or !summary.complete or !summary.saw_success) return;
+    try applyReturnedLengths(o, fields.len_bounds.items, output, prefix);
+    if (o.stoppedShort()) return;
+    if (cache_index) |index| {
+        const saved = try o.gpa.dupe(numeric_eval.Fact, fields.len_bounds.items);
+        errdefer o.gpa.free(saved);
+        // A child's minted paths die with the child, whereas memo entries
+        // live until the root query ends. Intern every result in the root.
+        for (saved) |*field| field.name = try internPath(o, "", field.name);
+        memo.?.aggregate_returns.items[index].fields = saved;
+        memo.?.aggregate_returns.items[index].visiting = false;
+        published = true;
+    }
+}
+
+fn applyReturnedLengths(o: *Oracle, fields: []const numeric_eval.Fact, output: *State, prefix: []const u8) QueryError!void {
+    for (fields) |field| {
+        if (!o.spend()) return;
+        const name = if (field.name.len == 0) prefix else try aggregateFieldPath(o, prefix, field.name);
+        try output.setLenBound(o.gpa, name, field.value);
+    }
+}
+
+fn aggregateFieldPath(o: *Oracle, prefix: []const u8, field: []const u8) error{OutOfMemory}![]const u8 {
+    if (prefix.len == 0) return field;
+    const owner = try internPath(o, prefix, ".");
+    return internPath(o, owner, field);
+}
+
+/// Check every evaluated field, not just the bounded one. A sibling
+/// initializer must not overwrite the header whose extent is being read.
+fn pureAggregateExpression(o: *Oracle, expression: Ast.Node.Index, depth: u8) bool {
+    if (depth >= walk_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
+        return false;
+    }
+    if (!o.spend()) return false;
+    const node = unwrapGrouped(o.tree, expression);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (o.tree.fullStructInit(&buffer, node)) |initializer| {
+        for (initializer.ast.fields) |field| {
+            if (!pureAggregateExpression(o, field, depth + 1)) return false;
+        }
+        return true;
+    }
+    if (o.tree.fullArrayInit(&buffer, node)) |initializer| {
+        for (initializer.ast.elements) |element| {
+            if (!pureAggregateExpression(o, element, depth + 1)) return false;
+        }
+        return true;
+    }
+    if (o.tree.nodeTag(node) == .address_of)
+        return pureAggregateExpression(o, o.tree.nodeData(node).node, depth + 1);
+    if (o.tree.fullSwitch(node)) |selection| {
+        if (!pureIntegerExpression(o, selection.ast.condition, depth + 1)) return false;
+        for (selection.ast.cases) |case_node| {
+            const case = o.tree.fullSwitchCase(case_node) orelse return false;
+            if (case.payload_token != null) return false;
+            const target = unwrapGrouped(o.tree, case.ast.target_expr);
+            if (o.tree.nodeTag(target) == .unreachable_literal) continue;
+            if (!pureAggregateExpression(o, target, depth + 1)) return false;
+        }
+        return true;
+    }
+    if (o.tree.fullSlice(node)) |slice| {
+        if (!pureAggregateExpression(o, slice.ast.sliced, depth + 1) or
+            !pureIntegerExpression(o, slice.ast.start, depth + 1)) return false;
+        if (slice.ast.end.unwrap()) |end| {
+            if (!pureIntegerExpression(o, end, depth + 1)) return false;
+        }
+        if (slice.ast.sentinel.unwrap()) |sentinel| {
+            if (!pureIntegerExpression(o, sentinel, depth + 1)) return false;
+        }
+        return true;
+    }
+    if (o.tree.nodeTag(node) == .string_literal or o.tree.nodeTag(node) == .multiline_string_literal) return true;
+    return pureIntegerExpression(o, node, depth);
+}
+
+/// Snapshot copied header projections. Rebinding the owner or a field
+/// invalidates these through the existing length-fact machinery.
+fn recordAggregateLengths(o: *Oracle, source: *const State, output: *State, expression: Ast.Node.Index, prefix: []const u8, depth: u8) QueryError!void {
+    if (depth >= walk_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
+        return;
+    }
+    if (!o.spend()) return;
+    const node = unwrapGrouped(o.tree, expression);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (o.tree.fullStructInit(&buffer, node)) |initializer| {
+        for (initializer.ast.fields) |field| {
+            const token = o.tree.firstToken(field);
+            if (token < 2 or o.tree.tokenTag(token - 2) != .identifier) continue;
+            const name = try aggregateFieldPath(o, prefix, o.tree.tokenSlice(token - 2));
+            var evaluation = evaluator(o, source);
+            const length = evaluation.containerLength(field);
+            if (length != .unknown) try output.setLenBound(o.gpa, name, length);
+            try recordAggregateLengths(o, source, output, field, name, depth + 1);
+        }
+    } else if (numeric_eval.path(o.tree, node)) |owner| {
+        var value_type_checked = false;
+        for (source.len_bounds.items) |field| {
+            if (!o.spend()) return;
+            if (field.name.len <= owner.len or !pathRootedAt(field.name, owner)) continue;
+            if (!value_type_checked) {
+                const resolver = (o.cache orelse return).zls orelse return;
+                const actual = (resolver.resolutionFrame().typeOfNode(node) catch |err| {
+                    if (strictQueryError(err)) |failure| return failure;
+                    return;
+                }) orelse return;
+                const actual_tag = resolver.typeTag(actual);
+                if (actual_tag != .@"struct" and actual_tag != .@"union") return;
+                value_type_checked = true;
+            }
+            const name = try aggregateFieldPath(o, prefix, field.name[owner.len + 1 ..]);
+            try output.setLenBound(o.gpa, name, field.value);
+        }
+    }
 }
 
 // ── Compile-time audits of a container ────────────────────────────────────
@@ -3484,6 +4738,15 @@ pub fn dropIndirectFacts(o: *Oracle, st: *State, effect: Reach) void {
             std.debug.assert(!numeric_escape.scalarSurvivesCall(o, removed.name, effect));
         } else len_bound += 1;
     }
+    var conditional: usize = 0;
+    while (conditional < st.conditional_lengths.items.len) {
+        const entry = st.conditional_lengths.items[conditional];
+        if (!numeric_escape.scalarSurvivesCall(o, entry.header, effect) or
+            !numeric_escape.scalarSurvivesCall(o, entry.selector, effect))
+        {
+            _ = st.conditional_lengths.swapRemove(conditional);
+        } else conditional += 1;
+    }
     var scalar_value: usize = 0;
     while (scalar_value < st.scalar_vals.items.len) {
         if (!numeric_escape.scalarSurvivesCall(o, st.scalar_vals.items[scalar_value].name, effect)) {
@@ -3541,15 +4804,17 @@ pub fn dropIndirectFacts(o: *Oracle, st: *State, effect: Reach) void {
     while (diff < st.diff_aliases.items.len) {
         const entry = st.diff_aliases.items[diff];
         if (numeric_escape.pathSurvivesCall(o, entry.diff, effect) and
-            numeric_escape.pathSurvivesCall(o, entry.minuend, effect)) diff += 1
-        else _ = st.diff_aliases.swapRemove(diff);
+            numeric_escape.pathSurvivesCall(o, entry.minuend, effect)) diff += 1 else _ = st.diff_aliases.swapRemove(diff);
     }
     var value: usize = 0;
     while (value < st.value_aliases.items.len) {
         const entry = st.value_aliases.items[value];
-        if (numeric_escape.scalarSurvivesCall(o, entry.local, effect) and
-            numeric_escape.pathSurvivesCall(o, entry.path, effect)) value += 1
-        else _ = st.value_aliases.swapRemove(value);
+        const other_survives = if (entry.other_path) |other|
+            numeric_escape.pathSurvivesCall(o, other, effect)
+        else
+            true;
+        if (numeric_escape.scalarSurvivesCall(o, entry.local, effect) and other_survives and
+            numeric_escape.pathSurvivesCall(o, entry.path, effect)) value += 1 else _ = st.value_aliases.swapRemove(value);
     }
     var bit: usize = 0;
     while (bit < st.bit_aliases.items.len) {
@@ -3558,13 +4823,19 @@ pub fn dropIndirectFacts(o: *Oracle, st: *State, effect: Reach) void {
         // its own yet, and an empty name is storage nobody has a fact about.
         const local_kept = entry.local.len == 0 or
             numeric_escape.scalarSurvivesCall(o, entry.local, effect);
-        if (local_kept and numeric_escape.pathSurvivesCall(o, entry.source, effect)) bit += 1
-        else _ = st.bit_aliases.swapRemove(bit);
+        if (local_kept and numeric_escape.pathSurvivesCall(o, entry.source, effect)) bit += 1 else _ = st.bit_aliases.swapRemove(bit);
     }
     st.clearPredicates();
 }
 
-pub fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+pub fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
+    if (o.summary_error) |err| return err;
+    const flow = try analyzeNodeInner(o, node, st);
+    if (o.summary_error) |err| return err;
+    return flow;
+}
+
+fn analyzeNodeInner(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     if (o.walk_depth == walk_depth_cap) {
         o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
         return .{};
@@ -3635,27 +4906,41 @@ pub fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemo
                 null;
             if (operand) |expression| {
                 if (o.predicate_capture) |capture| try capture.record(o, expression, st);
-                if (o.return_summary) |summary| summary.record(o, expression, st);
+                if (o.return_summary) |summary| try summary.record(o, expression, st);
             } else if (tree.nodeTag(node) == .@"return") {
                 // `return;` leaves nothing to join.  A body that reaches it is
                 // not a body whose exits this can summarise, so the claim is
                 // withdrawn rather than narrowed by the exits it did read.
                 if (o.return_summary) |summary| summary.complete = false;
             }
-            // An explicit `return` is an exit the caller can take, so its
-            // state joins the contract the body exports.
-            if (o.capture) |capture| {
-                if (capture.mode == .exit) try capture.record(st);
-            }
-            if (o.tokenInNode(node)) {
-                if (operand) |e| {
-                    const sub = try analyzeNode(o, e, st);
-                    flow.answer = sub.answer orelse o.answerAt(st);
-                } else flow.answer = o.answerAt(st);
+            // Return operands can mutate the state or propagate a helper's
+            // successful edge. Capture after those effects, never before.
+            if (operand) |e| {
+                const sub = try analyzeNode(o, e, st);
+                if (o.tokenInNode(node)) flow.answer = sub.answer orelse o.answerAt(st);
+                if (sub.diverged) return flow;
+            } else if (o.tokenInNode(node)) flow.answer = o.answerAt(st);
+            if (tree.nodeTag(node) == .@"return") {
+                if (o.capture) |capture| {
+                    const error_return = if (operand) |e| tree.nodeTag(unwrapGrouped(tree, e)) == .error_value else false;
+                    if (capture.mode == .exit and (!capture.success_only or !error_return)) try capture.record(st);
+                }
             }
             return flow;
         },
-        .fn_decl, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .@"comptime" => return .{},
+        .@"comptime" => {
+            // Only a resolved standard assertion exports a predicate. The
+            // assertion must succeed for any instantiation that can execute.
+            const expression = tree.nodeData(node).node;
+            var buffer: [1]Ast.Node.Index = undefined;
+            if (tree.fullCall(&buffer, expression)) |call| {
+                if (call.ast.params.len == 1 and
+                    isStdAssert(o, call.ast.fn_expr, tree.firstToken(expression)))
+                    try applyRefine(o, st, .{ .node = call.ast.params[0], .truth = true });
+            }
+            return .{};
+        },
+        .fn_decl, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => return .{},
         // `try <expr>` is a propagating edge: the statements after it run only
         // when the expression succeeded, which is what makes a fallible std
         // append's stored element a fact on this side of the call.
@@ -3704,6 +4989,14 @@ pub fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemo
             return if (o.tokenInNode(node)) .{ .answer = o.answerAt(st) } else .{};
         },
         .@"errdefer" => {
+            if (o.capture) |capture| {
+                if (capture.success_only and !o.tokenInNode(node)) {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    for (blockStmts(tree, o.body, &buffer)) |statement| {
+                        if (statement == node) return .{};
+                    }
+                }
+            }
             dropLoopMutated(o, node, st);
             dropIndirectFacts(o, st, .{ .subtree = tree.nodeData(node).opt_token_and_node[1] });
             return if (o.tokenInNode(node)) .{ .answer = o.answerAt(st) } else .{};
@@ -3716,14 +5009,23 @@ pub fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemo
 /// `recordAppendedElement` have stored their item by the time control reaches
 /// the next statement.  The rest of the walk is the ordinary expression walk —
 /// the operand has to be analysed for its own effects either way.
-fn analyzeTry(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeTry(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const inner = tree.nodeData(node).node;
+    if (o.capture) |capture| {
+        // A raw fallible call can leave through the error propagated here.
+        // That edge is not walked, so it cannot export an all-exit contract.
+        if (capture.mode == .exit and !capture.success_only) capture.complete = false;
+    }
+    const saved_success = o.successful_call;
+    o.successful_call = unwrapGrouped(tree, inner);
+    defer o.successful_call = saved_success;
     const flow = try analyzeNode(o, inner, st);
     if (o.tokenInNode(inner) and flow.answer != null) return flow;
     if (flow.diverged) return flow;
     if (o.tokenInNode(node)) return .{ .answer = o.answerAt(st) };
-    killMutatedContainers(o, node, st);
+    // The operand invalidated its effects before installing its success
+    // contracts. Repeating the invalidation would erase those contracts.
     try recordReadBounds(o, node, st);
     try recordAppendedElement(o, st, inner, true);
     try recordAssertedCondition(o, st, inner);
@@ -3739,7 +5041,7 @@ fn analyzeTry(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!F
 /// where `cond` was false.  A `catch`/`orelse` that continues reaches exactly
 /// that edge, so the fact is recorded here rather than in `analyzeCall` —
 /// where recording it would prove the condition on the handler as well.
-fn recordAssertedCondition(o: *Oracle, st: *State, expression: Ast.Node.Index) error{OutOfMemory}!void {
+fn recordAssertedCondition(o: *Oracle, st: *State, expression: Ast.Node.Index) QueryError!void {
     const tree = o.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, unwrapGrouped(tree, expression)) orelse return;
@@ -3747,7 +5049,7 @@ fn recordAssertedCondition(o: *Oracle, st: *State, expression: Ast.Node.Index) e
     try applyRefine(o, st, .{ .node = call.ast.params[0], .truth = true });
 }
 
-fn analyzeExpression(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeExpression(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     if (tree.nodeTag(node) == .builtin_call or tree.nodeTag(node) == .builtin_call_two or
         tree.nodeTag(node) == .builtin_call_comma or tree.nodeTag(node) == .builtin_call_two_comma)
@@ -3870,7 +5172,6 @@ fn declaredTypeOf(o: *Oracle, name: []const u8, at: Ast.TokenIndex) ?Ast.Node.In
     }
     return null;
 }
-
 
 /// This file's indexed nodes, in node-array order.
 ///
@@ -4039,10 +5340,29 @@ fn declaredTypeIsBounded(tree: *const Ast, type_node: Ast.Node.Index) bool {
     return bounded;
 }
 
-fn analyzeCall(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeCall(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node).?;
+    if (o.query == .numeric_range) {
+        if (o.expression) |expression| {
+            const queried = unwrapGrouped(tree, expression);
+            if (tree.nodeTag(queried) == .field_access) {
+                const field = tree.nodeData(queried).node_and_token;
+                if (unwrapGrouped(tree, field[0]) == node and
+                    std.mem.eql(u8, tree.tokenSlice(field[1]), "len"))
+                {
+                    // Arguments are copied before this call can rewrite
+                    // their sources. A post-call re-read would describe a
+                    // different header, even at this same AST occurrence.
+                    var returned: State = .{};
+                    defer returned.deinit(o.gpa);
+                    try callReturnLengths(o, st, node, &returned, "");
+                    o.queried_return_length = returned.lenBoundOf("") orelse .unknown;
+                }
+            }
+        }
+    }
     // The callee expression is evaluated before the arguments and long
     // before the callee body runs, so a use inside it — a subscript of a
     // method receiver, say — is answered against the state as it stood when
@@ -4070,7 +5390,7 @@ fn analyzeCall(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!
     // and the receiver were read before the callee ran, so none of this can
     // change the answer for this use either.
     var held: [max_contract_entry_facts]numeric_eval.Fact = undefined;
-    const held_count = if (o.query == .numeric_range) holdNumericFacts(st, &held) else 0;
+    const held_count = if (o.query == .numeric_range or o.query == .min_len_container) holdNumericFacts(st, &held) else 0;
     // This is the one drop of what the call reached: `dropEscapedScalarFacts`
     // has already run exactly this on this very node on the way here, so the
     // explicit copy that used to follow was a second full pass over every fact
@@ -4140,13 +5460,18 @@ fn isStdAssert(o: *Oracle, callee: Ast.Node.Index, anchor: Ast.TokenIndex) bool 
 ///
 /// It is a different contract from `std.debug.assert` and the two are
 /// therefore not interchangeable: what the call proves depends on which edge
-/// out of it the reader is standing on.  Both are recognised through the
-/// resolved `std` binding, so a project file that spells its own `std` with
-/// its own `expect` proves nothing here.
+/// out of it the reader is standing on. The exact `std` spelling keeps its
+/// token-only binding proof; aliases require the declaring toolchain document,
+/// so a project function with the same name proves nothing here.
 fn isStdExpect(o: *Oracle, call: Ast.full.Call, anchor: Ast.TokenIndex) bool {
     if (call.ast.params.len != 1) return false;
-    return std.mem.eql(u8, nodeSrc(o.tree, call.ast.fn_expr), "std.testing.expect") and
-        stdBindingValidAt(o, anchor);
+    if (std.mem.eql(u8, nodeSrc(o.tree, call.ast.fn_expr), "std.testing.expect") and
+        stdBindingValidAt(o, anchor)) return true;
+    const resolver = (o.cache orelse return false).zls orelse return false;
+    return resolver.stdTestingExpectOf(call.ast.fn_expr, call.ast.params.len) catch |err| {
+        o.summary_error = o.summary_error orelse err;
+        return false;
+    };
 }
 
 /// A standard assertion, which only ever READS the storage its condition
@@ -4168,7 +5493,7 @@ fn isPureStdCall(o: *Oracle, callee: Ast.Node.Index, anchor: Ast.TokenIndex) boo
     return false;
 }
 
-fn analyzeSeq(o: *Oracle, stmts: []const Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeSeq(o: *Oracle, stmts: []const Ast.Node.Index, st: *State) QueryError!Flow {
     for (stmts) |s| {
         const flow = try analyzeNode(o, s, st);
         if (flow.answer != null) return flow;
@@ -4177,7 +5502,7 @@ fn analyzeSeq(o: *Oracle, stmts: []const Ast.Node.Index, st: *State) error{OutOf
     return .{};
 }
 
-fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const decl = tree.fullVarDecl(node) orelse return .{};
     const name = tree.tokenSlice(decl.ast.mut_token + 1);
@@ -4191,17 +5516,32 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     // lower bound and the length range then read the same count node.
     const alloc_count = stdAllocCountNode(o, init_node);
     const allocated_minimum = allocatedMinimum(o, st, alloc_count);
-    // Only the numeric query reads a length range, and settling it costs the
-    // evaluator steps the other queries would never spend on it.
-    const allocated_length = if (o.query == .numeric_range)
+    // Numeric and minimum-length queries need the same count interval.
+    const allocated_length = if (o.query == .numeric_range or o.query == .min_len_container)
         allocatedLengthRange(o, st, alloc_count)
     else
         null;
+    var aggregate_lengths: State = .{};
+    defer aggregate_lengths.deinit(o.gpa);
+    // The value arguments are copied before a call can mutate their sources.
+    // A query inside the initializer still stops before that call executes.
+    if (!o.tokenInNode(init_node) and (o.query == .numeric_range or o.query == .min_len_container))
+        try callReturnLengths(o, st, init_node, &aggregate_lengths, name);
     const init_flow = try analyzeNode(o, init_node, st);
     if (o.tokenInNode(init_node) and init_flow.answer != null) return init_flow;
+    const initializer_length: NumericRange = if (o.query == .numeric_range or o.query == .min_len_container) blk: {
+        var evaluation = evaluator(o, st);
+        // A fixed declared type also supplies an extent when its initializer
+        // is undefined. Dynamic slice headers never gain a bound from type.
+        break :blk evaluation.containerLength(init_node).intersect(evaluation.containerLength(node));
+    } else .unknown;
     const init_min = exprMin(o, st, init_node) orelse
         if (parameterNonnegative(o, decl.ast.type_node.unwrap())) @as(?u64, 0) else null;
     const init_numeric = try numericAssignment(o, st, init_node, node);
+    if (o.query == .numeric_range or o.query == .min_len_container) {
+        if (pureAggregateExpression(o, init_node, 0))
+            try recordAggregateLengths(o, st, &aggregate_lengths, init_node, name, 0);
+    }
     const bit_alias = if (o.query == .numeric_range) bitAliasOf(o, st, init_node, 0) else null;
     // Re-binding `name` invalidates prior facts/aliases keyed on it.
     dropFactsForRebind(o, st, name);
@@ -4209,7 +5549,7 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     // binding, and it leaves the DECLARED type behind rather than the interval
     // a guard had recorded for a value that is gone — the same rule the
     // assignment path applies, and for the same reason.
-    if (o.query == .numeric_range) {
+    if (o.query == .numeric_range or o.query == .min_len_container) {
         try st.setNumeric(o.gpa, name, assignedRange(o, st, name, init_numeric, tree.firstToken(node), decl.ast.type_node.unwrap() orelse node));
     }
     if (bit_alias) |recorded| {
@@ -4228,9 +5568,17 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
         try st.addValueAlias(o.gpa, .{ .local = name, .path = psrc });
     }
     if (o.query == .numeric_range) {
+        try recordCheckedAddAliases(o, st, init_node, name);
+    }
+    if (o.query == .numeric_range) {
         var evaluation = evaluator(o, st);
-        if (evaluation.floatBits(node)) |width| {
-            if (floatBitSource(o, st, init_node, width)) |source| {
+        const destination_width = evaluation.floatBits(node) orelse width: {
+            const resolver = (o.cache orelse break :width null).zls orelse break :width null;
+            if ((resolver.typeParameterReference(node) catch null) == null) break :width null;
+            break :width computedFloatBitsAtDepth(o, node, 0, .minimum);
+        };
+        if (destination_width) |width| {
+            if (floatBitSource(o, st, init_node, width, node)) |source| {
                 if (!source.absolute) try st.addValueAlias(o.gpa, .{ .local = name, .path = source.source });
             }
         }
@@ -4253,6 +5601,11 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     // through the ordinary rebind path rather than leaving a length behind
     // that describes a slice that is no longer there.
     if (allocated_length) |length| try st.setLenBound(o.gpa, name, length);
+    if (initializer_length != .unknown) try st.setLenBound(o.gpa, name, initializer_length);
+    for (aggregate_lengths.len_bounds.items) |field|
+        try st.setLenBound(o.gpa, field.name, field.value);
+    for (aggregate_lengths.conditional_lengths.items) |entry|
+        try st.addConditionalLength(o.gpa, entry);
     // Record a `const/var name = <c>.len` length-snapshot alias.
     if (lenContainerPath(o, init_node)) |cpath| {
         try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
@@ -4266,6 +5619,15 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
         // Immediate propagation: if N is already proven nonzero (e.g. a prior
         // `if (N == 0) return` guard), `name` is non-empty right now.
         if (st.scalars.contains(nname)) try st.containers.add(o.gpa, name);
+    }
+    // `const tail = base[start..]` under a retained `start < base.len` holds at
+    // least `base.len - start >= 1` elements.  The order is the guard's own
+    // strict predicate, read as written, so it dies wherever a predicate does.
+    if (tree.fullSlice(init_node)) |slice| {
+        if (slice.ast.end == .none and startBelowLength(o, st, slice.ast.sliced, slice.ast.start)) {
+            try st.setMinLen(o.gpa, name, 1);
+            try st.containers.add(o.gpa, name);
+        }
     }
     // Record a `const/var name = MINUEND - SUBTRAHEND` diff alias.
     // Used to propagate: when `name` is proven nonzero AND the subtrahend
@@ -4286,7 +5648,7 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     return .{};
 }
 
-fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
@@ -4299,10 +5661,28 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         const flow = try analyzeNode(o, lhs, st);
         if (flow.answer != null) return flow;
     }
+    var aggregate_lengths: State = .{};
+    defer aggregate_lengths.deinit(o.gpa);
+    if (!o.tokenInNode(rhs) and (o.query == .numeric_range or o.query == .min_len_container)) {
+        if (scalarPath(o, lhs)) |name|
+            try callReturnLengths(o, st, rhs, &aggregate_lengths, name);
+    }
     const rhs_flow = try analyzeNode(o, rhs, st);
     if (o.tokenInNode(rhs) and rhs_flow.answer != null) return rhs_flow;
     const rhs_min = exprMin(o, st, rhs);
     const rhs_numeric = try numericAssignment(o, st, rhs, lhs);
+    const rhs_length: NumericRange = if (o.query == .numeric_range or o.query == .min_len_container) blk: {
+        var evaluation = evaluator(o, st);
+        const length = evaluation.containerLength(rhs);
+        if (o.cache) |cache| if (cache.fixedArrayLenOf(lhs)) |fixed|
+            break :blk length.intersect(NumericRange.constant(fixed));
+        break :blk length;
+    } else .unknown;
+    if (o.query == .numeric_range or o.query == .min_len_container) if (scalarPath(o, lhs)) |name| {
+        if (pureAggregateExpression(o, rhs, 0))
+            try recordAggregateLengths(o, st, &aggregate_lengths, rhs, name, 0);
+    };
+    const stored_source = if (rhs_min != null) sameIntegerElementSource(o, lhs, rhs) else null;
     // The written target is inside this expression, so the scan records it as
     // a write; what a right-hand call reaches is recorded as a call.  Neither
     // needs the "unknown effects" answer this used to give.
@@ -4327,9 +5707,14 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         if (tree.nodeTag(lhs) != .identifier) {
             try dropAliasedWrite(o, st, name, tree.firstToken(node));
         }
-        if (o.query == .numeric_range) {
+        if (o.query == .numeric_range or o.query == .min_len_container) {
             try st.setNumeric(o.gpa, name, assignedRange(o, st, name, rhs_numeric, tree.firstToken(node), lhs));
             try recordAbsentExitFact(o, name, lhs);
+            if (rhs_length != .unknown) try st.setLenBound(o.gpa, name, rhs_length);
+            for (aggregate_lengths.len_bounds.items) |field|
+                try st.setLenBound(o.gpa, field.name, field.value);
+            for (aggregate_lengths.conditional_lengths.items) |entry|
+                try st.addConditionalLength(o.gpa, entry);
         }
         if (rhs_min) |min| {
             try st.setScalarMin(o.gpa, name, min);
@@ -4346,7 +5731,56 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         // path is rooted at the written path's head identifier.
         if (lhsRootIdent(o, lhs)) |root| st.dropValueAliasesByRoot(root);
     }
+    if (stored_source) |name| {
+        // A same-type, naturally aligned element store either misses this
+        // scalar or writes back exactly the value just loaded from it.
+        try st.setScalarMin(o.gpa, name, rhs_min.?);
+        if (rhs_min.? > 0) try st.scalars.add(o.gpa, name);
+    }
     return .{};
+}
+
+/// Preserve only the scalar read by `slice[i] = pointer.*`, not arbitrary
+/// alias facts. Explicit natural alignment and one identical builtin integer
+/// type exclude partially overlapping stores and coercions. Computed pointers,
+/// address spaces, volatile storage, aliases and effectful indices prove nothing.
+fn sameIntegerElementSource(o: *Oracle, lhs: Ast.Node.Index, rhs: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    if (tree.nodeTag(lhs) != .array_access or tree.nodeTag(rhs) != .deref) return null;
+    const destination = tree.nodeData(lhs).node_and_node;
+    const slice_name = identName(tree, destination[0]) orelse return null;
+    const pointer_name = identName(tree, tree.nodeData(rhs).node) orelse return null;
+    if (!pureIntegerExpression(o, lhs, 0)) return null;
+    const declaration = enclosingFnDecl(o) orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return null;
+    var parameters = proto.iterate(tree);
+    var slice_integer: ?[]const u8 = null;
+    var pointer_integer: ?[]const u8 = null;
+    while (parameters.next()) |parameter| {
+        const name = tree.tokenSlice(parameter.name_token orelse continue);
+        const is_slice = std.mem.eql(u8, name, slice_name);
+        const is_pointer = std.mem.eql(u8, name, pointer_name);
+        if (!is_slice and !is_pointer) continue;
+        const pointer = tree.fullPtrType(parameter.type_expr orelse return null) orelse return null;
+        if (pointer.ast.align_node != .none or pointer.ast.addrspace_node != .none or
+            pointer.ast.bit_range_start != .none or pointer.volatile_token != null) return null;
+        if (is_slice and pointer.size != .slice) return null;
+        if (is_pointer and pointer.size != .one) return null;
+        const child = pointer.ast.child_type;
+        if (tree.nodeTag(child) != .identifier) return null;
+        const integer = tree.tokenSlice(tree.nodeMainToken(child));
+        if (!std.mem.eql(u8, integer, "u8") and !std.mem.eql(u8, integer, "u16") and
+            !std.mem.eql(u8, integer, "u32") and !std.mem.eql(u8, integer, "u64")) return null;
+        if (is_slice) slice_integer = integer;
+        if (is_pointer) pointer_integer = integer;
+    }
+    if (!std.mem.eql(u8, slice_integer orelse return null, pointer_integer orelse return null)) return null;
+    for (o.locals) |binding| {
+        if (binding.origin == .param) continue;
+        if (std.mem.eql(u8, binding.name, slice_name) or std.mem.eql(u8, binding.name, pointer_name)) return null;
+    }
+    return nodeSrc(tree, rhs);
 }
 
 /// The part of a written path that sits BELOW its root: `.count` in
@@ -4409,7 +5843,9 @@ fn escapeBindingBefore(o: *const Oracle, name: []const u8, at: Ast.TokenIndex) b
 fn dropAliasedWrite(o: *Oracle, st: *State, name: []const u8, at: Ast.TokenIndex) error{OutOfMemory}!void {
     const root = numeric_escape.rootText(name);
     const projection = writeProjection(name);
-    if (!o.pointer_roots.contains(root) or !isFieldProjection(projection)) {
+    if (!o.pointer_roots.contains(root) or !isFieldProjection(projection) or
+        numeric_escape.hasFreshStorage(o, root, at))
+    {
         try numeric_escape.dropAliasedStorage(o, st, name, at);
         return;
     }
@@ -4602,6 +6038,34 @@ pub fn pureIntegerExpression(o: *Oracle, node: Ast.Node.Index, depth: u8) bool {
     if (!o.spend()) return false;
     const tree = o.tree;
     switch (tree.nodeTag(node)) {
+        .@"switch", .switch_comma => {
+            const selector = tree.fullSwitch(node) orelse return false;
+            const condition_pure = pureIntegerExpression(o, selector.ast.condition, depth + 1);
+            if (!condition_pure) return false;
+            // Case labels are compile-time selectors, not runtime operands.
+            // Every arm that yields a value must be pure before its numeric
+            // range can be read from the state preceding the return.
+            for (selector.ast.cases) |case_node| {
+                const case = tree.fullSwitchCase(case_node) orelse return false;
+                if (case.payload_token != null) return false;
+                const target = unwrapGrouped(tree, case.ast.target_expr);
+                if (tree.nodeTag(target) == .unreachable_literal) continue;
+                if (!pureIntegerExpression(o, target, depth + 1)) return false;
+            }
+            return true;
+        },
+        .@"if", .if_simple => {
+            const conditional = tree.fullIf(node) orelse return false;
+            if (conditional.payload_token != null) return false;
+            const fallback = conditional.ast.else_expr.unwrap() orelse return false;
+            if (!pureIntegerExpression(o, conditional.ast.cond_expr, depth + 1)) return false;
+            for ([_]Ast.Node.Index{ conditional.ast.then_expr, fallback }) |arm| {
+                const target = unwrapGrouped(tree, arm);
+                if (tree.nodeTag(target) == .unreachable_literal) continue;
+                if (!pureIntegerExpression(o, target, depth + 1)) return false;
+            }
+            return true;
+        },
         .call, .call_comma, .call_one, .call_one_comma => {
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node).?;
@@ -4619,6 +6083,58 @@ pub fn pureIntegerExpression(o: *Oracle, node: Ast.Node.Index, depth: u8) bool {
         if (!pureIntegerExpression(o, child, depth + 1)) return false;
     }
     return true;
+}
+
+/// Retain the mathematical relation only on checked addition's success edge.
+/// A continuing overflow fallback produces a different value and no relation.
+fn recordCheckedAddAliases(o: *Oracle, st: *State, original: Ast.Node.Index, local: []const u8) error{OutOfMemory}!void {
+    const tree = o.tree;
+    var node = unwrapGrouped(tree, original);
+    switch (tree.nodeTag(node)) {
+        .@"try" => node = unwrapGrouped(tree, tree.nodeData(node).node),
+        .@"catch" => {
+            const parts = tree.nodeData(node).node_and_node;
+            var fallback = unwrapGrouped(tree, parts[1]);
+            if (isBlockTag(tree.nodeTag(fallback))) {
+                var statements: [2]Ast.Node.Index = undefined;
+                const listed = blockStmts(tree, fallback, &statements);
+                if (listed.len != 1) return;
+                fallback = unwrapGrouped(tree, listed[0]);
+            }
+            switch (tree.nodeTag(fallback)) {
+                .@"return", .unreachable_literal => {},
+                else => return,
+            }
+            node = unwrapGrouped(tree, parts[0]);
+        },
+        else => return,
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return;
+    if (call.ast.params.len != 3 or
+        !std.mem.eql(u8, nodeSrc(tree, call.ast.fn_expr), "std.math.add") or
+        !stdBindingValidAt(o, tree.firstToken(node))) return;
+    const domain = spelledIntegerDomain(o, call.ast.params[0]);
+    if (domain != .integer or domain.integer.min < 0) return;
+    const operands = call.ast.params[1..3];
+    for (operands) |operand|
+        if (!pureIntegerExpression(o, operand, 0)) return;
+    const left = numericValue(o, st, operands[0]);
+    const right = numericValue(o, st, operands[1]);
+    if (left != .integer or left.integer.min < 0 or right != .integer or right.integer.min < 0) return;
+    const values = [_]NumericRange{ left, right };
+    // Exact offsets retain both ends, as before. A variable sum does not.
+    for (0..2) |side| {
+        const path = numeric_eval.path(tree, operands[side]) orelse continue;
+        const offset = values[1 - side].integer;
+        if (offset.min != offset.max or offset.max > std.math.maxInt(u64)) continue;
+        try st.addValueAlias(o.gpa, .{ .local = local, .path = path, .offset = @intCast(offset.min) });
+        return;
+    }
+    const left_path = numeric_eval.path(tree, operands[0]) orelse return;
+    const right_path = numeric_eval.path(tree, operands[1]) orelse return;
+    try st.addValueAlias(o.gpa, .{ .local = local, .path = left_path, .other_path = right_path });
+    try st.addValueAlias(o.gpa, .{ .local = local, .path = right_path, .other_path = left_path });
 }
 
 fn recordProductAliases(
@@ -4814,7 +6330,7 @@ pub fn lhsRootIdent(o: *Oracle, lhs: Ast.Node.Index) ?[]const u8 {
 /// the addend have known non-negative lower bounds, the sum is retained (with
 /// checked `u64` arithmetic).  An unknown addend drops the bound instead of
 /// guessing that the local is unsigned; this keeps signed `-1 += 1` unknown.
-fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
@@ -4834,6 +6350,24 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
             if (left_min > std.math.maxInt(u64) - right_min) break :blk null;
             break :blk left_min + right_min;
         } else null;
+        // The induction verifier reads the numeric channel, not only the
+        // scalar floor. Checked integer addition keeps its mathematical
+        // interval on the successful edge, clipped to the destination domain.
+        var numeric: NumericRange = .unknown;
+        if ((o.query == .numeric_range or o.query == .min_len_container) and
+            tree.nodeTag(lhs) == .identifier and pureIntegerExpression(o, rhs, 0))
+        {
+            const domain = assignedRange(o, st, name, .unknown, tree.firstToken(node), lhs);
+            if (domain == .integer) {
+                numeric = numericValue(o, st, lhs).binary(numericValue(o, st, rhs), .add).intersect(domain);
+                if (new_min) |minimum| {
+                    numeric = numeric.intersect(.{ .integer = .{
+                        .min = @intCast(minimum),
+                        .max = domain.integer.max,
+                    } });
+                }
+            }
+        }
         if (tree.nodeTag(lhs) != .identifier) dropIndirectFacts(o, st, .{ .subtree = node });
         // The value changed: a `n = c.len` snapshot no longer holds, and any
         // container path rooted at `name` is stale.
@@ -4841,6 +6375,7 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
         if (tree.nodeTag(lhs) != .identifier) {
             try numeric_escape.dropAliasedStorage(o, st, name, tree.firstToken(node));
         }
+        if (numeric != .unknown) try st.setNumeric(o.gpa, name, numeric);
         if (new_min) |min| {
             try st.setScalarMin(o.gpa, name, min);
             if (min >= 1) try st.scalars.add(o.gpa, name);
@@ -4852,7 +6387,7 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
 }
 /// Any non-`+=` compound assignment can reduce a scalar to zero or destroy a
 /// product/equality snapshot.  Drop all facts before continuing after it.
-fn analyzeCompoundMutation(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeCompoundMutation(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
@@ -4887,7 +6422,21 @@ fn analyzeCompoundMutation(o: *Oracle, node: Ast.Node.Index, st: *State) error{O
     return .{};
 }
 
-fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+/// A payload introduces a new binding even when its spelling matches a selector.
+fn dropConditionalCapture(tree: *const Ast, st: *State, payload: ?Ast.TokenIndex) void {
+    var token = payload orelse return;
+    const tags = tree.tokens.items(.tag);
+    while (token < tags.len) {
+        if (tags[token] == .asterisk) token += 1;
+        if (token >= tags.len or tags[token] != .identifier) return;
+        st.dropConditionalLengthsRootedAt(tree.tokenSlice(token));
+        token += 1;
+        if (token >= tags.len or tags[token] != .comma) return;
+        token += 1;
+    }
+}
+
+fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const if_data = tree.fullIf(node) orelse return .{};
     const cond = if_data.ast.cond_expr;
@@ -4901,12 +6450,14 @@ fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Fl
     var then_st = try st.clone(o.gpa);
     defer then_st.deinit(o.gpa);
     try applyRefine(o, &then_st, .{ .node = cond, .truth = true });
+    dropConditionalCapture(tree, &then_st, if_data.payload_token);
     if (o.tokenInNode(then_node)) return try analyzeNode(o, then_node, &then_st);
     const then_flow = try analyzeNode(o, then_node, &then_st);
 
     var else_st = try st.clone(o.gpa);
     defer else_st.deinit(o.gpa);
     try applyRefine(o, &else_st, .{ .node = cond, .truth = false });
+    dropConditionalCapture(tree, &else_st, if_data.error_token);
     var else_flow: Flow = .{};
     if (else_opt) |else_node| {
         if (o.tokenInNode(else_node)) return try analyzeNode(o, else_node, &else_st);
@@ -4931,7 +6482,7 @@ fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Fl
 /// the LHS's THEN-facts hold (A is true); for `or`, the LHS's ELSE-facts hold
 /// (A is false).  Sound because Zig `and`/`or` only evaluate B when A is
 /// true/false respectively.
-fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: bool) error{OutOfMemory}!Flow {
+fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: bool) QueryError!Flow {
     const parts = o.tree.nodeData(node).node_and_node;
     const lhs_flow = try analyzeNode(o, parts[0], st);
     if (o.tokenInNode(parts[0]) and lhs_flow.answer != null) return lhs_flow;
@@ -4946,11 +6497,47 @@ fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: boo
     return if (o.tokenInNode(node)) .{ .answer = o.answerAt(st) } else .{};
 }
 
+/// A copied payload reads only its selected variant's projection. The return
+/// join has already dropped projections missing from any alternate return.
+/// Pointer captures and multi-label arms do not describe one copied header.
+fn refineSwitchPayload(o: *Oracle, source: *const State, output: *State, condition: Ast.Node.Index, case_node: Ast.Node.Index) QueryError!void {
+    const arm_capture = o.tree.fullSwitchCase(case_node) orelse return;
+    dropConditionalCapture(o.tree, output, arm_capture.payload_token);
+    if (o.query != .numeric_range) return;
+    const tree = o.tree;
+    const arm = tree.fullSwitchCase(case_node) orelse return;
+    const capture_token = arm.payload_token orelse return;
+    if (tree.tokenTag(capture_token) != .identifier) return;
+    const capture = tree.tokenSlice(capture_token);
+    dropFactsForRebind(o, output, capture);
+    if (arm.ast.values.len != 1) return;
+    const label = unwrapGrouped(tree, arm.ast.values[0]);
+    if (tree.nodeTag(label) != .enum_literal) return;
+    const owner_node = unwrapGrouped(tree, condition);
+    const owner = numeric_eval.path(tree, owner_node) orelse return;
+    const resolver = (o.cache orelse return).zls orelse return;
+    const actual = (resolver.resolutionFrame().typeOfNode(owner_node) catch |err| {
+        if (strictQueryError(err)) |failure| return failure;
+        return;
+    }) orelse return;
+    if (resolver.typeTag(actual) != .@"union") return;
+    const projection = try aggregateFieldPath(o, owner, tree.tokenSlice(tree.nodeMainToken(label)));
+    for (source.len_bounds.items) |field| {
+        if (!o.spend()) return;
+        if (!pathRootedAt(field.name, projection)) continue;
+        const name = if (field.name.len == projection.len)
+            capture
+        else
+            try aggregateFieldPath(o, capture, field.name[projection.len + 1 ..]);
+        try output.setLenBound(o.gpa, name, field.value);
+    }
+}
+
 /// `switch (scrutinee) { K => arm, … }`.  When the use is in an arm whose single
 /// label is an integer literal `K` and the scrutinee is a simple scalar, record
 /// `scrutinee == K` (and nonzero if K != 0) for that arm — so a slice whose
 /// length aliases the scrutinee is known to have length K inside the arm.
-fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) QueryError!Flow {
     const tree = o.tree;
     const sw = tree.fullSwitch(node) orelse return .{};
     const condition_flow = try analyzeNode(o, sw.ast.condition, st);
@@ -4963,6 +6550,7 @@ fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         if (!o.tokenInNode(body)) continue;
         var arm_st = try st.clone(o.gpa);
         defer arm_st.deinit(o.gpa);
+        try refineSwitchPayload(o, st, &arm_st, sw.ast.condition, case_node);
         if (scrut) |sn| {
             if (sc.ast.values.len == 1) {
                 if (intLiteralVal(tree, sc.ast.values[0])) |k| {
@@ -4988,6 +6576,7 @@ fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         const sc = tree.fullSwitchCase(case_node) orelse continue;
         var arm_st = try base.clone(o.gpa);
         defer arm_st.deinit(o.gpa);
+        try refineSwitchPayload(o, &base, &arm_st, sw.ast.condition, case_node);
         _ = try analyzeNode(o, sc.ast.target_expr, &arm_st);
         if (!joined) {
             joined = true;
@@ -4997,7 +6586,7 @@ fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
     return .{};
 }
 
-fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: numeric_loops.LoopKind) error{OutOfMemory}!Flow {
+fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: numeric_loops.LoopKind) QueryError!Flow {
     const tree = o.tree;
     if (tree.fullFor(node)) |loop| {
         for (loop.ast.inputs) |input| {
@@ -5007,6 +6596,10 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: numeric_loops
     }
     var invariants = try numeric_loops.numericLoopInvariants(o, node, st);
     defer invariants.deinit(o.gpa);
+    if (kind == .for_ and !o.tokenInNode(node) and o.query == .numeric_range) {
+        var evaluation = evaluator(o, st);
+        try numeric_loops.numericForExitFacts(o, node, st, &evaluation, &invariants);
+    }
     dropLoopMutated(o, node, st);
     for (invariants.items) |fact| try st.setNumeric(o.gpa, fact.name, fact.value);
 
@@ -5031,6 +6624,8 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: numeric_loops
                 const condition_flow = try analyzeNode(o, c, &body_st);
                 if (condition_flow.diverged) return condition_flow;
                 try applyRefine(o, &body_st, .{ .node = c, .truth = true });
+                if (tree.fullWhile(node)) |while_data|
+                    dropConditionalCapture(tree, &body_st, while_data.payload_token);
             } else if (tree.fullFor(node)) |for_data| {
                 var capture = for_data.payload_token;
                 const tags = tree.tokens.items(.tag);
@@ -5039,6 +6634,7 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: numeric_loops
                     const pointer_capture = tags[capture] == .asterisk;
                     if (pointer_capture) capture += 1;
                     if (capture >= tags.len or tags[capture] != .identifier) break;
+                    body_st.dropConditionalLengthsRootedAt(tree.tokenSlice(capture));
                     if (!pointer_capture) try refineForInput(o, &body_st, input, tree.tokenSlice(capture));
                     if (rangeUpperName(tree, input)) |upper| {
                         // The body only runs once `0 < upper`, which is a
@@ -5132,7 +6728,8 @@ fn refineForInput(o: *Oracle, st: *State, input: Ast.Node.Index, capture: []cons
     try st.setNumeric(o.gpa, capture, .{ .integer = .{ .min = @intCast(start), .max = last } });
 }
 
-pub fn applyRefine(o: *Oracle, st: *State, predicate: Predicate) error{OutOfMemory}!void {
+pub fn applyRefine(o: *Oracle, st: *State, predicate: Predicate) QueryError!void {
+    if (o.summary_error) |err| return err;
     // A helper's contract lands in the same state every query reads, so it is
     // applied for every query and not only for the range one: `provesPositive`
     // and `provesNonempty` ask whether a container is long enough, and the
@@ -5150,6 +6747,7 @@ pub fn applyRefine(o: *Oracle, st: *State, predicate: Predicate) error{OutOfMemo
     // decide that question against facts the descent has not established yet,
     // and the answer is a choice about which operand's facts to keep.
     try fold.pump();
+    if (o.summary_error) |err| return err;
 }
 
 /// Record every fact a proved predicate hands over as a standalone condition.
@@ -5341,7 +6939,11 @@ fn recordedFactSurvivesLater(
 ) bool {
     const key = name orelse return true;
     if (!o.spend()) return false;
-    const effect: Reach = .{ .one = later };
+    // `later` is an operand expression, not necessarily a call: `.one` answers
+    // "reaches everything" for any node that is not a call, so a call nested
+    // inside `!f(x)` was charged as an arbitrary effect.  The subtree scan
+    // names the calls and writes the operand really holds.
+    const effect: Reach = .{ .subtree = later };
     const survives = switch (kind) {
         .scalar => numeric_escape.scalarSurvivesCall(o, key, effect),
         .container => numeric_escape.containerSurvivesCall(o, key, effect),
@@ -5368,7 +6970,11 @@ fn recordedFactSurvivesLater(
 /// every assignment therefore disqualifies the earlier operand's facts, and
 /// running out of walk depth answers yes for the same reason.
 fn writesDirectly(o: *Oracle, node: Ast.Node.Index, depth: u8) bool {
-    if (depth == walk_depth_cap or !o.spend()) return true;
+    if (depth == walk_depth_cap) {
+        o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
+        return true;
+    }
+    if (!o.spend()) return true;
     if (numeric_nodes.isScalarAssignTag(o.tree.nodeTag(node))) return true;
     var children = @import("type_engine").AstIterator.init(o.tree, node);
     while (children.next(o.tree)) |child| if (writesDirectly(o, child, depth + 1)) return true;
@@ -5465,8 +7071,19 @@ const Fold = struct {
         const st = self.st;
         const node = unwrapGrouped(o.tree, original);
         const predicate = Predicate{ .node = node, .truth = truth };
+        // Only published selectors are type-proved bools; arbitrary nonzero
+        // scalars cannot establish a conditional header's selected branch.
+        if (truth) {
+            if (identName(o.tree, node)) |name| {
+                for (st.conditional_lengths.items) |entry| {
+                    if (!std.mem.eql(u8, entry.selector, name)) continue;
+                    try st.scalars.add(o.gpa, name);
+                    break;
+                }
+            }
+        }
         if (st.hasPredicate(predicate)) return false;
-        if (o.query == .numeric_range) try refineNumeric(o, st, node, truth);
+        if (o.query == .numeric_range or o.query == .min_len_container) try refineNumeric(o, st, node, truth);
         var refine: Refinement = .{};
         collectRefinement(o, st, node, &refine);
         if (truth) {
@@ -5571,7 +7188,6 @@ const Fold = struct {
     }
 };
 
-
 /// Record the same lower bound under the STORAGE a `p.*` guard describes.
 ///
 /// A guard about `p.*` is a claim about the storage `p` points at, and that
@@ -5651,9 +7267,9 @@ fn weakOrderProves(o: *Oracle, st: *const State, lesser: Ast.Node.Index, greater
         if (!o.spend()) return false;
         const tag = tree.nodeTag(predicate.node);
         const forward = (tag == .less_or_equal and predicate.truth) or
-            (tag == .less_than and !predicate.truth);
-        const reverse = (tag == .greater_or_equal and predicate.truth) or
             (tag == .greater_than and !predicate.truth);
+        const reverse = (tag == .greater_or_equal and predicate.truth) or
+            (tag == .less_than and !predicate.truth);
         if (!forward and !reverse) continue;
         const operands = tree.nodeData(predicate.node).node_and_node;
         const low = if (forward) operands[0] else operands[1];
@@ -5880,12 +7496,19 @@ fn exprMin(o: *Oracle, st: *const State, node: Ast.Node.Index) ?u64 {
     const tree = o.tree;
     const n = unwrapGrouped(tree, node);
     if (lenContainerPath(o, n)) |path| {
+        // A user-defined field can be named `len` and still be signed.
+        // Its declared negative domain must not acquire a collection's zero
+        // floor. Only a numeric value proof can supply a nonnegative floor.
+        if (o.cache) |cache| if (cache.intInfoOf(n)) |info| {
+            if (info.signed) return recordedFloor(st, nodeSrc(tree, n));
+        };
         if (st.minLenOf(path)) |minimum| return minimum;
         if (st.containers.contains(path)) return 1;
         if (o.cache) |cache| {
             const container = tree.nodeData(n).node_and_token[0];
             if (cache.fixedArrayLenOf(container)) |length| return length;
         }
+        if (recordedFloor(st, nodeSrc(tree, n))) |floor| return floor;
         return 0;
     }
     if (intLiteralVal(tree, n)) |v| return v;
@@ -6241,7 +7864,6 @@ fn dropEscapedScalarFacts(o: *Oracle, node: Ast.Node.Index, st: *State, depth: u
     var children = @import("type_engine").AstIterator.init(tree, node);
     while (children.next(tree)) |child| {
         dropEscapedScalarFacts(o, child, st, depth + 1);
-        if (o.budget == 0) return;
     }
 }
 
@@ -6253,7 +7875,6 @@ fn killMutatedContainers(o: *Oracle, node: Ast.Node.Index, st: *State) void {
     dropEscapedScalarFacts(o, node, st, 0);
     dropContainersMutatedInTokens(tree, first, last, st);
 }
-
 
 fn compoundAddPreservesScalar(o: *Oracle, st: *const State, node: Ast.Node.Index) bool {
     const tree = o.tree;
@@ -6284,7 +7905,21 @@ pub fn dropLoopMutated(o: *Oracle, loop_node: Ast.Node.Index, st: *State) void {
         const tag = tree.nodeTag(node);
         if (!numeric_nodes.isScalarAssignTag(tag)) continue;
         if (tree.firstToken(node) < first or tree.lastToken(node) > last) continue;
-        const name = scalarPath(o, tree.nodeData(node).node_and_node[0]) orelse continue;
+        const lhs = tree.nodeData(node).node_and_node[0];
+        const name = scalarPath(o, lhs) orelse {
+            // Computed storage has no scalar path; use the existing reach
+            // model rather than keep facts on an unresolved write target.
+            dropIndirectFacts(o, st, .{ .one = node });
+            continue;
+        };
+        if (tree.nodeTag(lhs) != .identifier) {
+            // The loop may be skipped, so no body walk will visit this store.
+            // Retire the aliased storage before retaining any loop facts.
+            dropAliasedWrite(o, st, name, tree.firstToken(node)) catch |err| {
+                o.summary_error = o.summary_error orelse err;
+                return;
+            };
+        }
         st.dropNumericRoot(name);
         st.dropValueAliasesByRoot(name);
         // The loop rebinds the name, so an exact constant recorded for it (a
@@ -6300,6 +7935,7 @@ pub fn dropLoopMutated(o: *Oracle, loop_node: Ast.Node.Index, st: *State) void {
         // snapshot records, exactly as it replaces the constant and the
         // `name = c.len` alias dropped just above.
         st.dropLenBoundsRootedAt(name);
+        st.dropConditionalLengthsRootedAt(name);
         if (tag != .assign_add or !compoundAddPreservesScalar(o, st, node)) {
             st.scalars.removeRooted(name);
             st.dropScalarMinsRootedAt(name);
@@ -6533,6 +8169,7 @@ pub fn dropFactsForRebind(o: *Oracle, st: *State, name: []const u8) void {
     dropContainersRootedAt(st, name);
     st.dropMinLensByRoot(name);
     st.dropLenBoundsRootedAt(name);
+    st.dropConditionalLengthsRootedAt(name);
     st.dropAliasesByScalar(name);
     // A header rebind breaks the scalar snapshot's equality with its length.
     // Indirect/header-field stores retire aliases through dropIndirectFacts.
@@ -6563,6 +8200,9 @@ fn dropProductAliasesByConditionName(o: *Oracle, st: *State, name: []const u8) v
 
 fn stateMentionsName(o: *Oracle, st: *const State, name: []const u8) bool {
     const root = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+    for (st.conditional_lengths.items) |entry| {
+        if (pathRootedAt(entry.header, root) or pathRootedAt(entry.selector, root)) return true;
+    }
     for (st.predicates.items) |predicate| {
         if (nodeHasIdentifier(o.tree, predicate.node, root)) return true;
     }
@@ -6675,6 +8315,34 @@ fn sliceLenScalarName(o: *Oracle, node: Ast.Node.Index) ?[]const u8 {
     return identName(tree, end);
 }
 
+/// Does a retained predicate prove `start < base.len`?  The four spellings
+/// of the strict order (`start < base.len`, `base.len > start`, and the
+/// negations of `start >= base.len` / `base.len <= start`) are read against
+/// the same operands `differenceOrdered` compares, except that the high side
+/// is the length of `base` written as a field access.
+fn startBelowLength(o: *Oracle, st: *const State, base: Ast.Node.Index, start: Ast.Node.Index) bool {
+    const tree = o.tree;
+    const sliced = unwrapGrouped(tree, base);
+    const offset = unwrapGrouped(tree, start);
+    for (st.predicates.items) |predicate| {
+        if (!o.spend()) return false;
+        const tag = tree.nodeTag(predicate.node);
+        const forward = (tag == .less_than and predicate.truth) or
+            (tag == .greater_or_equal and !predicate.truth);
+        const reverse = (tag == .greater_than and predicate.truth) or
+            (tag == .less_or_equal and !predicate.truth);
+        if (!forward and !reverse) continue;
+        const operands = tree.nodeData(predicate.node).node_and_node;
+        const low = unwrapGrouped(tree, if (forward) operands[0] else operands[1]);
+        const high = unwrapGrouped(tree, if (forward) operands[1] else operands[0]);
+        if (tree.nodeTag(high) != .field_access) continue;
+        const access = tree.nodeData(high).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(access[1]), "len")) continue;
+        if (sameExpression(tree, unwrapGrouped(tree, access[0]), sliced) and sameExpression(tree, low, offset)) return true;
+    }
+    return false;
+}
+
 fn isAssignOp(tag: std.zig.Token.Tag) bool {
     return switch (tag) {
         .equal,
@@ -6751,7 +8419,7 @@ fn argProvablyNonzero(o: *Oracle, st: *const State, arg: Ast.Node.Index) bool {
     if (fieldPathSrc(o, arg)) |psrc| {
         if (st.scalars.contains(psrc)) return true;
         for (st.value_aliases.items) |va|
-            if (std.mem.eql(u8, va.path, psrc) and st.scalars.contains(va.local)) return true;
+            if (va.other_path == null and va.offset == 0 and std.mem.eql(u8, va.path, psrc) and st.scalars.contains(va.local)) return true;
     }
     return false;
 }
@@ -6860,8 +8528,7 @@ fn calleeAlwaysReturnsPositive(o: *Oracle, fn_expr: Ast.Node.Index) bool {
     if (tree.nodeTag(body_statements[body_statements.len - 1]) != .@"return") return false;
     const function_name = proto.name_token orelse return false;
 
-    const allowance = @min(o.budget, max_contract_steps);
-    if (allowance == 0) return false;
+    const allowance = contractAllowance(o) orelse return false;
     var scanner: Oracle = .{
         .gpa = o.gpa,
         .tree = tree,
@@ -6874,6 +8541,7 @@ fn calleeAlwaysReturnsPositive(o: *Oracle, fn_expr: Ast.Node.Index) bool {
         .memo = o.memo,
     };
     defer scanner.deinit();
+    defer inheritStop(o, &scanner);
     defer o.budget -= chargeContractSteps(allowance, &scanner);
     var exits: State = .{};
     defer exits.deinit(o.gpa);
@@ -7069,7 +8737,621 @@ fn blockStmts(
     };
 }
 
+test "latched census failure is returned before numeric results" {
+    var tree = try Ast.parse(std.testing.allocator, "", .zig);
+    defer tree.deinit(std.testing.allocator);
+    var oracle: Oracle = .{
+        .gpa = std.testing.allocator,
+        .tree = &tree,
+        .body = .root,
+        .query = .numeric_range,
+        .target = "",
+        .use_token = 0,
+        .summary_error = error.UnsupportedScheme,
+    };
+    defer oracle.deinit();
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnsupportedScheme, analyzeBody(&oracle));
+    try std.testing.expectError(error.UnsupportedScheme, analyzeNode(&oracle, .root, &state));
+    try std.testing.expectError(error.UnsupportedScheme, applyRefine(
+        &oracle,
+        &state,
+        .{ .node = .root, .truth = true },
+    ));
+}
+
+fn emptyOracle(tree: *const Ast) Oracle {
+    return .{
+        .gpa = std.testing.allocator,
+        .tree = tree,
+        .body = .root,
+        .query = .numeric_range,
+        .target = "",
+        .use_token = 0,
+    };
+}
+
+test "contract allowance: a caller out of steps records the bound instead of skipping the helper silently" {
+    var tree = try Ast.parse(std.testing.allocator, "", .zig);
+    defer tree.deinit(std.testing.allocator);
+    var oracle = emptyOracle(&tree);
+    defer oracle.deinit();
+    oracle.budget = 0;
+    try std.testing.expectEqual(@as(?u32, null), contractAllowance(&oracle));
+    const stop = oracle.stopped orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_steps, stop.limit);
+    try std.testing.expect(oracle.stoppedShort());
+
+    oracle.stopped = null;
+    oracle.budget = 10;
+    try std.testing.expectEqual(@as(?u32, 10), contractAllowance(&oracle));
+    oracle.budget = step_budget;
+    try std.testing.expectEqual(@as(?u32, max_contract_steps), contractAllowance(&oracle));
+    try std.testing.expect(!oracle.stoppedShort());
+}
+
+test "inherit stop: a helper's bound reaches the asking walk and the first stop wins" {
+    var tree = try Ast.parse(std.testing.allocator, "", .zig);
+    defer tree.deinit(std.testing.allocator);
+    var parent = emptyOracle(&tree);
+    defer parent.deinit();
+    var helper = emptyOracle(&tree);
+    defer helper.deinit();
+
+    inheritStop(&parent, &helper);
+    try std.testing.expect(!parent.stoppedShort());
+
+    helper.giveUp(.{ .limit = .numeric_oracle_depth, .cap = walk_depth_cap });
+    parent.budget = 7;
+    inheritStop(&parent, &helper);
+    const stop = parent.stopped orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_depth, stop.limit);
+    // The caller settles the helper's cost itself; this must not touch it.
+    try std.testing.expectEqual(@as(u32, 7), parent.budget);
+
+    var later = emptyOracle(&tree);
+    defer later.deinit();
+    later.giveUp(.{ .limit = .numeric_oracle_steps, .cap = step_budget });
+    inheritStop(&parent, &later);
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_depth, parent.stopped.?.limit);
+}
+
+test "depth cutoffs record the bound instead of answering conservatively in silence" {
+    var tree = try Ast.parse(std.testing.allocator, "", .zig);
+    defer tree.deinit(std.testing.allocator);
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+
+    var bits = emptyOracle(&tree);
+    defer bits.deinit();
+    try std.testing.expect(bitAliasOf(&bits, &state, .root, bit_alias_depth_cap) == null);
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_depth, bits.stopped.?.limit);
+    try std.testing.expectEqual(@as(u32, bit_alias_depth_cap), bits.stopped.?.cap);
+
+    var width = emptyOracle(&tree);
+    defer width.deinit();
+    try std.testing.expect(computedFloatBitsAtDepth(&width, .root, float_width_depth_cap, .minimum) == null);
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_depth, width.stopped.?.limit);
+    try std.testing.expectEqual(@as(u32, float_width_depth_cap), width.stopped.?.cap);
+
+    var writes = emptyOracle(&tree);
+    defer writes.deinit();
+    try std.testing.expect(writesDirectly(&writes, .root, walk_depth_cap));
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_depth, writes.stopped.?.limit);
+
+    // Inside every bound nothing is recorded.
+    var quiet = emptyOracle(&tree);
+    defer quiet.deinit();
+    _ = bitAliasOf(&quiet, &state, .root, 0);
+    _ = computedFloatBitsAtDepth(&quiet, .root, 0, .minimum);
+    try std.testing.expect(!quiet.stoppedShort());
+}
+
+test "a predicate helper that runs out of steps fails the query instead of dropping its contract" {
+    const gpa = std.testing.allocator;
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/intfromfloat_without_clamp.zig");
+    // `valid` is a pure predicate, and the call guard below is what proves the
+    // conversion in range.  Its body is longer than one contract may walk, so
+    // the contract cannot be read; the query must say so rather than report an
+    // unproven conversion from the contract it never finished reading.
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa,
+        \\fn valid(comptime T: type, value: T) bool {
+        \\    const wide: f64 = @floatCast(value);
+        \\
+    );
+    var line: [64]u8 = undefined;
+    for (0..600) |index| {
+        try source.appendSlice(gpa, try std.fmt.bufPrint(&line, "    const pad{d} = wide + 1;\n", .{index}));
+    }
+    try source.appendSlice(gpa,
+        \\    if (wide != wide) return false;
+        \\    return wide >= -0x1p63 and wide < 0x1p63;
+        \\}
+        \\fn convert(comptime T: type, value: T) i64 {
+        \\    if (!valid(T, value)) return 0;
+        \\    return @intFromFloat(value);
+        \\}
+        \\pub fn single(value: f32) i64 { return convert(f32, value); }
+        \\
+    );
+    budget_mod.clear();
+    defer budget_mod.clear();
+    try std.testing.expectError(error.AnalysisBudgetExceeded, testing.runRuleTyped(gpa, rule.check, source.items));
+    const diagnostic = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_steps, diagnostic.limit);
+}
+
+test "aggregate return memo compares complete fact names and ranges" {
+    const Fact = numeric_eval.Fact;
+    const original = [_]Fact{
+        .{ .name = "input.len", .value = NumericRange.constant(12) },
+        .{ .name = "count", .value = NumericRange.constant(4) },
+    };
+    const identical = [_]Fact{
+        .{ .name = "input.len", .value = NumericRange.constant(12) },
+        .{ .name = "count", .value = NumericRange.constant(4) },
+    };
+    const widened = [_]Fact{
+        .{ .name = "input.len", .value = NumericRange.constant(1200) },
+        .{ .name = "count", .value = NumericRange.constant(4) },
+    };
+    const renamed = [_]Fact{
+        .{ .name = "other.len", .value = NumericRange.constant(12) },
+        .{ .name = "count", .value = NumericRange.constant(4) },
+    };
+    try std.testing.expect(PredicateMemo.AggregateReturn.factsEqual(&original, &identical));
+    try std.testing.expect(!PredicateMemo.AggregateReturn.factsEqual(&original, &widened));
+    try std.testing.expect(!PredicateMemo.AggregateReturn.factsEqual(&original, &renamed));
+    try std.testing.expect(!PredicateMemo.AggregateReturn.factsEqual(&original, original[0..1]));
+}
+
+test "Ocean universal nonempty controls require a current element proof" {
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/index_minus_one_without_zero_guard.zig");
+    try testing.expectNoFireTyped(rule.check,
+        \\const Block = struct { instructions: []const u8 };
+        \\pub fn validate(blocks: []const Block) !u8 {
+        \\    for (blocks) |block| {
+        \\        if (block.instructions.len == 0) return error.Empty;
+        \\    }
+        \\    var result: u8 = 0;
+        \\    for (blocks) |block| {
+        \\        if (block.instructions.len == 0) return error.Empty;
+        \\        result ^= block.instructions[block.instructions.len - 1];
+        \\    }
+        \\    return result;
+        \\}
+    );
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\const Block = struct { instructions: []const u8 };
+        \\pub fn validate(blocks: []const Block) !u8 {
+        \\    for (blocks) |block| {
+        \\        if (block.instructions.len == 0) return error.Empty;
+        \\        break;
+        \\    }
+        \\    var result: u8 = 0;
+        \\    for (blocks) |block| {
+        \\        result ^= block.instructions[block.instructions.len - 1];
+        \\    }
+        \\    return result;
+        \\}
+    );
+}
+
+test "Ocean universal nonempty controls reject overwritten instruction headers" {
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/index_minus_one_without_zero_guard.zig");
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\const Block = struct { instructions: []const u8 };
+        \\pub fn validate(blocks: []Block) !u8 {
+        \\    for (blocks) |block| {
+        \\        if (block.instructions.len == 0) return error.Empty;
+        \\    }
+        \\    if (blocks.len == 0) return 0;
+        \\    blocks[0].instructions = &.{};
+        \\    return blocks[0].instructions[blocks[0].instructions.len - 1];
+        \\}
+    );
+}
+
+test "Ocean optional loop witness controls require a container proof" {
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/index_minus_one_without_zero_guard.zig");
+    try testing.expectNoFireTyped(rule.check,
+        \\pub fn moveLast(items: []u8) void {
+        \\    var last: ?usize = null;
+        \\    for (items, 0..) |item, index| {
+        \\        if (item == 1) last = index;
+        \\    }
+        \\    if (last) |index| {
+        \\        if (items.len == 0) return;
+        \\        const tmp = items[index];
+        \\        items[index] = items[items.len - 1];
+        \\        items[items.len - 1] = tmp;
+        \\    }
+        \\}
+    );
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\pub fn moveLast(items: []u8, seed: ?usize) void {
+        \\    var last = seed;
+        \\    for (items, 0..) |item, index| {
+        \\        if (item == 1) last = index;
+        \\    }
+        \\    if (last) |index| {
+        \\        items[index] = items[items.len - 1];
+        \\    }
+        \\}
+    );
+}
+
+test "Ocean optional loop witness controls reject a later slice rebind" {
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/index_minus_one_without_zero_guard.zig");
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\pub fn moveLast(input: []u8) void {
+        \\    var items = input;
+        \\    var last: ?usize = null;
+        \\    for (items, 0..) |item, index| {
+        \\        if (item == 1) last = index;
+        \\    }
+        \\    items = items[0..0];
+        \\    if (last) |index| {
+        \\        items[index] = items[items.len - 1];
+        \\    }
+        \\}
+    );
+}
+
+test "Ocean seeded positive counter survives disjoint producer effects" {
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/index_minus_one_without_zero_guard.zig");
+    try testing.expectNoFireTyped(rule.check,
+        \\const Producer = struct {
+        \\    fn create(_: *Producer, state: *u64, inputs: []const u8) !u8 {
+        \\        state.* +%= 1;
+        \\        return if (inputs.len == 0) @truncate(state.*) else inputs[0];
+        \\    }
+        \\};
+        \\fn next(state: *u64) u64 { state.* +%= 1; return state.*; }
+        \\pub fn last(state: *u64) !u8 {
+        \\    var producer: Producer = .{};
+        \\    var values: [32]u8 = @splat(0);
+        \\    var count: usize = 0;
+        \\    values[count] = try producer.create(state, &.{});
+        \\    count += 1;
+        \\    const operation_count: usize = @intCast(next(state) % 20);
+        \\    for (0..operation_count) |_| {
+        \\        if (count >= values.len) break;
+        \\        const lhs = values[@as(usize, @intCast(next(state) % count))];
+        \\        const value = try producer.create(state, &.{lhs});
+        \\        values[count] = value;
+        \\        count += 1;
+        \\    }
+        \\    const shape = next(state) % 4;
+        \\    _ = shape;
+        \\    return values[count - 1];
+        \\}
+    );
+}
+
+test "Ocean seeded positive counter controls reject zero reaching loop updates" {
+    const testing = @import("../testing.zig");
+    const rule = @import("../rules/misc/index_minus_one_without_zero_guard.zig");
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\pub fn last(values: []const u8, iterations: usize) u8 {
+        \\    var count: usize = 1;
+        \\    for (0..iterations) |_| {
+        \\        count = 0;
+        \\    }
+        \\    return values[count - 1];
+        \\}
+    );
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\pub fn last(values: []const u8, iterations: usize) u8 {
+        \\    var count: usize = 1;
+        \\    for (0..iterations) |_| {
+        \\        count -= 1;
+        \\    }
+        \\    return values[count - 1];
+        \\}
+    );
+    try testing.expectFiresTyped(rule.check, "index-minus-one-without-zero-guard",
+        \\fn reset(count: *usize) void { count.* = 0; }
+        \\pub fn last(values: []const u8, iterations: usize) u8 {
+        \\    var count: usize = 1;
+        \\    for (0..iterations) |_| {
+        \\        reset(&count);
+        \\    }
+        \\    return values[count - 1];
+        \\}
+    );
+}
+
 test {
     _ = numbers;
     _ = @import("value_range_tests.zig");
+}
+
+test "numeric return memo: one nested call node keeps distinct actual callable contexts" {
+    const gpa = std.testing.allocator;
+    const resolver_mod = @import("../type_resolver.zig");
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-numeric-return-context.zig",
+        \\fn target(value: anytype) i32 { return @intCast(value); }
+        \\fn forward(comptime T: type, value: T) i32 { return target(value); }
+        \\pub fn use() i32 { return forward(u8, 0) + forward(u32, 0); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    const Find = struct {
+        fn call(tree_: *const Ast, name: []const u8, occurrence: usize) !Ast.Node.Index {
+            var seen: usize = 0;
+            for (0..tree_.nodes.len) |index| {
+                const node: Ast.Node.Index = @enumFromInt(index);
+                var buffer: [1]Ast.Node.Index = undefined;
+                const full = tree_.fullCall(&buffer, node) orelse continue;
+                if (!std.mem.eql(u8, tree_.getNodeSource(full.ast.fn_expr), name)) continue;
+                if (seen == occurrence) return node;
+                seen += 1;
+            }
+            return error.MissingCall;
+        }
+    };
+    const narrow_call = try Find.call(tree, "forward", 0);
+    const wide_call = try Find.call(tree, "forward", 1);
+    const nested_call = try Find.call(tree, "target", 0);
+    const narrow = switch (try resolver.functionReferenceOfCall(narrow_call)) {
+        .function => |reference| reference,
+        else => return error.MissingNarrowContext,
+    };
+    const wide = switch (try resolver.functionReferenceOfCall(wide_call)) {
+        .function => |reference| reference,
+        else => return error.MissingWideContext,
+    };
+    const narrow_frame = resolver.frameForFunction(narrow);
+    const wide_frame = resolver.frameForFunction(wide);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const nested = tree.fullCall(&buffer, nested_call).?;
+    const token = tree.nodeMainToken(nested.ast.fn_expr);
+    const narrow_actual = (try cache.actualCallSummaryAt(token, narrow_frame)) orelse return error.MissingNarrowCallee;
+    const wide_actual = (try cache.actualCallSummaryAt(token, wide_frame)) orelse return error.MissingWideCallee;
+    try std.testing.expect(narrow_actual.callee.reference.fn_token == wide_actual.callee.reference.fn_token);
+    try std.testing.expect(!narrow_actual.callee.reference.actual_type.eql(wide_actual.callee.reference.actual_type));
+    var memo: PredicateMemo = .{ .gpa = gpa };
+    defer memo.deinit();
+    const arguments = [_]numeric_eval.Fact{.{ .name = "value", .value = NumericRange.constant(0) }};
+    try memo.recordNumericReturn(narrow_actual.callee.reference, narrow_frame, nested_call, 1, &arguments, NumericRange.constant(0));
+    try std.testing.expect(memo.findNumericReturn(narrow_actual.callee.reference, narrow_frame, nested_call, 1, &arguments) != null);
+    try std.testing.expect(memo.findNumericReturn(wide_actual.callee.reference, wide_frame, nested_call, 1, &arguments) == null);
+}
+
+test "caller length fallback propagates embed metadata failure and permits retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const resolver_mod = @import("../type_resolver.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\fn consume(bytes: []const u8, token: u8) usize { _ = token; return bytes.len; }
+        \\extern fn effect() u8;
+        \\pub fn caller() usize { return consume(@embedFile("late.bin"), effect()); }
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = source });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "main.zig" });
+    defer gpa.free(path);
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{root} };
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.file_path = path;
+    var oracle = emptyOracle(tree);
+    defer oracle.deinit();
+    oracle.cache = &cache;
+    var call_node: ?Ast.Node.Index = null;
+    for (0..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (std.mem.eql(u8, tree.getNodeSource(call.ast.fn_expr), "consume")) {
+            call_node = node;
+            break;
+        }
+    }
+    const node = call_node orelse return error.MissingCall;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node).?;
+    try std.testing.expectError(error.FileNotFound, callerArgumentLength(&oracle, node, call.ast.params[0]));
+    try std.testing.expectEqual(@as(usize, 0), cache.embedded_file_lengths.count());
+    try tmp.dir.writeFile(io, .{ .sub_path = "late.bin", .data = "abc" });
+    const extent = try callerArgumentLength(&oracle, node, call.ast.params[0]);
+    try std.testing.expect(extent == .integer);
+    try std.testing.expectEqual(@as(i128, 3), extent.integer.min);
+    try std.testing.expectEqual(@as(i128, 3), extent.integer.max);
+}
+
+test "returned length export settles child cost before spending the final parent step" {
+    const gpa = std.testing.allocator;
+    const resolver_mod = @import("../type_resolver.zig");
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-returned-length-budget.zig",
+        \\fn take() []const u8 { return "abc"; }
+        \\pub fn caller() []const u8 { return take(); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    var call_node: ?Ast.Node.Index = null;
+    for (0..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (std.mem.eql(u8, tree.getNodeSource(call.ast.fn_expr), "take")) {
+            call_node = node;
+            break;
+        }
+    }
+    const node = call_node orelse return error.MissingCall;
+    const reference = switch (try resolver.functionReferenceOfCall(node)) {
+        .function => |function| function,
+        else => return error.MissingCallee,
+    };
+    const declaration = tokens.enclosingFnDecl(tree, reference.fn_token) orelse return error.MissingCallee;
+    const body = tokens.bodyOf(tree, declaration) orelse return error.MissingCallee;
+    var source: State = .{};
+    defer source.deinit(gpa);
+    var output: State = .{};
+    defer output.deinit(gpa);
+    var generous = emptyOracle(tree);
+    defer generous.deinit();
+    generous.cache = &cache;
+    const initial = generous.budget;
+    try summarizeReturnedLengths(&generous, &source, reference, node, body, false, true, &.{}, &.{}, &output, "header");
+    try std.testing.expect(!generous.stoppedShort());
+    try std.testing.expect(output.lenBoundOf("header") != null);
+    const spent = initial - generous.budget;
+    try std.testing.expect(spent > 1);
+    var tight = emptyOracle(tree);
+    defer tight.deinit();
+    tight.cache = &cache;
+    tight.budget = spent - 1;
+    tight.budget_cap = tight.budget;
+    var refused: State = .{};
+    defer refused.deinit(gpa);
+    try summarizeReturnedLengths(&tight, &source, reference, node, body, false, true, &.{}, &.{}, &refused, "header");
+    try std.testing.expectEqual(@as(u32, 0), tight.budget);
+    try std.testing.expect(tight.stoppedShort());
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_steps, tight.stopped.?.limit);
+    try std.testing.expect(refused.lenBoundOf("header") == null);
+}
+
+test "scalar contract settles analysis and clips later effect work to the caller budget" {
+    const gpa = std.testing.allocator;
+    const resolver_mod = @import("../type_resolver.zig");
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-scalar-contract-budget.zig",
+        \\fn positive(value: usize) !void {
+        \\    if (value == 0) return error.Zero;
+        \\}
+        \\pub fn caller(n: usize) !usize {
+        \\    try positive(n);
+        \\    return n - 1;
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    var call_node: ?Ast.Node.Index = null;
+    for (0..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (std.mem.eql(u8, tree.getNodeSource(call.ast.fn_expr), "positive")) {
+            call_node = node;
+            break;
+        }
+    }
+    const node = call_node orelse return error.MissingCall;
+    const caller_decl = tokens.enclosingFnDecl(tree, tree.firstToken(node)) orelse return error.MissingCaller;
+    const caller_body = tokens.bodyOf(tree, caller_decl) orelse return error.MissingCaller;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const caller_proto = tokens.fnProto(tree, &proto_buffer, caller_decl) orelse return error.MissingCaller;
+    var bindings = try local_bindings.build(gpa, tree, caller_proto, caller_body);
+    defer bindings.deinit();
+    const reference = switch (try resolver.functionReferenceOfCall(node)) {
+        .function => |function| function,
+        else => return error.MissingCallee,
+    };
+    const callee_decl = tokens.enclosingFnDecl(tree, reference.fn_token) orelse return error.MissingCallee;
+    const callee_body = tokens.bodyOf(tree, callee_decl) orelse return error.MissingCallee;
+    var probe = emptyOracle(tree);
+    defer probe.deinit();
+    probe.cache = &cache;
+    probe.body = caller_body;
+    probe.locals = bindings.items;
+    probe.successful_call = node;
+    var capture: Capture = .{ .gpa = gpa, .mode = .exit, .success_only = true };
+    defer capture.deinit();
+    var child = emptyOracle(tree);
+    defer child.deinit();
+    child.cache = &cache;
+    child.body = callee_body;
+    child.expression = callee_body;
+    child.use_token = std.math.maxInt(Ast.TokenIndex);
+    child.capture = &capture;
+    child.caller_parent = &probe;
+    child.infer_callers = false;
+    child.contract_depth = 1;
+    child.budget = contractAllowance(&probe).?;
+    const child_initial = child.budget;
+    _ = try analyzeBody(&child);
+    try std.testing.expect(capture.complete);
+    try std.testing.expect(!child.stoppedShort());
+    try std.testing.expect(capture.state.?.numericValue("value") == .integer);
+    try std.testing.expect(capture.state.?.numericValue("value").integer.min >= 1);
+    const analysis_cost = child_initial - child.budget;
+    const parent_initial = probe.budget;
+    try std.testing.expect(numeric_escape.scalarSurvivesCall(&probe, "n", .{ .subtree = node }));
+    const filter_cost = parent_initial - probe.budget;
+    try std.testing.expect(filter_cost > 0);
+
+    var generous = emptyOracle(tree);
+    defer generous.deinit();
+    generous.cache = &cache;
+    generous.body = caller_body;
+    generous.locals = bindings.items;
+    generous.successful_call = node;
+    var accepted: State = .{};
+    defer accepted.deinit(gpa);
+    try applyCallContracts(&generous, &accepted, node, &.{});
+    try std.testing.expect(!generous.stoppedShort());
+    try std.testing.expect(accepted.numericValue("n") == .integer);
+    try std.testing.expect(accepted.numericValue("n").integer.min >= 1);
+
+    var tight = emptyOracle(tree);
+    defer tight.deinit();
+    tight.cache = &cache;
+    tight.body = caller_body;
+    tight.locals = bindings.items;
+    tight.successful_call = node;
+    // Analysis and the caller filter fit; the later child effect scan does not.
+    tight.budget = 1 + analysis_cost + filter_cost;
+    tight.budget_cap = tight.budget;
+    var refused: State = .{};
+    defer refused.deinit(gpa);
+    try applyCallContracts(&tight, &refused, node, &.{});
+    try std.testing.expectEqual(@as(u32, 0), tight.budget);
+    try std.testing.expect(tight.stoppedShort());
+    try std.testing.expectEqual(budget_mod.Limit.numeric_oracle_steps, tight.stopped.?.limit);
+    try std.testing.expect(refused.scalarMinOf("n") == null);
+    try std.testing.expect(!refused.scalars.contains("n"));
+    try std.testing.expectEqual(@as(usize, 0), refused.numeric.items.len);
 }

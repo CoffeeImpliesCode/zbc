@@ -202,7 +202,7 @@ pub const all = [_]Rule{
     },
     .{
         .id = "memset-undef-after-len-truncation",
-        .title = "`@memset(<X>.<field>..., undefined)` AFTER `<X>.<field>.len = ...` truncation — memset is a no-op on the now-empty slice",
+        .title = "Empty undefined fill after a proved slice-length reduction",
         .body = @embedFile("rules/collection/memset-undef-after-len-truncation.md"),
     },
     .{
@@ -521,11 +521,6 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/collection/hashmap-getentry-forced-unwrap.md"),
     },
     .{
-        .id = "double-optional-ptr",
-        .title = "`?*?T` — doubly-optional pointer; almost always a copy-paste error; for nullable out-params use `?*T`, for non-null pointer to optional use `*?T`",
-        .body = @embedFile("rules/misc/double-optional-ptr.md"),
-    },
-    .{
         .id = "aligncast-on-optional-unwrap",
         .title = "`@alignCast(x.?)` — forced `.?` panics on null; alignment assertion panics on misalignment; two panic sources in one expression",
         .body = @embedFile("rules/misc/aligncast-on-optional-unwrap.md"),
@@ -547,6 +542,7 @@ const Ast = std.zig.Ast;
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const file_cache = @import("cache/file_cache.zig");
+const budget_mod = @import("budget.zig");
 
 const Problem = problem_mod.Problem;
 const Config = config_mod.Config;
@@ -654,7 +650,6 @@ const memcpy_overlapping_slices_mod = @import("rules/misc/memcpy_overlapping_sli
 const cmpxchgweak_orelse_break_mod = @import("rules/misc/cmpxchgweak_orelse_break.zig");
 const slice_write_at_len_mod = @import("rules/misc/slice_write_at_len.zig");
 const clamp_wrong_direction_mod = @import("rules/misc/clamp_wrong_direction.zig");
-const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const aligncast_on_optional_unwrap_mod = @import("rules/misc/aligncast_on_optional_unwrap.zig");
 const adjacent_decl_same_source_field_mod = @import("rules/misc/adjacent_decl_same_source_field.zig");
 const intcast_of_negated_signed_mod = @import("rules/misc/intcast_of_negated_signed.zig");
@@ -672,123 +667,145 @@ const unreleased_factory_handle_mod = @import("rules/cleanup/unreleased_factory_
 const unreleased_refs_on_error_mod = @import("rules/errdefer/unreleased_refs_on_error.zig");
 
 const escape_detectors = [_]Detector{
-    .{ .id = "aliased-heap-dupe",                          .check = aliased_heap_dupe_mod.check },
-    .{ .id = "clobbered-by-struct-reset",                  .check = clobbered_by_struct_reset_mod.check },
-    .{ .id = "realloc-byte-count",                         .check = realloc_byte_count_mod.check },
-    .{ .id = "asymmetric-field-free",                      .check = asymmetric_field_free_mod.check },
-    .{ .id = "missing-errdefer-between-tries",             .check = missing_errdefer_between_tries_mod.check },
-    .{ .id = "free-then-try-realloc",                      .check = free_then_try_realloc_mod.check },
-    .{ .id = "destroy-after-deinit-in-loop",               .check = destroy_after_deinit_in_loop_mod.check },
-    .{ .id = "dead-errdefer-in-result-fn",                 .check = dead_errdefer_in_result_fn_mod.check },
-    .{ .id = "duplicate-errdefer",                         .check = duplicate_errdefer_mod.check },
-    .{ .id = "overwrite-without-deinit",                   .check = overwrite_without_deinit_mod.check },
-    .{ .id = "stack-fallback-escape",                      .check = stack_fallback_escape_mod.check },
-    .{ .id = "unreleased-refs-on-error",                   .check = unreleased_refs_on_error_mod.check },
-    .{ .id = "hashmap-getptr-rehash",                      .check = hashmap_getptr_rehash_mod.check },
-    .{ .id = "arraylist-items-slice",                      .check = arraylist_items_slice_mod.check },
-    .{ .id = "arraylist-element-ptr",                      .check = arraylist_element_ptr_mod.check },
-    .{ .id = "fd-write-after-close",                       .check = fd_write_after_close_mod.check },
-    .{ .id = "slice-of-arena-into-heap",                   .check = slice_of_arena_into_heap_mod.check },
-    .{ .id = "free-without-null-then-check",               .check = free_without_null_then_check_mod.check },
-    .{ .id = "tagged-union-retag-with-old-payload-read",   .check = tagged_union_retag_with_old_payload_read_mod.check },
-    .{ .id = "union-deinit-without-inert-reset",           .check = union_deinit_without_inert_reset_mod.check },
-    .{ .id = "self-undefined-after-destroy",               .check = self_undefined_after_destroy_mod.check },
-    .{ .id = "missing-errdefer-on-out-param",              .check = missing_errdefer_on_out_param_mod.check },
-    .{ .id = "reset-skips-pooled-resource-release",        .check = reset_skips_pooled_resource_release_mod.check },
-    .{ .id = "return-borrowed-payload",                    .check = return_borrowed_payload_mod.check },
-    .{ .id = "unreleased-factory-handle",                  .check = unreleased_factory_handle_mod.check },
-    .{ .id = "memset-undef-after-len-truncation",          .check = memset_undef_after_len_truncation_mod.check },
-    .{ .id = "publish-then-touch-self",                    .check = publish_then_touch_self_mod.check },
-    .{ .id = "missing-deinit-on-composed-owner",           .check = missing_deinit_on_composed_owner_mod.check },
-    .{ .id = "owned-field-no-outer-cleanup",               .check = owned_field_no_outer_cleanup_mod.check },
-    .{ .id = "borrowed-slice-into-out-param",              .check = borrowed_slice_into_out_param_mod.check },
-    .{ .id = "defer-and-errdefer-free-overlap",            .check = defer_and_errdefer_free_overlap_mod.check },
-    .{ .id = "sentinel-strip-free-size-mismatch",          .check = sentinel_strip_free_size_mismatch_mod.check },
-    .{ .id = "move-out-without-restore",                   .check = move_out_without_restore_mod.check },
-    .{ .id = "deinit-order-violates-construction-dep",     .check = deinit_order_violates_construction_dep_mod.check },
-    .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = borrowed_slice_into_stack_buffer_returned_mod.check },
-    .{ .id = "getorput-unguarded-value-read",              .check = getorput_unguarded_value_read_mod.check },
-    .{ .id = "hashmap-iter-mutation",                      .check = hashmap_iter_mutation_mod.check },
-    .{ .id = "iterator-invalidation-mutation",             .check = iterator_invalidation_mutation_mod.check },
-    .{ .id = "thread-spawn-local-pointer",                 .check = thread_spawn_local_pointer_mod.check },
-    .{ .id = "self-pointer-in-returned-value",             .check = self_pointer_in_returned_value_mod.check },
-    .{ .id = "ref-before-ownership-transfer",              .check = ref_before_ownership_transfer_mod.check },
-    .{ .id = "opt-capture-ptr-after-field-clear",          .check = opt_capture_ptr_after_field_clear_mod.check },
-    .{ .id = "tagged-union-payload-early-exit",            .check = tagged_union_payload_early_exit_mod.check },
-    .{ .id = "union-payload-ptr-after-variant-change",     .check = union_payload_ptr_after_variant_change_mod.check },
-    .{ .id = "flag-reset-after-callback",                  .check = flag_reset_after_callback_mod.check },
-    .{ .id = "slice-loop-reentrant-grow",                  .check = slice_loop_reentrant_grow_mod.check },
-    .{ .id = "scope-push-pop-imbalance",                   .check = scope_push_pop_imbalance_mod.check },
-    .{ .id = "exit-callback-cross-thread",                 .check = exit_callback_cross_thread_mod.check },
-    .{ .id = "index-type-narrowing-wraparound",            .check = index_type_narrowing_wraparound_mod.check },
-    .{ .id = "ref-counted-copy-without-dupe",              .check = ref_counted_copy_without_dupe_mod.check },
-    .{ .id = "arraybuffer-slice-without-pin",               .check = arraybuffer_slice_without_pin_mod.check },
-    .{ .id = "optional-fallback-wrong-side",                .check = optional_fallback_wrong_side_mod.check },
-    .{ .id = "escape-skip-without-bounds-recheck",          .check = escape_skip_without_bounds_recheck_mod.check },
-    .{ .id = "recursive-parse-fn-without-stack-check",      .check = recursive_parse_without_stack_check_mod.check },
-    .{ .id = "slice-from-fixed-offset-without-len-check",   .check = slice_from_fixed_offset_without_len_check_mod.check },
-    .{ .id = "divmod-by-len-without-nonempty-guard",        .check = divmod_by_len_without_nonempty_guard_mod.check },
-    .{ .id = "negate-then-shift-without-minint-check",      .check = negate_then_shift_without_minint_check_mod.check },
-    .{ .id = "readint-unchecked-position-assignment",       .check = readint_unchecked_position_assignment_mod.check },
-    .{ .id = "arraylist-sentinel-write-without-capacity",  .check = arraylist_sentinel_write_without_capacity_mod.check },
-    .{ .id = "intfromfloat-without-clamp",                 .check = intfromfloat_without_clamp_mod.check },
-    .{ .id = "int-sum-overflow-in-bounds-cmp",             .check = int_sum_overflow_in_bounds_cmp_mod.check },
-    .{ .id = "ptr-slice-without-bounds-check",             .check = ptr_slice_without_bounds_check_mod.check },
-    .{ .id = "mutex-double-lock",                          .check = mutex_double_lock_mod.check },
-    .{ .id = "lock-held-across-early-exit",                .check = lock_held_across_early_exit_mod.check },
-    .{ .id = "ptrfromint-zero",                            .check = ptrfromint_zero_mod.check },
-    .{ .id = "resize-result-discarded",                    .check = resize_result_discarded_mod.check },
-    .{ .id = "errdefer-alive-after-ownership-transfer",    .check = errdefer_alive_after_ownership_transfer_mod.check },
-    .{ .id = "f32-narrowing-int-to-float",                .check = f32_narrowing_int_to_float_mod.check },
-    .{ .id = "array-maxint-off-by-one",                  .check = array_maxint_off_by_one_mod.check },
-    .{ .id = "intcast-clamp-uses-max",                   .check = intcast_clamp_uses_max_mod.check },
-    .{ .id = "forced-unwrap-iterator-next",              .check = forced_unwrap_iterator_next_mod.check },
-    .{ .id = "impossible-range-and",                    .check = impossible_range_and_mod.check },
-    .{ .id = "intcast-signed-timestamp",                .check = intcast_signed_timestamp_mod.check },
-    .{ .id = "truncate-subtraction-without-guard",      .check = truncate_subtraction_without_guard_mod.check },
-    .{ .id = "initcapacity-plain-add-overflow",         .check = initcapacity_plain_add_overflow_mod.check },
-    .{ .id = "index-minus-one-without-zero-guard",      .check = index_minus_one_without_zero_guard_mod.check },
-    .{ .id = "else-literal-absorbs-addend",             .check = else_literal_absorbs_addend_mod.check },
-    .{ .id = "catch-error-panic",                       .check = catch_error_panic_mod.check },
-    .{ .id = "toutf8-inline-slice-borrow",              .check = toutf8_inline_slice_borrow_mod.check },
-    .{ .id = "uv-return-value-intcast-truncation",      .check = uv_return_value_intcast_truncation_mod.check },
-    .{ .id = "tryget-orelse-unreachable",               .check = tryget_orelse_unreachable_mod.check },
-    .{ .id = "aligncast-on-byte-slice",                 .check = aligncast_on_byte_slice_mod.check },
-    .{ .id = "truncate-len-to-narrow-int",              .check = truncate_len_to_narrow_int_mod.check },
-    .{ .id = "field-self-assign-with-cast",             .check = field_self_assign_with_cast_mod.check },
-    .{ .id = "maybe-assert-panics",                     .check = maybe_assert_panics_mod.check },
-    .{ .id = "return-arraylist-items",                  .check = return_arraylist_items_mod.check },
-    .{ .id = "lessthan-uses-leq",                       .check = lessthan_uses_leq_mod.check },
-    .{ .id = "duplicate-defer-free",                    .check = duplicate_defer_free_mod.check },
-    .{ .id = "hashmap-getentry-forced-unwrap",          .check = hashmap_getentry_forced_unwrap_mod.check },
-    .{ .id = "double-optional-ptr",                    .check = double_optional_ptr_mod.check },
-    .{ .id = "aligncast-on-optional-unwrap",           .check = aligncast_on_optional_unwrap_mod.check },
-    .{ .id = "adjacent-decl-same-source-field",        .check = adjacent_decl_same_source_field_mod.check },
-    .{ .id = "intcast-of-negated-signed",               .check = intcast_of_negated_signed_mod.check },
-    .{ .id = "struct-literal-multiple-try",             .check = struct_literal_multiple_try_mod.check },
-    .{ .id = "writeint-truncated-value",                .check = writeint_truncated_value_mod.check },
-    .{ .id = "multiarray-items-deref-assign",           .check = multiarray_items_deref_assign_mod.check },
-    .{ .id = "startswith-strip-off-by-one",             .check = startswith_strip_off_by_one_mod.check },
-    .{ .id = "midpoint-addition-overflow",              .check = midpoint_addition_overflow_mod.check },
-    .{ .id = "arena-allocator-free-noop",               .check = arena_allocator_free_noop_mod.check },
-    .{ .id = "memcpy-overlapping-slices",               .check = memcpy_overlapping_slices_mod.check },
-    .{ .id = "cmpxchgweak-orelse-break",                .check = cmpxchgweak_orelse_break_mod.check },
-    .{ .id = "slice-write-at-len",                     .check = slice_write_at_len_mod.check },
-    .{ .id = "clamp-wrong-direction",                  .check = clamp_wrong_direction_mod.check },
+    .{ .id = "aliased-heap-dupe", .check = aliased_heap_dupe_mod.check },
+    .{ .id = "clobbered-by-struct-reset", .check = clobbered_by_struct_reset_mod.check },
+    .{ .id = "realloc-byte-count", .check = realloc_byte_count_mod.check },
+    .{ .id = "asymmetric-field-free", .check = asymmetric_field_free_mod.check },
+    .{ .id = "missing-errdefer-between-tries", .check = missing_errdefer_between_tries_mod.check },
+    .{ .id = "free-then-try-realloc", .check = free_then_try_realloc_mod.check },
+    .{ .id = "destroy-after-deinit-in-loop", .check = destroy_after_deinit_in_loop_mod.check },
+    .{ .id = "dead-errdefer-in-result-fn", .check = dead_errdefer_in_result_fn_mod.check },
+    .{ .id = "duplicate-errdefer", .check = duplicate_errdefer_mod.check },
+    .{ .id = "overwrite-without-deinit", .check = overwrite_without_deinit_mod.check },
+    .{ .id = "stack-fallback-escape", .check = stack_fallback_escape_mod.check },
+    .{ .id = "unreleased-refs-on-error", .check = unreleased_refs_on_error_mod.check },
+    .{ .id = "hashmap-getptr-rehash", .check = hashmap_getptr_rehash_mod.check },
+    .{ .id = "arraylist-items-slice", .check = arraylist_items_slice_mod.check },
+    .{ .id = "arraylist-element-ptr", .check = arraylist_element_ptr_mod.check },
+    .{ .id = "fd-write-after-close", .check = fd_write_after_close_mod.check },
+    .{ .id = "slice-of-arena-into-heap", .check = slice_of_arena_into_heap_mod.check },
+    .{ .id = "free-without-null-then-check", .check = free_without_null_then_check_mod.check },
+    .{ .id = "tagged-union-retag-with-old-payload-read", .check = tagged_union_retag_with_old_payload_read_mod.check },
+    .{ .id = "union-deinit-without-inert-reset", .check = union_deinit_without_inert_reset_mod.check },
+    .{ .id = "self-undefined-after-destroy", .check = self_undefined_after_destroy_mod.check },
+    .{ .id = "missing-errdefer-on-out-param", .check = missing_errdefer_on_out_param_mod.check },
+    .{ .id = "reset-skips-pooled-resource-release", .check = reset_skips_pooled_resource_release_mod.check },
+    .{ .id = "return-borrowed-payload", .check = return_borrowed_payload_mod.check },
+    .{ .id = "unreleased-factory-handle", .check = unreleased_factory_handle_mod.check },
+    .{ .id = "memset-undef-after-len-truncation", .check = memset_undef_after_len_truncation_mod.check },
+    .{ .id = "publish-then-touch-self", .check = publish_then_touch_self_mod.check },
+    .{ .id = "missing-deinit-on-composed-owner", .check = missing_deinit_on_composed_owner_mod.check },
+    .{ .id = "owned-field-no-outer-cleanup", .check = owned_field_no_outer_cleanup_mod.check },
+    .{ .id = "borrowed-slice-into-out-param", .check = borrowed_slice_into_out_param_mod.check },
+    .{ .id = "defer-and-errdefer-free-overlap", .check = defer_and_errdefer_free_overlap_mod.check },
+    .{ .id = "sentinel-strip-free-size-mismatch", .check = sentinel_strip_free_size_mismatch_mod.check },
+    .{ .id = "move-out-without-restore", .check = move_out_without_restore_mod.check },
+    .{ .id = "deinit-order-violates-construction-dep", .check = deinit_order_violates_construction_dep_mod.check },
+    .{ .id = "borrowed-slice-into-stack-buffer-returned", .check = borrowed_slice_into_stack_buffer_returned_mod.check },
+    .{ .id = "getorput-unguarded-value-read", .check = getorput_unguarded_value_read_mod.check },
+    .{ .id = "hashmap-iter-mutation", .check = hashmap_iter_mutation_mod.check },
+    .{ .id = "iterator-invalidation-mutation", .check = iterator_invalidation_mutation_mod.check },
+    .{ .id = "thread-spawn-local-pointer", .check = thread_spawn_local_pointer_mod.check },
+    .{ .id = "self-pointer-in-returned-value", .check = self_pointer_in_returned_value_mod.check },
+    .{ .id = "ref-before-ownership-transfer", .check = ref_before_ownership_transfer_mod.check },
+    .{ .id = "opt-capture-ptr-after-field-clear", .check = opt_capture_ptr_after_field_clear_mod.check },
+    .{ .id = "tagged-union-payload-early-exit", .check = tagged_union_payload_early_exit_mod.check },
+    .{ .id = "union-payload-ptr-after-variant-change", .check = union_payload_ptr_after_variant_change_mod.check },
+    .{ .id = "flag-reset-after-callback", .check = flag_reset_after_callback_mod.check },
+    .{ .id = "slice-loop-reentrant-grow", .check = slice_loop_reentrant_grow_mod.check },
+    .{ .id = "scope-push-pop-imbalance", .check = scope_push_pop_imbalance_mod.check },
+    .{ .id = "exit-callback-cross-thread", .check = exit_callback_cross_thread_mod.check },
+    .{ .id = "index-type-narrowing-wraparound", .check = index_type_narrowing_wraparound_mod.check },
+    .{ .id = "ref-counted-copy-without-dupe", .check = ref_counted_copy_without_dupe_mod.check },
+    .{ .id = "arraybuffer-slice-without-pin", .check = arraybuffer_slice_without_pin_mod.check },
+    .{ .id = "optional-fallback-wrong-side", .check = optional_fallback_wrong_side_mod.check },
+    .{ .id = "escape-skip-without-bounds-recheck", .check = escape_skip_without_bounds_recheck_mod.check },
+    .{ .id = "recursive-parse-fn-without-stack-check", .check = recursive_parse_without_stack_check_mod.check },
+    .{ .id = "slice-from-fixed-offset-without-len-check", .check = slice_from_fixed_offset_without_len_check_mod.check },
+    .{ .id = "divmod-by-len-without-nonempty-guard", .check = divmod_by_len_without_nonempty_guard_mod.check },
+    .{ .id = "negate-then-shift-without-minint-check", .check = negate_then_shift_without_minint_check_mod.check },
+    .{ .id = "readint-unchecked-position-assignment", .check = readint_unchecked_position_assignment_mod.check },
+    .{ .id = "arraylist-sentinel-write-without-capacity", .check = arraylist_sentinel_write_without_capacity_mod.check },
+    .{ .id = "intfromfloat-without-clamp", .check = intfromfloat_without_clamp_mod.check },
+    .{ .id = "int-sum-overflow-in-bounds-cmp", .check = int_sum_overflow_in_bounds_cmp_mod.check },
+    .{ .id = "ptr-slice-without-bounds-check", .check = ptr_slice_without_bounds_check_mod.check },
+    .{ .id = "mutex-double-lock", .check = mutex_double_lock_mod.check },
+    .{ .id = "lock-held-across-early-exit", .check = lock_held_across_early_exit_mod.check },
+    .{ .id = "ptrfromint-zero", .check = ptrfromint_zero_mod.check },
+    .{ .id = "resize-result-discarded", .check = resize_result_discarded_mod.check },
+    .{ .id = "errdefer-alive-after-ownership-transfer", .check = errdefer_alive_after_ownership_transfer_mod.check },
+    .{ .id = "f32-narrowing-int-to-float", .check = f32_narrowing_int_to_float_mod.check },
+    .{ .id = "array-maxint-off-by-one", .check = array_maxint_off_by_one_mod.check },
+    .{ .id = "intcast-clamp-uses-max", .check = intcast_clamp_uses_max_mod.check },
+    .{ .id = "forced-unwrap-iterator-next", .check = forced_unwrap_iterator_next_mod.check },
+    .{ .id = "impossible-range-and", .check = impossible_range_and_mod.check },
+    .{ .id = "intcast-signed-timestamp", .check = intcast_signed_timestamp_mod.check },
+    .{ .id = "truncate-subtraction-without-guard", .check = truncate_subtraction_without_guard_mod.check },
+    .{ .id = "initcapacity-plain-add-overflow", .check = initcapacity_plain_add_overflow_mod.check },
+    .{ .id = "index-minus-one-without-zero-guard", .check = index_minus_one_without_zero_guard_mod.check },
+    .{ .id = "else-literal-absorbs-addend", .check = else_literal_absorbs_addend_mod.check },
+    .{ .id = "catch-error-panic", .check = catch_error_panic_mod.check },
+    .{ .id = "toutf8-inline-slice-borrow", .check = toutf8_inline_slice_borrow_mod.check },
+    .{ .id = "uv-return-value-intcast-truncation", .check = uv_return_value_intcast_truncation_mod.check },
+    .{ .id = "tryget-orelse-unreachable", .check = tryget_orelse_unreachable_mod.check },
+    .{ .id = "aligncast-on-byte-slice", .check = aligncast_on_byte_slice_mod.check },
+    .{ .id = "truncate-len-to-narrow-int", .check = truncate_len_to_narrow_int_mod.check },
+    .{ .id = "field-self-assign-with-cast", .check = field_self_assign_with_cast_mod.check },
+    .{ .id = "maybe-assert-panics", .check = maybe_assert_panics_mod.check },
+    .{ .id = "return-arraylist-items", .check = return_arraylist_items_mod.check },
+    .{ .id = "lessthan-uses-leq", .check = lessthan_uses_leq_mod.check },
+    .{ .id = "duplicate-defer-free", .check = duplicate_defer_free_mod.check },
+    .{ .id = "hashmap-getentry-forced-unwrap", .check = hashmap_getentry_forced_unwrap_mod.check },
+    .{ .id = "aligncast-on-optional-unwrap", .check = aligncast_on_optional_unwrap_mod.check },
+    .{ .id = "adjacent-decl-same-source-field", .check = adjacent_decl_same_source_field_mod.check },
+    .{ .id = "intcast-of-negated-signed", .check = intcast_of_negated_signed_mod.check },
+    .{ .id = "struct-literal-multiple-try", .check = struct_literal_multiple_try_mod.check },
+    .{ .id = "writeint-truncated-value", .check = writeint_truncated_value_mod.check },
+    .{ .id = "multiarray-items-deref-assign", .check = multiarray_items_deref_assign_mod.check },
+    .{ .id = "startswith-strip-off-by-one", .check = startswith_strip_off_by_one_mod.check },
+    .{ .id = "midpoint-addition-overflow", .check = midpoint_addition_overflow_mod.check },
+    .{ .id = "arena-allocator-free-noop", .check = arena_allocator_free_noop_mod.check },
+    .{ .id = "memcpy-overlapping-slices", .check = memcpy_overlapping_slices_mod.check },
+    .{ .id = "cmpxchgweak-orelse-break", .check = cmpxchgweak_orelse_break_mod.check },
+    .{ .id = "slice-write-at-len", .check = slice_write_at_len_mod.check },
+    .{ .id = "clamp-wrong-direction", .check = clamp_wrong_direction_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
 /// is amortized per-file shared state — rules borrow FileModel,
 /// LocalBindings, FnSummary from it instead of building their own.
+///
+/// A rule that exhausts an analysis budget contributes no Problems and
+/// is appended to `incomplete`; the remaining rules still run. Any other
+/// error stops the dispatch and propagates.
 pub fn runEscape(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *FileCache,
     config: *const Config,
     problems: *std.ArrayListUnmanaged(Problem),
+    incomplete: *std.ArrayListUnmanaged(problem_mod.Incomplete),
 ) !void {
-    for (escape_detectors) |rule| {
-        try rule.check(gpa, tree, cache, config, problems);
+    return runDetectors(gpa, &escape_detectors, tree, cache, config, problems, incomplete);
+}
+
+fn runDetectors(
+    gpa: std.mem.Allocator,
+    detectors: []const Detector,
+    tree: *const Ast,
+    cache: *FileCache,
+    config: *const Config,
+    problems: *std.ArrayListUnmanaged(Problem),
+    incomplete: *std.ArrayListUnmanaged(problem_mod.Incomplete),
+) !void {
+    for (detectors) |rule| {
+        const before = problems.items.len;
+        budget_mod.clear();
+        rule.check(gpa, tree, cache, config, problems) catch |err| {
+            if (err != error.AnalysisBudgetExceeded) return err;
+            problem_mod.truncateProblems(gpa, problems, before);
+            try problem_mod.appendIncomplete(gpa, incomplete, .rule, rule.id, budget_mod.take());
+        };
     }
 }
 
@@ -925,7 +942,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = lessthan_uses_leq_mod;
     _ = duplicate_defer_free_mod;
     _ = hashmap_getentry_forced_unwrap_mod;
-    _ = double_optional_ptr_mod;
     _ = aligncast_on_optional_unwrap_mod;
     _ = adjacent_decl_same_source_field_mod;
     _ = intcast_of_negated_signed_mod;
@@ -939,4 +955,87 @@ test "registry: pull in every rule module so inline tests run" {
     _ = cmpxchgweak_orelse_break_mod;
     _ = slice_write_at_len_mod;
     _ = clamp_wrong_direction_mod;
+}
+
+const budget_test_support = struct {
+    fn problem(gpa: std.mem.Allocator, rule_id: []const u8) !Problem {
+        const pos: problem_mod.Pos = .{ .line = 1, .column = 1, .byte = 0 };
+        return .{
+            .rule_id = rule_id,
+            .severity = .@"error",
+            .start = pos,
+            .end = pos,
+            .message = try gpa.dupe(u8, "finding"),
+        };
+    }
+
+    fn emits(gpa: std.mem.Allocator, _: *const Ast, _: *FileCache, _: *const Config, out: *std.ArrayListUnmanaged(Problem)) anyerror!void {
+        try out.append(gpa, try problem(gpa, "emits"));
+    }
+
+    fn givesUpAfterEmitting(gpa: std.mem.Allocator, _: *const Ast, _: *FileCache, _: *const Config, out: *std.ArrayListUnmanaged(Problem)) anyerror!void {
+        try out.append(gpa, try problem(gpa, "partial"));
+        return budget_mod.fail(.{ .limit = .block_visits, .limit_value = 7, .reached = 7 });
+    }
+
+    fn failsHard(_: std.mem.Allocator, _: *const Ast, _: *FileCache, _: *const Config, _: *std.ArrayListUnmanaged(Problem)) anyerror!void {
+        return error.InvalidSyntax;
+    }
+};
+
+test "dispatch: a rule that exhausts its budget is dropped whole and the rest still run" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "const x = 1;", .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    const detectors = [_]Detector{
+        .{ .id = "first", .check = budget_test_support.emits },
+        .{ .id = "gives-up", .check = budget_test_support.givesUpAfterEmitting },
+        .{ .id = "last", .check = budget_test_support.emits },
+    };
+
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer {
+        for (problems.items) |*p| p.deinit(gpa);
+        problems.deinit(gpa);
+    }
+    var incomplete: std.ArrayListUnmanaged(problem_mod.Incomplete) = .empty;
+    defer {
+        for (incomplete.items) |*part| part.deinit(gpa);
+        incomplete.deinit(gpa);
+    }
+    try runDetectors(gpa, &detectors, &tree, &cache, &config_mod.Default, &problems, &incomplete);
+
+    // The aborted rule's finding is gone; its neighbours' findings remain.
+    try std.testing.expectEqual(@as(usize, 2), problems.items.len);
+    for (problems.items) |p| try std.testing.expectEqualStrings("emits", p.rule_id);
+    try std.testing.expectEqual(@as(usize, 1), incomplete.items.len);
+    try std.testing.expectEqual(problem_mod.Incomplete.Kind.rule, incomplete.items[0].kind);
+    try std.testing.expectEqualStrings("gives-up", incomplete.items[0].name);
+    const diagnostic = incomplete.items[0].budget orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.block_visits, diagnostic.limit);
+    try std.testing.expectEqual(@as(u32, 7), diagnostic.limit_value);
+}
+
+test "dispatch: errors other than budget exhaustion still stop the run" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "const x = 1;", .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    const detectors = [_]Detector{
+        .{ .id = "hard", .check = budget_test_support.failsHard },
+        .{ .id = "never", .check = budget_test_support.emits },
+    };
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer problems.deinit(gpa);
+    var incomplete: std.ArrayListUnmanaged(problem_mod.Incomplete) = .empty;
+    defer incomplete.deinit(gpa);
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        runDetectors(gpa, &detectors, &tree, &cache, &config_mod.Default, &problems, &incomplete),
+    );
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+    try std.testing.expectEqual(@as(usize, 0), incomplete.items.len);
 }

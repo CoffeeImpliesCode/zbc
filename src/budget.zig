@@ -58,6 +58,12 @@ pub const Limit = enum {
     /// spend proving a returned `.items` slice is arena-backed —
     /// declarations indexed, lookups answered and nodes walked.
     arena_proof_steps,
+    /// `return_arraylist_items` arena proof: how many allocator-expression
+    /// and caller levels one proof may descend.  A chain longer than the
+    /// bound is not an answer either way, so the proof gives up through
+    /// this limit rather than reporting or granting a site it never
+    /// finished reading.
+    arena_proof_depth,
     /// `index_minus_one_without_zero_guard`: how far the rule peels the
     /// transparent wrappers — casts, groupings, `@as` — between a
     /// subscript and the subtraction it must see.  Each wrapper peeled is
@@ -74,6 +80,24 @@ pub const Limit = enum {
     storage_alias_work,
     /// Shared semantic work spent projecting an actual call's returned storage.
     return_storage_work,
+    /// Structural and callee nesting in one normal-cleanup proof.
+    normal_cleanup_depth,
+    /// Actual body nodes visited by one normal-cleanup proof query.
+    normal_cleanup_nodes,
+    /// Frame depth of one returned-storage walk (`ExpressionWalk`, effect
+    /// scans and their helpers).
+    return_storage_depth,
+    /// Shared work spent by a fresh-storage proof when it ran the meter of
+    /// the query that called it down to zero.
+    fresh_storage_work,
+    /// AST walker stack depth inside one fresh-storage return scan.
+    fresh_storage_depth,
+    /// `FileCache.resolveTransitiveTakes`: passes one fixpoint phase may run
+    /// before the summaries it propagates are declared not to have settled.
+    transitive_fixpoint_rounds,
+    /// `FileCache.isRuntimeUse`: brace nesting depth read to decide whether a
+    /// token sits inside a `comptime` block.
+    comptime_scope_depth,
 
     /// Human-readable name of the cap, for the CLI diagnostic.
     pub fn label(limit: Limit) []const u8 {
@@ -93,12 +117,20 @@ pub const Limit = enum {
             .grow_fold_work => "grow fold work",
             .grow_fold_depth => "grow fold depth",
             .arena_proof_steps => "arena proof steps",
+            .arena_proof_depth => "arena proof depth",
             .index_minus_one_peel_depth => "index-minus-one peel depth",
             .numeric_oracle_callers => "numeric oracle callers",
             .readonly_call_depth => "readonly-call body depth",
             .readonly_call_nodes => "readonly-call body nodes",
             .storage_alias_work => "storage-alias query work",
             .return_storage_work => "returned-storage query work",
+            .normal_cleanup_depth => "normal-cleanup depth",
+            .normal_cleanup_nodes => "normal-cleanup body nodes",
+            .return_storage_depth => "returned-storage walk depth",
+            .fresh_storage_work => "fresh-storage proof work",
+            .fresh_storage_depth => "fresh-storage walk depth",
+            .transitive_fixpoint_rounds => "transitive summary fixpoint rounds",
+            .comptime_scope_depth => "comptime scope depth",
         };
     }
 };
@@ -195,7 +227,8 @@ pub fn lineCol(source: []const u8, byte: u32) struct { line: u32, column: u32 } 
             line_start = index + 1;
         }
     }
-    return .{ .line = line, .column = @intCast(limit - line_start + 1) };
+    // `limit` fits u32, but `+ 1` does not when it is maxInt(u32) on line 1.
+    return .{ .line = line, .column = std.math.cast(u32, limit - line_start + 1) orelse std.math.maxInt(u32) };
 }
 
 // ── Tests ──────────────────────────────────────────────────

@@ -4,6 +4,13 @@ Returning a pointer or slice into a function-local stack variable.
 The storage is reclaimed when the function returns, so the caller
 reads garbage (or, worse, a future frame's contents).
 
+The rule reports only a proved storage dependency. Passing a local address
+to a call does not prove that the call returns it. Opaque call results and
+unresolved field chains stay silent. A copied scalar field, such as an AST
+token index, does not borrow the scratch buffer used to obtain it. Returning
+the complete view can still escape when its slices point into that buffer.
+Explicit integer encodings of local addresses remain tracked.
+
 ## Example
 
 Incorrect:

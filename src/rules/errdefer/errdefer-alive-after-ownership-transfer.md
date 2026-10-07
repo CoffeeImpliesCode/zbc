@@ -2,48 +2,79 @@
 
 **Severity:** error  
 **Category:** errdefer / double-free  
-**Tier:** 1 (token walk)
+**Analysis:** typed callee summary and scoped token walk
 
 ## What this checks
 
-An `errdefer X.deinit()` (or `.deref`/`.free`/`.release`) remains armed
-after a constructor-style call takes ownership of `X`, so a subsequent
-`try` in the same scope triggers the errdefer and double-frees `X`.
+An `errdefer X.deinit()` remains armed after a call takes ownership of `X`.
+A later `try` can propagate an error and invoke cleanup on the consumed resource.
+The rule also recognizes `.deref`, `.free`, `.release`, `.close`, and `.destroy` cleanup.
+
+The rule resolves the actual AST callee through `FileCache.actualCallSummaryAt`.
+It requires an empty-root `normal_success_definite_freed_paths` certificate or a `retained_owned_params` cleanup certificate.
+An immediate certificate proves argument release on every successful normal exit.
+A retained certificate transfers cleanup responsibility while the resource remains live.
+The rule maps every certified formal to its actual argument, including implicit and explicit receivers.
+Constructor spelling, unresolved prototypes, and storage of a borrowed pointer do not establish ownership.
+Conditional frees, error-return cleanup, and `errdefer` frees do not prove transfer after successful return.
+Named-module identity remains part of callee resolution.
+Source and allocation failures propagate instead of supplying a safe verdict.
 
 ## Example (fires)
 
 ```zig
-fn buildS3File(global: *JSGlobal, args: *Args) !JSValue {
-    const path = try PathLike.fromJS(global, args);
-    errdefer path.deinit();                        // ← armed here
+const std = @import("std");
 
-    // constructS3File takes ownership of `path` — it will free `path` on its own path
-    const blob = try constructS3File(global, path);
-    _ = blob;
+const Resource = struct {
+    bytes: ?[]u8 = null,
 
-    try doMoreWork();     // ← BUG: if this throws, errdefer fires
-                          //   path.deinit() called on already-owned path → double-free
-    return .undefined;
+    fn deinit(self: *Resource) void {
+        if (self.bytes) |bytes| std.heap.page_allocator.free(bytes);
+    }
+};
+
+fn discard(gpa: std.mem.Allocator, resource: *Resource) void {
+    resource.deinit();
+    gpa.destroy(resource);
+}
+
+fn later() !void {
+    return error.Later;
+}
+
+fn open(gpa: std.mem.Allocator, resource: *Resource) !void {
+    errdefer resource.deinit();
+    discard(gpa, resource); // The body proves that formal 1 is consumed.
+    try later(); // The armed errdefer accesses the destroyed resource.
 }
 ```
 
 ## Fix
 
-After the ownership-taking call, reset `X` to an inert sentinel to disarm
-the errdefer:
+Limit the cleanup to the period when the caller owns the resource.
+For this example, a successful block exit expires the errdefer before the later fallible operation.
 
 ```zig
-const blob = try constructS3File(global, path);
-path = .{};   // ← disarms the errdefer — path is now "empty"
-try doMoreWork();  // safe: errdefer fires on empty path, which is a no-op
+fn open(gpa: std.mem.Allocator, resource: *Resource) !void {
+    {
+        errdefer resource.deinit();
+        discard(gpa, resource);
+    }
+    try later();
+}
 ```
 
-## Real-world instances
+Where appropriate, assign an inert replacement immediately after transfer.
+Its cleanup must be valid and must not release the transferred resource.
+Do not remove cleanup for a constructor that only borrows the resource.
 
-This pattern appeared in 8 bun PRs:
+## Scope and proof
 
-- oven-sh/bun#28495, #28592, #29081, #29643, #29656, #30169, #30437, #30465
+Fallible call arguments run before ownership transfers.
+The rule checks later `try` expressions only while the registering block remains active.
+An assignment to the cleanup local ends its tracked ownership state.
+Nested function bodies do not execute at their declaration.
 
-All fixed `PathLike`, `S3File`, `Blob`, and CSS-parser constructors that
-took ownership of a `PathLike` or `JSValue.Strong` handle without the
-caller disarming the `errdefer` that was still registered.
+Retained storage needs a proven owning cleanup contract, not merely a field assignment.
+For example, `TypeResolver.init` stores a borrowed context pointer and does not release that context in `deinit`.
+The caller must retain its context errdefer for initialization failures.

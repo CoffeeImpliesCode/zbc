@@ -203,8 +203,8 @@ fn scanForUnguardedRead(
         try problems.append(gpa, .{
             .rule_id = "getorput-unguarded-value-read",
             .severity = .@"error",
-            .start = Pos.fromTokenStart(tree, t),
-            .end = Pos.fromTokenEnd(tree, t + 3),
+            .start = try Pos.fromTokenStart(tree, t),
+            .end = try Pos.fromTokenEnd(tree, t + 3),
             .message = msg,
         });
         // Suppress further reports for this binding in this scope.

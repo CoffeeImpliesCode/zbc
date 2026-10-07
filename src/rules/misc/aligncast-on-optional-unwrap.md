@@ -9,6 +9,27 @@ The rule fires on the 6-token pattern `@alignCast ( identifier . ? )` — any `@
 It does not fire when:
 - The pointer is non-optional: `@alignCast(ctx)` — no `.?` involved
 - The optional is guarded before casting: `@alignCast(ctx orelse return)` — the guard is not inside the `@alignCast` argument
+- A same-block `if (pointer == null) return ...` dominates the cast, the
+  parameter's ordinary typed pointee matches the destination, and nothing
+  reassigns or escapes the pointer. A null check does not establish stronger
+  alignment for an opaque or explicitly underaligned pointer.
+
+A callback signature alone is not a proof that its argument is non-null or
+aligned. Callback recovery is quiet only when closed function-pointer uses
+and their paired context establish a non-null address aligned for the cast
+target. Guards in possible callers alone do not establish this contract;
+unresolved indirect-call provenance remains a finding.
+
+The closed-pair proof follows resolved by-value source dispatchers across
+files and immutable callback aggregates returned by private source factories.
+Each use of the returned aggregate must preserve the callback/context pair.
+Ordinary non-optional typed pointers, including allocated pointers and method
+receivers, establish the same pointee alignment. A non-optional slice's `.ptr`
+also establishes byte alignment, or its ordinary element alignment when the
+destination has the same element type. `@ptrCast` and `@constCast` do not add
+alignment. Explicitly underaligned or `allowzero` pointers, unknown calls,
+escaping returned aggregates, and unproved persistent registrations remain
+findings.
 
 ## Why it matters
 

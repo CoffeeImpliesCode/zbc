@@ -12,22 +12,22 @@ const SemanticVersion = struct {
     pre: ?[]const u8 = null,
     build: ?[]const u8 = null,
 
-    pub fn parse(_: []const u8) SemanticVersion {
-        return .{};
+    pub fn parse(input: []const u8) SemanticVersion {
+        return .{ .pre = input };
     }
 };
 
 // Bug — fires on the `return ver`.
 pub fn detectBuggy() SemanticVersion {
-    var buf: [64]u8 = undefined;
+    var buf: [64]u8 = [_]u8{0} ** 64;
     const ver = SemanticVersion.parse(&buf);
     return ver;
 }
 
-// Control — strip aliased fields before return.  Should NOT fire
-// (the return mentions `stripped`, not `ver`).
+// Control — overwrite every borrowing field before return. Should NOT fire:
+// both pre and build are null, so no stack-backed slice remains in stripped.
 pub fn detectFixed() SemanticVersion {
-    var buf: [64]u8 = undefined;
+    var buf: [64]u8 = [_]u8{0} ** 64;
     const ver = SemanticVersion.parse(&buf);
     var stripped = ver;
     stripped.pre = null;

@@ -1,109 +1,242 @@
 # zbc architecture
 
-zbc is a static analyzer for Zig.  Its 113 rules fall into two
-families distinguished by the analysis they require:
+zbc is a static analyzer for Zig, pinned to Zig 0.16.0.
+<!-- VERIFY: Update supported-invariant and documented-rule counts from the final CLI lists. -->
+It uses two analysis families:
 
-1. **Flow analysis** — full per-fn control-flow graph and abstract
-   interpretation.  Tracks values across branches, loops, defers,
-   captures, and out-params.  Used for must-not-escape /
-   must-not-double-free / must-not-use-after-free guarantees.
-2. **Pattern detectors** — per-fn (or per-file) token / AST walks
-   over canonical bug shapes mined from open-source Zig PRs.
-   Cheaper than flow analysis; targets recurring "look for this
-   exact shape" classes.
+1. **Flow analysis** uses a per-function control-flow graph and abstract interpretation.
+   It tracks values across branches, loops, defers, captures, and output parameters.
+   It reports proved lifetime, ownership, and initialization problems.
+2. **Pattern detectors** use per-function or per-file token and AST walks.
+   They check recurring bug shapes without the full flow pipeline.
 
 Both families produce `Problem` values for the same reporter.
 
-Those 113 rule ids are declared in three places, and the three
-agree:
+## Reporting contract
 
-- `src/rule_catalog.zig:32` — `all`, the documented catalog behind
-  `--list-rules` / `--explain`.  100 entries.
-- `src/rule_catalog.zig:674` — `escape_detectors`, the dispatch
-  table for pattern detectors.  103 entries.  Invariants emitted by
-  the CFG / worklist pipeline are NOT in it.
-- `src/config.zig:832` — `all_invariants: [113]Invariant`, the 113
-  toggles `Config.enabled` filters on.
+Rules report proved problems, except for advisory numeric warnings.
+`stack-escape` requires a proved loan from function-local storage.
+Unresolved field chains and opaque call results stay silent. Direct proved loans still report.
+Silence is not a safety certificate.
 
-The first two overlap on 90 ids (100 + 103 - 90 = 113).  Ten flow
-invariants appear only in `all`; the other 13 pattern rules are
-dispatched but have no `Rule` entry, so `--explain` does not reach
-them.
+`use-undefined` reports reads of proved-undefined bytes, not missing initialization certificates.
+Whole-value return, copy, assignment, by-value arguments, and `@memcpy` silently transport partially undefined values.
+Zig allows copying undefined bytes. Transport preserves holes in the destination, including into the caller.
+A later selected read of a proved-undefined part reports at that read.
+Selected reads include indexing, field access, arithmetic, comparisons, branches, and passing a selected element by value.
+Transporting an entirely proved-undefined value reports, except for the intentional literal `return undefined;`.
+Unknown values alone remain silent and supply no positive initialization certificate.
+Copies from container-level constants carry unknown holes, not undefined holes.
+A direct selected read on the constant still reports proved-undefined bytes.
+Strict initialization certificates are unchanged.
 
-This document focuses on the pattern-detector infrastructure
-(`lexer.zig` / `scope.zig` / `receiver.zig` / `model.zig` /
-`local.zig` / `testing.zig` / `trace.zig`) — the shared modules
-every pattern rule builds on.  See `cfg.zig` / `analyzer.zig` /
-`abstract_state.zig` / `transfer.zig` for the flow-analysis side.
+`index-type-narrowing-wraparound`, `intfromfloat-without-clamp`, and `f32-narrowing-int-to-float` retain advisory warnings.
+They warn when the required integer range, finite conversion range, or exact float representation is not proved.
+These warnings do not prove that every reachable input fails.
+
+The authoritative lists have different purposes:
+
+- `src/config.zig::all_invariants` lists the supported invariants.
+  `--list-invariants` prints their CLI names.
+- `src/rule_catalog.zig::all` contains the documented rules.
+  `--list-rules` prints this catalog. `--explain <rule-id>` prints one entry.
+- `src/rule_catalog.zig::escape_detectors` dispatches pattern detectors.
+  The CFG and worklist pipeline emits flow diagnostics separately.
+
+Catalog size is not the detector count. Do not derive the pattern count
+by subtracting flow rules from the invariant list.
+The categorical `double-optional-ptr` detector and its catalog entry are retired.
+
+This document describes the shared AST, cache, and model infrastructure.
+The flow-analysis modules are in `src/flow/`.
 
 ## File layout
 
 ```
-zbc/
-├── lib.zig                   — orchestrator; re-exports public API
+src/
+├── lib.zig                   — public Session and analysis API
 ├── main.zig                  — CLI
 ├── problem.zig               — Problem / Note / Pos / Severity
-├── config.zig                — Config + Invariant enum
-├── rule_catalog.zig          — catalog metadata (`all`) + detector dispatch (`escape_detectors`)
-├── cache/file_cache.zig      — per-file shared state (see "Per-file shared state" below)
-│
-├── lexer.zig                 — token primitives (matchBrace, FnDeclIter, …)
-├── scope.zig                 — scope-aware iterators (findIdentUseInEnclosingScope)
-├── receiver.zig              — name classifiers (isAllocatorishName, …)
-├── model.zig                 — FileModel: per-file TypeTable + FnTable
-├── model_query.zig           — AST-level DSL: find types/fields/methods
-├── local.zig                 — LocalBindings: per-fn binding-origin tracker
-├── query.zig                 — token-level pattern DSL (Atom / Match / findAll)
-├── testing.zig               — expectFires / expectNoFire / expectCount
-├── trace.zig                 — --trace=<rule-id> decision log (opt-in)
-│
-├── cfg.zig                   — flow-analysis CFG builder
-├── analyzer.zig              — flow-analysis dispatch
-├── abstract_state.zig        — flow-analysis abstract domain
-├── transfer.zig              — flow-analysis transfer functions
-│
+├── config.zig                — Config and supported invariants
+├── rule_catalog.zig          — documented catalog and pattern dispatch
+├── ast/
+│   ├── tokens.zig            — token primitives
+│   ├── scope_iter.zig        — scope-aware iterators
+│   └── token_query.zig       — token-level pattern queries
+├── model/
+│   ├── method_names.zig      — name classifiers
+│   ├── file_model.zig        — per-file types and functions
+│   ├── model_query.zig       — AST-level model queries
+│   ├── local_bindings.zig    — per-function binding origins
+│   └── fn_summary.zig        — function effects and origins
+├── cache/
+│   ├── file_cache.zig        — per-analysis shared state
+│   └── project_cache.zig     — session-scoped imported models
+├── type_engine/
+│   ├── document_store.zig    — original source and AST documents
+│   └── source_policy.zig     — source admission and canonical identity
+├── flow/
+│   ├── cfg.zig               — control-flow representation
+│   ├── cfg_builder.zig       — AST lowering
+│   ├── worklist.zig          — flow-analysis driver
+│   ├── abstract_state.zig    — abstract domain
+│   └── cfg_transfer.zig      — transfer functions
+├── testing.zig               — rule-test helpers
+├── trace.zig                 — optional decision logs
 └── rules/
-    ├── <rule_name>.zig       — pattern-detector implementation
-    └── <rule-name>.md        — per-rule documentation
+    └── <family>/
+        ├── <rule_name>.zig   — detector implementation
+        └── <rule-name>.md    — rule documentation
 ```
 
-Files at root are imported directly by rules:
+Rules import internal modules directly. A rule in `src/rules/<family>/` uses:
 
 ```zig
-const lexer      = @import("../lexer.zig");
-const scope      = @import("../scope.zig");
-const fmodel     = @import("../model.zig");
-const local      = @import("../local.zig");
-const query      = @import("../query.zig");     // token patterns
-const mq         = @import("../model_query.zig"); // AST-level queries
-const testing    = @import("../testing.zig");
-const trace      = @import("../trace.zig");      // optional
-const file_cache_mod = @import("../cache/file_cache.zig");
+const lexer = @import("../../ast/tokens.zig");
+const scope = @import("../../ast/scope_iter.zig");
+const fmodel = @import("../../model/file_model.zig");
+const local = @import("../../model/local_bindings.zig");
+const query = @import("../../ast/token_query.zig");
+const mq = @import("../../model/model_query.zig");
+const testing = @import("../../testing.zig");
+const trace = @import("../../trace.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 ```
 
-No umbrella module.  Each module is a clean dependency.
+External library consumers use the published `zbc` module, not these internal paths.
+
+## Session, source identity, and imports
+
+`src/lib.zig` publishes `Session`, `SourcePolicy`, `analyzeEscape`, `Analysis`, and `freeAnalysis`.
+`build.zig` registers the `zbc` module and supplies its `type_engine` import.
+Consumers add `zbc_dep.module("zbc")` to their module graph and use `@import("zbc")`.
+The README gives the caller-owned initialization and cleanup sequence.
+
+Initialize a `Session` in place with an allocator, `std.Io`, and `SourcePolicy`.
+Do not move or copy it after initialization. Each CLI worker owns a separate session.
+The allocator and I/O backend must outlive the session.
+`initWithToolchain` also borrows its caller-owned `Toolchain` until session teardown.
+Policy roots, exclusions, and their strings remain borrowed and unchanged during that lifetime.
+Roots must be canonical absolute paths. Empty roots deny all source access.
+Exclusions override roots, including roots nested within an excluded subtree.
+
+The session owns a `TypeContext` and `ProjectCache` for one source snapshot.
+Its document store retains original source bytes and their `std.zig.Ast` trees.
+Project models borrow those trees. Flow and pattern analysis use the same original tree.
+The parser does not rewrite source to approximate another Zig version.
+Diagnostics therefore retain original token locations and byte offsets.
+
+Source identity comes from OS-backed canonical paths.
+Relative spellings, `..`, and symlinks resolve through the filesystem, not lexical path folding.
+The policy checks source admission before reads and checks canonical targets again.
+An excluded import cannot authorize a wider scan.
+
+Relative imports resolve from the importing document's directory.
+Named imports resolve from statically parsed `build.zig` module declarations and import chains.
+The analyzer reads build scripts. It does not execute them.
+Discovered environments must agree on a named module's declared root.
+Conflicting or missing mappings stay unresolved, and source policy still gates a resolved root.
+Lookup follows import edges, not a process-global search for matching type names.
+Type and method identity includes the canonical source declaration, not only a leaf name.
+
+Contextual actual generic bindings can follow references to ancestor declarations.
+They do not change the lexical container that `@This()` names.
+If the actual and lexical containers have the same canonical owner, resolution retains the actual instantiation.
+Otherwise, resolution instantiates the lexical container with the applicable actual generic bindings.
+A nested container therefore cannot replace an ancestor's self-type alias with its own type.
+
+Completed type-value memoization retains positive results only.
+A null entry reserves an active recursive query, not a completed unknown result.
+Unresolved results and errors remove that reservation as the query unwinds.
+An enclosing explicit type can then establish a positive result for later queries.
+
+Strict source admission still applies, and errors still propagate.
+The memo does not retain unresolved results or errors.
+This contract needs no generations, cache resets, or detector-specific retries.
+
+Generic substitution is a pure function of its operands, so each resolver settles it once.
+`resolveGenericType` answers a question that binds none of the parameters its type names as that type, without allocating.
+Every other question is remembered under the whole type and every binding, and a distinct binding or pointer constness is a distinct question.
+A call site's instantiation of a callee's container and declared return value is remembered the same way.
+The state-dependent re-read of a value-dependent return type is not remembered; it runs on every call.
+These memos and the resolved-node memo live as long as their resolver: one per analysed file, plus one per borrowed source document until the file's analysis ends.
+
+Use a new session after source changes. The current session does not provide incremental invalidation.
+`analyzeEscape` borrows its path and configuration only during the call.
+It returns an `Analysis` with `problems` and `incomplete`.
+Both own their text and strings, so they can outlive the session.
+Release them with `freeAnalysis` and the session's allocator.
+Internal AST, model, and summary pointers do not have that detached-result lifetime.
+
+Invalid syntax in an input or import returns `error.InvalidSyntax`.
+`session.parse_failure` holds the original parser reason and location until the next analysis or teardown.
+Imported failures identify the imported document. The input file uses the caller's input path.
+An empty diagnostic result is not a successful parse-error outcome.
+
+## CLI selection and reporting
+
+The CLI applies source policy during input expansion and semantic source loading.
+It prunes excluded children before directory traversal.
+An explicitly requested excluded path fails selection. A pruned child is not selected.
+The README lists default exclusions and the exact `--jobs=<n>` and `--exclude=<path-or-name>` forms.
+
+JSON stdout contains a bare diagnostic array. SARIF stdout contains a SARIF 2.1.0 document.
+Coverage and operational errors use stderr, not the report stream.
+Successful files retain their findings when another selected file fails.
+SARIF marks an incomplete run, including one with a partial file, with `invocations[0].executionSuccessful: false`.
+
+Coverage reports `selected = analyzed + partial + failed` and counts unsuppressed findings separately.
+Failed selection operands count as selected failures. Parse and analysis failures do not count as analyzed.
+A file with a non-empty `Analysis.incomplete` counts as `partial`, never as analyzed or failed.
+The CLI prints its findings in every format and one `zbc: incomplete` stderr line for each part that gave up.
+Unresolved import lookups have a separate counter.
+That counter is not proof that external types resolved completely.
+
+Exit 0 means complete analysis without findings. Exit 1 means complete analysis with findings.
+Exit 2 means an operational failure or incomplete analysis and takes precedence over findings.
+Malformed imported source reports its own location and makes the selected importer's analysis incomplete.
 
 ## Per-file shared state + dispatch
 
-`lib.zig::analyzeEscape` builds ONE `FileCache` for the file
-(`src/lib.zig:75`) and owns it until the analysis returns.  Both
-halves of the analyzer read that one cache: the flow loop lowers
-each fn against it (`src/lib.zig:98`), and then a single
-`rule_catalog_mod.runEscape(gpa, &tree, &rule_cache, config,
-&problems)` call (`src/lib.zig:107`) walks `escape_detectors`
-(`src/rule_catalog.zig:674`) and dispatches every pattern rule.
+`analyzeEscape(&session, path, config)` creates one `FileCache` for the call.
+It destroys that cache before returning. The flow pipeline and pattern dispatch share it.
+The session retains source documents and imported models across calls within the same snapshot.
+No process-static project cache participates in this path.
 
-Ownership: the cache is created and `deinit`'d inside
-`analyzeEscape`, one per call, and never crosses a thread — the
-worker pool in `main.zig` runs one file per `workerLoop` pass,
-each with its own.  The one cross-file structure is the
-`ProjectCache` (`src/lib.zig:178`), which is process-static, so a
-sibling file reached through a relative `@import("./X.zig")` is
-parsed once per process instead of once per referencing file.
+### Analysis budgets
 
-Everything expensive a consumer needs is memoised in that cache
-and built on first use, so rules that need the same answer share
-one build instead of each repeating it:
+Call-effect and returned-storage queries use fixed per-query limits: 50,000 work units and nesting depth 64.
+Normal and error cleanup queries use the same work and depth limits.
+Nested queries spend the enclosing query's counter. They do not receive a fresh allowance.
+The depth limit measures active nesting, not the number of functions or statements.
+The numeric oracle also limits each query to 50,000 steps.
+Other bounded walks and fixpoint phases record budget failures through `src/budget.zig`.
+
+Work-budget exhaustion raises `error.AnalysisBudgetExceeded`.
+Some internal proof-query depth cutoffs instead leave the proof unproved.
+These cutoffs block completed-proof memoization and do not make the unit incomplete.
+Neither work-budget exhaustion nor a depth cutoff produces a finding or a positive safety proof.
+Depth limits in other walks can raise `error.AnalysisBudgetExceeded` and make the unit incomplete.
+
+The call runs three stages: the file-level summary pass, the per-function flow check, and the pattern rules.
+A stage unit is one function (or one function's summary) or one pattern rule.
+When a unit raises `error.AnalysisBudgetExceeded`, the analyzer discards that unit's findings and continues with the next unit.
+It adds the unit to `Analysis.incomplete`, with a budget diagnostic when the walk recorded one.
+A summary failure and a flow failure for the same function produce only one incomplete entry.
+The summary pass withdraws a failed summary. Later `summaryOfFn` lookups raise its recorded failure.
+A function that reads a failed summary also becomes incomplete.
+An unsettled fixpoint fails the pass instead of publishing partial summaries.
+A recorded budget failure never becomes a proof, a finding, or a completed unknown answer.
+Only `error.AnalysisBudgetExceeded` becomes an incomplete unit.
+Out-of-memory, cancellation, source-policy, syntax, and import errors still fail the whole call.
+
+The CLI prints `zbc: incomplete` lines and exits 2 when any unit is incomplete.
+Completed units retain their findings. Exit 2 takes precedence over those findings.
+
+### Cache and scratch ownership
+
+Each cache builds expensive derived state on first use.
+Consumers share these cached results:
 
 - `cache.fileModel()` — the FileModel, once per file.
 - `cache.localBindings(proto, body)` — LocalBindings, once per fn
@@ -112,9 +245,111 @@ one build instead of each repeating it:
 - `cache.getLineOffsets()` — the line-start table, once per file.
 - `cache.fileConstInitializer(name)` — the file-level `const`
   table, built once behind the accessor.
-- the cross-file method-lookup memo, keyed by type and method name.
+- the cross-file method-lookup memo, keyed by canonical declaration identity and method name.
 
-Every rule's `check` signature is the same:
+Imported function summaries contain slices into model and summary storage.
+The receiving cache deep-copies foreign summary slices and paths into its own summary arena.
+The temporary foreign cache can then end without invalidating the receiving summary.
+All internal summary borrows end with their owning cache.
+
+The root `FileCache.effects_state` owns the `State` memos in `src/cache/call_summary.zig`.
+Demand queries from imported documents reach this same state through `grow_state`.
+The state owns completed witness sets, short-circuit verdicts, interned paths, and structural type proofs.
+Memo keys include the canonical declaration, full actual context, formal parameter, and selected path.
+Call-site alias and disjointness proofs stay query-local.
+Cycle-dependent answers stay within their query or ownership-fold scope, not the completed-answer memo.
+Recorded exhausted root demands only reproduce budget failures. They are not effect answers.
+Persistent memo storage ends with `State.deinit`, normally during root-cache teardown.
+The state's separate scratch arena ends after each outermost query.
+
+The root `FileCache.return_storage_state` owns completed symbolic returns and their path bytes.
+Its keys borrow canonical resolver identities. Cache teardown precedes resolver teardown.
+`ExpressionLoanOptions.scratch` and the internal returned-storage `Query.scratch` borrow a `*std.heap.ArenaAllocator`.
+The caller owns this arena. Query snapshots and expression-loan slices remain valid only while the arena remains alive.
+Expression-loan requests retain explicit load horizons and do not cache result snapshots.
+`returnedStorageAt` creates a temporary scratch arena and copies returned path storage into the root state before teardown.
+
+Ordinary calls and `@call` share `Analyser.resolveCallReturnType` in `src/type_engine/analysis.zig`.
+`CallOperands` maps the bounded untyped literal tuple syntax to explicit `@call` arguments without an implicit receiver.
+An unknown or opaque argument tuple leaves the return type unresolved.
+Generic bindings use the actual caller's `ResolveOptions`. Resolver errors propagate instead of becoming a successful unknown result.
+
+Returned-storage memo keys include canonical declaration identity and actual type context.
+Only complete, caller-independent symbolic returns enter that memo.
+Private-cell effect proofs keep constructor and call bindings query-local.
+
+`FileCache.callEffectAt` uses `EffectSelection.whole` from `src/cache/call_summary.zig` for whole-call mutation queries.
+It resolves the canonical callee or authenticates a supplied callee against the call and caller context.
+Only `.read_only` proves no mutation. It proves neither returned-storage safety, loan independence, nor initialization.
+Whole-only negative early exits return `.unknown` and publish no partial witness set or completed source-event plan.
+Positive proofs still require complete effect coverage. Precise effect queries retain their full folds.
+
+A scalar byte element type alone does not prove destination/header disjointness.
+`@memcpy` and `@memset` require an authenticated typed destination region or actual canonical allocation/provider provenance.
+Incompatible pointer-header reinterpretations and union-member overlap keep effect proofs incomplete and retain positive loans.
+Distinct typed struct sibling fields remain disjoint, including byte fields.
+Callback field sources require authentication. An old mutable initializer does not establish the current callback source.
+
+The semantic witness memo remains keyed by canonical declaration, full actual context, formal parameter, and selected path.
+A separate completed source-event plan uses canonical declaration and full actual context.
+Only this syntax plan omits formal and path coordinates. It does not cache effect answers.
+The first scan completes branch pruning and reaches EOF before publication.
+Publication also requires successful witness freezing. Incomplete scans and errors publish no plan.
+Replay processes every ordered call, write, and opaque event with fresh question-local frame state.
+Origin, disjointness, and alias proofs remain live for each question.
+
+Source call-effect proofs follow capture origins through the actual condition, iterable, or switch scrutinee, not the control-flow body.
+Loop-backedge rebinding prevents the initial capture origin from discharging effects on formal-rooted storage.
+This includes rebinding after a capture use and arguments inside call-wrapped conditions.
+Undecodable opaque events retain an unknown witness.
+
+`src/cache/return_storage.zig` traverses native array and literal tuple element payloads from their syntax.
+This traversal does not establish a complete certificate for arbitrary typed tuple payloads.
+An ambiguous struct initializer requires a canonical array shape and an exact element count before it proves complete array payload coverage.
+
+When an aggregate can carry addresses, omitted defaults require address-free field proofs in the aggregate's declaring frame.
+Supplied fields alone cannot establish that proof.
+Expression-cycle reservations belong to one body frame and retire as each expression returns.
+A live cycle keeps the origin unknown.
+
+An immutable body shares a completed write index qualified by binding declaration, not only name.
+This index shares syntax only. Token horizons, declaration filtering, and unresolved-write policy remain query-specific.
+Incomplete construction and errors publish no write index.
+The root `FileCache` and its per-document caches own the event, formal-use, and write-index buffers.
+These buffers borrow the immutable source snapshot and the original resolver's identity arena.
+Cache teardown frees the buffers before resolver teardown.
+
+Unknown absorbs other expression origins, so traversal stops when further origins cannot change the answer.
+Syntax sharing adds no negative cache and does not change analysis budgets.
+
+Normal and error cleanup proofs share the enclosing work budget across nested callee queries.
+An authenticated `noreturn` call ends both exit paths. Its implementation cannot
+contribute a returned-storage cleanup certificate, so the proof does not descend
+into that implementation. Unknown effects remain unknown; budget failures still
+propagate for reachable cleanup paths.
+
+Numeric proofs use checked compile-time arithmetic and the actual tag interval
+of exhaustive enums. Non-exhaustive enums do not supply a closed interval.
+A slice passed by value copies its header: writes through its elements do not
+change the caller's length bound. A possible write through a pointer to that
+header invalidates the bound. Unknown values and unresolved destination types
+remain unproved, rather than being treated as safe conversions.
+
+`IntegerDomain` and `State.scalar_values` in `src/flow/abstract_state.zig` keep type bounds separate from runtime definedness.
+Type width or range cannot initialize an undefined or opaque runtime operand.
+`src/flow/cfg_transfer.zig` requires defined expressions and inputs before it records scalar values.
+Conversions and field payloads require operand definedness, not only a known result type.
+`RuntimeOperandFilter` in `src/flow/cfg_builder.zig` separates type-only queries from runtime payload reads.
+Type-only queries do not consume runtime payload.
+
+Fixed-array selections retain a separate `ModuloIndex` certificate for `input % modulus`.
+The input must be an authenticated unsigned local with a defined runtime value.
+The divisor must be positive and no larger than the source array extent.
+The parser accepts a constant divisor or a fixed array's `.len`, not trailing arithmetic.
+Only complete source payload coverage certifies this selection.
+Selected nested arrays retain both source coverage and selector dependencies. Partial payloads remain unproved.
+
+Pattern rules use this shared-cache signature:
 
 ```zig
 pub fn check(
@@ -130,7 +365,7 @@ Rules that need none of it take `cache` and `_ = cache;` it.
 
 ## Shared infrastructure for pattern detectors
 
-### `lexer.zig` — token primitives
+### `ast/tokens.zig` — token primitives
 
 Allocation-free helpers that work on a `tags: []const Token.Tag`
 slice extracted once via `tree.tokens.items(.tag)`.
@@ -169,13 +404,13 @@ Conventions:
 - Token-tag gotcha: `.?` is two tokens (`period` + `question_mark`),
   but `.*` is one token (`period_asterisk`).
 
-### `scope.zig` — scope-aware iteration
+### `ast/scope_iter.zig` — scope-aware iteration
 
 - `findIdentUseInEnclosingScope` — bounded by the enclosing `}`;
   allows nested blocks inside the scope; sibling scopes with the
   same name don't match (shadow-aware).
 
-### `receiver.zig` — name classifiers
+### `model/method_names.zig` — name classifiers
 
 Stable name-based filters used across many rules.  Centralizing
 keeps "is this an allocator?" / "is this a cleanup method?"
@@ -191,7 +426,7 @@ Classifiers:
 - `isReleaseMethodName` (release, deref, unref, …)
 - `isAllocMethodName` (alloc, allocSentinel, dupe, dupeZ, create, …)
 
-### `model.zig` — FileModel (TypeTable + FnTable)
+### `model/file_model.zig` — FileModel (TypeTable + FnTable)
 
 Per-file semantic model, built ONCE per `Ast`.  Replaces ad-hoc
 per-rule type / fn table-building.
@@ -223,7 +458,7 @@ Out of scope (v1; add when a rule needs them):
 - Anonymous types (`return struct { ... }`).
 - extern fns / extern structs.
 
-### `query.zig` — token-level pattern DSL
+### `ast/token_query.zig` — token-level pattern DSL
 
 Rules describe SHAPES instead of writing bespoke token-walk loops.
 A Pattern is a sequence of `Atom`s; matching it against a token
@@ -249,17 +484,17 @@ later" pattern most rules need.
 The `*_at` variants exist so report sites use stable capture slots
 instead of fragile `m.start + N` offsets.
 
-### `model_query.zig` — AST-level (FileModel) DSL
+### `model/model_query.zig` — AST-level (FileModel) DSL
 
-Companion to query.zig.  Where query.zig matches token sequences,
-model_query.zig matches entities in the FileModel — types, fields,
-methods — via `TypePred` / `FieldPred` / `MethodPred`.
+`model_query.zig` queries FileModel types, fields, and methods with
+`TypePred`, `FieldPred`, and `MethodPred`.
+`ast/token_query.zig` queries token sequences instead.
 
 The two compose: use `mq.findTypes` / `findFields` / `findMethods`
 to narrow down WHICH bodies to scan, then use `query.*` to scan
 those bodies for token patterns.
 
-### `local.zig` — LocalBindings (per-fn binding origins)
+### `model/local_bindings.zig` — LocalBindings (per-fn binding origins)
 
 Per-fn-body model.  For every `const NAME = <expr>` / `var NAME =
 <expr>` and every fn parameter, classify the **origin**:
@@ -294,7 +529,7 @@ currently do for the few questions they need.
 One-line test assertions:
 
 ```zig
-const testing = @import("../testing.zig");
+const testing = @import("../../testing.zig");
 const check = @import("./my_rule.zig").check;
 const R = "my-rule-id";
 
@@ -322,7 +557,7 @@ are available for tests that need raw problem inspection.
 Rules can emit decision events:
 
 ```zig
-const trace = @import("../trace.zig");
+const trace = @import("../../trace.zig");
 const R = "my-rule-id";
 
 trace.note(R, tree, t, "matched binding via opener");
@@ -354,7 +589,7 @@ A clean diff that adds a new rule without trace calls is fine.
 
 1. **Pick a name** in `kebab-case` (the rule ID) and `snake_case`
    (the file name).  E.g., `fd-write-after-close` →
-   `rules/fd_write_after_close.zig`.
+   `rules/io/fd_write_after_close.zig`.
 
 2. **Add the invariant** to `config.zig`:
    ```zig
@@ -369,21 +604,21 @@ A clean diff that adds a new rule without trace calls is fine.
    ```
    Bump the array length.
 
-3. **Write the rule** in `rules/<rule_name>.zig`:
+3. **Write the rule** in `rules/<family>/<rule_name>.zig`:
    ```zig
    const std = @import("std");
    const Ast = std.zig.Ast;
 
-   const lexer = @import("../lexer.zig");           // if you need token walks
-   const scope = @import("../scope.zig");           // if you need scope iteration
-   const fmodel = @import("../model.zig");          // if you need type/fn info
-   const local = @import("../local.zig");           // if you need binding origins
-   const query = @import("../query.zig");           // if your rule shape fits a token pattern
-   const mq = @import("../model_query.zig");        // if you need AST-level entity queries
-   const problem = @import("../problem.zig");
-   const testing = @import("../testing.zig");
-   const config_mod = @import("../config.zig");
-   const file_cache_mod = @import("../cache/file_cache.zig");
+   const lexer = @import("../../ast/tokens.zig");
+   const scope = @import("../../ast/scope_iter.zig");
+   const fmodel = @import("../../model/file_model.zig");
+   const local = @import("../../model/local_bindings.zig");
+   const query = @import("../../ast/token_query.zig");
+   const mq = @import("../../model/model_query.zig");
+   const problem = @import("../../problem.zig");
+   const testing = @import("../../testing.zig");
+   const config_mod = @import("../../config.zig");
+   const file_cache_mod = @import("../../cache/file_cache.zig");
 
    const R = "my-rule-id";
 
@@ -411,7 +646,7 @@ A clean diff that adds a new rule without trace calls is fine.
    2-3 edge cases.
 
 5. **Register it** in `rule_catalog.zig`:
-   - `const my_rule_mod = @import("rules/my_rule_name.zig");`
+   - `const my_rule_mod = @import("rules/<family>/my_rule_name.zig");`
    - Append `.{ .id = "my-rule-id", .check = my_rule_mod.check }` to
      `escape_detectors` (the dispatch table).
    - Append `_ = my_rule_mod;` to the test block at the bottom of
@@ -424,11 +659,11 @@ A clean diff that adds a new rule without trace calls is fine.
    .{
        .id = "my-rule-id",
        .title = "<one-line summary>",
-       .body = @embedFile("rules/my-rule-id.md"),
+       .body = @embedFile("rules/<family>/my-rule-id.md"),
    },
    ```
 
-7. **Write `rules/my-rule-id.md`** with the bug class, bad/good
+7. **Write `rules/<family>/my-rule-id.md`** with the bug class, bad/good
    examples, and detection notes.  This is what `zbc --explain
    my-rule-id` prints.
 
@@ -446,19 +681,24 @@ A clean diff that adds a new rule without trace calls is fine.
        echo "$repo: $count"
    done
    ```
-   Spot-check a few hits to confirm they're real (or at least
-   "useful noise" — every static analyzer reports some).
+
+## Build self-audit
+
+The default build step runs zbc on `src/` and `build.zig`.
+The build script supplies named-module declarations for imports such as `@import("type_engine")`.
+With the default Debug mode, the audit uses a separate ReleaseSafe executable with safety checks enabled.
+An explicit non-Debug optimization mode reuses the CLI executable built with that mode.
+The audit command uses the normal CLI exit contract, including exit 2 for incomplete analysis.
 
 ## Performance notes
 
-- `zig build -Doptimize=ReleaseFast` is essential for corpus
-  sweeps.  Debug-mode runs are ~10× slower.
-- The `Io.Group.concurrent` thread pool is lazy in Debug — it
-  effectively runs single-threaded.  Always sweep with
-  ReleaseFast.  `main.zig` uses raw `std.Thread.spawn` (one
-  worker per CPU) instead, which saturates properly.
-- Each rule's `check` fn runs on the parsed Ast.  Parsing the
-  Ast is the dominant cost; rule checks are cheap.  FileModel
-  and LocalBindings are amortized by `FileCache` — built at
-  most once per file (FileModel) / once per fn body
-  (LocalBindings) regardless of how many rules consume them.
+- Use `zig build -Doptimize=ReleaseFast` for corpus sweeps.
+  <!-- VERIFY: Measure the Debug versus ReleaseSafe runtime comparison before stating a speed ratio. -->
+- `main.zig` uses `std.Thread.spawn` with one session per worker.
+  `--jobs=<n>` selects a positive worker limit. The default uses the CPU count, or four if that lookup fails.
+  The worker count never exceeds the selected task count.
+  Each worker runs on a 256 MiB stack (`type_engine.resolve_stack_bytes`; pages commit only when touched). The main thread only joins, unless no worker could start.
+  The resolver stops at 256 nested node queries per analyser (`default_resolve_depth_limit`), answers unknown there, and settles no answer that rested on the cut.
+- Flow and pattern rules share the original parsed AST and per-analysis `FileCache`.
+  The cache builds FileModel once per file and LocalBindings once per function body.
+  A session retains imported documents and models for its worker's source snapshot.

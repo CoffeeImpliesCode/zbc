@@ -121,16 +121,16 @@ fn report(
     var notes = try gpa.alloc(problem.Note, 1);
     errdefer gpa.free(notes);
     notes[0] = .{
-        .start = problem.Pos.fromTokenStart(tree, bind_tok),
-        .end = problem.Pos.fromTokenEnd(tree, bind_tok),
+        .start = try problem.Pos.fromTokenStart(tree, bind_tok),
+        .end = try problem.Pos.fromTokenEnd(tree, bind_tok),
         .label = note_label,
     };
 
     try problems.append(gpa, .{
         .rule_id = R,
         .severity = .@"error",
-        .start = problem.Pos.fromTokenStart(tree, use_tok),
-        .end = problem.Pos.fromTokenEnd(tree, use_tok),
+        .start = try problem.Pos.fromTokenStart(tree, use_tok),
+        .end = try problem.Pos.fromTokenEnd(tree, use_tok),
         .message = msg,
         .notes = notes,
     });
