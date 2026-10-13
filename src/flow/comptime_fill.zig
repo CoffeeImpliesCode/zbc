@@ -238,8 +238,7 @@ pub const Declaration = struct {
 };
 
 /// The declarations and prototype parameters [Resolver.visibleDeclAt]
-/// answers from, read once per [Resolver] rather than once per
-/// question.
+/// answers from, read once per FileCache tree (or standalone resolver).
 ///
 /// The question is asked repeatedly and always about the same
 /// immutable tree: a `const` chain chased to its value asks it
@@ -258,13 +257,16 @@ pub const Declaration = struct {
 /// distinctions are therefore still decided by
 /// [Resolver.visibleDeclAt] exactly as before — only how often the
 /// file is read to find the candidates changes.
-const LexicalIndex = struct {
+pub const LexicalIndex = struct {
     /// Every `const`/`var` name token and every name a `| a, b |`
     /// payload binds, in source order.
     decls: std.ArrayListUnmanaged(Declaration) = .empty,
     /// Every prototype parameter in the file, with the body range
     /// it binds inside.
     params: std.ArrayListUnmanaged(ParamEntry) = .empty,
+    /// Exact syntax-only answers. The owning index supplies tree identity.
+    visible: std.HashMapUnmanaged(VisibleKey, ?ScopedDecl, VisibleContext, 80) = .empty,
+
     /// Set once the walk has run, so a build that gave up is not
     /// retried — and re-failed — by every later question.
     built: bool = false,
@@ -274,6 +276,21 @@ const LexicalIndex = struct {
     /// never reached is not evidence that none exists.
     complete: bool = true,
 
+    const VisibleKey = struct {
+        token: Ast.TokenIndex,
+        name: []const u8,
+        owned_name: bool = false,
+    };
+
+    const VisibleContext = struct {
+        pub fn hash(_: VisibleContext, key: VisibleKey) u64 {
+            return std.hash.Wyhash.hash(key.token, key.name);
+        }
+
+        pub fn eql(_: VisibleContext, a: VisibleKey, b: VisibleKey) bool {
+            return a.token == b.token and std.mem.eql(u8, a.name, b.name);
+        }
+    };
     const ParamEntry = struct {
         name_tok: Ast.TokenIndex,
         name: []const u8,
@@ -281,9 +298,12 @@ const LexicalIndex = struct {
         body_last: Ast.TokenIndex,
     };
 
-    fn deinit(self: *LexicalIndex, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *LexicalIndex, gpa: std.mem.Allocator) void {
         self.decls.deinit(gpa);
         self.params.deinit(gpa);
+        var keys = self.visible.keyIterator();
+        while (keys.next()) |key| if (key.owned_name) gpa.free(key.name);
+        self.visible.deinit(gpa);
     }
 };
 
@@ -347,8 +367,8 @@ pub const Resolver = struct {
     fn_proto: ?Ast.full.FnProto,
     /// The lowering's local table, null until [Resolver.bindLocals].
     locals: ?LocalMap = null,
-    /// The ONE declaration index, owned here.  Built on first use and
-    /// released by [Resolver.deinit]; there is no second copy.
+    /// Fallback index for standalone resolvers or a foreign tree. Matching
+    /// FileCache trees own the shared index across lowerings and replays.
     lex: LexicalIndex = .{},
 
     /// A resolver that answers about `tree` for the single function
@@ -518,6 +538,29 @@ pub const Resolver = struct {
     /// reach was already being claimed wider than it exists and the
     /// scan never treated a missing capture as evidence of anything.
     pub fn visibleDeclAt(self: *const Resolver, use_tok: Ast.TokenIndex, name: []const u8) ?ScopedDecl {
+        if (use_tok >= self.tree.tokens.len) return null;
+        const lex = self.index();
+        if (!lex.complete) return null;
+        const key: LexicalIndex.VisibleKey = .{ .token = use_tok, .name = name };
+        if (lex.visible.getPtr(key)) |answer| return answer.*;
+        const answer = self.visibleDeclAtUncached(use_tok, name);
+        const gpa = self.indexAllocator();
+        var saved = key;
+        if (answer) |decl| {
+            saved.name = self.tree.tokenSlice(decl.name_tok);
+        } else if (std.mem.eql(u8, self.tree.tokenSlice(use_tok), name)) {
+            saved.name = self.tree.tokenSlice(use_tok);
+        } else {
+            saved.name = gpa.dupe(u8, name) catch return answer;
+            saved.owned_name = true;
+        }
+        lex.visible.put(gpa, saved, answer) catch {
+            if (saved.owned_name) gpa.free(saved.name);
+        };
+        return answer;
+    }
+
+    fn visibleDeclAtUncached(self: *const Resolver, use_tok: Ast.TokenIndex, name: []const u8) ?ScopedDecl {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         if (use_tok >= tags.len) return null;
@@ -591,30 +634,22 @@ pub const Resolver = struct {
         return found.best;
     }
 
-    /// Build the index on first use and return it.
-    ///
-    /// One pass over the tokens collects every binding together with
-    /// the braces it was written under; one walk over the AST nodes
-    /// collects every prototype parameter with the body range it binds
-    /// inside.  Both are pure functions of a tree that does not change
-    /// for this resolver, which is the whole reason they may be done
-    /// once rather than per question.
-    ///
-    /// A walk that gives up marks the index incomplete and every
-    /// question declines against it, rather than answering from the
-    /// part that was collected.
-    ///
-    /// The `const` self is because every question is read-only and the
-    /// BUILD is not: a lowering must be able to ask a scope question
-    /// from a `*const` context, and the index is a pure function of
-    /// the tree either way, so nothing else about the resolver changes
-    /// while it is being built.  This is the only place the resolver
-    /// writes to itself.
+    fn indexAllocator(self: *const Resolver) std.mem.Allocator {
+        if (self.cache) |cache| if (cache.tree == self.tree) return cache.gpa;
+        return self.gpa;
+    }
+
+    /// Build syntax-only raw material once for the matching cache tree.
+    /// Standalone/foreign resolvers own their fallback. An incomplete walk
+    /// still declines every query, including a previously memoized answer.
     fn index(self: *const Resolver) *LexicalIndex {
-        const lex: *LexicalIndex = @constCast(&self.lex);
+        const lex: *LexicalIndex = if (self.cache) |cache|
+            if (cache.tree == self.tree) &cache.fill_lexical_index else @constCast(&self.lex)
+        else
+            @constCast(&self.lex);
         if (lex.built) return lex;
         lex.built = true;
-        const gpa = self.gpa;
+        const gpa = self.indexAllocator();
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
 
@@ -893,6 +928,14 @@ pub const Resolver = struct {
             }
         }
         return null;
+    }
+
+    /// Tuple shape supplies a byte-mask extent, not a fill-binding identity.
+    pub fn diagnosticTupleExtent(self: *const Resolver, span: TokenSpan) ?u64 {
+        const extent = self.declaredExtent(span) orelse return null;
+        const vector = extent.vec orelse return null;
+        const root = self.visibleConstDecl(span.first, self.tree.tokenSlice(vector)) orelse return null;
+        return self.aggregateFieldCount(.{ .root = root, .fields = undefined, .field_count = 0 });
     }
 
     /// Element count of what a loop enumerates.  A bare identifier —
@@ -1486,6 +1529,31 @@ pub const Resolver = struct {
         return count;
     }
 
+    /// Actual reflected tags describe possible destinations, not coverage.
+    pub fn enumValueIndices(self: *const Resolver, type_span: TokenSpan) !?[]u64 {
+        const declaration = self.enumContainerOf(type_span, 0) orelse return null;
+        const tree = declaration.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const container = tree.fullContainerDecl(&buffer, declaration.node) orelse return null;
+        var foreign = Resolver.init(self.gpa, tree, null, null);
+        defer foreign.deinit();
+        const evaluator = if (tree == self.tree) self else &foreign;
+        var values: std.ArrayListUnmanaged(u64) = .empty;
+        defer values.deinit(self.gpa);
+        var next: u64 = 0;
+        for (container.ast.members) |member| {
+            const field = tree.fullContainerField(member) orelse continue;
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(member)), "_")) return null;
+            const actual = if (field.ast.value_expr.unwrap()) |value|
+                evaluator.comptimeIntTokens(.{ .first = tree.firstToken(value), .last = tree.lastToken(value) }, 0) orelse return null
+            else
+                next;
+            try values.append(self.gpa, actual);
+            next = std.math.add(u64, actual, 1) catch return null;
+        }
+        return try values.toOwnedSlice(self.gpa);
+    }
+
     /// Value of the `const` a reference at `name_tok` resolves to,
     /// chased one binding at a time.
     fn constIntBinding(self: *const Resolver, name_tok: Ast.TokenIndex, depth: u32) ?u64 {
@@ -2053,4 +2121,97 @@ fn initSpanAfter(tree: *const Ast, eq_tok: Ast.TokenIndex) ?TokenSpan {
         }
     }
     return null;
+}
+
+test "comptime fill: lexical memo shares a tree but separates use tokens and names" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\const A = 3;
+        \\fn f(p: u8) void { const B = 4; _ = A; _ = p; }
+        \\fn g(q: u8) void { _ = A; _ = q; }
+    ;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    var cache = file_cache.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    var first = Resolver.init(gpa, &tree, &cache, null);
+    defer first.deinit();
+    var second = Resolver.init(gpa, &tree, &cache, null);
+    defer second.deinit();
+    var uses: [2]Ast.TokenIndex = undefined;
+    var count: usize = 0;
+    for (tree.tokens.items(.tag), 0..) |tag, raw| {
+        if (tag != .identifier) continue;
+        const token: Ast.TokenIndex = @intCast(raw);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "A") or tree.tokenTag(token - 1) == .keyword_const) continue;
+        uses[count] = token;
+        count += 1;
+    }
+    try std.testing.expectEqual(uses.len, count);
+    const a = first.visibleDeclAt(uses[0], "A").?;
+    const b = first.visibleDeclAt(uses[0], "B").?;
+    try std.testing.expect(a.name_tok != b.name_tok);
+    try std.testing.expect(first.visibleDeclAt(uses[0], "missing") == null);
+    try std.testing.expect(first.visibleDeclAt(uses[1], "B") == null);
+    try std.testing.expect(first.visibleDeclAt(uses[1], "A").?.name_tok == a.name_tok);
+    // A caller-owned spelling can change immediately after the query.
+    var name = [_]u8{'A'};
+    try std.testing.expect(first.visibleDeclAt(uses[0], &name).?.name_tok == a.name_tok);
+    name[0] = 'B';
+    try std.testing.expect(first.visibleDeclAt(uses[0], &name).?.name_tok == b.name_tok);
+    try std.testing.expect(first.index() == second.index());
+    first.deinit();
+    try std.testing.expect(second.visibleDeclAt(uses[0], "A").?.name_tok == a.name_tok);
+    try std.testing.expect(second.visibleDeclAt(uses[0], "B").?.name_tok == b.name_tok);
+}
+
+test "comptime fill: lexical memo does not cross trees or certify an incomplete index" {
+    const gpa = std.testing.allocator;
+    var one = try Ast.parse(gpa, "const A = 3; fn f() void { _ = A; }", .zig);
+    defer one.deinit(gpa);
+    var two = try Ast.parse(gpa, "const B = 4; fn f() void { _ = B; }", .zig);
+    defer two.deinit(gpa);
+    var cache = file_cache.FileCache.init(gpa, &one);
+    defer cache.deinit();
+    var first = Resolver.init(gpa, &one, &cache, null);
+    defer first.deinit();
+    var foreign = Resolver.init(gpa, &two, &cache, null);
+    defer foreign.deinit();
+    var token: Ast.TokenIndex = 0;
+    for (one.tokens.items(.tag), 0..) |tag, raw| {
+        if (tag == .identifier and std.mem.eql(u8, one.tokenSlice(@intCast(raw)), "A"))
+            token = @intCast(raw);
+    }
+    try std.testing.expect(first.visibleDeclAt(token, "A") != null);
+    try std.testing.expect(foreign.visibleDeclAt(token, "B") != null);
+    try std.testing.expect(foreign.visibleDeclAt(token, "A") == null);
+    try std.testing.expect(first.index() != foreign.index());
+    // No prefix of a failed raw-material walk is a visibility proof.
+    foreign.index().complete = false;
+    try std.testing.expect(foreign.visibleDeclAt(token, "B") == null);
+}
+
+test "comptime fill: lexical memo owns absent query spellings" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "const A = 3; fn f() void { _ = A; }", .zig);
+    defer tree.deinit(gpa);
+    var resolver = Resolver.init(gpa, &tree, null, null);
+    defer resolver.deinit();
+    var token: Ast.TokenIndex = 0;
+    for (tree.tokens.items(.tag), 0..) |tag, raw| {
+        if (tag == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(raw)), "A"))
+            token = @intCast(raw);
+    }
+    var name = [_]u8{'X'};
+    try std.testing.expect(resolver.visibleDeclAt(token, &name) == null);
+    name[0] = 'A';
+    try std.testing.expect(resolver.visibleDeclAt(token, &name) != null);
+    try std.testing.expect(resolver.visibleDeclAt(token, "X") == null);
+    try std.testing.expectEqual(@as(usize, 2), resolver.index().visible.count());
+    var keys = resolver.index().visible.keyIterator();
+    while (keys.next()) |key| {
+        if (!std.mem.eql(u8, key.name, "X")) continue;
+        try std.testing.expect(key.owned_name);
+        try std.testing.expect(key.name.ptr != &name);
+    }
 }

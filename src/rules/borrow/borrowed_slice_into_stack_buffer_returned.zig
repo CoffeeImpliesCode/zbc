@@ -1361,6 +1361,138 @@ test "allocator duplicate of scratch returns an owned copy" {
     );
 }
 
+test "arena allocations survive moving the arena with parsed entries" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Entry = struct { id: []const u8 };
+        \\const Parsed = struct { arena: std.heap.ArenaAllocator, entries: []Entry };
+        \\pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Parsed {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    errdefer arena.deinit();
+        \\    const a = arena.allocator();
+        \\    var entries: std.ArrayList(Entry) = .empty;
+        \\    var ids = std.mem.tokenizeScalar(u8, source, ',');
+        \\    while (ids.next()) |id| {
+        \\        try entries.append(a, .{ .id = try a.dupe(u8, id) });
+        \\    }
+        \\    return .{ .arena = arena, .entries = try entries.toOwnedSlice(a) };
+        \\}
+    );
+}
+
+test "fixed-buffer allocator duplicate still borrows a local array" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(source: []const u8) ![]u8 {
+        \\    var buf: [64]u8 = undefined;
+        \\    var fba = std.heap.FixedBufferAllocator.init(&buf);
+        \\    return try fba.allocator().dupe(u8, source);
+        \\}
+    );
+}
+
+test "returning the arena address still borrows its stack cell" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(gpa: std.mem.Allocator) *std.heap.ArenaAllocator {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    return &arena;
+        \\}
+    );
+}
+
+test "SDK heap allocator state is not allocation storage" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn parse(source: []const u8) ![]u8 {
+        \\    var heap: std.heap.DebugAllocator(.{}) = .init;
+        \\    return try heap.allocator().dupe(u8, source);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn parse(source: []const u8) ![]u8 {
+        \\    return try std.heap.page_allocator.dupe(u8, source);
+        \\}
+    );
+}
+
+test "heap allocators keep a stack-backed child allocator loan" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(source: []const u8) ![]u8 {
+        \\    var buf: [4096]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&buf);
+        \\    var arena = std.heap.ArenaAllocator.init(fixed.allocator());
+        \\    return try arena.allocator().dupe(u8, source);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(source: []const u8) ![]u8 {
+        \\    var buf: [4096]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&buf);
+        \\    var heap: std.heap.DebugAllocator(.{}) = .{ .backing_allocator = fixed.allocator() };
+        \\    return try heap.allocator().dupe(u8, source);
+        \\}
+    );
+}
+
+test "fixed-buffer allocator over caller storage does not borrow its stack header" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn parse(buf: []u8, source: []const u8) ![]u8 {
+        \\    var fixed = std.heap.FixedBufferAllocator.init(buf);
+        \\    return try fixed.allocator().dupe(u8, source);
+        \\}
+    );
+}
+
+test "stack fallback allocation retains inline stack storage" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(gpa: std.mem.Allocator) ![]u8 {
+        \\    var fallback = std.heap.stackFallback(64, gpa);
+        \\    return try fallback.get().dupe(u8, "x");
+        \\}
+    );
+}
+
+test "returned allocator header still carries the arena context pointer" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(gpa: std.mem.Allocator) std.mem.Allocator {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    return arena.allocator();
+        \\}
+    );
+}
+
+test "allocator headers observe later stack-backed allocator field changes" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
+        \\    var buf: [4096]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&buf);
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    const a = arena.allocator();
+        \\    arena.child_allocator = fixed.allocator();
+        \\    return try a.dupe(u8, source);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn parse(source: []const u8) ![]u8 {
+        \\    var buf: [4096]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&buf);
+        \\    var heap: std.heap.DebugAllocator(.{}) = .init;
+        \\    const a = heap.allocator();
+        \\    heap.backing_allocator = fixed.allocator();
+        \\    return try a.dupe(u8, source);
+        \\}
+    );
+}
+
 test "caller-owned buffer view does not borrow the current frame" {
     try testing.expectNoFireTyped(check,
         \\fn parse(input: []u8) []u8 { return input[1..]; }

@@ -47,6 +47,8 @@ pub const Seen = struct {
     const Key = struct { rule_id: []const u8, byte: u32, owner_byte: ?u32 = null };
 
     keys: std.ArrayHashMapUnmanaged(Key, void, Context, true) = .empty,
+    /// Diagnostic paths outlive all replay states, but not this check.
+    byte_paths: std.StringHashMapUnmanaged(void) = .empty,
     /// Findings the caller already held, and whether they have been
     /// folded in yet.  Both are set by [adopt] and consumed by the
     /// first [record].
@@ -84,6 +86,50 @@ pub const Seen = struct {
 
     pub fn deinit(self: *Seen, gpa: std.mem.Allocator) void {
         self.keys.deinit(gpa);
+        var paths = self.byte_paths.iterator();
+        while (paths.next()) |entry| gpa.free(entry.key_ptr.*);
+        self.byte_paths.deinit(gpa);
+    }
+
+    const BytePathParts = struct { prefix: []const u8, suffix: []const u8, separator: bool };
+    const BytePathContext = struct {
+        pub fn hash(_: BytePathContext, parts: BytePathParts) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(parts.prefix);
+            if (parts.separator) hasher.update(".");
+            hasher.update(parts.suffix);
+            return hasher.final();
+        }
+
+        pub fn eql(_: BytePathContext, parts: BytePathParts, path: []const u8) bool {
+            const suffix_start = parts.prefix.len + @intFromBool(parts.separator);
+            return path.len == suffix_start + parts.suffix.len and
+                std.mem.startsWith(u8, path, parts.prefix) and
+                (!parts.separator or path[parts.prefix.len] == '.') and
+                std.mem.eql(u8, path[suffix_start..], parts.suffix);
+        }
+    };
+
+    fn internBytePath(
+        self: *Seen,
+        gpa: std.mem.Allocator,
+        prefix: []const u8,
+        suffix: []const u8,
+    ) ![]const u8 {
+        // A field projected to the root loses its leading separator.
+        const tail = if (suffix.len != 0 and suffix[0] == '.') suffix[1..] else suffix;
+        const separator = prefix.len != 0 and tail.len != 0 and tail[0] != '[';
+        const parts: BytePathParts = .{ .prefix = prefix, .suffix = tail, .separator = separator };
+        if (self.byte_paths.getKeyAdapted(parts, BytePathContext{})) |path| return path;
+        const suffix_start = try std.math.add(usize, prefix.len, @intFromBool(separator));
+        const length = try std.math.add(usize, suffix_start, tail.len);
+        const path = try gpa.alloc(u8, length);
+        errdefer gpa.free(path);
+        @memcpy(path[0..prefix.len], prefix);
+        if (separator) path[prefix.len] = '.';
+        @memcpy(path[suffix_start..], tail);
+        try self.byte_paths.put(gpa, path, {});
+        return path;
     }
 
     /// Record `rule_id` at `byte`.  Returns false when that diagnostic
@@ -172,15 +218,28 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             .not_local => |local| try state.facts.assumeBoolean(ctx.gpa, local, false, !ctx.locals[@intFromEnum(local)].address_taken),
         },
         .indexed_read => |r| try transferIndexedRead(ctx, state, r, stmt.pos, stmt.end_pos),
-        .indexed_write => |w| try transferIndexedWrite(ctx, state, w, stmt.pos),
+        .indexed_write => |w| {
+            try transferIndexedWrite(ctx, state, w, stmt.pos);
+            try replayIndexedAggregateBytes(ctx, state, w);
+        },
         .counter_step => |s| try transferCounterStep(ctx, state, s),
         .compare_assume => |comparison| {
+            const lhs_defined = indexIsDefined(ctx, state, comparison.lhs);
+            const operands_defined = lhs_defined and indexIsDefined(ctx, state, comparison.rhs);
+            // A successful runtime guard may select a physically written
+            // prefix even when the helper count retains strict input
+            // obligations. Never expose this relation to the value solver.
+            if (comparison.op == .lt and comparison.lhs == .local and comparison.rhs == .local and
+                comparison.lhs.local.offset == 0 and comparison.rhs.local.offset == 0 and
+                lhs_defined and !operands_defined and
+                !localIsProvedUndefined(ctx, state, comparison.rhs.local.local))
+            {
+                try state.recordDiagnosticIndexBound(ctx.gpa, comparison.lhs.local.local, comparison.rhs.local.local);
+            }
             // Bounds constrain existing values, not an uncertain operand.
             // This gate does not require scalar identity for legacy counter
             // or header terms; fixed array lengths are constant terms.
-            if (indexIsDefined(ctx, state, comparison.lhs) and
-                indexIsDefined(ctx, state, comparison.rhs))
-            {
+            if (operands_defined) {
                 state.feasible = try state.assumeComparison(ctx.gpa, comparison);
             }
         },
@@ -192,25 +251,58 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                 .array = complete.array,
                 .index = .{ .constant = 0 },
                 .rhs_kind = .plain,
-                .defined = true,
+                .defined = complete.value_defined,
                 .inputs = complete.inputs,
                 .selected_inputs = complete.selected_inputs,
+                .value_has_undefined_origin = complete.value_has_undefined_origin,
+                .entire_source_undefined = complete.value_entirely_undefined,
+                .value_entirely_undefined = complete.value_entirely_undefined,
+                .result_is_computation = true,
             };
             if (!storageInputsAreCovered(ctx, state, &complete.inputs) or
                 !indexedRhsIsDefined(ctx, state, write, .plain))
             {
                 if (storageInputsMayBeUndefined(ctx, state, &complete.inputs) or
-                    indexedRhsReadsUndefined(ctx, state, write, .plain)) return;
+                    indexedRhsReadsUndefined(ctx, state, write, .plain))
+                {
+                    try transferIndexedWrite(ctx, state, .{
+                        .array = complete.array, .index = .{ .constant = 0 },
+                        .rhs_kind = .plain, .all_elements = true,
+                        .value_has_undefined_origin = true,
+                        .entire_source_undefined = complete.value_entirely_undefined,
+                        .value_entirely_undefined = complete.value_entirely_undefined,
+                        .result_is_computation = true,
+                        .selected_inputs = complete.selected_inputs,
+                    }, stmt.pos);
+                    return;
+                }
                 try state.unknown_values.put(ctx.gpa, complete.array, {});
-            } else _ = state.unknown_values.orderedRemove(complete.array);
+            } else {
+                _ = state.unknown_values.orderedRemove(complete.array);
+                state.forgetUndefinedBytes(complete.array);
+                // Completion repairs bytes, not the array's strict origin.
+                try state.bindWrittenField(ctx.gpa, .{ .parent = complete.array, .name = "" }, false);
+            }
             try state.markArrayComplete(ctx.gpa, complete.array);
         },
         .array_range_complete => |range| try transferArrayRangeComplete(ctx, state, range),
         .array_value => |value| {
+            if (value.mask_only) {
+                try copyCaptureDiagnosticBytes(ctx, state, value);
+                return;
+            }
+            if (value.diagnostic_only) {
+                try copyArrayDiagnosticBytes(ctx, state, value);
+                return;
+            }
             var may_undefined = exprMayBeUndefined(ctx, state, value.source) or
                 valueInputsMayBeUndefined(ctx, state, &value.selected_inputs);
             for (value.inputs) |input| {
                 if (input) |local| may_undefined = may_undefined or localIsProvedUndefined(ctx, state, local);
+            }
+            if (value.layout_change and value.source == .field_copy_of) {
+                const field = value.source.field_copy_of;
+                may_undefined = may_undefined or fieldValueMayBeUndefined(ctx, state, field.parent, field.name);
             }
             var exact_copy = value.source == .copy_of and !value.whole_payload and
                 !ctx.locals[@intFromEnum(value.source.copy_of)].is_pointer and
@@ -237,9 +329,18 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                 }
             }
             if (may_undefined) {
-                if (!exact_copy) state.forgetInitializationArray(value.target);
-                try state.may_undefined_values.put(ctx.gpa, value.target, {});
+                if (value.layout_change)
+                    try markPayloadMayBeUndefined(ctx, state, value.target)
+                else {
+                    if (!exact_copy) state.forgetInitializationArray(value.target);
+                    try state.may_undefined_values.put(ctx.gpa, value.target, {});
+                }
             }
+            // Field-copy abstention revokes certificates, not transported
+            // byte witnesses. Materialize the negative mask before returning.
+            if (!value.whole_payload and value.source == .field_copy_of and
+                !ctx.locals[@intFromEnum(value.source.field_copy_of.parent)].is_pointer)
+                try copyArrayDiagnosticBytes(ctx, state, value);
             if (!valueInputsAreDefined(ctx, state, &value.selected_inputs, false)) {
                 try state.unknown_values.put(ctx.gpa, value.target, {});
                 return;
@@ -289,6 +390,8 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                     const origin = try originOfInit(ctx, state, value.source, stmt.pos);
                     if (origin != .undef and state.fieldArrayBaseIsDefined(field.parent, field.name)) {
                         try state.markArrayComplete(ctx.gpa, value.target);
+                        // Restoring strict coverage must not erase transported holes.
+                        try copyArrayDiagnosticBytes(ctx, state, value);
                         // A whole-field default or parameter proof remains a
                         // complete base after an exact undefined overwrite.
                         // Carry its sparse holes, including nested slot holes.
@@ -330,6 +433,32 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         },
         .array_prefix => |prefix| {
             const extent = ctx.locals[@intFromEnum(prefix.array)].array_extent orelse return;
+            if (prefix.seeded_append) {
+                // The builder proves the seed-one, capacity-guarded adjacent
+                // store/push shape. Actual transfers must have written slot
+                // zero, and no undefined store may have poisoned any lane.
+                // Unknown stored values do not gain a payload/count proof.
+                // The undefined declaration retains MAY for its unwritten
+                // suffix. Unplaced undefined overwrites revoke fixed coverage;
+                // placed holes are checked below.
+                if (prefix.scale != 1 or extent == 0 or state.fixedPrefix(prefix.array) < 1 or
+                    localIsProvedUndefined(ctx, state, prefix.count)) return;
+                for (state.undefined_elements.keys()) |hole| if (hole.array == prefix.array) return;
+                for (state.undefined_field_values.keys()) |key| {
+                    if (key.parent == prefix.array and key.name.len != 0 and
+                        state.fieldValueMayBeUndefined(prefix.array, key.name)) return;
+                }
+                var buffer: [128]u8 = undefined;
+                const temporary = try std.fmt.bufPrint(&buffer, "[0..${d}:1:0:{d}:0]", .{
+                    @intFromEnum(prefix.count), extent,
+                });
+                const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+                try state.bindWrittenField(ctx.gpa, .{ .parent = prefix.array, .name = path }, false);
+                try state.diagnostic_index_bounds.put(ctx.gpa, .{
+                    .index = prefix.count, .counter = prefix.count, .offset = -1,
+                }, {});
+                return;
+            }
             var certified = storageInputsAreCovered(ctx, state, &prefix.inputs);
             for (prefix.inputs) |input| {
                 const local = input orelse continue;
@@ -345,6 +474,16 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             // its bounds and the initialized bytes remain separate facts.
             if (certified) _ = state.unknown_values.swapRemove(prefix.count);
             try state.setScaledSymbolicPrefix(ctx.gpa, prefix.array, prefix.count, prefix.scale, extent);
+            // Keep the written region visible when an old undefined base
+            // survives alias revocation. This grants no value certificate.
+            if (prefix.scale != 0) {
+                var buffer: [128]u8 = undefined;
+                const temporary = try std.fmt.bufPrint(&buffer, "[0..${d}:{d}:0:{d}:0]", .{
+                    @intFromEnum(prefix.count), prefix.scale, extent,
+                });
+                const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+                try state.bindWrittenField(ctx.gpa, .{ .parent = prefix.array, .name = path }, false);
+            }
         },
         .array_memset_prefix => |prefix| try transferArrayMemsetPrefix(ctx, state, prefix, stmt.pos),
         .guard_fact => |g| state.feasible = try state.facts.assumeGuard(ctx.gpa, g.guard, g.holds),
@@ -372,7 +511,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                     break :backing null;
                 break :backing array;
             } else null;
-            try forgetAliasedValueFacts(ctx, state, p.target);
+            try forgetAliasedValueFacts(ctx, state, p.target, p.preserves_diagnostic_base);
             if (writes_undefined) try markPayloadMayBeUndefined(ctx, state, p.target);
             if (!(p.payload_only and ctx.locals[@intFromEnum(p.target)].is_slice))
                 try invalidateFieldValueCertificates(ctx, state, p.target);
@@ -394,8 +533,24 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                     }
                 }
                 if (owner) |local| {
-                    try forgetAliasedValueFacts(ctx, state, local);
+                    try forgetAliasedValueFacts(ctx, state, local, p.preserves_diagnostic_base);
                     if (writes_undefined) try markPayloadMayBeUndefined(ctx, state, local);
+                    if (!writes_undefined and !p.preserves_diagnostic_base) {
+                        var buffer: [96]u8 = undefined;
+                        const pointer = state.fields.getContext(.{ .parent = p.target, .name = "ptr" }, .{});
+                        const scoped_index = if (pointer != null and pointer.? == .stack and pointer.?.stack == local)
+                            p.diagnostic_index
+                        else
+                            null;
+                        const path = if (scoped_index) |index| scoped: {
+                            const extent = ctx.locals[@intFromEnum(local)].array_extent orelse break :scoped "";
+                            const range = state.diagnosticWriteRange(index, extent);
+                            if (range.start >= range.end) break :scoped "";
+                            break :scoped try std.fmt.bufPrint(&buffer, "[{d}..{d}]", .{ range.start, range.end });
+                        } else "";
+                        const owned = try ctx.seen.internBytePath(ctx.gpa, "", path);
+                        try state.uncertain_byte_writes.putContext(ctx.gpa, .{ .parent = local, .name = owned }, {}, .{});
+                    }
                     try invalidateFieldValueCertificates(ctx, state, local);
                     // Preserve field resource origins for lifetime checks, while
                     // revoking every field's initialized-payload certificate.
@@ -414,7 +569,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             }
         },
         .reset_capture => |r| {
-            const defined = r.value_defined and if (r.value_source) |source|
+            const defined = r.value_defined and valueInputsAreDefined(ctx, state, &r.value_inputs, false) and if (r.value_source) |source|
                 if (localIsArray(ctx, source))
                     arrayHasFullCoverage(ctx, state, source)
                 else if (ctx.locals[@intFromEnum(source)].is_slice) backing: {
@@ -558,7 +713,11 @@ fn transferDecl(
     else
         copiedPayloadIsDefined(state, d.init_kind, d.value_defined);
     const array_complete = d.array_copy and arrayInitializerComplete(ctx, state, d.local, d.init_kind, origin, payload_defined);
-    const may_undefined = bindingMayBeUndefined(ctx, state, d.init_kind, &d.value_inputs);
+    const may_undefined = d.value_has_undefined_origin or d.value_entirely_undefined or
+        bindingMayBeUndefined(ctx, state, d.init_kind, &d.value_inputs);
+    const entirely_undefined = bindingIsEntirelyUndefined(ctx, state, d.init_kind,
+        d.entire_source_undefined, d.value_entirely_undefined,
+        d.result_is_computation, &d.value_inputs);
     forgetLocalValueFacts(ctx, state, d.local);
     try bindBoolean(ctx, state, d.local, d.init_kind);
     const binding_origin: Origin = if (origin == .undef and !may_undefined) .plain else origin;
@@ -583,8 +742,24 @@ fn transferDecl(
     if (d.init_kind == .copy_of and localIsArray(ctx, d.local) and state.unknown_values.contains(d.init_kind.copy_of)) {
         try state.unknown_values.put(ctx.gpa, d.local, {});
     }
-    if (ctx.locals[@intFromEnum(d.local)].tracks_array_payload and d.init_kind == .copy_of) {
+    if (d.init_kind == .copy_of and (ctx.locals[@intFromEnum(d.local)].tracks_array_payload or
+        localDiagnosticIsAggregate(ctx, state, d.init_kind.copy_of)))
+    {
         try copyUnknownFieldValues(ctx, state, d.local, d.init_kind.copy_of);
+    }
+    if (entirely_undefined) {
+        try state.entire_undefined_values.put(ctx.gpa, d.local, {});
+        try state.bindEntireUndefinedField(ctx.gpa, .{ .parent = d.local, .name = "" }, true);
+    } else if (binding_origin == .undef) {
+        try state.partial_undefined_values.put(ctx.gpa, d.local, {});
+    }
+    if (d.init_kind == .field_copy_of and (localIsAggregate(ctx, d.local) or
+        fieldHasDiagnosticChildren(state, d.init_kind.field_copy_of.parent, d.init_kind.field_copy_of.name))) {
+        try copyArrayDiagnosticBytes(ctx, state, .{
+            .target = d.local,
+            .source = d.init_kind,
+            .diagnostic_only = true,
+        });
     }
 }
 
@@ -625,7 +800,7 @@ fn seedLocalValueFacts(
 
 /// An undefined member overwrite through an element alias can corrupt any
 /// slot in its backing array. A defined member store grants no new coverage.
-fn invalidateAliasedArrayPayload(ctx: Ctx, state: *AbstractState, parent: LocalId) !void {
+fn invalidateAliasedArrayPayload(ctx: Ctx, state: *AbstractState, parent: LocalId, member: []const u8) !void {
     const info = ctx.locals[@intFromEnum(parent)];
     if (!info.is_pointer) return;
     var owner = info.frame_borrow_origin;
@@ -635,17 +810,34 @@ fn invalidateAliasedArrayPayload(ctx: Ctx, state: *AbstractState, parent: LocalI
     const array = owner orelse return;
     if (!localIsArray(ctx, array) and !ctx.locals[@intFromEnum(array)].is_slice and
         !ctx.locals[@intFromEnum(array)].is_pointer) return;
-    const may_undefined = state.fieldValueMayBeUndefined(parent, "");
-    try forgetAliasedValueFacts(ctx, state, array);
-    if (may_undefined) try markPayloadMayBeUndefined(ctx, state, array);
+    const may_undefined = state.fieldValueMayBeUndefined(parent, member);
+    try forgetAliasedValueFacts(ctx, state, array, false);
+    if (may_undefined) {
+        if (member.len != 0 and ctx.locals[@intFromEnum(array)].array_extent != null) {
+            var buffer: [48]u8 = undefined;
+            const range = try std.fmt.bufPrint(&buffer, "[0..{d}]", .{ctx.locals[@intFromEnum(array)].array_extent.?});
+            const path = try ctx.seen.internBytePath(ctx.gpa, range, member);
+            const key: state_mod.FieldKey = .{ .parent = array, .name = path };
+            try state.bindWrittenField(ctx.gpa, key, true);
+            try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+        } else try markPayloadMayBeUndefined(ctx, state, array);
+    }
     try invalidateFieldValueCertificates(ctx, state, array);
     try state.unknown_values.put(ctx.gpa, array, {});
 }
 
 fn markPayloadMayBeUndefined(ctx: Ctx, state: *AbstractState, local: LocalId) !void {
+    // This is an authenticated negative effect, not an opaque mutation.
+    // It supersedes uncertainty emitted before the precise effect summary.
+    var uncertain_index: usize = 0;
+    while (uncertain_index < state.uncertain_byte_writes.count()) {
+        if (state.uncertain_byte_writes.keys()[uncertain_index].parent == local) {
+            _ = state.uncertain_byte_writes.swapRemoveAt(uncertain_index);
+        } else uncertain_index += 1;
+    }
     const info = ctx.locals[@intFromEnum(local)];
     state.forgetInitializationArray(local);
-    if (info.is_pointer and !info.is_slice) state.forgetWrittenFields(local);
+    if (!info.is_slice) state.forgetWrittenFields(local);
     if (info.is_slice or info.is_pointer) {
         const key: state_mod.FieldKey = .{
             .parent = local,
@@ -669,9 +861,14 @@ fn forgetLocalValueFacts(ctx: Ctx, state: *AbstractState, local: LocalId) void {
 }
 
 /// Keep byte-write witnesses when only a value certificate becomes unknown.
-fn forgetAliasedValueFacts(ctx: Ctx, state: *AbstractState, local: LocalId) !void {
+fn forgetAliasedValueFacts(ctx: Ctx, state: *AbstractState, local: LocalId, preserve_diagnostic_base: bool) !void {
     state.facts.forgetLocal(local);
     state.forgetInitializationLocal(local);
+    _ = state.entire_undefined_values.swapRemove(local);
+    if (!preserve_diagnostic_base) state.forgetEntireUndefinedFields(local);
+    if ((state.locals.get(local) orelse .plain) == .undef)
+        try state.partial_undefined_values.put(ctx.gpa, local, {});
+    try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = local, .name = "" }, {}, .{});
     if (localIsArray(ctx, local)) try state.unknown_values.put(ctx.gpa, local, {});
 }
 
@@ -786,7 +983,11 @@ fn transferAssign(
     else
         copiedPayloadIsDefined(state, a.rhs_kind, a.value_defined);
     const array_complete = a.array_copy and arrayInitializerComplete(ctx, state, a.target, a.rhs_kind, origin, payload_defined);
-    const may_undefined = bindingMayBeUndefined(ctx, state, a.rhs_kind, &a.value_inputs);
+    const may_undefined = a.value_has_undefined_origin or a.value_entirely_undefined or
+        bindingMayBeUndefined(ctx, state, a.rhs_kind, &a.value_inputs);
+    const entirely_undefined = bindingIsEntirelyUndefined(ctx, state, a.rhs_kind,
+        a.entire_source_undefined, a.value_entirely_undefined,
+        a.result_is_computation, &a.value_inputs);
     forgetLocalValueFacts(ctx, state, a.target);
     try bindBoolean(ctx, state, a.target, a.rhs_kind);
     const binding_origin: Origin = if (origin == .undef and !may_undefined) .plain else origin;
@@ -813,8 +1014,24 @@ fn transferAssign(
     if (a.rhs_kind == .copy_of and localIsArray(ctx, a.target) and state.unknown_values.contains(a.rhs_kind.copy_of)) {
         try state.unknown_values.put(ctx.gpa, a.target, {});
     }
-    if (ctx.locals[@intFromEnum(a.target)].tracks_array_payload and a.rhs_kind == .copy_of) {
+    if (a.rhs_kind == .copy_of and (ctx.locals[@intFromEnum(a.target)].tracks_array_payload or
+        localDiagnosticIsAggregate(ctx, state, a.rhs_kind.copy_of)))
+    {
         try copyUnknownFieldValues(ctx, state, a.target, a.rhs_kind.copy_of);
+    }
+    if (entirely_undefined) {
+        try state.entire_undefined_values.put(ctx.gpa, a.target, {});
+        try state.bindEntireUndefinedField(ctx.gpa, .{ .parent = a.target, .name = "" }, true);
+    } else if (binding_origin == .undef) {
+        try state.partial_undefined_values.put(ctx.gpa, a.target, {});
+    }
+    if (a.rhs_kind == .field_copy_of and (localIsAggregate(ctx, a.target) or
+        fieldHasDiagnosticChildren(state, a.rhs_kind.field_copy_of.parent, a.rhs_kind.field_copy_of.name))) {
+        try copyArrayDiagnosticBytes(ctx, state, .{
+            .target = a.target,
+            .source = a.rhs_kind,
+            .diagnostic_only = true,
+        });
     }
 }
 
@@ -979,17 +1196,15 @@ fn transferRetValueChecks(
         else => null,
     };
     if (array_source) |source| {
-        if (localIsArray(ctx, source)) {
-            const complete = arrayHasWrittenCoverage(ctx, state, source);
-            if (state.locals.contains(source)) {
-                try reportUncoveredArrayUse(ctx, state, source, complete, true, pos, end_pos);
-                if (complete and origin == .undef) origin = .plain;
-            }
-        }
+        // A retained strict origin is not an entirely undefined byte witness.
+        const entirely_undefined = localIsEntirelyUndefined(ctx, state, source);
+        if (origin == .undef and !entirely_undefined) origin = .plain;
+        if (localIsArray(ctx, source) and state.locals.contains(source) and entirely_undefined)
+            try reportUncoveredArrayUse(ctx, state, source, false, true, pos, end_pos);
     }
-    if (array_source) |source| {
-        if (origin == .undef and !localIsProvedUndefined(ctx, state, source)) origin = .plain;
-    }
+    if (r.value_kind == .field_copy_of and origin == .undef and
+        !fieldIsEntirelyUndefined(ctx, state, r.value_kind.field_copy_of.parent, r.value_kind.field_copy_of.name))
+        origin = .plain;
 
     // Undefined-return check: not gated on return type — returning
     // garbage is wrong for value types and pointers alike.
@@ -1001,7 +1216,15 @@ fn transferRetValueChecks(
     // bug class — undef leaking through a variable — still fires
     // because that path produces .undef via an identifier expr, which
     // doesn't set is_literal_undef.
-    if (origin == .undef and !r.is_literal_undef and
+    const diagnostic_undefined = if (r.diagnostic_source) |source|
+        localIsEntirelyUndefined(ctx, state, source)
+    else
+        switch (r.value_kind) {
+            .copy_of => |source| localIsEntirelyUndefined(ctx, state, source),
+            .field_copy_of => |field| fieldIsEntirelyUndefined(ctx, state, field.parent, field.name),
+            else => r.value_has_undefined_origin,
+        };
+    if ((origin == .undef or r.value_entirely_undefined or diagnostic_undefined) and !r.is_literal_undef and
         config_mod.isEnabled(ctx.config, .use_undefined))
     {
         try report(ctx, "use-undefined", pos, end_pos, .@"error", "returning a value that is still `undefined`", .{});
@@ -1115,6 +1338,470 @@ fn copyUnknownFieldValues(ctx: Ctx, state: *AbstractState, target: LocalId, sour
         const key = state.written_fields.keys()[index];
         if (key.parent == source) try state.written_fields.putContext(ctx.gpa, .{ .parent = target, .name = key.name }, {}, .{});
     }
+    const uncertain_count = state.uncertain_byte_writes.count();
+    index = 0;
+    while (index < uncertain_count) : (index += 1) {
+        const key = state.uncertain_byte_writes.keys()[index];
+        if (key.parent == source) try state.uncertain_byte_writes.putContext(ctx.gpa, .{ .parent = target, .name = key.name }, {}, .{});
+    }
+    if (state.partial_undefined_values.contains(source))
+        try state.partial_undefined_values.put(ctx.gpa, target, {});
+    try state.copyEntireUndefinedFields(ctx.gpa, target, source);
+}
+
+const ArrayBytePlace = struct { parent: LocalId, path: []const u8 = "" };
+
+fn arrayByteSuffix(ctx: Ctx, place: ArrayBytePlace, key: state_mod.FieldKey) ?[]const u8 {
+    if (key.parent != place.parent) return null;
+    if (!state_mod.fieldPathPrefix(place.path, key.name)) {
+        // Selecting one element narrows a diagnostic range pattern without
+        // turning that selection into an initialization certificate.
+        for (1..key.name.len + 1) |end| {
+            if (end < key.name.len and key.name[end] != '.' and key.name[end] != '[') continue;
+            const matched = state_mod.diagnosticFieldPrefix(key.name[0..end], place.path) orelse continue;
+            if (matched == place.path.len) return key.name[end..];
+        }
+        return null;
+    }
+    if (key.name.len <= place.path.len) return null;
+    if (place.path.len == 0 and ctx.locals[@intFromEnum(place.parent)].is_slice and
+        (std.mem.eql(u8, key.name, "ptr") or std.mem.eql(u8, key.name, "len"))) return null;
+    return key.name[place.path.len..];
+}
+
+fn arrayByteKey(ctx: Ctx, target: ArrayBytePlace, suffix: []const u8) !state_mod.FieldKey {
+    return .{
+        .parent = target.parent,
+        .name = try ctx.seen.internBytePath(ctx.gpa, target.path, suffix),
+    };
+}
+
+fn bindArrayByteRepair(
+    ctx: Ctx,
+    state: *AbstractState,
+    target: ArrayBytePlace,
+    suffix: []const u8,
+) !void {
+    const key = try arrayByteKey(ctx, target, suffix);
+    try state.bindWrittenField(ctx.gpa, key, false);
+    if (target.path.len != 0) return;
+    if (state_mod.diagnosticSymbolicRange(suffix)) |range| {
+        if (range.length != suffix.len) return;
+        try state.symbolic_prefixes.put(ctx.gpa, .{
+            .array = target.parent, .counter = range.counter,
+        }, .{
+            .scale = range.scale, .offset = range.offset,
+            .extent = range.extent, .capped = range.capped,
+        });
+        return;
+    }
+    const range = state_mod.diagnosticArrayRange(suffix) orelse return;
+    if (range.length != suffix.len) return;
+    if (range.range) {
+        try state.markArrayRangeComplete(ctx.gpa, target.parent, range.start, range.end);
+    } else try state.setExactElement(ctx.gpa, target.parent, range.start, true);
+}
+
+fn bindArrayByteHole(
+    ctx: Ctx,
+    state: *AbstractState,
+    target: ArrayBytePlace,
+    suffix: []const u8,
+) !void {
+    const key = try arrayByteKey(ctx, target, suffix);
+    try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+    if (target.path.len != 0) return;
+    const range = state_mod.diagnosticArrayRange(suffix) orelse return;
+    // A descendant hole is not a whole-slot hole that poisons siblings.
+    if (range.length != suffix.len) return;
+    if (!range.range) try state.setExactElement(ctx.gpa, target.parent, range.start, false);
+}
+
+/// A negative base survives selected repairs, but not a whole-scope overwrite.
+fn arrayByteHasEntireUndefinedBase(state: *const AbstractState, source: ArrayBytePlace) bool {
+    const proof = state.entireUndefinedFieldPrefix(source.parent, source.path) orelse return false;
+    for (state.written_fields.keys()) |key| {
+        if (key.parent != source.parent) continue;
+        const prefix = state_mod.diagnosticFieldPrefix(key.name, source.path) orelse continue;
+        if (prefix >= proof) return false;
+    }
+    for ([_][]const state_mod.FieldKey{
+        state.undefined_field_values.keys(), state.unknown_field_values.keys(),
+    }) |keys| {
+        for (keys) |key| {
+            if (key.parent != source.parent) continue;
+            const prefix = state_mod.diagnosticFieldPrefix(key.name, source.path) orelse continue;
+            if (prefix < proof) continue;
+            const exact = state.entireUndefinedFieldPrefix(source.parent, key.name) orelse return false;
+            if (exact < state_mod.diagnosticFieldPrefix(key.name, key.name).?) return false;
+        }
+    }
+    return true;
+}
+
+fn optionalValueChildPath(value: ArrayBytePlace, path: []const u8, child: []const u8) bool {
+    if (value.path.len == 0) return std.mem.eql(u8, path, child);
+    return path.len == value.path.len + 1 + child.len and
+        std.mem.startsWith(u8, path, value.path) and path[value.path.len] == '.' and
+        std.mem.eql(u8, path[value.path.len + 1 ..], child);
+}
+
+/// Select an existing ALL byte-base while ignoring only the enclosing tag
+/// repair. Payload repairs and unproved mutations still defeat the witness.
+fn optionalPayloadIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, value: ArrayBytePlace) bool {
+    if (if (value.path.len == 0)
+        localIsEntirelyUndefined(ctx, state, value.parent)
+    else
+        fieldIsEntirelyUndefined(ctx, state, value.parent, value.path)) return true;
+    if (!fieldValueMayBeUndefined(ctx, state, value.parent, value.path)) return false;
+    const proof = state.entireUndefinedFieldPrefix(value.parent, value.path) orelse return false;
+    for (state.written_fields.keys()) |key| {
+        if (key.parent != value.parent) continue;
+        if (optionalValueChildPath(value, key.name, cfg.diagnostic_optional_tag)) continue;
+        if (state_mod.diagnosticFieldPrefix(key.name, value.path)) |written| {
+            if (written >= proof) return false;
+        } else if (state_mod.diagnosticFieldPrefix(value.path, key.name) != null) return false;
+    }
+    for ([_][]const state_mod.FieldKey{
+        state.undefined_field_values.keys(), state.unknown_field_values.keys(),
+    }) |keys| {
+        for (keys) |key| {
+            if (key.parent != value.parent) continue;
+            if (optionalValueChildPath(value, key.name, cfg.diagnostic_optional_tag)) continue;
+            const ancestor = state_mod.diagnosticFieldPrefix(key.name, value.path);
+            if (ancestor == null and state_mod.diagnosticFieldPrefix(value.path, key.name) == null) continue;
+            if (ancestor != null and ancestor.? < proof) continue;
+            const exact = state.entireUndefinedFieldPrefix(value.parent, key.name) orelse return false;
+            const scope = state_mod.diagnosticFieldPrefix(key.name, key.name).?;
+            if (exact < scope) return false;
+        }
+    }
+    return true;
+}
+
+fn captureByteSuffix(ctx: Ctx, source: ArrayBytePlace, key: state_mod.FieldKey, optional_payload: bool) ?[]const u8 {
+    // An optional slice capture selects its descriptor, unlike an array-byte
+    // copy through a slice, which deliberately excludes ptr/len descriptors.
+    const suffix = if (optional_payload and source.path.len == 0 and ctx.locals[@intFromEnum(source.parent)].is_slice)
+        if (key.parent == source.parent and key.name.len != 0) key.name else return null
+    else
+        arrayByteSuffix(ctx, source, key) orelse return null;
+    const tail = if (suffix.len != 0 and suffix[0] == '.') suffix[1..] else suffix;
+    if (optional_payload and std.mem.eql(u8, tail, cfg.diagnostic_optional_tag)) return null;
+    return suffix;
+}
+
+/// Immutable by-value captures replay only diagnostic bytes. Positive maps,
+/// resource origins, and array initialization certificates are not destinations.
+fn copyCaptureDiagnosticBytes(ctx: Ctx, state: *AbstractState, value: @TypeOf(@as(StmtKind, undefined).array_value)) !void {
+    var source: ArrayBytePlace = switch (value.source) {
+        .copy_of => |parent| .{ .parent = parent },
+        .field_copy_of => |field| .{ .parent = field.parent, .path = field.name },
+        else => return,
+    };
+    // An implicit pointer field selection reads the borrowed owner's bytes,
+    // not the independently defined pointer header.
+    if (source.path.len != 0 and ctx.locals[@intFromEnum(source.parent)].is_pointer) {
+        if (state.locals.get(source.parent)) |origin| {
+            if (origin == .stack and !ctx.locals[@intFromEnum(origin.stack)].is_pointer)
+                source.parent = origin.stack;
+        }
+    }
+    std.debug.assert(value.target_field == null);
+    const target: ArrayBytePlace = .{ .parent = value.target };
+    if (source.parent == target.parent) return;
+    const entire = if (value.optional_payload)
+        optionalPayloadIsEntirelyUndefined(ctx, state, source)
+    else if (source.path.len == 0)
+        localIsEntirelyUndefined(ctx, state, source.parent)
+    else
+        fieldIsEntirelyUndefined(ctx, state, source.parent, source.path);
+    const base_undefined = state.fieldArrayBaseMayBeUndefined(source.parent, source.path);
+    const entire_base = base_undefined and arrayByteHasEntireUndefinedBase(state, source);
+    state.forgetUndefinedBytes(target.parent);
+    state.forgetWrittenFields(target.parent);
+    const base = try arrayByteKey(ctx, target, "");
+    if (base_undefined) {
+        try state.undefined_field_values.putContext(ctx.gpa, base, {}, .{});
+        try state.may_undefined_values.put(ctx.gpa, target.parent, {});
+    } else try state.written_fields.putContext(ctx.gpa, base, {}, .{});
+    if (source.path.len == 0 and localIsArray(ctx, source.parent)) {
+        var buffer: [48]u8 = undefined;
+        const prefix = state.fixedPrefix(source.parent);
+        if (prefix != 0) {
+            const suffix = try std.fmt.bufPrint(&buffer, "[0..{d}]", .{prefix});
+            try state.written_fields.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+        }
+        for (state.exact_elements.keys()) |element| {
+            if (element.array != source.parent) continue;
+            const suffix = try std.fmt.bufPrint(&buffer, "[{d}]", .{element.index});
+            try state.written_fields.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+        }
+        for (state.undefined_elements.keys()) |element| {
+            if (element.array != source.parent) continue;
+            const suffix = try std.fmt.bufPrint(&buffer, "[{d}]", .{element.index});
+            try state.undefined_field_values.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+        }
+    }
+    const written_count = state.written_fields.count();
+    for (0..written_count) |index| {
+        const key = state.written_fields.keys()[index];
+        const suffix = captureByteSuffix(ctx, source, key, value.optional_payload) orelse continue;
+        try state.written_fields.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+    }
+    const negative_count = state.undefined_field_values.count();
+    for (0..negative_count) |index| {
+        const key = state.undefined_field_values.keys()[index];
+        const suffix = captureByteSuffix(ctx, source, key, value.optional_payload) orelse continue;
+        if (!state.fieldValueMayBeUndefined(source.parent, key.name)) continue;
+        try state.undefined_field_values.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+    }
+    // Physical fields can also retain a proved-undefined origin.
+    for (state.fields.keys(), state.fields.values()) |key, origin| {
+        if (origin != .undef or !state.fieldValueMayBeUndefined(source.parent, key.name)) continue;
+        const suffix = captureByteSuffix(ctx, source, key, value.optional_payload) orelse continue;
+        try state.undefined_field_values.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+    }
+    const entire_count = state.entire_undefined_fields.count();
+    for (0..entire_count) |index| {
+        const suffix = captureByteSuffix(ctx, source, state.entire_undefined_fields.keys()[index], value.optional_payload) orelse continue;
+        try state.entire_undefined_fields.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+    }
+    const uncertain_count = state.uncertain_byte_writes.count();
+    for (0..uncertain_count) |index| {
+        const key = state.uncertain_byte_writes.keys()[index];
+        if (key.parent != source.parent) continue;
+        const suffix = if (state_mod.diagnosticFieldPrefix(key.name, source.path) != null)
+            ""
+        else captureByteSuffix(ctx, source, key, value.optional_payload) orelse continue;
+        try state.uncertain_byte_writes.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+    }
+    if (entire or entire_base) try state.entire_undefined_fields.putContext(ctx.gpa, base, {}, .{});
+    if (entire) {
+        try state.entire_undefined_values.put(ctx.gpa, target.parent, {});
+    } else try state.partial_undefined_values.put(ctx.gpa, target.parent, {});
+}
+
+/// Payload repairs do not write a union tag. Only a whole-root byte witness
+/// can defeat a root undefined origin; descendant MAY holes cannot create one.
+fn unionTagMayBeUndefined(state: *const AbstractState, local: LocalId) bool {
+    const root: state_mod.FieldKey = .{ .parent = local, .name = "" };
+    if (state.entire_undefined_values.contains(local)) return true;
+    if (state.undefined_field_values.containsContext(root, .{})) return true;
+    if (state.fields.getContext(root, .{})) |origin| if (origin == .undef) return true;
+    if (state.written_fields.containsContext(root, .{})) return false;
+    return (state.locals.get(local) orelse .plain) == .undef or
+        state.entire_undefined_fields.containsContext(root, .{});
+}
+
+/// Replay byte masks, never resource origins or initialized-value certificates.
+/// Sparse intervals and paths make work proportional to observed facts.
+fn copyArrayDiagnosticBytes(
+    ctx: Ctx,
+    state: *AbstractState,
+    value: @TypeOf(@as(StmtKind, undefined).array_value),
+) !void {
+    const source: ArrayBytePlace = switch (value.source) {
+        .copy_of => |parent| .{ .parent = parent },
+        .field_copy_of => |field| .{ .parent = field.parent, .path = field.name },
+        else => return,
+    };
+    const target: ArrayBytePlace = .{
+        .parent = value.target,
+        .path = value.target_field orelse "",
+    };
+    if (source.parent == target.parent and std.mem.eql(u8, source.path, target.path)) return;
+    const root_source = source.path.len == 0;
+    const root_target = target.path.len == 0;
+    // Capture the exact negative guarantee before replacing destination facts.
+    // MAY masks alone must never certify an entirely undefined transport.
+    const source_entirely_undefined = if (root_source)
+        localIsEntirelyUndefined(ctx, state, source.parent)
+    else
+        fieldIsEntirelyUndefined(ctx, state, source.parent, source.path);
+    const source_base_covered = if (root_source)
+        state.baseComplete(source.parent) or arrayHasWrittenCoverage(ctx, state, source.parent)
+    else
+        state.fieldArrayBaseIsDefined(source.parent, source.path);
+    const base_undefined = if (source_base_covered)
+        false
+    else
+        state.fieldArrayBaseMayBeUndefined(source.parent, source.path);
+    const source_has_entire_base = base_undefined and arrayByteHasEntireUndefinedBase(state, source);
+    var partial = root_source and state.partial_undefined_values.contains(source.parent);
+    const source_has_value_certificate = if (root_source)
+        !state.unknown_values.contains(source.parent)
+    else
+        state.fieldValueIsDefined(source.parent, source.path);
+    // Destination repairs can remove map entries. Freeze only source paths,
+    // not the whole state, before replaying into the same unordered ledger.
+    var repair_paths: [16][]const u8 = undefined;
+    var repair_count: usize = 0;
+    var extra_repairs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer extra_repairs.deinit(ctx.gpa);
+    for (state.written_fields.keys()) |key| {
+        const suffix = arrayByteSuffix(ctx, source, key) orelse continue;
+        if (repair_count < repair_paths.len)
+            repair_paths[repair_count] = suffix
+        else
+            try extra_repairs.append(ctx.gpa, suffix);
+        repair_count += 1;
+    }
+
+    if (root_target) {
+        _ = state.may_undefined_values.swapRemove(target.parent);
+        _ = state.partial_undefined_values.swapRemove(target.parent);
+        _ = state.entire_undefined_values.swapRemove(target.parent);
+        if (root_source) {
+            try state.copyArrayInitialization(ctx.gpa, target.parent, source.parent);
+        } else {
+            state.forgetInitializationArray(target.parent);
+            if (source_base_covered) try state.markArrayComplete(ctx.gpa, target.parent);
+        }
+    }
+    const base: state_mod.FieldKey = .{ .parent = target.parent, .name = target.path };
+    try state.bindWrittenField(ctx.gpa, base, base_undefined);
+    if (base_undefined) {
+        try state.undefined_field_values.putContext(ctx.gpa, base, {}, .{});
+        if (root_target) try state.may_undefined_values.put(ctx.gpa, target.parent, {});
+    }
+
+    // Physical root-array coverage is also a field-path byte witness, so an
+    // inherited negative base cannot swallow a copied repair.
+    if (root_source) {
+        var buffer: [48]u8 = undefined;
+        const prefix = state.fixedPrefix(source.parent);
+        if (prefix != 0) {
+            const suffix = try std.fmt.bufPrint(&buffer, "[0..{d}]", .{prefix});
+            try bindArrayByteRepair(ctx, state, target, suffix);
+            partial = true;
+        }
+        const count = state.exact_elements.count();
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const element = state.exact_elements.keys()[index];
+            if (element.array != source.parent) continue;
+            const suffix = try std.fmt.bufPrint(&buffer, "[{d}]", .{element.index});
+            try bindArrayByteRepair(ctx, state, target, suffix);
+            partial = true;
+        }
+        var symbolic_buffer: [128]u8 = undefined;
+        const symbolic_count = state.symbolic_prefixes.count();
+        index = 0;
+        while (index < symbolic_count) : (index += 1) {
+            const key = state.symbolic_prefixes.keys()[index];
+            if (key.array != source.parent) continue;
+            const range = state.symbolic_prefixes.values()[index];
+            const suffix = try std.fmt.bufPrint(
+                &symbolic_buffer, "[0..${d}:{d}:{d}:{d}:{d}]",
+                .{ @intFromEnum(key.counter), range.scale, range.offset,
+                    range.extent, @intFromBool(range.capped) },
+            );
+            try bindArrayByteRepair(ctx, state, target, suffix);
+            partial = true;
+        }
+    }
+    for (repair_paths[0..@min(repair_count, repair_paths.len)]) |suffix|
+        try bindArrayByteRepair(ctx, state, target, suffix);
+    for (extra_repairs.items) |suffix|
+        try bindArrayByteRepair(ctx, state, target, suffix);
+    if (repair_count != 0) partial = true;
+    const field_count = state.fields.count();
+    var index: usize = 0;
+    while (index < field_count) : (index += 1) {
+        const key = state.fields.keys()[index];
+        const origin = state.fields.values()[index];
+        if (origin == .undef or state.unknown_field_values.containsContext(key, .{})) continue;
+        const suffix = arrayByteSuffix(ctx, source, key) orelse continue;
+        try bindArrayByteRepair(ctx, state, target, suffix);
+        partial = true;
+    }
+
+    // Holes follow repairs. A broad initialized base must never erase an
+    // exact undefined overwrite, including a nested field of one slot.
+    const negative_count = state.undefined_field_values.count();
+    index = 0;
+    while (index < negative_count) : (index += 1) {
+        const key = state.undefined_field_values.keys()[index];
+        const suffix = arrayByteSuffix(ctx, source, key) orelse continue;
+        if (!state.fieldValueMayBeUndefined(source.parent, key.name)) continue;
+        try bindArrayByteHole(ctx, state, target, suffix);
+    }
+    index = 0;
+    while (index < field_count) : (index += 1) {
+        const key = state.fields.keys()[index];
+        if (state.fields.values()[index] != .undef) continue;
+        const suffix = arrayByteSuffix(ctx, source, key) orelse continue;
+        if (!state.fieldValueMayBeUndefined(source.parent, key.name)) continue;
+        try bindArrayByteHole(ctx, state, target, suffix);
+    }
+    if (root_source) {
+        var buffer: [48]u8 = undefined;
+        const count = state.undefined_elements.count();
+        index = 0;
+        while (index < count) : (index += 1) {
+            const element = state.undefined_elements.keys()[index];
+            if (element.array != source.parent) continue;
+            const suffix = try std.fmt.bufPrint(&buffer, "[{d}]", .{element.index});
+            // Physical certificates keep their old hole until a strict write.
+            // A later exact diagnostic repair nevertheless replaces these bytes.
+            if (state.fieldBytesAreWritten(source.parent, suffix) and
+                !state.fieldValueMayBeUndefined(source.parent, suffix)) continue;
+            try bindArrayByteHole(ctx, state, target, suffix);
+        }
+    }
+    if (partial or !base_undefined)
+        try state.partial_undefined_values.put(ctx.gpa, target.parent, {});
+    if (value.diagnostic_only or !source_has_value_certificate) {
+        if (root_target) {
+            try state.unknown_values.put(ctx.gpa, target.parent, {});
+        } else try state.unknown_field_values.putContext(ctx.gpa, base, {}, .{});
+        for (state.fields.keys()) |key| {
+            if (arrayByteSuffix(ctx, target, key) == null) continue;
+            try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+        }
+    }
+    // Replay exact negative bases with their copied repair/MAY exceptions.
+    // A partially repaired base is not an entirely undefined whole value.
+    const entire_count = state.entire_undefined_fields.count();
+    if (source_has_entire_base)
+        try state.entire_undefined_fields.putContext(ctx.gpa, base, {}, .{});
+    index = 0;
+    while (index < entire_count) : (index += 1) {
+        const key = state.entire_undefined_fields.keys()[index];
+        const suffix = arrayByteSuffix(ctx, source, key) orelse continue;
+        const copied = try arrayByteKey(ctx, target, suffix);
+        try state.entire_undefined_fields.putContext(ctx.gpa, copied, {}, .{});
+    }
+    const uncertain_count = state.uncertain_byte_writes.count();
+    index = 0;
+    while (index < uncertain_count) : (index += 1) {
+        const key = state.uncertain_byte_writes.keys()[index];
+        if (key.parent != source.parent) continue;
+        const suffix = if (state_mod.diagnosticFieldPrefix(key.name, source.path) != null)
+            ""
+        else arrayByteSuffix(ctx, source, key) orelse continue;
+        try state.uncertain_byte_writes.putContext(ctx.gpa, try arrayByteKey(ctx, target, suffix), {}, .{});
+    }
+    // Existing resource-field records stay physical. Certificate revocation
+    // is not a new MAY write: keep its exact negative scope only when proved
+    // by the corresponding current source scope.
+    for (state.fields.keys()) |key| {
+        const suffix = arrayByteSuffix(ctx, target, key) orelse continue;
+        const source_key = if (root_source)
+            state_mod.FieldKey{ .parent = source.parent, .name = suffix }
+        else
+            try arrayByteKey(ctx, source, suffix);
+        if (!source_entirely_undefined and
+            !fieldIsEntirelyUndefined(ctx, state, source.parent, source_key.name)) continue;
+        try state.entire_undefined_fields.putContext(ctx.gpa, key, {}, .{});
+    }
+    if (source_entirely_undefined) {
+        try state.entire_undefined_fields.putContext(ctx.gpa, base, {}, .{});
+        if (root_target) try state.entire_undefined_values.put(ctx.gpa, target.parent, {});
+    } else if (!root_target) {
+        _ = state.entire_undefined_values.swapRemove(target.parent);
+    }
 }
 
 fn fieldAssignmentIsDefined(ctx: Ctx, state: *const AbstractState, assignment: @TypeOf(@as(StmtKind, undefined).field_assign), origin: Origin) bool {
@@ -1166,6 +1853,7 @@ fn fieldAssignmentIsDefined(ctx: Ctx, state: *const AbstractState, assignment: @
 
 /// Diagnostic question: does this store read an operand proved undefined?
 fn fieldAssignmentReadsUndefined(ctx: Ctx, state: *const AbstractState, assignment: @TypeOf(@as(StmtKind, undefined).field_assign)) bool {
+    if (assignment.value_has_undefined_origin or assignment.entire_value_undefined) return true;
     if (bindingMayBeUndefined(ctx, state, assignment.rhs_kind, &assignment.selected_inputs)) return true;
     if (assignment.reads_old_value and state.fieldValueMayBeUndefined(assignment.parent, assignment.name)) return true;
     for (assignment.inputs) |input| {
@@ -1179,6 +1867,19 @@ fn fieldAssignmentReadsUndefined(ctx: Ctx, state: *const AbstractState, assignme
 
 fn fieldValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, parent: LocalId, path: []const u8) bool {
     const info = ctx.locals[@intFromEnum(parent)];
+    if (localIsArray(ctx, parent) and (std.mem.eql(u8, path, "len") or std.mem.eql(u8, path, "ptr"))) return false;
+    if (localIsArray(ctx, parent)) if (state_mod.diagnosticArrayRange(path)) |element| {
+        if (!element.range and state.hasInitializedElement(parent, .{ .constant = element.start })) {
+            for (state.undefined_field_values.keys()) |key| {
+                if (key.parent != parent or key.name.len == 0) continue;
+                if ((state_mod.diagnosticFieldPrefix(key.name, path) != null or
+                    state_mod.diagnosticFieldPrefix(path, key.name) != null) and
+                    state.fieldValueMayBeUndefined(parent, path)) return true;
+            }
+            return false;
+        }
+    };
+    if (path.len == 0 and !info.is_pointer and state.entire_undefined_values.contains(parent)) return true;
     if (std.mem.indexOf(u8, path, ".*")) |marker| {
         const header = path[0..marker];
         if (fieldValueMayBeUndefined(ctx, state, parent, header)) return true;
@@ -1206,6 +1907,8 @@ fn fieldValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, parent: Local
         if (origin == .stack) {
             if (path.len == 0 and !ctx.locals[@intFromEnum(origin.stack)].is_pointer and localIsArray(ctx, origin.stack))
                 return localIsProvedUndefined(ctx, state, origin.stack);
+            if (localIsArray(ctx, origin.stack) and
+                (std.mem.eql(u8, path, "len") or std.mem.eql(u8, path, "ptr"))) return false;
             return state.fieldValueMayBeUndefined(origin.stack, path);
         }
     }
@@ -1219,25 +1922,201 @@ fn undefinedFieldBytesRemain(state: *const AbstractState, local: LocalId) bool {
     return false;
 }
 
+/// Diagnostic tag bytes use the same written/undefined ledger as other fields.
+pub fn optionalTagMayBeUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    return optionalTagBytesMayBeUndefined(ctx, state, local, cfg.diagnostic_optional_tag);
+}
+
+fn optionalTagBytesMayBeUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId, path: []const u8) bool {
+    const tag: state_mod.FieldKey = .{ .parent = local, .name = path };
+    // Joins can discard a tag repair while retaining payload-only negatives.
+    // An exact negative tag survives that join; a payload hole is not one.
+    if (state.undefined_field_values.containsContext(tag, .{}) and
+        state.fieldValueMayBeUndefined(local, path)) return true;
+    if (state.fieldBytesAreWritten(local, path)) return false;
+    if (path.len > cfg.diagnostic_optional_tag.len) {
+        const field = path[0 .. path.len - cfg.diagnostic_optional_tag.len - 1];
+        return fieldIsEntirelyUndefined(ctx, state, local, field);
+    }
+    if (state.partial_undefined_values.contains(local)) return false;
+    // A selected tag view must not recurse through localIsProvedUndefined.
+    if (ctx.locals[@intFromEnum(local)].diagnostic_tag_only)
+        return unionTagMayBeUndefined(state, local);
+    return localIsProvedUndefined(ctx, state, local);
+}
+
+fn isOptionalTagPath(path: []const u8) bool {
+    const tag = cfg.diagnostic_optional_tag;
+    return std.mem.endsWith(u8, path, tag) and
+        (path.len == tag.len or path[path.len - tag.len - 1] == '.');
+}
+
 fn localIsProvedUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    const info = ctx.locals[@intFromEnum(local)];
+    if (info.diagnostic_tag_only) {
+        if (info.diagnostic_tag_guard) |guard| if (localIsProvedUndefined(ctx, state, guard)) return true;
+        if (info.tracks_optional_tag) return optionalTagMayBeUndefined(ctx, state, local);
+        return info.diagnostic_tag_may_undefined orelse unionTagMayBeUndefined(state, local);
+    }
+    if (state.entire_undefined_values.contains(local)) return true;
     if (ctx.locals[@intFromEnum(local)].is_slice)
         return state.fieldValueMayBeUndefined(local, "ptr") or state.fieldValueMayBeUndefined(local, "len");
-    if (!ctx.locals[@intFromEnum(local)].is_pointer and undefinedFieldBytesRemain(state, local)) return true;
     if (!ctx.locals[@intFromEnum(local)].is_pointer) {
         if (ctx.locals[@intFromEnum(local)].runtime_fields) |fields| {
             const complete = for (fields) |name| {
+                if (fieldValueMayBeUndefined(ctx, state, local, name)) return true;
                 if (!state.fieldBytesAreWritten(local, name)) break false;
             } else true;
             if (complete) return false;
         }
     }
+    if (!ctx.locals[@intFromEnum(local)].is_pointer and undefinedFieldBytesRemain(state, local)) return true;
     if (!ctx.locals[@intFromEnum(local)].is_pointer and
         (state.isArrayComplete(local) or
             (localIsArray(ctx, local) and arrayHasWrittenCoverage(ctx, state, local)))) return false;
-    if (state.may_undefined_values.contains(local)) return true;
-    if (state.locals.get(local)) |origin| if (origin == .undef) return true;
+    // Joins can retain MAY from the old strict root after a physical repair.
+    // Pointer headers are separate from their written pointee bytes.
+    if (state.may_undefined_values.contains(local) and
+        (info.is_pointer or !state.fieldBytesAreWritten(local, ""))) return true;
+    // Physical transport can replace unknown scalar bytes while retaining
+    // the old strict origin. A recorded whole-value repair defeats it here.
+    if (state.locals.get(local)) |origin| if (origin == .undef and
+        (info.is_pointer or !state.fieldBytesAreWritten(local, ""))) return true;
     if (!ctx.locals[@intFromEnum(local)].is_pointer and state.fieldValueMayBeUndefined(local, "")) return true;
     for (state.undefined_elements.keys()) |hole| if (hole.array == local) return true;
+    return false;
+}
+
+fn localIsAggregate(ctx: Ctx, local: LocalId) bool {
+    const info = ctx.locals[@intFromEnum(local)];
+    return !info.is_pointer and (localIsArray(ctx, local) or info.is_slice or
+        info.runtime_fields != null or info.tracks_array_payload);
+}
+
+fn fieldHasDiagnosticChildren(state: *const AbstractState, parent: LocalId, path: []const u8) bool {
+    for ([_][]const state_mod.FieldKey{
+        state.written_fields.keys(), state.undefined_field_values.keys(),
+        state.entire_undefined_fields.keys(), state.unknown_field_values.keys(),
+    }) |keys| {
+        for (keys) |key| {
+            if (key.parent == parent and key.name.len > path.len and
+                state_mod.diagnosticFieldPrefix(path, key.name) != null) return true;
+        }
+    }
+    return false;
+}
+
+fn localDiagnosticIsAggregate(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    return localIsAggregate(ctx, local) or (!ctx.locals[@intFromEnum(local)].is_pointer and
+        fieldHasDiagnosticChildren(state, local, ""));
+}
+
+/// Exact ALL proof for whole-value transport and strict result summaries.
+/// Selected reads instead use the retained per-byte undefined mask.
+fn localIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    if (state.entire_undefined_values.contains(local)) return true;
+    const info = ctx.locals[@intFromEnum(local)];
+    if (!info.is_pointer and
+        state.entire_undefined_fields.containsContext(.{ .parent = local, .name = "" }, .{}) and
+        fieldIsEntirelyUndefined(ctx, state, local, "")) return true;
+    // Known record layout can prove that every runtime field is undefined,
+    // even when computed constructors established those facts independently.
+    if (!info.is_pointer) if (info.runtime_fields) |fields| {
+        if (fields.len != 0) {
+            var all_undefined = true;
+            for (fields) |field| {
+                if (!fieldIsEntirelyUndefined(ctx, state, local, field)) {
+                    all_undefined = false;
+                    break;
+                }
+            }
+            if (all_undefined) return true;
+        }
+    };
+    if ((state.locals.get(local) orelse .plain) != .undef) return false;
+    if (state.partial_undefined_values.contains(local)) return false;
+    if (!localIsProvedUndefined(ctx, state, local)) return false;
+    for (state.written_fields.keys()) |key| if (key.parent == local) return false;
+    if (localIsArray(ctx, local)) {
+        if (state.baseComplete(local) or state.fixedPrefix(local) != 0) return false;
+        for (state.exact_elements.keys()) |key| if (key.array == local) return false;
+        for (state.symbolic_prefixes.keys()) |key| if (key.array == local) return false;
+    }
+    return true;
+}
+
+fn fieldIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, parent: LocalId, path: []const u8) bool {
+    if (fixedArrayLength(ctx, parent, path) != null) return false;
+    if (state.entire_undefined_values.contains(parent)) return true;
+    if (!fieldValueMayBeUndefined(ctx, state, parent, path)) return false;
+    const exact = state.entireUndefinedFieldPrefix(parent, path);
+    const proof_prefix = exact orelse return false;
+    for (state.written_fields.keys()) |key| {
+        if (key.parent != parent) continue;
+        if (state_mod.diagnosticFieldPrefix(key.name, path)) |written_prefix| {
+            if (written_prefix >= proof_prefix) return false;
+        } else if (state_mod.diagnosticFieldPrefix(path, key.name) != null) return false;
+    }
+    for ([_][]const state_mod.FieldKey{
+        state.undefined_field_values.keys(), state.unknown_field_values.keys(),
+    }) |keys| {
+        for (keys) |key| {
+            if (key.parent != parent) continue;
+            const ancestor = state_mod.diagnosticFieldPrefix(key.name, path);
+            if (ancestor == null and state_mod.diagnosticFieldPrefix(path, key.name) == null)
+                continue;
+            if (ancestor != null and ancestor.? < proof_prefix) continue;
+            const mutation_proof = state.entireUndefinedFieldPrefix(parent, key.name);
+            const mutation_scope = state_mod.diagnosticFieldPrefix(key.name, key.name).?;
+            if (mutation_proof != null and mutation_proof.? >= mutation_scope) continue;
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn returnValueIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, kind: StmtKind) bool {
+    if (kind != .ret) return false;
+    const ret = kind.ret;
+    if (ret.diagnostic_source) |source| return localIsEntirelyUndefined(ctx, state, source);
+    return ret.is_literal_undef or bindingIsEntirelyUndefined(ctx, state, ret.value_kind,
+        ret.entire_source_undefined, ret.value_entirely_undefined,
+        ret.result_is_computation, &ret.value_inputs);
+}
+
+/// A proved-undefined operand makes an infallible scalar computation undefined.
+/// Opaque calls must not use this rule merely because their arguments are read.
+fn bindingIsEntirelyUndefined(
+    ctx: Ctx,
+    state: *const AbstractState,
+    kind: ExprKind,
+    entire_source: bool,
+    static_entire: bool,
+    computation: bool,
+    inputs: []const ?cfg.ValueInput,
+) bool {
+    if (static_entire) return true;
+    const origin_entire = switch (kind) {
+        .undef => entire_source,
+        .copy_of => |local| localIsEntirelyUndefined(ctx, state, local),
+        .field_copy_of => |field| fieldIsEntirelyUndefined(ctx, state, field.parent, field.name),
+        else => false,
+    };
+    return origin_entire or (computation and valueInputsAreEntirelyUndefined(ctx, state, inputs));
+}
+
+fn valueInputsAreEntirelyUndefined(ctx: Ctx, state: *const AbstractState, inputs: []const ?cfg.ValueInput) bool {
+    for (inputs) |entry| switch (entry orelse continue) {
+        .local => |local| if (localIsEntirelyUndefined(ctx, state, local)) return true,
+        .field => |field| if (fieldIsEntirelyUndefined(ctx, state, field.parent, field.name)) return true,
+        .indexed => |indexed| {
+            if (localIsEntirelyUndefined(ctx, state, indexed.array)) return true;
+            const index = resolveIndex(state, indexed.index) orelse continue;
+            var buffer: [32]u8 = undefined;
+            const path = std.fmt.bufPrint(&buffer, "[{d}]", .{index}) catch continue;
+            if (fieldIsEntirelyUndefined(ctx, state, indexed.array, path)) return true;
+        },
+    };
     return false;
 }
 
@@ -1328,13 +2207,33 @@ fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: Loca
         }
         return false;
     }
+    if (resolveIndex(state, index)) |known| {
+        var buffer: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&buffer, "[{d}]", .{known}) catch unreachable;
+        if (state.fieldBytesAreUnknown(array, path)) return false;
+        if (state.fieldBytesAreWritten(array, path)) return false;
+    }
+    if (state.fieldRangeBytesAreWritten(array, "", index)) return false;
     for (state.undefined_field_values.keys()) |key| {
         if (key.parent != array or !state.fieldValueMayBeUndefined(array, key.name)) continue;
+        if (state_mod.diagnosticArrayPrefixEnd(key.name)) |bound| {
+            if (state.provesComparison(.{
+                .lhs = index, .rhs = .{ .constant = bound }, .op = .ge,
+            }) or state.provesComparison(.{
+                .lhs = index, .rhs = .{ .constant = 0 }, .op = .lt,
+            })) continue;
+            return true;
+        }
         const slot = literalArrayElementIndex(key.name) orelse return true;
         if (!state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = slot }, .op = .ne })) return true;
     }
     for (state.written_fields.keys()) |key| {
         if (key.parent != array) continue;
+        if (state_mod.diagnosticArrayPrefixEnd(key.name)) |bound| {
+            if (state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = 0 }, .op = .ge }) and
+                state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = bound }, .op = .lt })) return false;
+            continue;
+        }
         const slot = literalArrayElementIndex(key.name) orelse continue;
         if (state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = slot }, .op = .eq }) and
             !state.fieldValueMayBeUndefined(array, key.name)) return false;
@@ -1356,15 +2255,101 @@ fn transferFieldAssign(
     a: @TypeOf(@as(StmtKind, undefined).field_assign),
     pos: cfg.SrcPos,
 ) !void {
-    if (a.diagnostic_only) {
-        const may_undefined = fieldAssignmentReadsUndefined(ctx, state, a);
+    if (a.may_write_only) {
+        if (!fieldAssignmentReadsUndefined(ctx, state, a)) return;
         const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
-        if (a.name.len == 0 and !ctx.locals[@intFromEnum(a.parent)].is_pointer) {
+        // This is a unioned negative alternative, not an overwrite. In
+        // particular, bindWrittenField would erase older holes and repairs.
+        try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+        try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+        try state.unknown_values.put(ctx.gpa, a.parent, {});
+        return;
+    }
+    if (a.diagnostic_only) {
+        const tag_copy = isOptionalTagPath(a.name) and
+            a.rhs_kind == .field_copy_of and isOptionalTagPath(a.rhs_kind.field_copy_of.name);
+        const may_undefined = if (tag_copy)
+            optionalTagBytesMayBeUndefined(ctx, state, a.rhs_kind.field_copy_of.parent, a.rhs_kind.field_copy_of.name)
+        else
+            fieldAssignmentReadsUndefined(ctx, state, a);
+        const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
+        if (isOptionalTagPath(a.name)) {
+            const value_path = if (a.name.len == cfg.diagnostic_optional_tag.len)
+                ""
+            else
+                a.name[0 .. a.name.len - cfg.diagnostic_optional_tag.len - 1];
+            const value: ArrayBytePlace = .{ .parent = a.parent, .path = value_path };
+            const entire_payload = optionalPayloadIsEntirelyUndefined(ctx, state, value);
+            const entire_tag = a.entire_value_undefined or (tag_copy and
+                fieldIsEntirelyUndefined(ctx, state, a.rhs_kind.field_copy_of.parent, a.rhs_kind.field_copy_of.name));
+            // A tag fact changes only negative byte masks, never value,
+            // pointer, lifetime, or aliased payload certificates.
+            if (may_undefined) {
+                // A negative tag cannot repair its ENTIRE undefined owner.
+                _ = state.written_fields.swapRemoveContext(key, .{});
+                try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+                if (entire_tag) {
+                    try state.entire_undefined_fields.putContext(ctx.gpa, key, {}, .{});
+                } else {
+                    _ = state.entire_undefined_fields.swapRemoveContext(key, .{});
+                    _ = state.entire_undefined_values.swapRemove(a.parent);
+                }
+            } else {
+                try state.bindWrittenField(ctx.gpa, key, false);
+                _ = state.undefined_field_values.swapRemoveContext(key, .{});
+                _ = state.entire_undefined_values.swapRemove(a.parent);
+            }
+            if (entire_payload) {
+                // Retain only a proved ALL byte-base at the actual value
+                // prefix. The tag repair still defeats whole-optional ALL.
+                const base: state_mod.FieldKey = .{ .parent = a.parent, .name = value_path };
+                try state.entire_undefined_fields.putContext(ctx.gpa, base, {}, .{});
+            }
+            return;
+        }
+        const aggregate_copy = switch (a.rhs_kind) {
+            .copy_of => |source| localDiagnosticIsAggregate(ctx, state, source),
+            .field_copy_of => a.aggregate_value,
+            else => false,
+        };
+        if (aggregate_copy) {
+            try copyArrayDiagnosticBytes(ctx, state, .{
+                .target = a.parent, .target_field = a.name,
+                .source = a.rhs_kind, .diagnostic_only = true,
+            });
+            return;
+        }
+        if (a.preserve_undefined_descendants) {
+            // These are simultaneous snapshot facts, not ordered stores.
+            if (may_undefined) {
+                _ = state.written_fields.swapRemoveContext(key, .{});
+                try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+                if (a.entire_value_undefined)
+                    try state.entire_undefined_fields.putContext(ctx.gpa, key, {}, .{})
+                else
+                    _ = state.entire_undefined_fields.swapRemoveContext(key, .{});
+            } else try state.written_fields.putContext(ctx.gpa, key, {}, .{});
+            if (a.name.len == 0)
+                try state.unknown_values.put(ctx.gpa, a.parent, {})
+            else
+                try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+            if (a.name.len == 0 and a.entire_value_undefined)
+                try state.entire_undefined_values.put(ctx.gpa, a.parent, {})
+            else if (!a.entire_value_undefined)
+                _ = state.entire_undefined_values.swapRemove(a.parent);
+            if (!a.entire_value_undefined and (state.locals.get(a.parent) orelse .plain) == .undef)
+                try state.partial_undefined_values.put(ctx.gpa, a.parent, {});
+            return;
+        }
+        if (a.name.len == 0 and (!ctx.locals[@intFromEnum(a.parent)].is_pointer or a.whole_value_bytes)) {
             state.forgetUndefinedBytes(a.parent);
             if (localIsArray(ctx, a.parent)) state.forgetInitializationArray(a.parent);
-            if (state.locals.getPtr(a.parent)) |origin| if (origin.* == .undef) {
-                origin.* = .plain;
-            };
+            if (state.locals.getPtr(a.parent)) |origin| {
+                if (a.entire_value_undefined and may_undefined and (origin.* == .plain or origin.* == .undef))
+                    origin.* = .undef
+                else if (origin.* == .undef)
+                    origin.* = .plain;
+            }
             try state.unknown_values.put(ctx.gpa, a.parent, {});
             if (may_undefined) try state.may_undefined_values.put(ctx.gpa, a.parent, {});
             try state.bindWrittenField(ctx.gpa, key, may_undefined);
@@ -1375,10 +2360,27 @@ fn transferFieldAssign(
             if (may_undefined) {
                 try state.undefined_field_values.putContext(ctx.gpa, selected, {}, .{});
             }
-            try invalidateAliasedArrayPayload(ctx, state, a.parent);
+            try invalidateAliasedArrayPayload(ctx, state, a.parent, a.name);
+        }
+        const exact = a.entire_value_undefined and may_undefined;
+        try state.bindEntireUndefinedField(ctx.gpa, key, exact);
+        if (a.name.len == 0 and (!ctx.locals[@intFromEnum(a.parent)].is_pointer or a.whole_value_bytes) and exact) {
+            try state.entire_undefined_values.put(ctx.gpa, a.parent, {});
+        } else if (!exact) {
+            _ = state.entire_undefined_values.swapRemove(a.parent);
+            if ((state.locals.get(a.parent) orelse .plain) == .undef)
+                try state.partial_undefined_values.put(ctx.gpa, a.parent, {});
         }
         return;
     }
+    if (!a.reads_old_value and a.rhs_kind == .field_copy_of and
+        a.rhs_kind.field_copy_of.parent == a.parent and
+        std.mem.eql(u8, a.rhs_kind.field_copy_of.name, a.name)) return;
+    const entirely_undefined = bindingIsEntirelyUndefined(
+        ctx, state, a.rhs_kind, a.entire_source_undefined,
+        a.entire_value_undefined, a.result_is_computation, &a.selected_inputs,
+    ) or (a.reads_old_value and
+        fieldIsEntirelyUndefined(ctx, state, a.parent, a.name));
     var origin = try originOfInit(ctx, state, a.rhs_kind, pos);
     // Retain the selected descriptor scalar at value time. A later source
     // clobber must revoke the relation, not the already copied scalar value.
@@ -1397,17 +2399,19 @@ fn transferFieldAssign(
     }
     state.forgetFieldComparisons(a.parent);
     const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
-    const defined = !(a.interior_view and origin == .stack and localIsArray(ctx, origin.stack)) and
+    const defined = !entirely_undefined and
+        !(a.interior_view and origin == .stack and localIsArray(ctx, origin.stack)) and
         fieldAssignmentIsDefined(ctx, state, a, origin);
-    // An unproved store is unknown. A store computed from a proved undefined
-    // operand or old value holds undefined bytes, so later reads report.
-    const reads_undefined = fieldAssignmentReadsUndefined(ctx, state, a);
-    if (!defined and origin == .plain and reads_undefined) origin = .undef;
+    // MAY taint remains diagnostic-only. Only the separate exact negative
+    // proof can tag a plain field as entirely undefined.
+    const reads_undefined = entirely_undefined or fieldAssignmentReadsUndefined(ctx, state, a);
+    if (entirely_undefined and origin == .plain) origin = .undef;
+    if (!entirely_undefined and origin == .undef) origin = .plain;
     try state.bindFieldValue(ctx.gpa, key, defined);
     try state.fields.putContext(ctx.gpa, key, origin, .{});
     try state.bindWrittenField(ctx.gpa, key, reads_undefined);
     if (reads_undefined) try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
-    if (!defined) try invalidateAliasedArrayPayload(ctx, state, a.parent);
+    if (!defined) try invalidateAliasedArrayPayload(ctx, state, a.parent, a.name);
     // An aggregate field rebind revokes every descendant descriptor proof.
     var fields = state.fields.iterator();
     while (fields.next()) |entry| {
@@ -1465,6 +2469,18 @@ fn transferFieldAssign(
         if (state.arenas.getPtr(aid)) |st| {
             if (!st.is_heap_allocated) st.is_heap_allocated = true;
         }
+    }
+    try state.bindEntireUndefinedField(ctx.gpa, key, entirely_undefined);
+    if (!entirely_undefined) _ = state.entire_undefined_values.swapRemove(a.parent);
+    const aggregate_source = a.aggregate_value or switch (a.rhs_kind) {
+        .copy_of => |source| localDiagnosticIsAggregate(ctx, state, source),
+        else => false,
+    };
+    if (aggregate_source and exprMayBeUndefined(ctx, state, a.rhs_kind)) {
+        try copyArrayDiagnosticBytes(ctx, state, .{
+            .target = a.parent, .target_field = a.name,
+            .source = a.rhs_kind, .diagnostic_only = true,
+        });
     }
 
     // A field store never defines its owner or an unwritten sibling.
@@ -1553,6 +2569,13 @@ fn transferFieldUse(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
+    // Whole aggregate transport preserves holes but only rejects an ALL proof.
+    const reads_undefined = !u.lifetime_only and if (u.optional_tag_path) |path|
+        optionalTagBytesMayBeUndefined(ctx, state, u.parent, path)
+    else if (u.aggregate_transport)
+        fieldIsEntirelyUndefined(ctx, state, u.parent, u.name)
+    else
+        fieldValueMayBeUndefined(ctx, state, u.parent, u.name);
     // Reading a field dereferences its owner, whatever origin the
     // FIELD itself carries.  A dead heap owner invalidates the read,
     // and an owner that is still `undefined` has no bytes to read at
@@ -1594,7 +2617,7 @@ fn transferFieldUse(
         (ctx.locals[@intFromEnum(u.parent)].is_slice or localIsArray(ctx, u.parent));
     if (state.locals.get(u.parent)) |parent_origin| if (!element_owner or parent_origin != .undef) switch (parent_origin) {
         .undef => {
-            if (!u.lifetime_only and fieldValueMayBeUndefined(ctx, state, u.parent, u.name) and config_mod.isEnabled(ctx.config, .use_undefined)) {
+            if (reads_undefined and config_mod.isEnabled(ctx.config, .use_undefined)) {
                 const owner_name = ctx.locals[@intFromEnum(u.parent)].name;
                 try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while `{s}` is still `undefined`", .{ owner_name, pathSep(u.name), u.name, owner_name });
                 return;
@@ -1642,7 +2665,7 @@ fn transferFieldUse(
             }
         },
         .undef => {
-            if (u.lifetime_only or !fieldValueMayBeUndefined(ctx, state, u.parent, u.name) or
+            if (!reads_undefined or
                 !config_mod.isEnabled(ctx.config, .use_undefined)) return;
             try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` while still `undefined`", .{ parent_name, pathSep(u.name), u.name });
         },
@@ -1670,8 +2693,8 @@ fn transferFieldUse(
         },
         else => {},
     }
-    if (origin != .undef and !u.lifetime_only and !element_owner and
-        fieldValueMayBeUndefined(ctx, state, u.parent, u.name) and config_mod.isEnabled(ctx.config, .use_undefined))
+    if (origin != .undef and (!element_owner or u.aggregate_transport) and reads_undefined and
+        config_mod.isEnabled(ctx.config, .use_undefined))
     {
         try report(ctx, "use-undefined", pos, end_pos, .@"error", "use of `{s}{s}{s}` without a defined field value", .{ parent_name, pathSep(u.name), u.name });
     }
@@ -1820,20 +2843,27 @@ fn transferUse(
     const origin = state.locals.get(u.local) orelse return;
     // Borrowing an undefined receiver does not read its payload. Only a
     // proven write may initialize it; a method name supplies no such proof.
-    if (u.from_method_call and !localIsArray(ctx, u.local) and !ctx.locals[@intFromEnum(u.local)].is_pointer)
+    if (u.from_method_call and !ctx.locals[@intFromEnum(u.local)].is_pointer)
     {
         if (origin != .undef)
             try checkOriginAlive(ctx, state, origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
         return;
     }
     if (localIsArray(ctx, u.local)) {
-        const complete = arrayHasWrittenCoverage(ctx, state, u.local);
-        try reportUncoveredArrayUse(ctx, state, u.local, complete, false, pos, end_pos);
-        const read_origin = if (complete and origin == .undef) Origin.plain else origin;
+        const reads_undefined = localIsEntirelyUndefined(ctx, state, u.local);
+        if (reads_undefined) try reportUncoveredArrayUse(ctx, state, u.local, false, false, pos, end_pos);
+        const read_origin = if (!reads_undefined and origin == .undef) Origin.plain else origin;
         try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
         return;
     }
-    const may_undefined = localIsProvedUndefined(ctx, state, u.local);
+    const may_undefined = if (u.tag_only)
+        optionalTagMayBeUndefined(ctx, state, u.local)
+    else if (u.optional_payload)
+        localIsProvedUndefined(ctx, state, u.local)
+    else if (localDiagnosticIsAggregate(ctx, state, u.local))
+        localIsEntirelyUndefined(ctx, state, u.local)
+    else
+        localIsProvedUndefined(ctx, state, u.local);
     if (origin != .undef and may_undefined)
         try checkOriginAlive(ctx, state, .undef, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
     const read_origin = if (origin == .undef and !may_undefined) Origin.plain else origin;
@@ -1903,6 +2933,22 @@ fn transferIndexedRead(
 ) !void {
     const origin = state.locals.get(read.array);
     const info = ctx.locals[@intFromEnum(read.array)];
+    if (read.field_array) |path| {
+        // A projected index selects bytes, not every hole in the backing field.
+        const written = state.fieldRangeBytesAreWritten(read.array, path, read.index);
+        const selected_index = resolveIndex(state, read.index);
+        const selected_undefined = if (selected_index) |index| blk: {
+            var buffer: [256]u8 = undefined;
+            const selected = std.fmt.bufPrint(&buffer, "{s}[{d}]", .{ path, index }) catch
+                break :blk fieldValueMayBeUndefined(ctx, state, read.array, path);
+            break :blk fieldValueMayBeUndefined(ctx, state, read.array, selected);
+        } else fieldValueMayBeUndefined(ctx, state, read.array, path);
+        if ((selected_index != null or !written) and selected_undefined)
+            try checkOriginAlive(ctx, state, .undef, pos, end_pos, info.name);
+        if (origin) |root| if (root != .undef)
+            try checkOriginAlive(ctx, state, root, pos, end_pos, info.name);
+        return;
+    }
     if (info.is_slice) {
         const initialized = !indexedValueMayBeUndefined(ctx, state, read.array, read.index);
         const pointer = state.fields.getContext(.{ .parent = read.array, .name = "ptr" }, .{});
@@ -1918,7 +2964,14 @@ fn transferIndexedRead(
                 state.hasInitializedScaledElement(read.array, element)
         else
             false;
-        const initialized = !indexedValueMayBeUndefined(ctx, state, read.array, read.index) or
+        const selected_field = if (read.name) |name| blk: {
+            const slot = state_mod.diagnosticArrayRange(name) orelse break :blk false;
+            break :blk slot.length < name.len;
+        } else false;
+        const initialized = (if (selected_field)
+            !fieldValueMayBeUndefined(ctx, state, read.array, read.name.?)
+        else
+            !indexedValueMayBeUndefined(ctx, state, read.array, read.index)) or
             (scaled_initialized and !undefinedFieldBytesRemain(state, read.array));
         try reportUncoveredArrayUse(ctx, state, read.array, initialized, false, pos, end_pos);
         if (origin) |root| {
@@ -1958,13 +3011,39 @@ fn transferIndexedWrite(
     }
     const rhs_origin = try originOfInit(ctx, state, write.rhs_kind, pos);
     const reads_undefined = indexedRhsReadsUndefined(ctx, state, write, rhs_origin);
+    const rhs_entire = bindingIsEntirelyUndefined(ctx, state, write.rhs_kind,
+        write.entire_source_undefined, write.value_entirely_undefined,
+        write.result_is_computation, write.selected_inputs[0 .. write.certificate_only_input orelse write.selected_inputs.len]);
     const info = ctx.locals[@intFromEnum(write.array)];
+    // Retain the initialized byte base when an exact overwrite adds a hole.
+    // This witness carries no payload or lifetime certificate.
+    if (localIsArray(ctx, write.array) and
+        (state.baseComplete(write.array) or arrayHasWrittenCoverage(ctx, state, write.array)))
+        try state.written_fields.putContext(ctx.gpa, .{ .parent = write.array, .name = "" }, {}, .{});
+    if (!rhs_entire and !info.is_pointer and !info.is_slice) {
+        _ = state.entire_undefined_values.swapRemove(write.array);
+        if ((state.locals.get(write.array) orelse .plain) == .undef)
+            try state.partial_undefined_values.put(ctx.gpa, write.array, {});
+    }
+    const aggregate_rhs = switch (write.rhs_kind) {
+        .copy_of => |source| localDiagnosticIsAggregate(ctx, state, source),
+        .field_copy_of => |source| fieldHasDiagnosticChildren(state, source.parent, source.name),
+        else => false,
+    };
+    if (!write.diagnostic_children_follow and !reads_undefined and !rhs_entire and !info.is_pointer and !info.is_slice and
+        (resolveIndex(state, write.index) == null or !aggregate_rhs))
+    {
+        const index = write.diagnostic_index orelse write.index;
+        if (index == .unknown or indexIsDefined(ctx, state, index))
+            try recordPossibleIndexedWrite(ctx, state, write, index);
+    }
     if (write.all_elements and (info.is_pointer or info.is_slice or !localIsArray(ctx, write.array))) {
         try transferFieldAssign(ctx, state, .{
             .parent = write.array,
             .name = if (info.is_slice) "[]" else "",
             .rhs_kind = if (reads_undefined) .undef else .plain,
             .diagnostic_only = true,
+            .entire_value_undefined = rhs_entire,
         }, pos);
         return;
     }
@@ -1978,6 +3057,7 @@ fn transferIndexedWrite(
             try state.bindWrittenField(ctx.gpa, key, reads_undefined);
             if (reads_undefined)
                 try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+            try state.bindEntireUndefinedField(ctx.gpa, key, rhs_entire);
         } else if (!rhs_defined) {
             // An unplaced undefined overwrite can hit any existing slot.
             // Revoke descendants too: a formerly complete element must not
@@ -1988,11 +3068,17 @@ fn transferIndexedWrite(
                 try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
             }
             try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
-            try state.bindWrittenField(ctx.gpa, .{ .parent = write.array, .name = path }, reads_undefined);
-            if (reads_undefined)
+            if (reads_undefined) {
+                try state.bindWrittenField(ctx.gpa, .{ .parent = write.array, .name = path }, true);
                 try state.undefined_field_values.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
+            }
+            state.forgetEntireUndefinedField(.{ .parent = write.array, .name = path });
         }
-        if (!rhs_defined) try invalidateAliasedArrayPayload(ctx, state, write.array);
+        if (write.name == null and rhs_defined and fieldValueMayBeUndefined(ctx, state, write.array, path)) {
+            state.forgetEntireUndefinedField(.{ .parent = write.array, .name = path });
+            try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
+        }
+        if (!rhs_defined) try invalidateAliasedArrayPayload(ctx, state, write.array, write.name orelse path);
         // Defined dynamic writes preserve existing coverage, but grant none.
         return;
     }
@@ -2003,6 +3089,26 @@ fn transferIndexedWrite(
         try state.bindWrittenField(ctx.gpa, key, reads_undefined);
         if (reads_undefined)
             try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+        try state.bindEntireUndefinedField(ctx.gpa, key, rhs_entire);
+    }
+    if (write.name == null and !write.all_elements and !info.is_pointer and !info.is_slice) {
+        if (resolveIndex(state, write.index)) |index| {
+            var buffer: [32]u8 = undefined;
+            const temporary = try std.fmt.bufPrint(&buffer, "[{d}]", .{index});
+            if (reads_undefined or state.fieldValueMayBeUndefined(write.array, temporary) or
+                state.entireUndefinedFieldPrefix(write.array, temporary) != null)
+            {
+                const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+                const key: state_mod.FieldKey = .{ .parent = write.array, .name = path };
+                try state.bindWrittenField(ctx.gpa, key, reads_undefined);
+                if (!indexedRhsIsDefined(ctx, state, write, rhs_origin))
+                    try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+                if (reads_undefined) try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+                try state.bindEntireUndefinedField(ctx.gpa, key, rhs_entire);
+            }
+        } else if (!rhs_entire and localIsProvedUndefined(ctx, state, write.array)) {
+            state.forgetEntireUndefinedFields(write.array);
+        }
     }
     var rhs_defined = indexedRhsIsDefined(ctx, state, write, rhs_origin);
     if (!rhs_defined and !reads_undefined) {
@@ -2011,8 +3117,15 @@ fn transferIndexedWrite(
         try state.unknown_values.put(ctx.gpa, write.array, {});
         rhs_defined = true;
     }
-    if (!rhs_defined and resolveIndex(state, write.index) == null)
-        try markPayloadMayBeUndefined(ctx, state, write.array);
+    if (!rhs_defined and resolveIndex(state, write.index) == null) {
+        if (indexedAggregateSource(ctx, state, write) != null) {
+            // Keep the same strict revocation, but replay child negatives
+            // below instead of manufacturing a whole-element MAY origin.
+            state.forgetInitializationArray(write.array);
+            state.forgetWrittenFields(write.array);
+            try state.unknown_values.put(ctx.gpa, write.array, {});
+        } else try markPayloadMayBeUndefined(ctx, state, write.array);
+    }
     const defined = indexIsDefined(ctx, state, write.index) and rhs_defined;
     if (write.all_elements) {
         if (defined) {
@@ -2020,6 +3133,10 @@ fn transferIndexedWrite(
         } else {
             state.forgetInitializationArray(write.array);
             if (reads_undefined) try markPayloadMayBeUndefined(ctx, state, write.array);
+        }
+        if (rhs_entire) {
+            try state.entire_undefined_values.put(ctx.gpa, write.array, {});
+            try state.bindEntireUndefinedField(ctx.gpa, .{ .parent = write.array, .name = "" }, true);
         }
         return;
     }
@@ -2055,6 +3172,47 @@ fn transferIndexedWrite(
     try extendSymbolicPrefix(ctx, state, write.array, write.index, prefix_before, extent);
 }
 
+/// Possible placement suppresses inherited holes, never strict certificates.
+fn recordPossibleIndexedWrite(
+    ctx: Ctx,
+    state: *AbstractState,
+    write: @TypeOf(@as(StmtKind, undefined).indexed_write),
+    index: cfg.IndexTerm,
+) !void {
+    var buffer: [96]u8 = undefined;
+    if (index == .field and std.mem.eql(u8, index.field.name, "value") and index.field.offset == 0) {
+        if (ctx.locals[@intFromEnum(index.field.parent)].enum_value_indices) |indices| {
+            const extent = ctx.locals[@intFromEnum(write.array)].array_extent;
+            for (indices) |selected| {
+                if (extent != null and selected >= extent.?) continue;
+                const path = try std.fmt.bufPrint(&buffer, "[{d}]", .{selected});
+                const owned = try ctx.seen.internBytePath(ctx.gpa, "", path);
+                try state.uncertain_byte_writes.putContext(ctx.gpa, .{ .parent = write.array, .name = owned }, {}, .{});
+            }
+            return;
+        }
+    }
+    const path = if (resolveIndex(state, index)) |selected| fixed: {
+        const suffix = if (write.name) |name|
+            if (state_mod.diagnosticArrayRange(name)) |slot| name[slot.length..] else ""
+        else "";
+        break :fixed try std.fmt.bufPrint(&buffer, "[{d}..{d}]{s}", .{ selected, std.math.add(u64, selected, 1) catch return, suffix });
+    } else if (write.name) |name| name else blk: {
+        const extent = ctx.locals[@intFromEnum(write.array)].array_extent orelse break :blk "";
+        if (write.diagnostic_scaled) |scaled| {
+            if (scaled.scale > 1)
+                break :blk try std.fmt.bufPrint(&buffer, "[%{d}:{d}:{d}]", .{ scaled.offset, scaled.scale, extent });
+        }
+        if (write.diagnostic_stride) |stride|
+            break :blk try std.fmt.bufPrint(&buffer, "[%{d}:{d}:{d}]", .{ stride.offset, stride.period, extent });
+        const range = state.diagnosticWriteRange(index, extent);
+        if (range.start >= range.end) return;
+        break :blk try std.fmt.bufPrint(&buffer, "[{d}..{d}]", .{ range.start, range.end });
+    };
+    const owned = try ctx.seen.internBytePath(ctx.gpa, "", path);
+    try state.uncertain_byte_writes.putContext(ctx.gpa, .{ .parent = write.array, .name = owned }, {}, .{});
+}
+
 /// Diagnostic question: does this store write a value proved undefined?
 fn indexedRhsReadsUndefined(
     ctx: Ctx,
@@ -2062,13 +3220,61 @@ fn indexedRhsReadsUndefined(
     write: @TypeOf(@as(StmtKind, undefined).indexed_write),
     rhs_origin: Origin,
 ) bool {
+    if (write.value_has_undefined_origin or write.value_entirely_undefined) return true;
     if (rhs_origin == .undef and write.rhs_kind != .copy_of and write.rhs_kind != .field_copy_of) return true;
     if (exprMayBeUndefined(ctx, state, write.rhs_kind)) return true;
     for (write.inputs) |input| {
         const local = input orelse continue;
         if (localIsProvedUndefined(ctx, state, local)) return true;
     }
-    return valueInputsMayBeUndefined(ctx, state, &write.selected_inputs);
+    return valueInputsMayBeUndefined(ctx, state,
+        write.selected_inputs[0 .. write.certificate_only_input orelse write.selected_inputs.len]);
+}
+
+fn indexedAggregateSource(
+    ctx: Ctx,
+    state: *const AbstractState,
+    write: @TypeOf(@as(StmtKind, undefined).indexed_write),
+) ?LocalId {
+    if (write.result_is_computation or write.rhs_kind != .copy_of or write.all_elements or
+        write.field_array != null or ctx.locals[@intFromEnum(write.array)].array_extent == null) return null;
+    const source = write.rhs_kind.copy_of;
+    const info = ctx.locals[@intFromEnum(source)];
+    if (source == write.array or info.is_pointer or info.is_slice or
+        (!localIsArray(ctx, source) and (!info.tracks_array_payload or info.tracks_scalar_value)) or
+        localIsEntirelyUndefined(ctx, state, source)) return null;
+    return source;
+}
+
+/// A whole-element copy transports the source's child masks at its placement.
+/// Flattening a partial source to a whole-slot MAY taint loses its siblings.
+fn replayIndexedAggregateBytes(
+    ctx: Ctx,
+    state: *AbstractState,
+    write: @TypeOf(@as(StmtKind, undefined).indexed_write),
+) !void {
+    const source = indexedAggregateSource(ctx, state, write) orelse return;
+    const extent = ctx.locals[@intFromEnum(write.array)].array_extent orelse return;
+    const resolved = resolveIndex(state, write.index);
+    var buffer: [64]u8 = undefined;
+    const temporary = if (resolved) |index| fixed: {
+        if (index >= extent) return;
+        break :fixed try std.fmt.bufPrint(&buffer, "[{d}]", .{index});
+    } else unplaced: {
+        const range = state.diagnosticWriteRange(write.index, extent);
+        if (range.start >= range.end) return;
+        break :unplaced try std.fmt.bufPrint(&buffer, "[{d}..{d}]", .{ range.start, range.end });
+    };
+    const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+    try copyArrayDiagnosticBytes(ctx, state, .{
+        .target = write.array,
+        .target_field = path,
+        .source = .{ .copy_of = source },
+        .diagnostic_only = true,
+    });
+    // Replayed holes remain authoritative. Other bytes must not inherit a
+    // coarse whole-source MAY taint when a loop join drops repair witnesses.
+    try state.uncertain_byte_writes.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
 }
 
 fn transferArrayRangeComplete(
@@ -2094,16 +3300,22 @@ fn transferArrayRangeComplete(
         .inputs = range.inputs,
         .selected_inputs = range.selected_inputs,
     };
-    if (!storageInputsAreCovered(ctx, state, &range.inputs) or
-        !indexedRhsIsDefined(ctx, state, write, .plain)) {
-        if (indexedRhsReadsUndefined(ctx, state, write, .plain)) {
-            state.forgetInitializationArray(range.array);
-            try state.may_undefined_values.put(ctx.gpa, range.array, {});
-            return;
-        }
-        try state.unknown_values.put(ctx.gpa, range.array, {});
+    const covered = storageInputsAreCovered(ctx, state, &range.inputs) and
+        indexedRhsIsDefined(ctx, state, write, .plain);
+    if (!covered and indexedRhsReadsUndefined(ctx, state, write, .plain)) {
+        state.forgetInitializationArray(range.array);
+        try state.may_undefined_values.put(ctx.gpa, range.array, {});
+    } else {
+        if (!covered) try state.unknown_values.put(ctx.gpa, range.array, {});
+        try state.markArrayRangeComplete(ctx.gpa, range.array, range.start, range.end);
     }
-    try state.markArrayRangeComplete(ctx.gpa, range.array, range.start, range.end);
+    // Certificate revocation clears initialization repairs. Replay the exact
+    // source bytes afterwards, without restoring any strict certificate.
+    if (range.diagnostic_source) |source| {
+        try copyCaptureDiagnosticBytes(ctx, state, .{
+            .target = range.array, .source = .{ .copy_of = source }, .mask_only = true,
+        });
+    }
 }
 
 fn transferArrayMemsetPrefix(
@@ -2154,12 +3366,40 @@ fn transferArrayMemsetPrefix(
         .rhs_kind = prefix.rhs_kind,
         .defined = prefix.defined,
         .selected_inputs = prefix.selected_inputs,
+        .value_has_undefined_origin = prefix.value_has_undefined_origin,
+        .entire_source_undefined = prefix.entire_source_undefined,
     };
     if (!indexedRhsIsDefined(ctx, state, write, rhs_origin) or
         !valueInputsAreDefined(ctx, state, &prefix.selected_inputs, false))
     {
         if (prefix.count == .constant and prefix.count.constant == 0) return;
         if (indexedRhsReadsUndefined(ctx, state, write, rhs_origin)) {
+            if (prefix.count == .constant) {
+                const count = prefix.count.constant;
+                if (count == extent) {
+                    var whole_write = write;
+                    whole_write.all_elements = true;
+                    whole_write.value_entirely_undefined = prefix.entire_source_undefined;
+                    try transferIndexedWrite(ctx, state, whole_write, pos);
+                    return;
+                }
+                // Keep untouched coverage; this mask poisons only filled lanes.
+                var buffer: [48]u8 = undefined;
+                const temporary = try std.fmt.bufPrint(&buffer, "[0..{d}]", .{count});
+                const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+                const key: state_mod.FieldKey = .{ .parent = prefix.array, .name = path };
+                try state.bindWrittenField(ctx.gpa, key, true);
+                try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
+                try state.unknown_field_values.putContext(ctx.gpa, key, {}, .{});
+                try state.bindEntireUndefinedField(ctx.gpa, key, prefix.entire_source_undefined);
+                try state.unknown_values.put(ctx.gpa, prefix.array, {});
+                if (!prefix.entire_source_undefined) {
+                    _ = state.entire_undefined_values.swapRemove(prefix.array);
+                    if ((state.locals.get(prefix.array) orelse .plain) == .undef)
+                        try state.partial_undefined_values.put(ctx.gpa, prefix.array, {});
+                }
+                return;
+            }
             state.forgetInitializationArray(prefix.array);
             try state.may_undefined_values.put(ctx.gpa, prefix.array, {});
             return;
@@ -2167,6 +3407,7 @@ fn transferArrayMemsetPrefix(
         // Unknown stores write bytes without supplying a value certificate.
         try state.unknown_values.put(ctx.gpa, prefix.array, {});
     }
+    if (resolveIndex(state, prefix.count)) |count| if (count == 0) return;
     var hole_index: usize = 0;
     while (hole_index < state.undefined_elements.count()) {
         const hole = state.undefined_elements.keys()[hole_index];
@@ -2179,6 +3420,14 @@ fn transferArrayMemsetPrefix(
     }
     switch (prefix.count) {
         .constant => |count| {
+            if (count != 0) {
+                var buffer: [48]u8 = undefined;
+                const temporary = try std.fmt.bufPrint(&buffer, "[0..{d}]", .{count});
+                if (state.fieldValueMayBeUndefined(prefix.array, temporary)) {
+                    const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+                    try state.bindWrittenField(ctx.gpa, .{ .parent = prefix.array, .name = path }, false);
+                }
+            }
             try state.setFixedPrefix(ctx.gpa, prefix.array, @max(state.fixedPrefix(prefix.array), count));
             if (count == extent) try state.markArrayComplete(ctx.gpa, prefix.array);
         },
@@ -2186,6 +3435,10 @@ fn transferArrayMemsetPrefix(
             if (state.symbolicPrefixOffset(prefix.array, term.local)) |offset| {
                 if (offset >= 0) return;
             }
+            var buffer: [128]u8 = undefined;
+            const temporary = try std.fmt.bufPrint(&buffer, "[0..${d}:1:0:{d}:0]", .{ @intFromEnum(term.local), extent });
+            const path = try ctx.seen.internBytePath(ctx.gpa, "", temporary);
+            try state.bindWrittenField(ctx.gpa, .{ .parent = prefix.array, .name = path }, false);
             try state.setSymbolicPrefix(ctx.gpa, prefix.array, term.local, 0, extent);
         },
         else => unreachable,
@@ -2210,7 +3463,8 @@ fn indexedRhsIsDefined(
     write: @TypeOf(@as(StmtKind, undefined).indexed_write),
     rhs_origin: Origin,
 ) bool {
-    if (!write.defined or write.rhs_kind == .undef) return false;
+    if (!write.defined or write.rhs_kind == .undef or
+        write.value_has_undefined_origin or write.value_entirely_undefined) return false;
     if (rhs_origin == .undef) {
         const source = switch (write.rhs_kind) {
             .copy_of => |local| local,
@@ -2277,7 +3531,8 @@ pub fn returnValueIsDefined(ctx: Ctx, state: *const AbstractState, returned: cfg
 pub fn returnValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, returned: cfg.StmtKind) bool {
     const value = returned.ret;
     if (value.diagnostic_source) |source| return localIsProvedUndefined(ctx, state, source);
-    return value.is_literal_undef or bindingMayBeUndefined(ctx, state, value.value_kind, &value.value_inputs);
+    return value.value_has_undefined_origin or value.is_literal_undef or
+        bindingMayBeUndefined(ctx, state, value.value_kind, &value.value_inputs);
 }
 
 fn scalarValueIsDefined(
@@ -3740,14 +4995,14 @@ test "indexed transfers keep exact coverage separate from array origin" {
     });
     try testing.expectEqual(@as(usize, 0), problems.items.len);
 
-    // A write to one slot must not clear the array's undefined origin.
+    // A partial transport is silent, without clearing the strict origin.
     try transfer(ctx, &state, .{
         .kind = .{ .use = .{ .local = items } },
         .pos = .{ .line = 1, .column = 3, .byte = 2 },
         .end_pos = .{ .line = 1, .column = 4, .byte = 3 },
     });
-    try testing.expectEqual(@as(usize, 1), problems.items.len);
-    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try testing.expect(state.locals.get(items).? == .undef);
 
     // Explicit completion suppresses aggregate undefined without changing
     // the underlying origin.
@@ -3762,7 +5017,7 @@ test "indexed transfers keep exact coverage separate from array origin" {
         .pos = .{ .line = 1, .column = 4, .byte = 3 },
         .end_pos = .{ .line = 1, .column = 5, .byte = 4 },
     });
-    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
 
     // An undefined overwrite must revoke the prior proof for slot zero.
     try transfer(ctx, &state, .{
@@ -3780,7 +5035,7 @@ test "indexed transfers keep exact coverage separate from array origin" {
         .pos = .{ .line = 1, .column = 5, .byte = 4 },
         .end_pos = .{ .line = 1, .column = 6, .byte = 5 },
     });
-    try testing.expectEqual(@as(usize, 2), problems.items.len);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
 test "compact range completion joins prefixes and exact sparse suffixes" {
@@ -4151,9 +5406,9 @@ test "undefined indexed writes revoke initialized coverage on plain arrays" {
         .end_pos = .{ .line = 1, .column = 6, .byte = 5 },
     });
 
-    try testing.expectEqual(@as(usize, 2), problems.items.len);
+    // Only the selected hole reports; the partial whole-value use is silent.
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
     try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
-    try testing.expectEqualStrings("use-undefined", problems.items[1].rule_id);
 }
 
 test "indexed coverage holes preserve array resource origin" {
@@ -4664,6 +5919,8 @@ test "successful prefix certificate defines its returned count without filling t
     var state: AbstractState = .{};
     defer state.deinit(gpa);
     try state.locals.put(gpa, array, .undef);
+    try state.undefined_field_values.putContext(gpa, .{ .parent = array, .name = "" }, {}, .{});
+    try state.entire_undefined_fields.putContext(gpa, .{ .parent = array, .name = "" }, {}, .{});
     try state.locals.put(gpa, count, .plain);
     try state.unknown_values.put(gpa, count, {});
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
@@ -4680,7 +5937,54 @@ test "successful prefix certificate defines its returned count without filling t
     try testing.expect(try state.assumeComparison(gpa, .{ .lhs = .{ .local = .{ .local = count } }, .rhs = .{ .constant = 2 }, .op = .eq }));
     try testing.expect(state.hasInitializedElement(array, .{ .constant = 1 }));
     try testing.expect(!state.hasInitializedElement(array, .{ .constant = 3 }));
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 1 }));
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 3 }));
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_write = .{
+            .array = array, .index = .{ .constant = 1 },
+            .rhs_kind = .undef, .defined = false,
+        } },
+        .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 1 }));
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 0 }));
 }
+
+test "nullable OR audit: optional tag masks do not revoke payload certificates" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const optional: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 1 },
+        .{ .name = "optional", .decl_pos = pos1(), .is_slice = true, .tracks_optional_tag = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, array, .plain);
+    try state.locals.put(gpa, optional, .{ .stack = array });
+    try state.markArrayComplete(gpa, array);
+    try state.fields.putContext(gpa, .{ .parent = optional, .name = "ptr" }, .{ .stack = array }, .{});
+    try state.bindFieldValue(gpa, .{ .parent = optional, .name = "ptr" }, true);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    for ([_]ExprKind{ .undef, .unknown }) |kind| {
+        try transfer(ctx, &state, .{
+            .kind = .{ .field_assign = .{
+                .parent = optional, .name = cfg.diagnostic_optional_tag,
+                .rhs_kind = kind, .diagnostic_only = true,
+            } },
+            .pos = pos0(), .end_pos = pos1(),
+        });
+        try testing.expectEqual(kind == .undef, optionalTagMayBeUndefined(ctx, &state, optional));
+        try testing.expect(state.isArrayComplete(array));
+        try testing.expectEqual(@as(usize, 0), state.unknown_field_values.count());
+        try testing.expectEqual(Origin{ .stack = array }, state.locals.get(optional).?);
+    }
+}
+
 
 test "successful prefix source inputs reject opaque scalars without clearing the count" {
     const gpa = testing.allocator;
@@ -4696,6 +6000,8 @@ test "successful prefix source inputs reject opaque scalars without clearing the
         var state: AbstractState = .{};
         defer state.deinit(gpa);
         try state.locals.put(gpa, array, .undef);
+        try state.undefined_field_values.putContext(gpa, .{ .parent = array, .name = "" }, {}, .{});
+        try state.entire_undefined_fields.putContext(gpa, .{ .parent = array, .name = "" }, {}, .{});
         try state.locals.put(gpa, count, .plain);
         try state.locals.put(gpa, source, .plain);
         try state.setScalarValue(gpa, count, 2);
@@ -4714,6 +6020,8 @@ test "successful prefix source inputs reject opaque scalars without clearing the
             .end_pos = pos1(),
         });
         try testing.expect(state.hasInitializedElement(array, .{ .constant = 1 }));
+        try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 1 }));
+        try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 3 }));
         try testing.expectEqual(!opaque_source, valueInputsAreDefined(ctx, &state, &.{.{
             .indexed = .{ .array = array, .index = .{ .constant = 1 } },
         }}, false));
@@ -4867,5 +6175,1023 @@ test "undefined diagnostics: unknown field writes initialize bytes without certi
             .end_pos = pos1(),
         });
         try testing.expectEqual(@as(usize, if (undefined_input) 1 else 0), problems.items.len);
+    }
+}
+
+test "diagnostic-only array transport preserves holes without positive value certificates" {
+    const gpa = testing.allocator;
+    const source: LId = @enumFromInt(0);
+    const destination: LId = @enumFromInt(1);
+    const locals = [_]LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .is_array = true, .array_extent = 3, .tracks_array_payload = true },
+        .{ .name = "destination", .decl_pos = pos0(), .is_array = true, .array_extent = 3, .tracks_array_payload = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, source, .undef);
+    try state.locals.put(gpa, destination, .undef);
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_assign = .{ .parent = source, .name = "[0]", .rhs_kind = .unknown } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = source } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_value = .{
+            .target = destination,
+            .source = .{ .copy_of = source },
+            .diagnostic_only = true,
+        } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    });
+    // Partial transport is silent and does not grant a defined-value certificate.
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try testing.expect(!valueInputsAreDefined(ctx, &state, &.{.{ .local = destination }}, false));
+    try testing.expect(!valueInputsAreDefined(ctx, &state, &.{.{
+        .indexed = .{ .array = destination, .index = .{ .constant = 0 } },
+    }}, false));
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = destination, .index = .{ .constant = 0 } } },
+        .pos = pos1(),
+        .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    const hole_pos: cfg.SrcPos = .{ .line = 3, .column = 5, .byte = 20 };
+    try transfer(ctx, &state, .{
+        .kind = .{ .indexed_read = .{ .array = destination, .index = .{ .constant = 1 } } },
+        .pos = hole_pos,
+        .end_pos = hole_pos,
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expectEqual(hole_pos.line, problems.items[0].start.line);
+    try testing.expectEqual(hole_pos.column, problems.items[0].start.column);
+}
+
+test "returned descriptor prefix: written unknown locations never certify payloads" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const source: LocalId = @enumFromInt(2);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 4 },
+        .{ .name = "count", .decl_pos = pos1(), .is_unsigned = true },
+        .{ .name = "source", .decl_pos = pos1(), .is_slice = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, array, .undef);
+    try state.locals.put(gpa, count, .plain);
+    try state.locals.put(gpa, source, .plain);
+    try state.unknown_values.put(gpa, source, {});
+    try state.unknown_values.put(gpa, count, {});
+    try state.setScalarValue(gpa, count, 2);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_assign = .{ .parent = array, .name = "[0..$1:1:0:4:0]", .rhs_kind = .plain,
+            .selected_inputs = .{ .{ .local = source }, null, null, null, null, null, null, null },
+            .diagnostic_only = true } },
+        .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 1 }));
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, .{ .constant = 2 }));
+    try testing.expect(!state.hasInitializedElement(array, .{ .constant = 1 }));
+    try testing.expect(!state.isArrayComplete(array));
+    try testing.expect(!state.fieldValueIsDefined(array, "[1]"));
+    try testing.expect(state.unknown_values.contains(count));
+}
+
+test "returned descriptor prefix: runtime guard stays diagnostic through mutations and joins" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const index: LocalId = @enumFromInt(2);
+    const domains = [_]state_mod.IntegerDomain{ .{}, .{ .kind = .unsigned, .bits = 64 }, .{ .kind = .unsigned, .bits = 64 } };
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 4 },
+        .{ .name = "count", .decl_pos = pos1(), .is_unsigned = true },
+        .{ .name = "index", .decl_pos = pos1(), .is_unsigned = true },
+    };
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, array, .undef);
+    try state.locals.put(gpa, count, .plain);
+    try state.locals.put(gpa, index, .plain);
+    try state.unknown_values.put(gpa, count, {});
+    try state.setScalarValue(gpa, index, 0);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_assign = .{ .parent = array, .name = "[0..$1:1:0:4:0]", .rhs_kind = .plain, .diagnostic_only = true } },
+        .pos = pos0(), .end_pos = pos1(),
+    });
+    const selected: cfg.IndexTerm = .{ .local = .{ .local = index } };
+    const guard: cfg.Stmt = .{
+        .kind = .{ .compare_assume = .{ .lhs = selected, .rhs = .{ .local = .{ .local = count } }, .op = .lt } },
+        .pos = pos0(), .end_pos = pos1(),
+    };
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try transfer(ctx, &state, guard);
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, selected));
+    // The observable caller certificate obligations stay strict.
+    try testing.expect(!indexIsDefined(ctx, &state, .{ .local = .{ .local = count } }));
+    try testing.expect(state.unknown_values.contains(count));
+    try testing.expectEqual(@as(usize, 0), state.comparisons.items.len);
+    try testing.expect(!state.hasInitializedElement(array, selected));
+    try testing.expect(!state.isArrayComplete(array));
+    try testing.expect(!state.fieldValueIsDefined(array, "[0]"));
+
+    var joined: AbstractState = .{};
+    defer joined.deinit(gpa);
+    try joined.cloneFrom(&state, gpa);
+    var unguarded: AbstractState = .{};
+    defer unguarded.deinit(gpa);
+    try unguarded.cloneFrom(&state, gpa);
+    unguarded.forgetAllComparisons();
+    _ = try state_mod.join(&joined, &unguarded, gpa);
+    try testing.expect(indexedValueMayBeUndefined(ctx, &joined, array, selected));
+
+    // An index mutation loses the guard, but not the saved prefix.
+    try state.stepCounter(gpa, index, 1);
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try transfer(ctx, &state, guard);
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, selected));
+
+    // A count mutation loses BOTH guard and original prefix. A fresh guard
+    // must not turn the enlarged count into a new store witness.
+    try state.stepCounter(gpa, count, 1);
+    try transfer(ctx, &state, guard);
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try testing.expectEqual(@as(usize, 0), state.written_fields.count());
+    try testing.expectEqual(@as(usize, 0), state.diagnostic_index_bounds.count());
+}
+
+test "MAY-only field stores union proved poison without granting or erasing byte credit" {
+    const gpa = testing.allocator;
+    const storage: LId = @enumFromInt(0);
+    const input: LId = @enumFromInt(1);
+    const locals = [_]LocalInfo{
+        .{ .name = "storage", .decl_pos = pos0(), .tracks_array_payload = true },
+        .{ .name = "input", .decl_pos = pos0(), .tracks_scalar_value = true },
+    };
+    const known: state_mod.FieldKey = .{ .parent = storage, .name = "known" };
+    const spare: state_mod.FieldKey = .{ .parent = storage, .name = "spare" };
+    for ([_]bool{ false, true }) |undefined_input| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, storage, .plain);
+        try state.locals.put(gpa, input, if (undefined_input) .undef else .plain);
+        try state.unknown_values.put(gpa, input, {});
+        try state.bindWrittenField(gpa, known, false);
+        try state.undefined_field_values.putContext(gpa, spare, {}, .{});
+        try state.fields.putContext(gpa, known, .{ .stack = input }, .{});
+        try transfer(ctx, &state, .{
+            .kind = .{ .field_assign = .{
+                .parent = storage,
+                .name = "known",
+                .rhs_kind = .unknown,
+                .selected_inputs = .{ .{ .local = input }, null, null, null, null, null, null, null },
+                .may_write_only = true,
+            } },
+            .pos = pos0(),
+            .end_pos = pos1(),
+        });
+        try testing.expectEqual(undefined_input, state.fieldValueMayBeUndefined(storage, "known"));
+        try testing.expect(state.fieldValueMayBeUndefined(storage, "spare"));
+        try testing.expect(state.written_fields.containsContext(known, .{}));
+        try testing.expect(!state.written_fields.containsContext(spare, .{}));
+        try testing.expect((state.locals.get(storage) orelse unreachable) == .plain);
+        const preserved = state.fields.getContext(known, .{}) orelse unreachable;
+        try testing.expect(preserved == .stack and preserved.stack == input);
+        try testing.expectEqual(undefined_input, state.unknown_values.contains(storage));
+    }
+}
+
+test "switch capture masks: byte replay preserves positive certificates and origins" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const capture: LocalId = @enumFromInt(1);
+    const control: LocalId = @enumFromInt(2);
+    const domains = [_]state_mod.IntegerDomain{ .{}, .{ .kind = .unsigned, .bits = 8 }, .{ .kind = .unsigned, .bits = 8 } };
+    const locals = [_]LocalInfo{
+        .{ .name = "selector", .decl_pos = pos0(), .tracks_array_payload = true },
+        .{ .name = "capture", .decl_pos = pos0(), .tracks_scalar_value = true, .is_array = true, .array_extent = 2 },
+        .{ .name = "control", .decl_pos = pos0(), .tracks_scalar_value = true },
+    };
+    for ([_]bool{ false, true }) |unknown_capture| {
+        var state: AbstractState = .{ .integer_domains = &domains };
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, source, .plain);
+        try state.locals.put(gpa, capture, .plain);
+        try state.locals.put(gpa, control, .plain);
+        try state.undefined_field_values.putContext(gpa, .{ .parent = source, .name = "a" }, {}, .{});
+        try state.entire_undefined_fields.putContext(gpa, .{ .parent = source, .name = "a" }, {}, .{});
+        try state.written_fields.putContext(gpa, .{ .parent = source, .name = "a.child" }, {}, .{});
+        try state.fields.putContext(gpa, .{ .parent = capture, .name = "existing" }, .plain, .{});
+        if (unknown_capture) try state.unknown_values.put(gpa, capture, {});
+        try state.unknown_field_values.putContext(gpa, .{ .parent = capture, .name = "uncertified" }, {}, .{});
+        try state.unknown_values.put(gpa, control, {});
+        try state.setScalarValue(gpa, control, 7);
+        try state.markArrayComplete(gpa, capture);
+        try state.setExactElement(gpa, capture, 0, true);
+        const child_defined = scalarFieldIsDefined(ctx, &state, capture, "child");
+        const existing_defined = scalarFieldIsDefined(ctx, &state, capture, "existing");
+        const whole_defined = state.fieldValueIsDefined(capture, "");
+        const value_defined = localInputIsDefined(ctx, &state, capture, true);
+        const control_defined = localInputIsDefined(ctx, &state, control, true);
+        const fields_count = state.fields.count();
+        const locals_count = state.locals.count();
+        const unknown_count = state.unknown_values.count();
+        const unknown_fields_count = state.unknown_field_values.count();
+        const complete_count = state.complete_arrays.count();
+        const exact_count = state.exact_elements.count();
+        try transfer(ctx, &state, .{
+            .kind = .{ .array_value = .{ .target = capture, .source = .{ .field_copy_of = .{ .parent = source, .name = "a" } }, .mask_only = true } },
+            .pos = pos0(), .end_pos = pos1(),
+        });
+        try testing.expect(!state.fieldValueMayBeUndefined(capture, "child"));
+        try testing.expect(state.fieldValueMayBeUndefined(capture, "spare"));
+        try testing.expect(!state.entire_undefined_values.contains(capture));
+        try testing.expectEqual(child_defined, scalarFieldIsDefined(ctx, &state, capture, "child"));
+        try testing.expectEqual(existing_defined, scalarFieldIsDefined(ctx, &state, capture, "existing"));
+        try testing.expectEqual(whole_defined, state.fieldValueIsDefined(capture, ""));
+        try testing.expectEqual(value_defined, localInputIsDefined(ctx, &state, capture, true));
+        try testing.expectEqual(control_defined, localInputIsDefined(ctx, &state, control, true));
+        try testing.expectEqual(fields_count, state.fields.count());
+        try testing.expectEqual(locals_count, state.locals.count());
+        try testing.expectEqual(unknown_count, state.unknown_values.count());
+        try testing.expectEqual(unknown_fields_count, state.unknown_field_values.count());
+        try testing.expectEqual(complete_count, state.complete_arrays.count());
+        try testing.expectEqual(exact_count, state.exact_elements.count());
+        try testing.expect(state.locals.get(capture).? == .plain);
+        try testing.expectEqual(@as(?u64, 7), state.scalarValue(control));
+        try testing.expect(state.isArrayComplete(capture));
+    }
+}
+
+test "switch tag diagnostics: payload holes are not tag holes and payload repairs do not write tags" {
+    const gpa = testing.allocator;
+    const selector: LocalId = @enumFromInt(0);
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, selector, .plain);
+    try state.undefined_field_values.putContext(gpa, .{ .parent = selector, .name = "a.spare" }, {}, .{});
+    try testing.expect(!unionTagMayBeUndefined(&state, selector));
+    try state.locals.put(gpa, selector, .undef);
+    try state.written_fields.putContext(gpa, .{ .parent = selector, .name = "a.child" }, {}, .{});
+    try state.partial_undefined_values.put(gpa, selector, {});
+    try testing.expect(unionTagMayBeUndefined(&state, selector));
+    try state.undefined_field_values.putContext(gpa, .{ .parent = selector, .name = "" }, {}, .{});
+    try state.locals.put(gpa, selector, .plain);
+    try testing.expect(unionTagMayBeUndefined(&state, selector));
+}
+
+
+test "counted append prefix: physical last slot does not certify unknown values" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const domains = [_]state_mod.IntegerDomain{ .{}, .{ .kind = .unsigned, .bits = @bitSizeOf(usize) } };
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "chain", .decl_pos = pos0(), .is_array = true, .array_extent = 16 },
+        .{ .name = "count", .decl_pos = pos1(), .is_unsigned = true, .tracks_scalar_value = true },
+    };
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, array, .undef);
+    try state.locals.put(gpa, count, .plain);
+    try state.unknown_values.put(gpa, array, {});
+    try state.unknown_values.put(gpa, count, {});
+    try state.setExactElement(gpa, array, 0, true);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const prefix: cfg.Stmt = .{
+        .kind = .{ .array_prefix = .{ .array = array, .count = count, .seeded_append = true } },
+        .pos = pos0(), .end_pos = pos1(),
+    };
+    const selected: cfg.IndexTerm = .{ .local = .{ .local = count, .offset = -1 } };
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try transfer(ctx, &state, prefix);
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try testing.expect(state.unknown_values.contains(array));
+    try testing.expect(state.unknown_values.contains(count));
+    try testing.expect(!indexIsDefined(ctx, &state, selected));
+    try testing.expectEqual(@as(?u64, null), state.scalarValue(count));
+    try testing.expectEqual(@as(usize, 0), state.comparisons.items.len);
+    try testing.expectEqual(@as(usize, 0), state.symbolic_prefixes.count());
+    try testing.expect(!state.hasInitializedElement(array, selected));
+    try testing.expect(!arrayHasFullCoverage(ctx, &state, array));
+    try testing.expect(!state.isArrayComplete(array));
+    try testing.expect(!state.fieldValueIsDefined(array, "[1]"));
+    const input: cfg.ValueInput = .{ .indexed = .{ .array = array, .index = selected } };
+    try testing.expect(!valueInputsAreDefined(ctx, &state, &.{input}, false));
+    try testing.expect(!returnValueIsDefined(ctx, &state, .{ .ret = .{
+        .value_kind = .plain, .is_borrowed_return_type = false,
+        .value_defined = true, .value_inputs = .{input} ++ .{null} ** 7,
+    } }));
+
+    var uncertified: AbstractState = .{};
+    defer uncertified.deinit(gpa);
+    try uncertified.cloneFrom(&state, gpa);
+    uncertified.forgetWrittenFields(array);
+    uncertified.forgetAllComparisons();
+    var joined: AbstractState = .{};
+    defer joined.deinit(gpa);
+    try joined.cloneFrom(&state, gpa);
+    _ = try state_mod.join(&joined, &uncertified, gpa);
+    try testing.expect(indexedValueMayBeUndefined(ctx, &joined, array, selected));
+
+    // A sparse undefined overwrite defeats the dynamic physical prefix.
+    var hole: AbstractState = .{};
+    defer hole.deinit(gpa);
+    try hole.cloneFrom(&state, gpa);
+    try transferIndexedWrite(ctx, &hole, .{
+        .array = array, .index = .{ .constant = 2 }, .rhs_kind = .undef,
+    }, pos1());
+    try testing.expect(indexedValueMayBeUndefined(ctx, &hole, array, selected));
+
+    // Count+1 without a write removes the witness, not just a scalar bound.
+    try transferCounterStep(ctx, &state, .{ .local = count, .step = 1 });
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try testing.expectEqual(@as(usize, 0), state.diagnostic_index_bounds.count());
+    try testing.expectEqual(@as(usize, 0), state.written_fields.count());
+
+    var missing: AbstractState = .{ .integer_domains = &domains };
+    defer missing.deinit(gpa);
+    try missing.locals.put(gpa, array, .undef);
+    try missing.locals.put(gpa, count, .plain);
+    try transfer(ctx, &missing, prefix);
+    try testing.expect(indexedValueMayBeUndefined(ctx, &missing, array, .{ .constant = 0 }));
+    try testing.expectEqual(@as(usize, 0), missing.diagnostic_index_bounds.count());
+}
+
+test "optional payload ALL corrections: scalar MAY stays MAY through root and field captures" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const capture: LocalId = @enumFromInt(1);
+    for ([_]bool{ false, true }) |nested| {
+        for ([_]bool{ false, true }) |all| {
+            const locals = [_]cfg.LocalInfo{
+                .{ .name = "source", .decl_pos = pos0(), .tracks_optional_tag = !nested, .tracks_array_payload = true },
+                .{ .name = "capture", .decl_pos = pos1(), .tracks_scalar_value = true },
+            };
+            var state: AbstractState = .{};
+            defer state.deinit(gpa);
+            var problems: std.ArrayListUnmanaged(Problem) = .empty;
+            defer freeProblems(gpa, &problems);
+            var seen = Seen.init();
+            defer seen.deinit(gpa);
+            const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+            try state.locals.put(gpa, source, .plain);
+            try state.locals.put(gpa, capture, .plain);
+            const path: []const u8 = if (nested) "value" else "";
+            try state.undefined_field_values.putContext(gpa, .{ .parent = source, .name = path }, {}, .{});
+            if (all) {
+                if (nested)
+                    try state.entire_undefined_fields.putContext(gpa, .{ .parent = source, .name = path }, {}, .{})
+                else
+                    try state.entire_undefined_values.put(gpa, source, {});
+            }
+            const tag_path: []const u8 = if (nested) "value.$optional-tag" else cfg.diagnostic_optional_tag;
+            try transfer(ctx, &state, .{
+                .kind = .{ .field_assign = .{
+                    .parent = source, .name = tag_path, .rhs_kind = .unknown, .diagnostic_only = true,
+                } },
+                .pos = pos0(), .end_pos = pos1(),
+            });
+            const fields_count = state.fields.count();
+            const unknown_count = state.unknown_values.count();
+            const unknown_fields_count = state.unknown_field_values.count();
+            try transfer(ctx, &state, .{
+                .kind = .{ .array_value = .{
+                    .target = capture,
+                    .source = if (nested) .{ .field_copy_of = .{ .parent = source, .name = path } } else .{ .copy_of = source },
+                    .mask_only = true, .optional_payload = true,
+                } },
+                .pos = pos0(), .end_pos = pos1(),
+            });
+            try testing.expectEqual(all, state.entire_undefined_values.contains(capture));
+            try testing.expect(state.fieldValueMayBeUndefined(capture, ""));
+            try testing.expect(!fieldHasDiagnosticChildren(&state, capture, ""));
+            try testing.expectEqual(Origin.plain, state.locals.get(capture).?);
+            try testing.expectEqual(fields_count, state.fields.count());
+            try testing.expectEqual(unknown_count, state.unknown_values.count());
+            try testing.expectEqual(unknown_fields_count, state.unknown_field_values.count());
+            try transfer(ctx, &state, .{
+                .kind = .{ .use = .{ .local = capture } }, .pos = pos1(), .end_pos = pos1(),
+            });
+            try testing.expectEqual(@as(usize, 1), problems.items.len);
+            try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+        }
+    }
+}
+
+test "optional payload ALL corrections: payload repair defeats virtual ALL but keeps selected holes" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const capture: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .tracks_optional_tag = true, .tracks_array_payload = true },
+        .{ .name = "capture", .decl_pos = pos1(), .tracks_array_payload = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, source, .undef);
+    try state.locals.put(gpa, capture, .plain);
+    try state.entire_undefined_values.put(gpa, source, {});
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_assign = .{
+            .parent = source, .name = cfg.diagnostic_optional_tag, .rhs_kind = .unknown, .diagnostic_only = true,
+        } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expect(optionalPayloadIsEntirelyUndefined(ctx, &state, .{ .parent = source }));
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_assign = .{ .parent = source, .name = "good", .rhs_kind = .plain, .defined = true } },
+        .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expect(!optionalPayloadIsEntirelyUndefined(ctx, &state, .{ .parent = source }));
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_value = .{
+            .target = capture, .source = .{ .copy_of = source }, .mask_only = true, .optional_payload = true,
+        } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expect(!state.entire_undefined_values.contains(capture));
+    try testing.expect(!state.fieldValueMayBeUndefined(capture, "good"));
+    try testing.expect(state.fieldValueMayBeUndefined(capture, "bad"));
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = capture } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    // Partial transport is silent and leaves the selected bad field undefined.
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_use = .{ .parent = capture, .name = "good" } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_use = .{ .parent = capture, .name = "bad" } }, .pos = pos1(), .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expectEqual(pos1().line, problems.items[0].start.line);
+    try testing.expectEqual(pos1().column, problems.items[0].start.column);
+}
+
+test "optional payload ALL corrections: slice capture keeps descriptor holes without tag bytes" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const capture: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .is_slice = true, .tracks_optional_tag = true },
+        .{ .name = "capture", .decl_pos = pos1(), .is_slice = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, source, .plain);
+    try state.locals.put(gpa, capture, .plain);
+    try state.undefined_field_values.putContext(gpa, .{ .parent = source, .name = "ptr" }, {}, .{});
+    try state.written_fields.putContext(gpa, .{ .parent = source, .name = "len" }, {}, .{});
+    try state.written_fields.putContext(gpa, .{ .parent = source, .name = cfg.diagnostic_optional_tag }, {}, .{});
+    try transfer(ctx, &state, .{
+        .kind = .{ .array_value = .{
+            .target = capture, .source = .{ .copy_of = source }, .mask_only = true, .optional_payload = true,
+        } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expect(!state.entire_undefined_values.contains(capture));
+    try testing.expect(state.fieldValueMayBeUndefined(capture, "ptr"));
+    try testing.expect(state.fieldBytesAreWritten(capture, "len"));
+    try testing.expect(!state.written_fields.containsContext(.{ .parent = capture, .name = cfg.diagnostic_optional_tag }, .{}));
+    try testing.expectEqual(@as(usize, 0), state.fields.count());
+    try testing.expectEqual(Origin.plain, state.locals.get(capture).?);
+    try transfer(ctx, &state, .{
+        .kind = .{ .use = .{ .local = capture } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    // Partial descriptor transport is silent; only selecting the ptr hole reports.
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_use = .{ .parent = capture, .name = "len" } }, .pos = pos0(), .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try transfer(ctx, &state, .{
+        .kind = .{ .field_use = .{ .parent = capture, .name = "ptr" } }, .pos = pos1(), .end_pos = pos1(),
+    });
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+    try testing.expectEqual(pos1().line, problems.items[0].start.line);
+    try testing.expectEqual(pos1().column, problems.items[0].start.column);
+}
+
+
+test "constructor mask replay: nested slot holes stay selected through two physical copies" {
+    const gpa = testing.allocator;
+    const recipe: LocalId = @enumFromInt(0);
+    const snapshot: LocalId = @enumFromInt(1);
+    const destination: LocalId = @enumFromInt(2);
+    const input: LocalId = @enumFromInt(3);
+    const locals = [_]LocalInfo{
+        .{ .name = "recipe", .decl_pos = pos0(), .tracks_array_payload = true, .is_array = true, .array_extent = 2 },
+        .{ .name = "snapshot", .decl_pos = pos0(), .tracks_array_payload = true, .is_array = true, .array_extent = 2 },
+        .{ .name = "destination", .decl_pos = pos0(), .tracks_array_payload = true, .is_array = true, .array_extent = 2 },
+        .{ .name = "input", .decl_pos = pos0(), .tracks_scalar_value = true },
+    };
+    for ([_]bool{ false, true }) |undefined_input| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, recipe, .plain);
+        try state.locals.put(gpa, snapshot, .plain);
+        try state.locals.put(gpa, destination, if (undefined_input) .plain else .undef);
+        try state.locals.put(gpa, input, if (undefined_input) .undef else .plain);
+        try state.unknown_values.put(gpa, recipe, {});
+        // Replay the flattened constructor in producer order: parents first,
+        // then leaf stores. Only [0].b consumes the caller input.
+        for ([_][]const u8{ "[0]", "[0].a", "[0].b", "[1]", "[1].a", "[1].b" }) |path| {
+            var assignment: @TypeOf(@as(StmtKind, undefined).field_assign) = .{
+                .parent = recipe, .name = path, .rhs_kind = .unknown, .diagnostic_only = true,
+            };
+            if (std.mem.eql(u8, path, "[0].b")) assignment.selected_inputs[0] = .{ .local = input };
+            try transferFieldAssign(ctx, &state, assignment, pos0());
+        }
+        try testing.expectEqual(undefined_input, state.fieldValueMayBeUndefined(recipe, "[0].b"));
+        try testing.expect(!state.fieldValueMayBeUndefined(recipe, "[0].a"));
+        for ([_]struct { target: LocalId, source: LocalId }{
+            .{ .target = snapshot, .source = recipe },
+            .{ .target = destination, .source = snapshot },
+        }) |copy| {
+            try copyArrayDiagnosticBytes(ctx, &state, .{
+                .target = copy.target, .source = .{ .copy_of = copy.source }, .diagnostic_only = true,
+            });
+            try testing.expect(!state.undefined_elements.contains(.{ .array = copy.target, .index = 0 }));
+            try testing.expect(!state.fieldValueMayBeUndefined(copy.target, "[0].a"));
+            try testing.expectEqual(undefined_input, state.fieldValueMayBeUndefined(copy.target, "[0].b"));
+            try testing.expect(!state.fieldValueMayBeUndefined(copy.target, "[1].b"));
+            try testing.expect(state.unknown_values.contains(copy.target));
+            try testing.expect(!state.fieldValueIsDefined(copy.target, "[0].a"));
+        }
+        for ([_][]const u8{ "[0].a", "[0].b", "[1].b" }, 0..) |path, ordinal| {
+            const position: cfg.SrcPos = .{ .line = 1, .column = @intCast(ordinal + 1), .byte = @intCast(ordinal) };
+            try transferIndexedRead(ctx, &state, .{
+                .array = destination,
+                .index = .{ .constant = if (ordinal == 2) 1 else 0 },
+                .name = path,
+            }, position, position);
+        }
+        try testing.expectEqual(@as(usize, @intFromBool(undefined_input)), problems.items.len);
+        if (undefined_input) {
+            try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+            try testing.expectEqual(@as(u32, 2), problems.items[0].start.column);
+        }
+    }
+}
+
+test "constructor mask replay: a whole slot hole still reaches every selected field" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const destination: LocalId = @enumFromInt(1);
+    const locals = [_]LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .tracks_array_payload = true, .is_array = true, .array_extent = 2 },
+        .{ .name = "destination", .decl_pos = pos0(), .tracks_array_payload = true, .is_array = true, .array_extent = 2 },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, source, .plain);
+    try state.locals.put(gpa, destination, .plain);
+    try state.undefined_field_values.putContext(gpa, .{ .parent = source, .name = "[0]" }, {}, .{});
+    try copyArrayDiagnosticBytes(ctx, &state, .{
+        .target = destination, .source = .{ .copy_of = source }, .diagnostic_only = true,
+    });
+    try testing.expect(state.undefined_elements.contains(.{ .array = destination, .index = 0 }));
+    try testing.expect(state.fieldValueMayBeUndefined(destination, "[0].a"));
+    try testing.expect(state.fieldValueMayBeUndefined(destination, "[0].b"));
+    try testing.expect(!state.fieldValueMayBeUndefined(destination, "[1].b"));
+}
+
+test "counted append prefix: undefined declaration seed is not an append poison" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const count: LocalId = @enumFromInt(1);
+    const domains = [_]state_mod.IntegerDomain{
+        .{}, .{ .kind = .unsigned, .bits = @bitSizeOf(usize) },
+    };
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "chain", .decl_pos = pos0(), .is_array = true,
+            .array_extent = 16, .tracks_array_payload = true },
+        .{ .name = "count", .decl_pos = pos1(), .is_unsigned = true,
+            .tracks_scalar_value = true },
+    };
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{
+        .gpa = gpa, .locals = &locals, .problems = &problems,
+        .seen = &seen, .path = "test",
+    };
+    var state: AbstractState = .{ .integer_domains = &domains };
+    defer state.deinit(gpa);
+    try transferDecl(ctx, &state, .{
+        .local = array, .init_kind = .undef, .value_defined = false,
+    }, pos0());
+    try state.locals.put(gpa, count, .plain);
+    try state.unknown_values.put(gpa, count, {});
+    const prefix: cfg.Stmt = .{
+        .kind = .{ .array_prefix = .{
+            .array = array, .count = count, .seeded_append = true,
+        } },
+        .pos = pos0(), .end_pos = pos1(),
+    };
+    const selected: cfg.IndexTerm = .{ .local = .{ .local = count, .offset = -1 } };
+
+    // The declaration alone cannot establish even the physical seed.
+    try transfer(ctx, &state, prefix);
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try testing.expectEqual(@as(usize, 0), state.diagnostic_index_bounds.count());
+    try transferIndexedWrite(ctx, &state, .{
+        .array = array, .index = .{ .constant = 0 }, .rhs_kind = .unknown,
+    }, pos0());
+    try testing.expectEqual(@as(u64, 1), state.fixedPrefix(array));
+    try testing.expect(state.may_undefined_values.contains(array));
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try transfer(ctx, &state, prefix);
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try testing.expect(state.may_undefined_values.contains(array));
+    try testing.expect(state.unknown_values.contains(array));
+    try testing.expect(state.unknown_values.contains(count));
+    try testing.expect(!indexIsDefined(ctx, &state, selected));
+    try testing.expectEqual(@as(?u64, null), state.scalarValue(count));
+    try testing.expectEqual(@as(usize, 0), state.comparisons.items.len);
+    try testing.expectEqual(@as(usize, 0), state.symbolic_prefixes.count());
+    try testing.expect(!state.hasInitializedElement(array, selected));
+    try testing.expect(!arrayHasFullCoverage(ctx, &state, array));
+    try testing.expect(!state.isArrayComplete(array));
+    const input: cfg.ValueInput = .{ .indexed = .{ .array = array, .index = selected } };
+    try testing.expect(!returnValueIsDefined(ctx, &state, .{ .ret = .{
+        .value_kind = .plain, .is_borrowed_return_type = false,
+        .value_defined = true,
+        .value_inputs = .{input} ++ .{null} ** 7,
+    } }));
+
+    for ([_]cfg.IndexTerm{ .{ .constant = 2 }, .unknown }) |index| {
+        var poisoned: AbstractState = .{};
+        defer poisoned.deinit(gpa);
+        try poisoned.cloneFrom(&state, gpa);
+        try transferIndexedWrite(ctx, &poisoned, .{
+            .array = array, .index = index, .rhs_kind = .undef,
+        }, pos1());
+        try transfer(ctx, &poisoned, prefix);
+        try testing.expect(indexedValueMayBeUndefined(ctx, &poisoned, array, selected));
+    }
+    try transferCounterStep(ctx, &state, .{ .local = count, .step = 1 });
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, array, selected));
+    try testing.expectEqual(@as(usize, 0), state.diagnostic_index_bounds.count());
+}
+
+
+test "pointee transport corrections: mask replay respects repairs without strict certificates" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const target: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .is_array = true, .array_extent = 2, .tracks_array_payload = true },
+        .{ .name = "target", .decl_pos = pos0(), .is_array = true, .array_extent = 2, .tracks_array_payload = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, source, .plain);
+    try state.locals.put(gpa, target, .plain);
+    try state.unknown_values.put(gpa, source, {});
+    try state.undefined_elements.put(gpa, .{ .array = source, .index = 0 }, {});
+    try state.undefined_elements.put(gpa, .{ .array = source, .index = 1 }, {});
+    try transferFieldAssign(ctx, &state, .{
+        .parent = source, .name = "[0]", .rhs_kind = .unknown, .diagnostic_only = true,
+    }, pos0());
+    try copyArrayDiagnosticBytes(ctx, &state, .{
+        .target = target, .source = .{ .copy_of = source }, .diagnostic_only = true,
+    });
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, target, .{ .constant = 0 }));
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, target, .{ .constant = 1 }));
+    try testing.expect(state.undefined_elements.contains(.{ .array = source, .index = 0 }));
+    const selected: cfg.ValueInput = .{ .indexed = .{ .array = target, .index = .{ .constant = 0 } } };
+    try testing.expect(!returnValueIsDefined(ctx, &state, .{ .ret = .{
+        .value_kind = .plain, .is_borrowed_return_type = false, .value_defined = true,
+        .value_inputs = .{selected} ++ .{null} ** 7,
+    } }));
+}
+
+test "pointee transport corrections: unknown array snapshot poison keeps disjoint slots silent" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const target: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .is_array = true, .array_extent = 2, .tracks_array_payload = true },
+        .{ .name = "target", .decl_pos = pos0(), .is_array = true, .array_extent = 2, .tracks_array_payload = true },
+    };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, source, .plain);
+    try state.locals.put(gpa, target, .plain);
+    try state.unknown_values.put(gpa, source, {});
+    try transferFieldAssign(ctx, &state, .{
+        .parent = source, .name = "[1]", .rhs_kind = .undef,
+        .diagnostic_only = true, .entire_value_undefined = true,
+    }, pos0());
+    try copyArrayDiagnosticBytes(ctx, &state, .{
+        .target = target, .source = .{ .copy_of = source }, .diagnostic_only = true,
+    });
+    try testing.expect(!indexedValueMayBeUndefined(ctx, &state, target, .{ .constant = 0 }));
+    try testing.expect(indexedValueMayBeUndefined(ctx, &state, target, .{ .constant = 1 }));
+    try testing.expect(state.unknown_values.contains(target));
+}
+
+test "certified array completion: only a value certificate retires prior byte holes" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const owner: LocalId = @enumFromInt(1);
+    const locals = [_]LocalInfo{
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 2, .tracks_array_payload = true },
+        .{ .name = "owner", .decl_pos = pos0() },
+    };
+    for ([_]bool{ false, true }) |certified| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try transferDecl(ctx, &state, .{ .local = array, .init_kind = .undef, .value_defined = false }, pos0());
+        try state.undefined_field_values.putContext(gpa, .{ .parent = array, .name = "[0].b" }, {}, .{});
+        try state.fields.putContext(gpa, .{ .parent = array, .name = "[1].ptr" }, .{ .stack = owner }, .{});
+        try transfer(ctx, &state, .{
+            .kind = .{ .array_complete = .{ .array = array, .value_defined = certified } },
+            .pos = pos0(), .end_pos = pos1(),
+        });
+        try testing.expectEqual(!certified, state.fieldValueMayBeUndefined(array, "[0].b"));
+        try testing.expectEqual(!certified, state.unknown_values.contains(array));
+        try testing.expectEqual(@as(Origin, .{ .stack = owner }), state.fields.getContext(.{ .parent = array, .name = "[1].ptr" }, .{}).?);
+        const selected: cfg.ValueInput = .{ .indexed = .{ .array = array, .index = .{ .constant = 0 } } };
+        try testing.expectEqual(certified, returnValueIsDefined(ctx, &state, .{ .ret = .{
+            .value_kind = .plain, .is_borrowed_return_type = false, .value_defined = true,
+            .value_inputs = .{selected} ++ .{null} ** 7,
+        } }));
+    }
+}
+
+test "optional selection followup: tag ALL stores and copies do not survive repaired joins" {
+    const gpa = testing.allocator;
+    const owner: LocalId = @enumFromInt(0);
+    const copied: LocalId = @enumFromInt(1);
+    for ([_]bool{ false, true }) |nested| {
+        const locals = [_]cfg.LocalInfo{
+            .{ .name = "owner", .decl_pos = pos0(), .tracks_array_payload = true, .tracks_optional_tag = !nested },
+            .{ .name = "copied", .decl_pos = pos1(), .tracks_array_payload = true, .tracks_optional_tag = true },
+        };
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        const path: []const u8 = if (nested) "value" else "";
+        const tag_path: []const u8 = if (nested) "value.$optional-tag" else cfg.diagnostic_optional_tag;
+        var negative: AbstractState = .{};
+        defer negative.deinit(gpa);
+        try negative.locals.put(gpa, owner, .plain);
+        try negative.undefined_field_values.putContext(gpa, .{ .parent = owner, .name = path }, {}, .{});
+        try negative.entire_undefined_fields.putContext(gpa, .{ .parent = owner, .name = path }, {}, .{});
+        if (!nested) try negative.entire_undefined_values.put(gpa, owner, {});
+        try transferFieldAssign(ctx, &negative, .{
+            .parent = owner, .name = tag_path, .rhs_kind = .undef,
+            .diagnostic_only = true, .entire_value_undefined = true,
+        }, pos0());
+        try testing.expect(fieldIsEntirelyUndefined(ctx, &negative, owner, path));
+        try testing.expect(fieldIsEntirelyUndefined(ctx, &negative, owner, tag_path));
+        try transferDecl(ctx, &negative, .{
+            .local = copied,
+            .init_kind = if (nested) .{ .field_copy_of = .{ .parent = owner, .name = path } } else .{ .copy_of = owner },
+        }, pos1());
+        try transferFieldAssign(ctx, &negative, .{
+            .parent = copied, .name = cfg.diagnostic_optional_tag,
+            .rhs_kind = .{ .field_copy_of = .{ .parent = owner, .name = tag_path } },
+            .diagnostic_only = true,
+        }, pos1());
+        try testing.expect(localIsEntirelyUndefined(ctx, &negative, copied));
+        try testing.expect(optionalTagMayBeUndefined(ctx, &negative, copied));
+
+        var repaired: AbstractState = .{};
+        defer repaired.deinit(gpa);
+        try repaired.cloneFrom(&negative, gpa);
+        try transferFieldAssign(ctx, &repaired, .{
+            .parent = owner, .name = tag_path, .rhs_kind = .unknown, .diagnostic_only = true,
+        }, pos1());
+        try testing.expect(!fieldIsEntirelyUndefined(ctx, &repaired, owner, path));
+        try testing.expect(!optionalTagBytesMayBeUndefined(ctx, &repaired, owner, tag_path));
+        try testing.expect(optionalPayloadIsEntirelyUndefined(ctx, &repaired, .{ .parent = owner, .path = path }));
+        for ([_]bool{ false, true }) |reverse| {
+            var joined: AbstractState = .{};
+            defer joined.deinit(gpa);
+            try joined.cloneFrom(if (reverse) &repaired else &negative, gpa);
+            _ = try state_mod.join(&joined, if (reverse) &negative else &repaired, gpa);
+            try testing.expect(optionalTagBytesMayBeUndefined(ctx, &joined, owner, tag_path));
+            try testing.expect(!fieldIsEntirelyUndefined(ctx, &joined, owner, path));
+            try testing.expect(!fieldIsEntirelyUndefined(ctx, &joined, owner, tag_path));
+            try testing.expect(optionalPayloadIsEntirelyUndefined(ctx, &joined, .{ .parent = owner, .path = path }));
+            try transferDecl(ctx, &joined, .{
+                .local = copied,
+                .init_kind = if (nested) .{ .field_copy_of = .{ .parent = owner, .name = path } } else .{ .copy_of = owner },
+            }, pos1());
+            try transferFieldAssign(ctx, &joined, .{
+                .parent = copied, .name = cfg.diagnostic_optional_tag,
+                .rhs_kind = .{ .field_copy_of = .{ .parent = owner, .name = tag_path } },
+                .diagnostic_only = true,
+            }, pos1());
+            try testing.expect(optionalTagMayBeUndefined(ctx, &joined, copied));
+            try testing.expect(!localIsEntirelyUndefined(ctx, &joined, copied));
+        }
+    }
+}
+
+test "optional selection followup: optional tag selector snapshots do not certify payloads" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const selector: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .tracks_array_payload = true, .tracks_optional_tag = true },
+        .{ .name = "selector", .decl_pos = pos1(), .tracks_scalar_value = true, .tracks_optional_tag = true, .diagnostic_tag_only = true },
+    };
+    for ([_]bool{ false, true }) |tag_undefined| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, source, .plain);
+        try state.locals.put(gpa, selector, .plain);
+        try state.undefined_field_values.putContext(gpa, .{ .parent = source, .name = "" }, {}, .{});
+        try state.entire_undefined_fields.putContext(gpa, .{ .parent = source, .name = "" }, {}, .{});
+        try state.entire_undefined_values.put(gpa, source, {});
+        try transferFieldAssign(ctx, &state, .{
+            .parent = source, .name = cfg.diagnostic_optional_tag,
+            .rhs_kind = if (tag_undefined) .undef else .unknown,
+            .diagnostic_only = true, .entire_value_undefined = tag_undefined,
+        }, pos0());
+        try transferAssign(ctx, &state, .{
+            .target = selector, .rhs_kind = .{ .copy_of = source }, .value_defined = false,
+        }, pos1());
+        const selector_origin = state.locals.get(selector).?;
+        const fields_count = state.fields.count();
+        const unknown_count = state.unknown_values.count();
+        const unknown_fields_count = state.unknown_field_values.count();
+        try testing.expectEqual(tag_undefined, localIsProvedUndefined(ctx, &state, selector));
+        try testing.expect(!localInputIsDefined(ctx, &state, selector, true));
+        try transferFieldAssign(ctx, &state, .{
+            .parent = source, .name = cfg.diagnostic_optional_tag,
+            .rhs_kind = if (tag_undefined) .unknown else .undef,
+            .diagnostic_only = true, .entire_value_undefined = !tag_undefined,
+        }, pos1());
+        try testing.expectEqual(!tag_undefined, optionalTagMayBeUndefined(ctx, &state, source));
+        try testing.expectEqual(tag_undefined, localIsProvedUndefined(ctx, &state, selector));
+        try testing.expectEqual(selector_origin, state.locals.get(selector).?);
+        try testing.expectEqual(fields_count, state.fields.count());
+        try testing.expectEqual(unknown_count, state.unknown_values.count());
+        try testing.expectEqual(unknown_fields_count, state.unknown_field_values.count());
+        try testing.expect(!localInputIsDefined(ctx, &state, selector, true));
+    }
+}
+
+test "diagnostic scalar transport: unknown overwrite retires holes without certifying its strict origin" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const target: LocalId = @enumFromInt(1);
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "source", .decl_pos = pos0(), .tracks_scalar_value = true },
+        .{ .name = "target", .decl_pos = pos1(), .tracks_scalar_value = true },
+    };
+    for ([_]bool{ false, true }) |poison| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try state.locals.put(gpa, source, if (poison) .undef else .plain);
+        try state.unknown_values.put(gpa, source, {});
+        try state.locals.put(gpa, target, .undef);
+        try state.entire_undefined_values.put(gpa, target, {});
+        try copyArrayDiagnosticBytes(ctx, &state, .{
+            .target = target, .source = .{ .copy_of = source }, .diagnostic_only = true,
+        });
+        try testing.expect(state.locals.get(target).? == .undef);
+        try testing.expect(state.unknown_values.contains(target));
+        try testing.expect(!localInputIsDefined(ctx, &state, target, false));
+        try testing.expectEqual(poison, localIsProvedUndefined(ctx, &state, target));
+        try testing.expectEqual(poison, localIsEntirelyUndefined(ctx, &state, target));
+        try transfer(ctx, &state, .{
+            .kind = .{ .ret = .{ .value_kind = .{ .copy_of = target }, .is_borrowed_return_type = false } },
+            .pos = pos1(), .end_pos = pos1(),
+        });
+        try testing.expectEqual(@as(usize, if (poison) 1 else 0), problems.items.len);
+    }
+}
+
+test "diagnostic scalar transport: joins retain UNKNOWN repairs and actual poison separately" {
+    const gpa = testing.allocator;
+    const source: LocalId = @enumFromInt(0);
+    const target: LocalId = @enumFromInt(1);
+    for ([_]enum { repaired_both, one_unwritten, undefined_pointer_header }{ .repaired_both, .one_unwritten, .undefined_pointer_header }) |scenario| {
+        const locals = [_]cfg.LocalInfo{
+            .{ .name = "source", .decl_pos = pos0(), .tracks_scalar_value = true },
+            .{ .name = "target", .decl_pos = pos1(), .tracks_scalar_value = true,
+                .is_pointer = scenario == .undefined_pointer_header },
+        };
+        var left: AbstractState = .{};
+        defer left.deinit(gpa);
+        var right: AbstractState = .{};
+        defer right.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try left.locals.put(gpa, source, .plain);
+        try left.unknown_values.put(gpa, source, {});
+        try left.locals.put(gpa, target, .undef);
+        try right.cloneFrom(&left, gpa);
+        try copyArrayDiagnosticBytes(ctx, &left, .{
+            .target = target, .source = .{ .copy_of = source }, .diagnostic_only = true,
+        });
+        if (scenario != .one_unwritten) try copyArrayDiagnosticBytes(ctx, &right, .{
+            .target = target, .source = .{ .copy_of = source }, .diagnostic_only = true,
+        });
+        _ = try state_mod.join(&left, &right, gpa);
+        _ = try state_mod.join(&left, &right, gpa);
+        try testing.expect(left.locals.get(target).? == .undef);
+        try testing.expect(left.unknown_values.contains(target));
+        try testing.expect(!localInputIsDefined(ctx, &left, target, false));
+        try testing.expectEqual(scenario != .repaired_both, localIsProvedUndefined(ctx, &left, target));
+        try transfer(ctx, &left, .{
+            .kind = .{ .use = .{ .local = target } }, .pos = pos1(), .end_pos = pos1(),
+        });
+        try testing.expectEqual(@as(usize, if (scenario == .repaired_both) 0 else 1), problems.items.len);
     }
 }

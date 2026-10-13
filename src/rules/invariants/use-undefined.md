@@ -1,8 +1,9 @@
 # use-undefined
 
-Reading a value that was declared `undefined` and never assigned
-a real value before the read.  In debug builds this is a panic;
-in release builds it is whatever garbage happened to be in memory.
+This rule reports reads of proved-undefined bytes, including bytes that can
+still hold a proved-undefined value on a reachable path.
+UNKNOWN values alone do not cause a diagnostic.
+Diagnostic facts and strict defined-value certificates are separate.
 
 ## Example
 
@@ -20,77 +21,96 @@ first assignment:
 
 ## When this might be a false positive
 
-- **Pointer initialization requires source proof.** Taking an address
-  or calling a method with a mutable pointer does not prove a write.
-  zbc credits only the pointee or exact inline field paths that the
-  resolved source callee definitely writes before successful return.
-  Unwritten fields remain undefined. A boolean success result keeps its
-  store certificate on the corresponding result path; ignoring that
-  result does not initialize the failure path. Unknown externs add no
-  credit. Function and parameter names do not establish initialization.
-  A partial field store does not initialize its containing aggregate.
-  Only the written field paths can be read until a complete store is proved.
+- **Definite pointer writes initialize only their destination paths.**
+  An address or implicit mutable receiver does not read the aggregate payload.
+  A resolved definite write removes prior holes from the paths it writes,
+  even when the stored value has no positive defined-value certificate.
+  A proved-undefined stored value creates holes in those paths instead.
+  Unwritten fields retain their holes.
+  Strict source and payload certificates still require defined inputs and definite writes.
+  A boolean result selects its store certificate only on the corresponding path.
+  Ignoring that result does not initialize the failure path.
+  Opaque or unresolved calls establish no definite write.
+  Names do not establish initialization.
+  A partial field store does not certify its containing aggregate.
 
-  A direct pointer copy keeps the formal's identity. Reassignment or
-  escape ends that proof. A namespace type does not prove its member
-  values. Those values require defined initializers.
+  A direct pointer copy keeps the formal's identity.
+  Reassignment or escape ends that identity proof.
+  A defined pointer or slice header does not prove a defined pointee.
+  Pointer-parameter pointees are UNKNOWN unless independent facts establish holes or defined storage.
+  Reading the pointer or slice header does not read its payload.
+  A namespace type does not prove its member values.
+  Positive certificates for those values require defined initializers.
 - **Explicit aggregate values retain their element coverage.**
-  Array literals, `@splat`, member arithmetic and indexed inputs are
-  checked against the storage they read. Selected value branches retain
-  separate element masks. An undefined member or source element remains
-  a hole after copying it. Sentinel slices are descriptors, not fixed
-  arrays.
-- **Complete array payloads survive value copies.** Full element coverage
-  over a known array extent permits runtime-index reads. Undefined holes
-  remain errors. Immutable constant tables require a resolved declaration
-  and a fully initialized literal payload, including nested elements.
-  Every table selector must also fit its selected array extent.
+  Array literals, `@splat`, member arithmetic, and indexed inputs retain
+  facts about the storage they read.
+  Arithmetic and selected reads report proved-undefined inputs.
+  Selected value branches retain separate element masks.
+  An undefined member or source element remains a hole after transport.
+  Sentinel slices are descriptors, not fixed arrays.
+- **Partial aggregate transport is silent.**
+  Return, declaration, copy, assignment, by-value arguments, whole `@memcpy`,
+  and optional wrap or unwrap report only an entirely proved-undefined value.
+  These operations preserve precise holes and repair masks in the destination.
+  A later selected read of a proved-undefined field, element, or byte reports.
+  This includes selected reads after a call return or inside a source-proven by-value callee.
+  Holes copied from container-level constants become UNKNOWN.
+  A direct selected read on the constant still reports.
+  UNKNOWN slots alone do not cause a diagnostic.
+  An implicit receiver address does not read the aggregate payload.
+  Opaque, extern, or unresolved results remain silent UNKNOWN values.
+  A missing certificate alone does not establish undefined bytes.
+  UNKNOWN values add no positive value, input, return, or payload certificates.
+  Strict complete-payload certificates still require every element to be defined.
+  Immutable constant tables require resolved declarations and initialized payloads,
+  including nested elements. Every selector must fit its selected array extent.
   Constant indices and bounded unsigned modulo indices can prove this.
-  An unsupported bound adds no destination initialization credit.
-  A vector copy or `@bitCast` requires complete source payload coverage.
-  A cast does not map partial element coverage across different layouts.
-  Declarations and assignments keep cast lifetime origins, but do not
-  copy their source slot masks. A valid whole-payload certificate can
-  initialize the destination after those earlier transfer steps.
+  An unsupported bound adds no positive destination initialization certificate.
+  A complete vector or `@bitCast` payload certificate requires a complete source certificate.
+  Its absence alone does not cause a diagnostic.
+  Positive certificates do not map partial element coverage across different layouts.
+  Casts keep the storage's lifetime origin. Diagnostic byte facts remain separate.
   Sentinel arrays have extra storage outside their logical extent.
-  Their logical coverage does not certify all bytes for `@bitCast`.
-  A returned array requires a body-definedness proof and covered inputs.
-  Pointer types, integer addresses and opaque extern returns prove no
-  payload initialization.
+  Logical coverage does not certify all bytes for `@bitCast`.
+  A strict returned-array certificate requires body-definedness and covered inputs.
+  Pointer types, integer addresses, and opaque extern returns prove no positive payload certificate.
 - **Optional slice bindings retain their selected descriptor.**
   `const view = optional_slice orelse return` retains the source pointer
   and length on the non-null path, including fresh bindings in loops.
-  A local backing array still requires element coverage. Optional slice
-  type information does not initialize its backing storage.
-- **Defined element writes preserve prior array coverage.**
-  A defined runtime-index overwrite preserves existing coverage; it
-  does not initialize other slots. Undefined writes retain exact holes
-  when their index is known and revoke coverage when it is not known.
-  This applies to fixed arrays stored in aggregate fields as well.
+  A local backing array retains its element coverage and holes.
+  Optional slice type information does not initialize its backing storage.
+- **Runtime element writes retain precise diagnostic facts.**
+  A defined runtime-index overwrite preserves existing coverage.
+  It does not initialize other slots.
+  A definite write with an UNKNOWN value removes prior holes from its selected location.
+  It adds no positive defined-value certificate.
+  A known-index undefined write creates an exact hole.
+  An unresolved index retains facts about elements that may hold proved-undefined bytes.
+  These rules also apply to fixed arrays stored in aggregate fields.
   A resolved `std.mem.swap` between two elements of the same complete
   array also preserves coverage. An arbitrary mutable-pointer call
   does not receive this guarantee.
   Source-proven element helpers and optional insertion helpers can
   preserve complete arrays when their actual inputs are defined.
-  Preservation adds no initialization credit to incomplete storage.
-  Fixed-array pointer captures retain their owner for defined stores
+  Preservation adds no positive initialization certificate to incomplete storage.
+  Fixed-array pointer captures retain their owner for definite stores
   and for invalidation through opaque mutable aliases.
 - **Read-only calls preserve coverage.** A resolved
   `std.mem.doNotOptimizeAway` does not write its input storage. Local
   functions with the same name and unresolved mutable-pointer calls do
   not receive this guarantee.
-- **A loop must prove the region it writes.** The generic CFG permits
-  zero iterations. Exhaustive proofs require a covering enumeration
-  and an unconditional defined store. A bounded `0..array.len` fill can
-  establish complete coverage. A runtime `0..count` fill establishes
-  only its initialized prefix; reads beyond that prefix remain errors.
-  Conditional stores, nonzero starts and interrupted loops do not
-  establish these certificates.
-  A canonical zero-seeded counter loop can fill a fixed array on its
-  normal exit. A fallible store gives no completion credit on an error
-  exit. A decrement-before-store countdown gives only its initialized
-  prefix, not the unused suffix. Each proof checks current input
-  definedness before it adds coverage.
+- **A loop must prove the region it writes.**
+  The generic CFG permits zero iterations.
+  Strict exhaustive certificates require a covering enumeration and an unconditional defined store.
+  A bounded `0..array.len` fill can establish complete coverage.
+  A runtime `0..count` fill establishes only its initialized prefix.
+  Reads beyond that prefix report when the selected storage can still contain proved-undefined bytes.
+  Conditional stores, nonzero starts, and interrupted loops do not establish complete certificates.
+  A canonical zero-seeded counter loop can fill a fixed array on its normal exit.
+  A fallible store gives no completion certificate on an error exit.
+  A decrement-before-store countdown gives only its initialized prefix, not the unused suffix.
+  Each strict proof checks current input definedness before it adds coverage.
+  A failed proof alone does not cause a diagnostic.
 - **Runtime fills certify only their destination region.**
   `@memset(array[0..count], value)` can initialize `[0,count)` when the
   count and value are defined. A nonzero start does not initialize the
@@ -135,9 +155,9 @@ The enumeration IS the target, so the trip count is the target's
 own length and the by-pointer capture names the one element this
 iteration owns.  Refused for a different array, a by-value payload,
 a conditional store, or an unlabeled `break`/`continue`.  A body
-that writes `target[i] = …` with a by-pointer payload is a
-*different* shape — the write index is then not proven in range —
-and is still reported.
+that writes `target[i] = …` with a by-pointer payload has a different shape.
+Its write index does not establish an in-range fill certificate.
+A missing certificate alone does not cause a diagnostic.
 
 ### Manual counter over nested loops
 
@@ -185,20 +205,40 @@ at one, or when the values stored are themselves `undefined`.
 
 ### What counts as a read
 
-A read is anything the program actually evaluates, and only that.
-zbc reads `local[i]` as the contents of the element it names, so
-`var out: [4]u8 = undefined; if (out[1] == 0)` reports.  A bare
-`local[a..b]` reads nothing by itself — building a slice over the
-storage is not a read of it. `&local` and `&local[i]` are address
-uses, not initialization. A call such as `f(&local)` clears `.undef`
-only when the resolved callee proves the required writes.
+A selected read evaluates a field or element of the storage.
+It reports if the selected bytes are proved undefined or can still hold proved-undefined values.
+For example, `var out: [4]u8 = undefined; if (out[1] == 0)` reports.
+Arithmetic, comparisons, and conditions also report proved-undefined inputs.
+A bare `local[a..b]` builds a slice without reading the payload.
+Its pointer and bounds still require their own diagnostic facts.
+`&local`, `&local[i]`, and an implicit receiver address do not read the payload.
+Taking an address does not initialize storage.
+A resolved definite write initializes only its destination paths diagnostically.
+The stored value needs no positive certificate to remove prior destination holes.
+If the stored value is proved undefined, the destination receives those holes.
+Strict source and payload certificates remain separate.
 
-A whole array counts as read when something copies out of it:
-`@memcpy(ptr[0..out.len], out[0..])` moves every element, the ones
-no store wrote included, so a partially filled array is reported at
-the copy rather than at the return.  The DESTINATION is not a
-read: `@memcpy(out[0..], src)` still writes into an undefined
-array without firing.
+Whole-value transport reports when any transported slot, field, or byte is proved undefined.
+The same policy applies to return, value copy, declaration, assignment, and by-value arguments.
+Transport preserves precise holes in the destination.
+A selected read of a proved-undefined field or element still reports.
+Strict initialization certificates are unchanged.
+
+Reported: `@memcpy` copies an array with three proved-undefined elements.
+
+    var out: [4]u8 = undefined;
+    out[0] = 0;
+    @memcpy(ptr[0..out.len], out[0..]); // reports
+
+Silent: `src` is a pointer parameter whose payload is UNKNOWN, with no independent facts that prove undefined bytes.
+
+    @memcpy(dst[0..4], src[0..4]); // silent: UNKNOWN source payload
+
+Opaque, extern, unresolved, and uncertified sources remain silent UNKNOWN unless independent facts prove undefined bytes.
+They earn no positive value, input, return, array-completeness, or payload certificates.
+Pointer and slice headers remain separate from their backing storage.
+UNKNOWN pointer-parameter pointees do not report merely because their payload lacks a certificate.
+The destination of a write is not a read.
 
 A `const` is storage too.  A file-scope
 
@@ -234,19 +274,19 @@ after the establishing test. Its straight-line prefix must restore
 the saved operands before the matching test. A conditional restore,
 a changed guard, or a handler that falls through does not qualify.
 
-Refused, and still reported: a read outside the re-tested guard; a
-call that can reach through an operand with no restore after it,
-including a call inside the establishing arm after its test; a
-shadowing declaration between the two tests; a `defer`/`errdefer` in
-between (its body runs at scope exit, which nothing here orders).
+The guard proof does not apply to a read outside the re-tested guard.
+It also rejects calls that can change an operand without a later restore,
+including calls inside the establishing arm after its test.
+Shadowing declarations and intervening `defer` or `errdefer` also prevent this proof.
+These cases report only if the reachable read can contain proved-undefined bytes.
 
 - **A read inside the arm of a conditional value that never runs.**
   `return if (live) 0 else scratch[0];` evaluates one arm, not the
   whole conditional.  Each arm is lowered as its own return under
   the assumption its condition makes, so a read that only the dead
   arm has never enters a state where it happens.  A read on the arm
-  that DOES run is reported normally — `live` being false there is
-  exactly what makes it reachable.
+  that DOES run reports only if it reads proved-undefined bytes.
+  A reachable UNKNOWN input alone does not report.
 
 ## Related
 

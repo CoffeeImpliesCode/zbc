@@ -989,6 +989,25 @@ pub const TypeResolver = struct {
             return self.resolver.normalizedType(value);
         }
 
+        /// The nearest source function body owning this token. Function-type
+        /// prototypes are scopes, but do not own executable local storage.
+        /// Uses the document's cached scope tree, including in foreign frames.
+        pub fn enclosingFunctionAt(self: ResolutionFrame, token: Ast.TokenIndex) error{OutOfMemory}!?Ast.Node.Index {
+            const tree = &self.handle.document.tree;
+            const scopes = try self.handle.getDocumentScope();
+            var current = Analyser.innermostScopeAtIndexWithTag(
+                scopes, tree.tokenStart(token), .initOne(.function),
+            ).unwrap();
+            while (current) |scope| {
+                if (scopes.getScopeTag(scope) == .function) {
+                    const node = scopes.getScopeAstNode(scope).?;
+                    if (tree.nodeTag(node) == .fn_decl) return node;
+                }
+                current = scopes.getScopeParent(scope).unwrap();
+            }
+            return null;
+        }
+
         /// Expected expression type from its source ancestors in this exact
         /// instantiation. Missing context remains unknown.
         pub fn expectedTypeOfNode(self: ResolutionFrame, node: Ast.Node.Index) !?ActualType {
@@ -5010,6 +5029,83 @@ test "test-local inline tuple frames retain each generic conversion destination"
     }
 }
 
+test "actual method calls bind This pointer receivers on locals and fields" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-this-pointer-receivers.zig",
+        \\const Other = struct { value: u8 };
+        \\const Pair = struct {
+        \\    known: u8,
+        \\    runtime: [2]u8,
+        \\    fn checked(out: *@This(), src: @This(), flag: bool) bool {
+        \\        if (!flag) return false;
+        \\        const saved = src;
+        \\        out.* = saved;
+        \\        return true;
+        \\    }
+        \\    fn mismatched(out: *Other, src: @This(), flag: bool) bool {
+        \\        _ = out; _ = src; return flag;
+        \\    }
+        \\};
+        \\const Holder = struct { pair: Pair, sibling: u8 };
+        \\pub fn selected(flag: bool) void {
+        \\    const src: Pair = .{ .known = 1, .runtime = .{ 2, undefined } };
+        \\    var direct: Pair = undefined;
+        \\    if (direct.checked(src, flag)) {
+        \\        _ = direct.known;
+        \\        _ = direct.runtime[1];
+        \\    }
+        \\    var holder: Holder = .{ .pair = undefined, .sibling = 9 };
+        \\    if (holder.pair.checked(src, flag)) {
+        \\        _ = holder.pair.known;
+        \\        _ = holder.sibling;
+        \\        _ = holder.pair.runtime[1];
+        \\    }
+        \\    _ = direct.mismatched(src, flag);
+        \\    _ = holder.pair.mismatched(src, flag);
+        \\}
+        \\const callback = selected;
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    // Body queries precede call-summary queries during flow lowering.
+    for (1..tree.nodes.len) |raw| {
+        _ = try resolver.resolutionFrame().resolveValueOfNode(@enumFromInt(raw));
+    }
+    const selected = switch (try resolver.functionReference(try testIdentifier(tree, "selected"))) {
+        .function => |reference| reference,
+        else => return error.MissingCaller,
+    };
+    const frame = resolver.frameForFunction(selected);
+    var checked_token: ?Ast.TokenIndex = null;
+    for (0..2) |occurrence| {
+        const node = try testNthCallNamed(tree, "checked", occurrence);
+        try std.testing.expect(try resolver.functionReferenceOfCall(node) == .function);
+        const checked = switch (try frame.functionReferenceOfCall(node)) {
+            .function => |reference| reference,
+            else => return error.MissingThisReceiver,
+        };
+        if (checked_token) |token| {
+            try std.testing.expectEqual(token, checked.fn_token);
+        } else {
+            checked_token = checked.fn_token;
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        const arguments = (try frame.callArgumentsOf(&buffer, node)) orelse return error.MissingArguments;
+        try std.testing.expect(arguments.receiver != null);
+        try std.testing.expectEqual(@as(usize, 2), arguments.arguments.len);
+        try std.testing.expectEqual(arguments.receiver, try frame.callArgument(node, 0));
+        try std.testing.expectEqual(arguments.arguments[0], (try frame.callArgument(node, 1)).?);
+        try std.testing.expectEqual(arguments.arguments[1], (try frame.callArgument(node, 2)).?);
+        const mismatched = try testNthCallNamed(tree, "mismatched", occurrence);
+        try std.testing.expect(try frame.functionReferenceOfCall(mismatched) == .unknown);
+        try std.testing.expectEqual(@as(?TypeResolver.CallArguments, null), try frame.callArgumentsOf(&buffer, mismatched));
+    }
+}
+
 fn testFieldExpression(tree: *const Ast, expression: []const u8, first: Ast.TokenIndex, last: Ast.TokenIndex) !Ast.Node.Index {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (tag != .field_access) continue;
@@ -6354,4 +6450,128 @@ test "generic allocator metadata retains its bounded integer field type" {
     const tree = &resolver.handle.document.tree;
     const node = try testFieldAccess(tree, "node");
     try std.testing.expectEqual(TypeResolver.IntInfo{ .signed = false, .bits = 16 }, (try resolver.intInfo(node)).?);
+}
+
+test "imported generic iterator locals retain their method receiver identity" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "container.zig", .data =
+        \\pub fn Collection(comptime T: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        pub const Cursor = CursorType(*Self, *T);
+        \\        fn CursorType(comptime Owner: type, comptime Element: type) type {
+        \\            return struct {
+        \\                owner: Owner,
+        \\                element: Element,
+        \\                index: usize,
+        \\                pub fn seek(cursor: *@This(), index: usize) void { cursor.index = index; }
+        \\                pub fn wrong(cursor: *Self, index: usize) void { _ = cursor; _ = index; }
+        \\            };
+        \\        }
+        \\        pub fn cursor(self: *Self, index: usize) Cursor {
+        \\            var result: Cursor = undefined;
+        \\            result.owner = self;
+        \\            result.seek(index);
+        \\            result.wrong(index);
+        \\            var inferred = Cursor{ .owner = self, .element = undefined, .index = undefined };
+        \\            inferred.seek(index);
+        \\            return result;
+        \\        }
+        \\    };
+        \\}
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var context: TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path,
+        \\const Collection = @import("container.zig").Collection;
+        \\fn use(wide: *Collection(u64), narrow: *Collection(u8)) void {
+        \\    _ = wide.cursor(1);
+        \\    _ = narrow.cursor(2);
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var references: [2]TypeResolver.FunctionReference = undefined;
+    for ([_]usize{ 0, 1, 0 }) |occurrence| {
+        const factory = switch (try resolver.functionReferenceOfCall(try testNthCallNamed(tree, "cursor", occurrence))) {
+            .function => |reference| reference,
+            else => return error.MissingCursorFactory,
+        };
+        const frame = resolver.frameForFunction(factory);
+        const seek = switch (try frame.functionReferenceOfCall(try testNthCallNamed(factory.tree, "seek", 0))) {
+            .function => |reference| reference,
+            else => return error.MissingCursorMethod,
+        };
+        try std.testing.expect(seek.handle.eql(factory.handle));
+        try std.testing.expectEqualStrings("seek", seek.actual_type.data.function.name.?);
+        const declaration = try testFunctionDeclaration(seek);
+        try std.testing.expectEqual(seek.fn_token, seek.tree.nodeMainToken(declaration));
+        try std.testing.expectEqual(TypeResolver.FunctionResolution.unknown, try frame.functionReferenceOfCall(try testNthCallNamed(factory.tree, "wrong", 0)));
+        const inferred = switch (try frame.functionReferenceOfCall(try testNthCallNamed(factory.tree, "seek", 1))) {
+            .function => |reference| reference,
+            else => return error.MissingInferredCursorMethod,
+        };
+        try std.testing.expect(seek.actual_type.eql(inferred.actual_type));
+        references[occurrence] = seek;
+    }
+    try std.testing.expectEqual(references[0].fn_token, references[1].fn_token);
+    try std.testing.expect(!references[0].actual_type.eql(references[1].actual_type));
+}
+
+test "framed enclosing functions skip type prototypes and retain nested ownership" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-enclosing-function-scope.zig",
+        \\var outside: u8 = 0;
+        \\fn outer() void {
+        \\    var local: u8 = 0;
+        \\    const Callback = fn (@TypeOf(local)) void;
+        \\    const Nested = struct {
+        \\        fn inner() void {
+        \\            var inner_local: u8 = 0;
+        \\            _ = &inner_local;
+        \\        }
+        \\    };
+        \\    _ = &local;
+        \\    _ = Callback;
+        \\    Nested.inner();
+        \\}
+        \\pub fn run() void { outer(); }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var outer: ?Ast.Node.Index = null;
+    var inner: ?Ast.Node.Index = null;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .fn_decl) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const name = tree.tokenSlice(tree.nodeMainToken(node) + 1);
+        if (std.mem.eql(u8, name, "outer")) outer = node;
+        if (std.mem.eql(u8, name, "inner")) inner = node;
+    }
+    const frame = resolver.resolutionFrame();
+    for (tree.tokens.items(.tag), 0..) |tag, index| {
+        if (tag != .identifier) continue;
+        const token: Ast.TokenIndex = @intCast(index);
+        const name = tree.tokenSlice(token);
+        if (std.mem.eql(u8, name, "local"))
+            try std.testing.expectEqual(outer.?, (try frame.enclosingFunctionAt(token)).?);
+        if (std.mem.eql(u8, name, "inner_local"))
+            try std.testing.expectEqual(inner.?, (try frame.enclosingFunctionAt(token)).?);
+        if (std.mem.eql(u8, name, "outside"))
+            try std.testing.expect((try frame.enclosingFunctionAt(token)) == null);
+    }
 }

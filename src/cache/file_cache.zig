@@ -37,6 +37,7 @@ const cfg_builder_mod = @import("../flow/cfg_builder.zig");
 const cfg_mod = @import("../flow/cfg.zig");
 const grow_analysis_mod = @import("grow_analysis.zig");
 const worklist_mod = @import("../flow/worklist.zig");
+const comptime_fill_mod = @import("../flow/comptime_fill.zig");
 const config_mod = @import("../config.zig");
 const problem_mod = @import("../problem.zig");
 const call_summary_mod = @import("call_summary.zig");
@@ -254,6 +255,44 @@ const CleanupBudget = struct {
     remaining: u32 = 50_000,
     initiating_cache: ?*FileCache = null,
     initiating_node: ?Ast.Node.Index = null,
+    initiating_tree: ?*const Ast = null,
+};
+
+/// AST snapshots outlive replay memo entries. Temporary caches and their
+/// borrowed cleanup demands do not, so retain only the raw tree and node.
+const ReplayFailureSite = struct {
+    tree: *const Ast,
+    node: Ast.Node.Index,
+};
+
+threadlocal var replay_failure_site: ?ReplayFailureSite = null;
+
+const ReplayFailureKey = struct {
+    callee: CleanupKey,
+    remaining: u32,
+    depth: u32,
+};
+
+const ReplayFailureKeyContext = struct {
+    pub fn hash(_: ReplayFailureKeyContext, key: ReplayFailureKey) u64 {
+        var hasher = std.hash.Wyhash.init(CleanupKeyContext.hash(.{}, key.callee));
+        hasher.update(std.mem.asBytes(&key.remaining));
+        hasher.update(std.mem.asBytes(&key.depth));
+        return hasher.final();
+    }
+
+    pub fn eql(_: ReplayFailureKeyContext, a: ReplayFailureKey, b: ReplayFailureKey) bool {
+        return a.remaining == b.remaining and a.depth == b.depth and
+            CleanupKeyContext.eql(.{}, a.callee, b.callee);
+    }
+};
+
+const ReplayFailure = struct {
+    site: ReplayFailureSite,
+    diagnostic: budget_mod.Diagnostic,
+    remaining: u32,
+    memo_entries: usize,
+    exhausted_entries: usize,
 };
 
 // Every cache on one worker shares the outer semantic query's allowance,
@@ -331,6 +370,7 @@ const CleanupProbeEdge = struct {
 
 const CleanupProbeRow = struct {
     cache: *FileCache,
+    tree: *const Ast,
     node: Ast.Node.Index,
     frame: ?TypeResolver.ResolutionFrame,
     demand: CleanupProbeDemand,
@@ -356,6 +396,7 @@ fn cleanupProbeHit(key: CleanupKey, visiting: bool) void {
 fn cleanupProbeRow(cache: *FileCache, node: Ast.Node.Index) CleanupProbeRow {
     return .{
         .cache = cache,
+        .tree = cache.tree,
         .node = node,
         .frame = cache.cleanup_frame,
         .demand = CleanupProbeDemand.init(cache.cleanup_demand),
@@ -380,8 +421,8 @@ fn cleanupProbeFormalCount(tree: *const Ast, declaration: Ast.Node.Index) ?u32 {
 }
 
 fn cleanupProbeTarget(row: *const CleanupProbeRow) bool {
-    const tree = row.cache.tree;
-    const declaration = tokens.enclosingFnDecl(tree, tree.nodeMainToken(row.node)) orelse return false;
+    const tree = row.tree;
+    const declaration = row.cache.enclosingFunctionAt(tree, tree.nodeMainToken(row.node)) orelse return false;
     const name = cleanupProbeName(tree, declaration);
     // Names select diagnostic output only. They never select an analysis answer.
     return (std.mem.endsWith(u8, row.cache.file_path, "/grow_analysis.zig") and
@@ -423,10 +464,10 @@ fn cleanupProbePrintKey(label: []const u8, key: *const CleanupProbeKey) void {
 
 fn cleanupProbePrintRow(index: usize, row: *const CleanupProbeRow) void {
     const cache = row.cache;
-    const tree = cache.tree;
+    const tree = row.tree;
     const token = tree.nodeMainToken(row.node);
     const lc = budget_mod.lineCol(tree.source, tree.tokens.items(.start)[token]);
-    const declaration = tokens.enclosingFnDecl(tree, token);
+    const declaration = cache.enclosingFunctionAt(tree, token);
     const name = if (declaration) |decl| cleanupProbeName(tree, decl) else "?";
     std.debug.print("ZBC_CLEANUP_STACK row={d} cache=0x{x} tree=0x{x} module={any} path={s} node={d} tag={s} loc={d}:{d} caller_decl={any} caller={s} caller_context={?x} cache_hits={d} visiting_hits={d}", .{
         index,                                              @intFromPtr(cache),                                              @intFromPtr(tree),                cache.module_id,
@@ -482,11 +523,11 @@ fn cleanupProbePrintRow(index: usize, row: *const CleanupProbeRow) void {
             }
             if (previous.frame) |frame| {
                 if (frame.actual_type) |actual| {
-                    const previous_decl = tokens.enclosingFnDecl(
-                        previous.cache.tree,
-                        previous.cache.tree.nodeMainToken(previous.node),
+                    const previous_decl = previous.cache.enclosingFunctionAt(
+                        previous.tree,
+                        previous.tree.nodeMainToken(previous.node),
                     );
-                    if (previous.cache.tree == b.declaration.tree and
+                    if (previous.tree == b.declaration.tree and
                         frame.handle.module == b.declaration.module and
                         previous_decl == b.declaration.declaration)
                     {
@@ -512,9 +553,10 @@ fn cleanupProbePrintRow(index: usize, row: *const CleanupProbeRow) void {
     }
 }
 
-fn cleanupProbeFailure(cache: *FileCache, node: Ast.Node.Index, limit: budget_mod.Limit) void {
+fn cleanupProbeFailure(cache: *FileCache, tree: *const Ast, node: Ast.Node.Index, limit: budget_mod.Limit) void {
     if (cleanup_probe_dumped.load(.monotonic)) return;
-    const failed = cleanupProbeRow(cache, node);
+    var failed = cleanupProbeRow(cache, node);
+    failed.tree = tree;
     var targeted = cleanupProbeTarget(&failed);
     for (cleanup_probe_stack[0..cleanup_budget.depth]) |*row| {
         targeted = targeted or cleanupProbeTarget(row);
@@ -569,6 +611,16 @@ pub const FileCache = struct {
     /// already on the stack cannot publish a recursive certificate.
     return_defined_summaries: std.HashMapUnmanaged(CleanupKey, ReturnValueVerdict, CleanupKeyContext, 80) = .empty,
     return_defined_visiting: std.AutoHashMapUnmanaged(DeclKey, void) = .empty,
+    /// Failed standalone replays, never verdicts. Exact initial allowances
+    /// and unchanged memo state are required; active outer proofs do not reuse.
+    return_replay_failures: std.HashMapUnmanaged(ReplayFailureKey, ReplayFailure, ReplayFailureKeyContext, 80) = .empty,
+    return_replay_syntax: std.AutoHashMapUnmanaged(DeclKey, ReturnReplaySyntax) = .empty,
+    /// Completed identity queries, without argument or cleanup summaries.
+    return_calls: std.HashMapUnmanaged(ReturnCallKey, ?ActualCallSummary, ReturnCallKeyContext, 80) = .empty,
+    /// Eligibility is not a verdict. A later settled replay takes precedence.
+    return_diagnostic_seeds: std.HashMapUnmanaged(CleanupKey, bool, CleanupKeyContext, 80) = .empty,
+    return_source_eligibility: std.HashMapUnmanaged(ReturnSourceKey, SourceEligibility, ReturnSourceKeyContext, 80) = .empty,
+    return_source_visiting: std.HashMapUnmanaged(ReturnSourceKey, void, ReturnSourceKeyContext, 80) = .empty,
     return_defined_mode: bool = false,
     array_source_visiting: std.AutoHashMapUnmanaged(DeclKey, void) = .empty,
     cleanup_demand: CleanupDemand = .all,
@@ -722,11 +774,16 @@ pub const FileCache = struct {
     /// body's question about every token, so a body walked repeatedly
     /// reads a table instead of re-walking the file's node array.
     address_uses: ?AddressUseMap = null,
+    /// Completed in-place address proofs also invalidate failed replay stamps.
+    address_proof_generation: usize = 0,
     /// Successful root certificates only; failures and abstentions are retried.
     definite_parameter_writes: std.HashMapUnmanaged(ParameterWriteKey, void, ParameterWriteKeyContext, 80) = .empty,
     /// `(first << 32) | last` → lowest node with exactly that token span.
     /// Built on the first `nodeForExactSpan` question; null until then.
     exact_spans: ?std.AutoHashMapUnmanaged(u64, Ast.Node.Index) = null,
+    /// Tree-only fill scope material and exact visibility queries, shared by
+    /// ordinary lowering and return replay. No type/value certificate.
+    fill_lexical_index: comptime_fill_mod.LexicalIndex = .{},
 
     const ForeignBodyKey = struct {
         tree: *const Ast,
@@ -734,15 +791,110 @@ pub const FileCache = struct {
         body: u32,
     };
 
+    const ReturnCallKey = struct {
+        token: Ast.TokenIndex,
+        resolver: *TypeResolver,
+        tree: *const Ast,
+        module: ModuleId,
+        callable: ?TypeResolver.ActualTypeID,
+        container: ?TypeResolver.ActualTypeID,
+    };
+
+    const ReturnCallKeyContext = struct {
+        pub fn hash(_: ReturnCallKeyContext, key: ReturnCallKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(std.mem.asBytes(&key.token));
+            const resolver = @intFromPtr(key.resolver);
+            const tree = @intFromPtr(key.tree);
+            hasher.update(std.mem.asBytes(&resolver));
+            hasher.update(std.mem.asBytes(&tree));
+            hasher.update(std.mem.asBytes(&key.module));
+            // Syntax distributes node queries without recursively hashing
+            // their entire generic binding closure. Context collisions still
+            // require full structural equality below; no key loses a field.
+            inline for (.{ key.callable, key.container }) |context| {
+                const present = context != null;
+                hasher.update(std.mem.asBytes(&present));
+            }
+            return hasher.final();
+        }
+
+        pub fn eql(_: ReturnCallKeyContext, a: ReturnCallKey, b: ReturnCallKey) bool {
+            if (a.token != b.token or a.resolver != b.resolver or
+                a.tree != b.tree or a.module != b.module) return false;
+            if (a.callable) |context| {
+                if (!context.eql(b.callable orelse return false)) return false;
+            } else if (b.callable != null) return false;
+            if (a.container) |context| {
+                if (!context.eql(b.container orelse return false)) return false;
+            } else if (b.container != null) return false;
+            return true;
+        }
+    };
+
     const ReturnValueVerdict = struct {
         defined: bool,
         may_undefined: bool,
+        all_undefined: bool,
         stores: std.ArrayListUnmanaged(worklist_mod.UndefinedParameterStore) = .empty,
         bytes: std.ArrayListUnmanaged(worklist_mod.UndefinedReturnBytes) = .empty,
     };
 
+    const ReturnReplaySyntax = struct {
+        has_defer: bool = false,
+    };
+
+    /// A source is only permission to ask the settled replay, never a mask.
+    /// Cycle-dependent absences are not published as completed answers.
+    const SourceEligibility = enum {
+        absent,
+        present,
+        cycle,
+
+        fn merge(a: SourceEligibility, b: SourceEligibility) SourceEligibility {
+            if (a == .present or b == .present) return .present;
+            if (a == .cycle or b == .cycle) return .cycle;
+            return .absent;
+        }
+    };
+
+    const ReturnSourceKey = struct {
+        frame: ReturnCallKey,
+        node: Ast.Node.Index,
+        returns: bool,
+        stores: bool = false,
+        mutation_root: ?Ast.Node.Index = null,
+    };
+
+    const ReturnSourceKeyContext = struct {
+        pub fn hash(_: ReturnSourceKeyContext, key: ReturnSourceKey) u64 {
+            var hasher = std.hash.Wyhash.init((ReturnCallKeyContext{}).hash(key.frame));
+            hasher.update(std.mem.asBytes(&key.node));
+            hasher.update(std.mem.asBytes(&key.returns));
+            hasher.update(std.mem.asBytes(&key.stores));
+            const rooted = key.mutation_root != null;
+            hasher.update(std.mem.asBytes(&rooted));
+            if (key.mutation_root) |root| hasher.update(std.mem.asBytes(&root));
+            return hasher.final();
+        }
+
+        pub fn eql(_: ReturnSourceKeyContext, a: ReturnSourceKey, b: ReturnSourceKey) bool {
+            return a.node == b.node and a.returns == b.returns and a.stores == b.stores and
+                a.mutation_root == b.mutation_root and (ReturnCallKeyContext{}).eql(a.frame, b.frame);
+        }
+    };
+
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
+    }
+
+    fn enclosingFunctionAt(self: *FileCache, tree: *const Ast, token: Ast.TokenIndex) ?Ast.Node.Index {
+        if (tree == self.tree) {
+            if (self.zls) |resolver| {
+                return resolver.enclosingFunctionAt(token) catch tokens.enclosingFnDecl(tree, token);
+            }
+        }
+        return tokens.enclosingFnDecl(tree, token);
     }
 
     pub fn setZls(self: *FileCache, zls: ?*zls_resolver_mod.TypeResolver) void {
@@ -1625,10 +1777,359 @@ pub const FileCache = struct {
     ///
     /// Possible mutation is not initialization. `definite_write` proves the
     /// complete pointee; `fields` proves only those inline projections.
+    pub const ComputedStoreBase = struct {
+        source: ?WholeStoreSource = null,
+        computations: u8 = 0,
+        original_alternative: bool = false,
+        opaque_alternative: bool = false,
+
+        pub fn equal(a: ComputedStoreBase, b: ComputedStoreBase) bool {
+            return WholeStoreSource.equal(a.source, b.source) and a.computations == b.computations and
+                a.original_alternative == b.original_alternative and a.opaque_alternative == b.opaque_alternative;
+        }
+    };
+
     pub const WrittenRead = struct {
         argument: Ast.Node.Index,
         tree: *const Ast,
         node: Ast.Node.Index,
+        identity_projection: bool = false,
+        /// Original pointee bytes require a current caller backing, not pointer identity.
+        pointee_read: bool = false,
+        base_read: ?u3 = null,
+        relative_path: ?[]const u8 = null,
+        index: ?u64 = null,
+        is_array: bool = false,
+        array_extent: ?u64 = null,
+        value_type: ?TypeResolver.ActualType = null,
+        output_read: bool = false,
+        /// Select one runtime-indexed element from the immutable output COW base.
+        output_index_read: bool = false,
+        output_prefix: ?[]const u8 = null,
+        output_base: ?ComputedStoreBase = null,
+    };
+
+    /// Authenticated value identity, not an initialized-value certificate.
+    /// Bits name independently proved originating-caller written_inputs slots.
+    pub const WholeStoreSource = struct {
+        sources: u8 = 0,
+        projections: u8 = 0,
+        opaque_alternative: bool = true,
+
+        fn merge(a: WholeStoreSource, b: WholeStoreSource) WholeStoreSource {
+            return .{ .sources = a.sources | b.sources, .projections = a.projections | b.projections, .opaque_alternative = a.opaque_alternative or b.opaque_alternative };
+        }
+
+        fn equal(a: ?WholeStoreSource, b: ?WholeStoreSource) bool {
+            if (a == null or b == null) return a == null and b == null;
+            return a.?.sources == b.?.sources and a.?.projections == b.?.projections and a.?.opaque_alternative == b.?.opaque_alternative;
+        }
+    };
+
+    /// Slots in the bounded, deduplicated caller-input and projected-read tables.
+    /// This recipe describes byte dependencies, never a value certificate.
+    pub const WrittenDependencies = struct {
+        inputs: u8 = 0,
+        reads: u8 = 0,
+
+        fn merge(self: *WrittenDependencies, other: WrittenDependencies) void {
+            self.inputs |= other.inputs;
+            self.reads |= other.reads;
+        }
+
+        fn eql(self: WrittenDependencies, other: WrittenDependencies) bool {
+            return self.inputs == other.inputs and self.reads == other.reads;
+        }
+
+        fn isEmpty(self: WrittenDependencies) bool {
+            return self.inputs == 0 and self.reads == 0;
+        }
+    };
+    pub const ComputedStoreWrite = struct {
+        path: []const u8,
+        parent: ?u7 = null,
+        array_index: ?u64 = null,
+        dependencies: WrittenDependencies = .{},
+        source: ?WholeStoreSource = null,
+        literal_undefined: bool = false,
+        literal_may_undefined: bool = false,
+        opaque_alternative: bool = false,
+        is_array: bool = false,
+        array_extent: ?u64 = null,
+    };
+
+    /// One immutable COW result. Its base is an older result set, and its
+    /// ordered component writes replace only the paths they name.
+    pub const ComputedStoreValue = struct {
+        whole_value: bool = false,
+        base_source: ?WholeStoreSource = null,
+        base_computations: u8 = 0,
+        base_original_alternative: bool = false,
+        base_opaque_alternative: bool = false,
+        writes: []const ComputedStoreWrite = &.{},
+        is_array: bool = false,
+        array_extent: ?u64 = null,
+        output_prefix: ?[]const u8 = null,
+    };
+
+    /// Proof-local staging pool. Templates and writes remain inline scratch
+    /// until the root proof succeeds. Publication copies only reachable write
+    /// slices into the summary arena, once per immutable result.
+    const ComputedStoreBuilders = struct {
+        values: [8]?ComputedStoreValue = .{null} ** 8,
+        expanded_alternatives: [8]u8 = @splat(0),
+        write_offsets: [8]usize = undefined,
+        write_counts: [8]usize = undefined,
+        writes: [128]ComputedStoreWrite = undefined,
+        count: usize = 0,
+        write_count: usize = 0,
+        overflow: bool = false,
+
+        fn sourceAlternativeCount(source: ?WholeStoreSource, write: ?ComputedStoreWrite) u16 {
+            var count: u16 = 0;
+            if (source) |identity| {
+                count += @intCast(@popCount(identity.sources));
+                count += @intCast(@popCount(identity.projections));
+            }
+            const source_opaque = if (source) |identity| identity.opaque_alternative else false;
+            const write_opaque = if (write) |component| component.opaque_alternative else false;
+            if (source_opaque or write_opaque) count += 1;
+            if (if (write) |component| component.literal_undefined or component.literal_may_undefined else false) count += 1;
+            return if (count == 0) 1 else count;
+        }
+
+        fn alternativeCount(self: *const ComputedStoreBuilders, base: ComputedStoreBase) ?u8 {
+            var count: u16 = 0;
+            if (base.source) |source| {
+                count += @intCast(@popCount(source.sources));
+                count += @intCast(@popCount(source.projections));
+                if (source.opaque_alternative) count += 1;
+            }
+            if (base.original_alternative) count += 1;
+            if (base.opaque_alternative) count += 1;
+            var handles = base.computations;
+            while (handles != 0) {
+                const index: usize = @intCast(@ctz(handles));
+                if (index >= self.count) return null;
+                count += self.expanded_alternatives[index];
+                handles &= handles - 1;
+            }
+            if (count == 0 or count > 8) return null;
+            return @intCast(count);
+        }
+
+        fn add(
+            self: *ComputedStoreBuilders,
+            value: ComputedStoreValue,
+        ) ?u8 {
+            for (self.values[0..self.count], 0..) |entry, index| {
+                const previous = entry orelse continue;
+                if (previous.whole_value != value.whole_value or
+                    !WholeStoreSource.equal(previous.base_source, value.base_source) or
+                    previous.base_computations != value.base_computations or
+                    previous.base_original_alternative != value.base_original_alternative or
+                    previous.base_opaque_alternative != value.base_opaque_alternative or
+                    previous.is_array != value.is_array or previous.array_extent != value.array_extent or
+                    previous.writes.len != value.writes.len) continue;
+                if (previous.output_prefix) |prefix| {
+                    if (value.output_prefix == null or !std.mem.eql(u8, prefix, value.output_prefix.?)) continue;
+                } else if (value.output_prefix != null) continue;
+                var same = true;
+                for (previous.writes, value.writes) |old, new| {
+                    if (!std.mem.eql(u8, old.path, new.path) or old.parent != new.parent or
+                        old.array_index != new.array_index or !old.dependencies.eql(new.dependencies) or
+                        !WholeStoreSource.equal(old.source, new.source) or
+                        old.literal_undefined != new.literal_undefined or
+                        old.literal_may_undefined != new.literal_may_undefined or
+                        old.opaque_alternative != new.opaque_alternative or
+                        old.is_array != new.is_array or old.array_extent != new.array_extent)
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) return @as(u8, 1) << @intCast(index);
+            }
+            if (self.overflow) return null;
+            if (self.count == self.values.len or value.writes.len == 0 or
+                value.writes.len > self.writes.len - self.write_count)
+            {
+                self.overflow = true;
+                return null;
+            }
+            const handle_mask: u8 = if (self.count == 0) 0 else (@as(u8, 1) << @intCast(self.count)) - 1;
+            if (value.whole_value) {
+                if (value.base_source != null or value.base_computations != 0 or
+                    value.base_original_alternative or value.base_opaque_alternative)
+                {
+                    self.overflow = true;
+                    return null;
+                }
+            } else if (value.base_computations & ~handle_mask != 0) {
+                self.overflow = true;
+                return null;
+            }
+
+            const base: ComputedStoreBase = .{
+                .source = value.base_source,
+                .computations = value.base_computations,
+                .original_alternative = value.base_original_alternative,
+                .opaque_alternative = value.base_opaque_alternative,
+            };
+            var alternatives: u16 = if (value.whole_value) 1 else self.alternativeCount(base) orelse {
+                self.overflow = true;
+                return null;
+            };
+            for (value.writes) |write| {
+                const choices = sourceAlternativeCount(write.source, write);
+                if (alternatives > 8 / choices) {
+                    self.overflow = true;
+                    return null;
+                }
+                alternatives *= choices;
+            }
+
+            const index = self.count;
+            const first = self.write_count;
+            const last = first + value.writes.len;
+            @memcpy(self.writes[first..last], value.writes);
+            self.write_offsets[index] = first;
+            self.write_counts[index] = value.writes.len;
+            self.values[index] = .{
+                .whole_value = value.whole_value,
+                .base_source = value.base_source,
+                .base_computations = value.base_computations,
+                .base_original_alternative = value.base_original_alternative,
+                .base_opaque_alternative = value.base_opaque_alternative,
+                .writes = self.writes[first..last],
+                .is_array = value.is_array,
+                .array_extent = value.array_extent,
+                .output_prefix = value.output_prefix,
+            };
+            self.expanded_alternatives[index] = @intCast(alternatives);
+            self.write_count = last;
+            self.count += 1;
+            return @as(u8, 1) << @intCast(index);
+        }
+
+        fn markReachable(
+            self: *const ComputedStoreBuilders,
+            handles: u8,
+            reachable: *u8,
+        ) bool {
+            var pending = handles;
+            while (pending != 0) {
+                const index: usize = @intCast(@ctz(pending));
+                const bit = @as(u8, 1) << @intCast(index);
+                pending &= pending - 1;
+                if (reachable.* & bit != 0) continue;
+                if (index >= self.count) return false;
+                reachable.* |= bit;
+                pending |= self.values[index].?.base_computations;
+            }
+            return true;
+        }
+
+        fn publish(
+            self: *const ComputedStoreBuilders,
+            owner: *FileCache,
+            root: ComputedStoreBase,
+            include_root: bool,
+            reads: *const [8]?WrittenRead,
+            selected_reads: u8,
+            use: *AddressUse,
+        ) !bool {
+            use.written_computations = .{null} ** 8;
+            if (self.overflow or (include_root and self.alternativeCount(root) == null)) return false;
+            var reachable: u8 = 0;
+            var pending_reads = selected_reads;
+            if (include_root) {
+                if (!self.markReachable(root.computations, &reachable)) return false;
+                if (root.source) |source| pending_reads |= source.projections;
+            }
+            var examined_nodes: u8 = 0;
+            var examined_reads: u8 = 0;
+            while (true) {
+                var nodes = reachable & ~examined_nodes;
+                var requested = pending_reads & ~examined_reads;
+                if (nodes == 0 and requested == 0) break;
+                while (nodes != 0) {
+                    const index: usize = @intCast(@ctz(nodes));
+                    const bit = @as(u8, 1) << @intCast(index);
+                    nodes &= nodes - 1;
+                    examined_nodes |= bit;
+                    const node = self.values[index] orelse return false;
+                    if (node.base_source) |source| pending_reads |= source.projections;
+                    for (node.writes) |write| {
+                        pending_reads |= write.dependencies.reads;
+                        if (write.source) |source| pending_reads |= source.projections;
+                    }
+                }
+                requested |= pending_reads & ~examined_reads;
+                while (requested != 0) {
+                    const index: usize = @intCast(@ctz(requested));
+                    const bit = @as(u8, 1) << @intCast(index);
+                    requested &= requested - 1;
+                    examined_reads |= bit;
+                    const entry = reads[index] orelse return false;
+                    const read_base = entry.output_base orelse continue;
+                    if (self.alternativeCount(read_base) == null or
+                        !self.markReachable(read_base.computations, &reachable)) return false;
+                    if (read_base.source) |source| pending_reads |= source.projections;
+                }
+            }
+            var handles = reachable;
+            while (handles != 0) {
+                const index: usize = @intCast(@ctz(handles));
+                handles &= handles - 1;
+                const value = self.values[index] orelse return false;
+                const first = self.write_offsets[index];
+                const last = first + self.write_counts[index];
+                if (owner.summary_arena == null) owner.summary_arena = std.heap.ArenaAllocator.init(owner.gpa);
+                const writes = try owner.summary_arena.?.allocator().dupe(
+                    ComputedStoreWrite,
+                    self.writes[first..last],
+                );
+                var published = value;
+                published.writes = writes;
+                use.written_computations[index] = published;
+            }
+            return true;
+        }
+    };
+
+    /// Passive changed-continue alternatives. Proof snapshots borrow this
+    /// bounded sink; they never copy another binding or coverage payload.
+    const WrittenMayStores = struct {
+        fields: [128][]const u8 = undefined,
+        dependencies: [128]WrittenDependencies = undefined,
+        literal_may_undefined: [128]bool = @splat(false),
+        count: usize = 0,
+
+        fn add(self: *WrittenMayStores, path: []const u8, recipe: WrittenDependencies) bool {
+            for (self.fields[0..self.count], self.dependencies[0..self.count]) |field, *dependencies| {
+                if (!std.mem.eql(u8, field, path)) continue;
+                dependencies.merge(recipe);
+                return true;
+            }
+            if (self.count == self.fields.len) return false;
+            self.fields[self.count] = path;
+            self.dependencies[self.count] = recipe;
+            self.literal_may_undefined[self.count] = false;
+            self.count += 1;
+            return true;
+        }
+
+        fn addLiteral(self: *WrittenMayStores, path: []const u8) bool {
+            if (!self.add(path, .{})) return false;
+            for (self.fields[0..self.count], self.literal_may_undefined[0..self.count]) |field, *literal| {
+                if (std.mem.eql(u8, field, path)) {
+                    literal.* = true;
+                    return true;
+                }
+            }
+            unreachable;
+        }
     };
 
     pub const AddressUse = struct {
@@ -1636,6 +2137,23 @@ pub const FileCache = struct {
         may_write: bool,
         definite_write: bool = false,
         location_written: bool = false,
+        whole_source: ?WholeStoreSource = null,
+        written_computations: [8]?ComputedStoreValue = .{null} ** 8,
+        location_computed_sources: u8 = 0,
+        location_computed_original_alternative: bool = false,
+        location_computed_opaque_alternative: bool = false,
+        location_computed_complete: bool = true,
+        physical_store_only: bool = false,
+        /// Exact physical C scalar destination; never a whole-array certificate.
+        location_element_index: ?u64 = null,
+        location_value_type: ?TypeResolver.ActualType = null,
+        /// Definite physical writes, separate from initialized-value proofs.
+        location_fields: [128][]const u8 = undefined,
+        location_field_dependencies: [128]WrittenDependencies = undefined,
+        /// Independently authenticated exact field sources; never dependency identities.
+        location_field_sources: [128]?WholeStoreSource = .{null} ** 128,
+        location_field_count: usize = 0,
+        may_written_stores: WrittenMayStores = .{},
         written_inputs: [8]?Ast.Node.Index = .{null} ** 8,
         written_reads: [8]?WrittenRead = .{null} ** 8,
         undefined_fields: [128][]const u8 = undefined,
@@ -1692,6 +2210,7 @@ pub const FileCache = struct {
         if (!try self.definiteAddressWrite(&proved)) return if (use.receiver) null else use;
         proved.proof_queried = true;
         self.address_uses.?.getPtr(operand_token).?.* = proved;
+        self.address_proof_generation += 1;
         return proved;
     }
 
@@ -1700,7 +2219,10 @@ pub const FileCache = struct {
         var use = self.address_uses.?.get(token) orelse return null;
         use.definite_write = false;
         use.location_written = false;
+        use.whole_source = null;
+        use.location_field_count = 0;
         use.field_count = 0;
+        use.may_written_stores.count = 0;
         use.written_inputs = .{null} ** 8;
         use.written_reads = .{null} ** 8;
         use.success_bool = success_bool;
@@ -1717,10 +2239,37 @@ pub const FileCache = struct {
         use.definite_write = false;
         use.field_count = 0;
         use.location_written = false;
+        use.whole_source = null;
+        use.location_field_count = 0;
+        use.location_field_sources = .{null} ** 128;
         use.written_inputs = .{null} ** 8;
         use.written_reads = .{null} ** 8;
         use.success_bool = expected;
         if (!try self.definiteAddressWrite(&use)) return null;
+        return use;
+    }
+
+
+    /// Query an explicit pointer actual only after the consumer authenticates a
+    /// current local backing. This reuses the same must-store proof as address-of
+    /// arguments; it does not infer pointee identity from a pointer type.
+    pub fn pointerArgumentStoreUseAt(
+        self: *FileCache,
+        call_node: Ast.Node.Index,
+        argument: Ast.Node.Index,
+        success_bool: ?bool,
+    ) SummaryError!?AddressUse {
+        var use: AddressUse = .{
+            .address_node = argument,
+            .operand = if (self.tree.fullSlice(argument)) |slice| slice.ast.sliced else argument,
+            .call_node = call_node,
+            .may_write = true,
+            .success_bool = success_bool,
+            .physical_store_only = true,
+        };
+        if (!try self.definiteAddressWrite(&use)) return null;
+        if (self.tree.fullSlice(argument) != null and use.location_element_index == null) return null;
+        use.proof_queried = true;
         return use;
     }
 
@@ -1732,15 +2281,29 @@ pub const FileCache = struct {
         field_count: usize = 0,
     };
 
+    /// A by-value aggregate transports bytes; a source-proven scalar selection
+    /// in its callee reads only the corresponding actual bytes.
+    pub fn valueScalarReadsAt(self: *FileCache, call_token: Ast.TokenIndex, frame: ?TypeResolver.ResolutionFrame, argument: Ast.Node.Index) SummaryError!?MethodScalarReads {
+        const canonical = (try self.actualCallSummaryAt(call_token, frame)) orelse return null;
+        const call_node = canonical.callee.call_node;
+        self.beginNormalCleanup();
+        defer self.endNormalCleanup();
+        try self.enterNormalCleanup(call_node);
+        defer self.leaveNormalCleanup();
+        try self.chargeNormalCleanup(call_node);
+        return self.scalarReadsForUse(.{ .operand = argument, .address_node = argument, .call_node = call_node, .may_write = false }, call_node, canonical, true);
+    }
+
     /// Reuse the raw method-address mapping even when it proves no write.
-    /// Every formal occurrence must select inline struct fields ending in a
-    /// scalar. Calls, payload traversal, escapes and unsupported bodies abstain.
+    /// Every formal occurrence must select inline scalar bytes, a fixed-array
+    /// element, or scalar dereference. Unknown pointees supply no byte fact.
+    /// Calls, escapes and unsupported bodies abstain.
     pub fn methodScalarReadsAt(self: *FileCache, operand_token: Ast.TokenIndex) SummaryError!?MethodScalarReads {
         if (self.address_uses == null) self.address_uses = try self.buildAddressUses();
         const use = self.address_uses.?.get(operand_token) orelse return null;
         if (!use.receiver) return null;
         const call_node = use.call_node orelse return null;
-        const resolver = self.zls orelse return null;
+        _ = self.zls orelse return null;
         self.beginNormalCleanup();
         defer self.endNormalCleanup();
         try self.enterNormalCleanup(call_node);
@@ -1748,7 +2311,13 @@ pub const FileCache = struct {
         try self.chargeNormalCleanup(call_node);
         var call_buffer: [2]Ast.Node.Index = undefined;
         const call = TypeResolver.CallOperands.full(self.tree, &call_buffer, call_node) orelse return null;
-        const canonical = (try self.actualCallSummaryAt(call.queryToken(self.tree, call_node), null)) orelse return null;
+        const canonical = (try self.actualCallSummaryAt(call.queryToken(self.tree, call_node), self.cleanup_frame)) orelse return null;
+        return self.scalarReadsForUse(use, call_node, canonical, false);
+    }
+
+    fn scalarReadsForUse(self: *FileCache, use: AddressUse, call_node: Ast.Node.Index, canonical: ActualCallSummary, by_value: bool) SummaryError!?MethodScalarReads {
+        const resolver = self.zls orelse return null;
+        var call_buffer: [2]Ast.Node.Index = undefined;
         const tree = canonical.callee.tree;
         if (tree.nodeTag(canonical.callee.declaration) != .fn_decl) return null;
         const body = tokens.bodyOf(tree, canonical.callee.declaration) orelse return null;
@@ -1766,10 +2335,13 @@ pub const FileCache = struct {
         const name = tree.tokenSlice(parameter_token orelse return null);
         const formal_types = canonical.callee.reference.actual_type.data.function.parameters;
         if (parameter_index >= formal_types.len) return null;
-        const pointer = (try resolver.normalizedType(formal_types[parameter_index].type)) orelse return null;
-        if (resolver.pointerSize(pointer) != .one) return null;
-        const pointee = (try resolver.normalizedType(resolver.childType(pointer) orelse return null)) orelse return null;
-        if (resolver.typeTag(pointee) != .@"struct") return null;
+        const formal = (try resolver.normalizedType(formal_types[parameter_index].type)) orelse return null;
+        const pointee = if (by_value) formal else pointer: {
+            if (resolver.pointerSize(formal) != .one) return null;
+            break :pointer (try resolver.normalizedType(resolver.childType(formal) orelse return null)) orelse return null;
+        };
+        const value_tag = resolver.typeTag(pointee) orelse return null;
+        if (value_tag != .@"struct" and !(by_value and value_tag == .array)) return null;
 
         // The caller path must also stay in inline storage. Pointer-valued
         // places need alias/payload facts this field-only certificate lacks.
@@ -1780,7 +2352,8 @@ pub const FileCache = struct {
             try self.chargeNormalCleanup(call_node);
             const actual = (try caller_frame.typeOfNode(receiver_node)) orelse return null;
             const normalized = (try resolver.normalizedType(actual)) orelse return null;
-            if (resolver.typeTag(normalized) != .@"struct") return null;
+            if (resolver.typeTag(normalized) != .@"struct" and
+                !(by_value and resolver.typeTag(normalized) == .array)) return null;
             switch (self.tree.nodeTag(receiver_node)) {
                 .identifier => break,
                 .field_access => {
@@ -1817,7 +2390,7 @@ pub const FileCache = struct {
             };
             try self.chargeNormalCleanup(call_node);
             const tag = tree.nodeTag(node);
-            if (tag == .field_access) {
+            if (tag == .field_access or tag == .array_access or tag == .deref) {
                 const root = tokens.rootIdentifier(tree, node) orelse return null;
                 if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(root)), name)) {
                     const path = (try self.methodScalarReadPath(tree, node, pointee, call_node)) orelse return null;
@@ -1870,6 +2443,11 @@ pub const FileCache = struct {
                     const branch = tree.fullIf(node) orelse return null;
                     if (branch.payload_token != null) return null;
                 },
+                .assign => {
+                    const lhs = tree.nodeData(node).node_and_node[0];
+                    if (!by_value or tree.nodeTag(lhs) != .identifier or
+                        !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_")) return null;
+                },
                 else => return null,
             }
             if (depth == frames.len) return null;
@@ -1904,6 +2482,16 @@ pub const FileCache = struct {
         var selectors: [128]Ast.TokenIndex = undefined;
         var count: usize = 0;
         var current = node;
+        const pointer_header = tree.nodeTag(current) == .deref;
+        var selected_index: ?u64 = null;
+        if (pointer_header) {
+            current = tree.nodeData(current).node;
+        } else if (tree.nodeTag(current) == .array_access) {
+            const base, const index = tree.nodeData(current).node_and_node;
+            if (tree.nodeTag(index) != .number_literal) return null;
+            selected_index = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(index)), 0) catch return null;
+            current = base;
+        }
         while (tree.nodeTag(current) == .field_access) {
             if (count == selectors.len) return null;
             const base, const selector = tree.nodeData(current).node_and_token;
@@ -1911,7 +2499,7 @@ pub const FileCache = struct {
             count += 1;
             current = base;
         }
-        if (tree.nodeTag(current) != .identifier or count == 0) return null;
+        if (tree.nodeTag(current) != .identifier or (count == 0 and selected_index == null)) return null;
         var actual = pointee;
         var path: ?[]const u8 = null;
         while (count != 0) {
@@ -1942,7 +2530,25 @@ pub const FileCache = struct {
                 break :joined try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}.{s}", .{ prefix, field_name });
             } else field_name;
         }
-        const scalar = (try resolver.normalizedType(actual)) orelse return null;
+        var scalar = (try resolver.normalizedType(actual)) orelse return null;
+        if (pointer_header) {
+            if (resolver.pointerSize(scalar) != .one) return null;
+            const pointee_value = (try resolver.normalizedType(resolver.childType(scalar) orelse return null)) orelse return null;
+            switch (resolver.typeTag(pointee_value) orelse return null) {
+                .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" => {
+                    if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+                    return try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}.*", .{path orelse return null});
+                },
+                // A partial aggregate pointee is transported, not selected.
+                else => return path,
+            }
+        }
+        if (selected_index) |index| {
+            if (resolver.typeTag(scalar) != .array) return null;
+            scalar = (try resolver.normalizedType(resolver.childType(scalar) orelse return null)) orelse return null;
+            if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+            path = try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}[{d}]", .{ path orelse "", index });
+        }
         switch (resolver.typeTag(scalar) orelse return null) {
             .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" => return path,
             else => return null,
@@ -1957,7 +2563,7 @@ pub const FileCache = struct {
         token: Ast.TokenIndex,
         caller_frame: ?TypeResolver.ResolutionFrame,
     ) anyerror!bool {
-        return self.callResultValueAt(token, caller_frame, false);
+        return self.callResultValueAt(token, caller_frame, false, null);
     }
 
     pub fn callResultFieldMayBeUndefinedAt(
@@ -1966,15 +2572,55 @@ pub const FileCache = struct {
         caller_frame: ?TypeResolver.ResolutionFrame,
         field: []const u8,
     ) anyerror!bool {
-        if (!try self.callResultMayBeUndefinedAt(token, caller_frame)) return false;
-        const canonical = (try self.actualCallSummaryAt(token, caller_frame)) orelse return false;
-        const origin = self.cleanup_origin orelse self;
-        const key = resolvedCleanupKey(canonical.callee.reference, canonical.callee.declaration);
-        const verdict = origin.return_defined_summaries.get(key) orelse return false;
+        const verdict = (try self.diagnosticReturnVerdictAt(token, caller_frame)) orelse return false;
         for (verdict.bytes.items) |mask| {
             if (mask.mayBeUndefined(field)) return true;
         }
         return false;
+    }
+
+    /// Whole-value undefined origin requires every reached return to retain
+    /// it. A partial aggregate or an unknown alternative is not `.undef`.
+    pub fn callResultIsUndefinedAt(
+        self: *FileCache,
+        token: Ast.TokenIndex,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) anyerror!bool {
+        const verdict = (try self.diagnosticReturnVerdictAt(token, caller_frame)) orelse return false;
+        return verdict.all_undefined;
+    }
+
+    /// Borrowed negative byte masks from the existing settled replay.
+    /// They convey no value, payload, or lifetime certificate.
+    pub fn callResultUndefinedBytesAt(
+        self: *FileCache,
+        token: Ast.TokenIndex,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) anyerror![]const worklist_mod.UndefinedReturnBytes {
+        const verdict = (try self.diagnosticReturnVerdictAt(token, caller_frame)) orelse return &.{};
+        return if (verdict.may_undefined) verdict.bytes.items else &.{};
+    }
+
+    fn returnReplaySyntax(self: *FileCache, callee: ActualCallee) SummaryError!ReturnReplaySyntax {
+        const origin = self.cleanup_origin orelse self;
+        const key = resolvedCleanupKey(callee.reference, callee.declaration).declaration;
+        if (origin.return_replay_syntax.get(key)) |syntax| return syntax;
+        const body = tokens.bodyOf(callee.tree, callee.declaration) orelse return .{};
+        var syntax: ReturnReplaySyntax = .{};
+        var token = callee.tree.firstToken(body);
+        const last = callee.tree.lastToken(body);
+        while (token <= last) : (token += 1) {
+            try self.chargeNormalCleanupAt(callee.tree, body);
+            switch (callee.tree.tokenTag(token)) {
+                .keyword_defer, .keyword_errdefer => {
+                    syntax.has_defer = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+        try origin.return_replay_syntax.put(origin.gpa, key, syntax);
+        return syntax;
     }
 
     pub fn callResultMayBeUndefinedAt(
@@ -1982,18 +2628,841 @@ pub const FileCache = struct {
         token: Ast.TokenIndex,
         caller_frame: ?TypeResolver.ResolutionFrame,
     ) anyerror!bool {
-        const canonical = (try self.actualCallSummaryAt(token, caller_frame)) orelse return false;
-        const resolver = if (caller_frame) |frame| frame.resolver else self.zls orelse return false;
-        // Type, void and noreturn results carry no runtime bytes to replay.
-        // Unresolved result types still take the full diagnostic query.
+        return if (try self.diagnosticReturnVerdictAt(token, caller_frame)) |verdict| verdict.may_undefined else false;
+    }
+
+    /// Select only discriminant bytes; payload verdicts remain unchanged.
+    pub fn callResultTagMayBeUndefinedAt(
+        self: *FileCache,
+        token: Ast.TokenIndex,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) anyerror!bool {
+        const verdict = (try self.diagnosticReturnVerdictAt(token, caller_frame)) orelse return false;
+        for (verdict.bytes.items) |mask| if (mask.tag_may_undefined) return true;
+        return false;
+    }
+
+    /// Identity-only record shared with return-value dependency lowering.
+    /// This does not add an argument, effect, or definedness certificate.
+    pub fn returnCallAt(
+        self: *FileCache,
+        token: Ast.TokenIndex,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) SummaryError!?ActualCallSummary {
+        const frame = caller_frame orelse (self.zls orelse return null).resolutionFrame();
+        std.debug.assert(&frame.handle.document.tree == self.tree);
+        const key: ReturnCallKey = .{
+            .token = token,
+            .resolver = frame.resolver,
+            .tree = self.tree,
+            .module = frame.handle.module,
+            .callable = frame.actual_type,
+            .container = frame.container_type,
+        };
+        if (self.return_calls.get(key)) |record| return record;
+        const callee = callee: {
+            // An explicit ordinary frame asks the same query as null.
+            // Reuse only a completed token memo; contextual frames stay separate.
+            if (self.zls) |resolver| {
+                if (frame.resolver == resolver and frame.handle.eql(resolver.handle) and
+                    frame.actual_type == null and frame.container_type == null)
+                {
+                    if (self.actual_callees.get(token)) |cached| break :callee cached;
+                }
+            }
+            break :callee try grow_analysis_mod.actualCalleeOf(self, token, caller_frame);
+        };
+        var record: ?ActualCallSummary = if (callee) |actual| .{
+            .callee = actual,
+            .summary = null,
+            .argument_offset = null,
+            .read_only = null,
+        } else null;
+        if (record) |*actual| actual.callee.caller_frame = caller_frame;
+        try self.return_calls.put(self.gpa, key, record);
+        return record;
+    }
+
+    fn diagnosticReturnVerdictAt(
+        self: *FileCache,
+        token: Ast.TokenIndex,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) anyerror!?*const ReturnValueVerdict {
+        const canonical = (try self.returnCallAt(token, caller_frame)) orelse return null;
+        const origin = self.cleanup_origin orelse self;
+        const key = resolvedCleanupKey(canonical.callee.reference, canonical.callee.declaration);
+        // A positive replay can retain uncertified scratch dependencies.
+        // It does not authorize a negative result that the source gate rejects.
+        if (origin.return_defined_summaries.getPtr(key)) |verdict| {
+            if (!verdict.may_undefined) return verdict;
+        }
+        if (try self.diagnosticReturnSeed(canonical, caller_frame) != .present) return null;
+        // Seed resolution can rehash the map: borrow its verdict only now.
+        if (origin.return_defined_summaries.getPtr(key)) |verdict| return verdict;
+        _ = try self.callResultValueAt(token, caller_frame, true, &canonical);
+        return origin.return_defined_summaries.getPtr(key);
+    }
+
+    fn diagnosticReturnSeed(
+        self: *FileCache,
+        canonical: ActualCallSummary,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) SummaryError!SourceEligibility {
+        const origin = self.cleanup_origin orelse self;
+        const key = resolvedCleanupKey(canonical.callee.reference, canonical.callee.declaration);
+        if (origin.return_diagnostic_seeds.get(key)) |seed| return if (seed) .present else .absent;
+        self.beginNormalCleanup();
+        defer self.endNormalCleanup();
+        // A root has explored the entire reachable dependency closure. If
+        // every leaf is absent, its remaining back edges add no source.
+        // Nested cycles still depend on unfinished ancestors and stay open.
+        const root_query = origin.return_source_visiting.count() == 0;
+        var seed = try self.computeDiagnosticReturnSeed(canonical, caller_frame);
+        if (root_query and seed == .cycle) seed = .absent;
+        if (seed != .cycle) try origin.return_diagnostic_seeds.put(origin.gpa, key, seed == .present);
+        return seed;
+    }
+
+    fn computeDiagnosticReturnSeed(
+        self: *FileCache,
+        canonical: ActualCallSummary,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+    ) SummaryError!SourceEligibility {
+        const resolver = if (caller_frame) |frame| frame.resolver else self.zls orelse return .absent;
         const declared = canonical.callee.reference.actual_type.data.function.return_value.*;
         if (try resolver.normalizedType(declared)) |result| {
             if (resolver.typeTag(result)) |tag| switch (tag) {
-                .type, .void, .noreturn => return false,
+                .type, .void, .noreturn => return .absent,
                 else => {},
             };
         }
-        return self.callResultValueAt(token, caller_frame, true);
+        const body = tokens.bodyOf(canonical.callee.tree, canonical.callee.declaration) orelse return .absent;
+        return self.returnSourceEligibility(resolver.frameForFunction(canonical.callee.reference), body, true);
+    }
+
+    fn returnSourceEligibility(
+        self: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        returns: bool,
+    ) SummaryError!SourceEligibility {
+        return self.sourceEligibility(frame, node, returns, false);
+    }
+
+    fn sourceEligibility(
+        self: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        returns: bool,
+        stores: bool,
+    ) SummaryError!SourceEligibility {
+        const origin = self.cleanup_origin orelse self;
+        const tree = &frame.handle.document.tree;
+        const key: ReturnSourceKey = .{
+            .frame = .{
+                .token = tree.nodeMainToken(node),
+                .resolver = frame.resolver,
+                .tree = tree,
+                .module = frame.handle.module,
+                .callable = frame.actual_type,
+                .container = frame.container_type,
+            },
+            .node = node,
+            .returns = returns,
+            .stores = stores,
+        };
+        if (origin.return_source_eligibility.get(key)) |answer| return answer;
+        if (origin.return_source_visiting.contains(key)) return .cycle;
+        try self.enterNormalCleanupAt(tree, node);
+        defer self.leaveNormalCleanup();
+        try self.chargeNormalCleanupAt(tree, node);
+        try origin.return_source_visiting.put(origin.gpa, key, {});
+        defer _ = origin.return_source_visiting.remove(key);
+        const answer = if (stores)
+            try self.storeSourceEligibilityUncached(frame, node, returns)
+        else
+            try self.returnSourceEligibilityUncached(frame, node, returns);
+        if (answer != .cycle) try origin.return_source_eligibility.put(origin.gpa, key, answer);
+        return answer;
+    }
+
+    /// Store eligibility is independent of return eligibility: void helpers
+    /// can write undefined. Parameters and pointees remain unknown.
+    fn storeSourceEligibilityUncached(
+        self: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        effects: bool,
+    ) SummaryError!SourceEligibility {
+        const tree = &frame.handle.document.tree;
+        const tag = tree.nodeTag(node);
+        if (tag == .fn_decl) return .absent;
+        if (tree.fullIf(node)) |branch| {
+            var answer: SourceEligibility = .absent;
+            if (effects) answer = try self.sourceEligibility(frame, branch.ast.cond_expr, true, true);
+            if (answer == .present) return answer;
+            if (try frame.boolValueOfNode(branch.ast.cond_expr)) |condition| {
+                if (condition) return answer.merge(try self.sourceEligibility(frame, branch.ast.then_expr, effects, true));
+                const other = branch.ast.else_expr.unwrap() orelse return answer;
+                return answer.merge(try self.sourceEligibility(frame, other, effects, true));
+            }
+            answer = answer.merge(try self.sourceEligibility(frame, branch.ast.then_expr, effects, true));
+            if (answer == .present) return answer;
+            if (branch.ast.else_expr.unwrap()) |other|
+                answer = answer.merge(try self.sourceEligibility(frame, other, effects, true));
+            return answer;
+        }
+        if (!effects) {
+            const known = try self.returnSourceEligibility(frame, node, false);
+            if (known == .present) return known;
+            if (tag == .identifier) {
+                const token = tree.nodeMainToken(node);
+                const declaration = (try frame.resolver.analyser.lookupSymbolGlobal(
+                    frame.handle, tree.tokenSlice(token), tree.tokenStart(token),
+                )) orelse return known;
+                const declared = switch (declaration.decl) {
+                    .ast_node => |value| value,
+                    else => return known,
+                };
+                const owner_tree = &declaration.handle.document.tree;
+                const variable = owner_tree.fullVarDecl(declared) orelse return known;
+                const initial = variable.ast.init_node.unwrap() orelse return known;
+                // A local mutable initializer is a possible source only;
+                // settled replay still decides its value at the later store.
+                if (!declaration.isConst()) {
+                    const actual = frame.actual_type orelse return known;
+                    if (actual.data != .function or !declaration.handle.eql(frame.handle)) return known;
+                    const function = actual.data.function;
+                    const function_decl = (try frame.resolver.analyser.lookupSymbolGlobal(
+                        frame.handle, function.name orelse return known, tree.tokenStart(function.fn_token),
+                    )) orelse return known;
+                    const function_node = switch (function_decl.decl) {
+                        .ast_node => |value| value,
+                        else => return known,
+                    };
+                    const body = tokens.bodyOf(tree, function_node) orelse return known;
+                    if (owner_tree.firstToken(declared) < tree.firstToken(body) or
+                        owner_tree.lastToken(declared) > tree.lastToken(body)) return known;
+                }
+                const owner: TypeResolver.ResolutionFrame = .{
+                    .resolver = frame.resolver,
+                    .handle = declaration.handle,
+                    .container_type = declaration.container_type orelse
+                        if (declaration.handle.eql(frame.handle)) frame.container_type else null,
+                    .actual_type = if (declaration.handle.eql(frame.handle)) frame.actual_type else null,
+                };
+                return known.merge(try self.sourceEligibility(owner, initial, false, true));
+            }
+            if (tag == .field_access or tag == .array_access) {
+                const base = if (tag == .field_access)
+                    tree.nodeData(node).node_and_token[0]
+                else
+                    tree.nodeData(node).node_and_node[0];
+                const ty = (try frame.typeOfNode(base)) orelse return known;
+                const type_tag = frame.resolver.typeTag(ty) orelse return known;
+                if (type_tag != .@"struct" and type_tag != .@"union" and type_tag != .array) return known;
+                return known.merge(try self.sourceEligibility(frame, base, false, true));
+            }
+            var value_buffer: [2]Ast.Node.Index = undefined;
+            if (tree.builtinCallParams(&value_buffer, node)) |arguments| {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (arguments.len == 2 and std.mem.eql(u8, name, "@as"))
+                    return known.merge(try self.sourceEligibility(frame, arguments[1], false, true));
+                if (arguments.len == 1 and
+                    (std.mem.eql(u8, name, "@intCast") or std.mem.eql(u8, name, "@floatCast") or
+                        std.mem.eql(u8, name, "@bitCast") or std.mem.eql(u8, name, "@truncate")))
+                    return known.merge(try self.sourceEligibility(frame, arguments[0], false, true));
+                return known;
+            }
+            switch (tag) {
+                .grouped_expression, .@"try", .@"catch", .@"orelse",
+                .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap,
+                .add_sat, .sub_sat, .mul_sat, .bit_and, .bit_or, .bit_xor,
+                .array_init, .array_init_comma, .array_init_one, .array_init_one_comma,
+                .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma,
+                .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
+                .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+                => {},
+                else => return known,
+            }
+            var children = engine.AstIterator.init(tree, node);
+            var answer = known;
+            while (children.next(tree)) |child| {
+                answer = answer.merge(try self.sourceEligibility(frame, child, false, true));
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        if (tree.fullVarDecl(node)) |variable| {
+            const initial = variable.ast.init_node.unwrap() orelse return .absent;
+            return self.sourceEligibility(frame, initial, true, true);
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.builtinCallParams(&buffer, node)) |arguments| {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            var answer: SourceEligibility = .absent;
+            if (arguments.len == 2 and
+                (std.mem.eql(u8, name, "@memset") or std.mem.eql(u8, name, "@memcpy")))
+            {
+                var source = arguments[1];
+                if (std.mem.eql(u8, name, "@memcpy")) {
+                    while (tree.nodeTag(source) == .grouped_expression)
+                        source = tree.nodeData(source).node_and_token[0];
+                    if (tree.nodeTag(source) == .address_of) {
+                        const payload = tree.nodeData(source).node;
+                        if (try frame.typeOfNode(payload)) |ty| {
+                            if (frame.resolver.typeTag(ty) == .array) source = payload;
+                        }
+                    }
+                }
+                // The copy reads an addressed array's payload, not its defined
+                // pointer header. This grants replay eligibility, not a mask
+                // or initialization certificate.
+                answer = try self.sourceEligibility(frame, source, false, true);
+            }
+            for (arguments) |argument| {
+                answer = answer.merge(try self.sourceEligibility(frame, argument, true, true));
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        if (TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
+            const declaring = if (tree == self.tree and frame.handle.module == self.module_id)
+                self
+            else
+                &(try grow_analysis_mod.sourceDocument(self, frame.handle, frame.resolver.ctx)).cache;
+            var answer = try self.sourceEligibility(frame, call.ast.fn_expr, true, true);
+            if (answer == .present) return answer;
+            if (try declaring.returnCallAt(call.queryToken(tree, node), frame)) |canonical| {
+                const callee = canonical.callee;
+                if (tokens.bodyOf(callee.tree, callee.declaration)) |body|
+                    answer = answer.merge(try self.sourceEligibility(frame.resolver.frameForFunction(callee.reference), body, true, true));
+            }
+            // Unknown effects are not a source. Known effects in actual
+            // arguments are still reached before the outer call.
+            for (call.ast.params) |argument| {
+                answer = answer.merge(try self.sourceEligibility(frame, argument, true, true));
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
+            .assign_bit_and, .assign_bit_or, .assign_bit_xor,
+            .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap,
+            .assign_add_sat, .assign_sub_sat, .assign_mul_sat,
+            => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                var answer = try self.sourceEligibility(frame, rhs, false, true);
+                if (answer == .present) return answer;
+                answer = answer.merge(try self.sourceEligibility(frame, lhs, true, true));
+                return answer.merge(try self.sourceEligibility(frame, rhs, true, true));
+            },
+            .block, .block_semicolon, .block_two, .block_two_semicolon,
+            .@"while", .while_simple, .while_cont, .@"for", .for_simple,
+            .@"switch", .switch_comma, .switch_case, .switch_case_inline,
+            .switch_case_one, .switch_case_inline_one,
+            .@"return", .@"break", .@"defer", .@"errdefer",
+            .grouped_expression, .@"try", .@"catch", .@"orelse",
+            .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap,
+            .add_sat, .sub_sat, .mul_sat, .bit_and, .bit_or, .bit_xor,
+            .field_access, .array_access, .deref, .address_of,
+            .array_init, .array_init_comma, .array_init_one, .array_init_one_comma,
+            .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma,
+            .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
+            .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+            => {},
+            else => return .absent,
+        }
+        var children = engine.AstIterator.init(tree, node);
+        var answer: SourceEligibility = .absent;
+        while (children.next(tree)) |child| {
+            answer = answer.merge(try self.sourceEligibility(frame, child, true, true));
+            if (answer == .present) return answer;
+        }
+        return answer;
+    }
+
+    /// A clean mutable return needs only sources that can reach its storage.
+    /// Escapes and unsupported uses retain the existing whole-body demand.
+    fn mutableReturnSourceEligibility(
+        self: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        body: Ast.Node.Index,
+        root: Ast.Node.Index,
+    ) SummaryError!SourceEligibility {
+        const origin = self.cleanup_origin orelse self;
+        const tree = &frame.handle.document.tree;
+        const key: ReturnSourceKey = .{
+            .frame = .{
+                .token = tree.nodeMainToken(body),
+                .resolver = frame.resolver,
+                .tree = tree,
+                .module = frame.handle.module,
+                .callable = frame.actual_type,
+                .container = frame.container_type,
+            },
+            .node = body,
+            .returns = true,
+            .stores = true,
+            .mutation_root = root,
+        };
+        if (origin.return_source_eligibility.get(key)) |answer| return answer;
+        if (origin.return_source_visiting.contains(key)) return .cycle;
+        try origin.return_source_visiting.put(origin.gpa, key, {});
+        defer _ = origin.return_source_visiting.remove(key);
+        const answer = (try self.mutableReturnSources(frame, body, root, .value)) orelse
+            try self.sourceEligibility(frame, body, true, true);
+        if (answer != .cycle) try origin.return_source_eligibility.put(origin.gpa, key, answer);
+        return answer;
+    }
+
+    const MutableReturnUse = enum { value, target, escape };
+
+    /// The spelling is only a cheap candidate filter. A match is accepted only
+    /// for the exact lexical declaration, including shadowed and quoted names.
+    fn mutableReturnIdentifier(
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        root: Ast.Node.Index,
+    ) SummaryError!?bool {
+        const tree = &frame.handle.document.tree;
+        if (tree.nodeTag(node) != .identifier) return false;
+        const token = tree.nodeMainToken(node);
+        const name = tree.tokenSlice(token);
+        const variable = tree.fullVarDecl(root) orelse return null;
+        const root_name = tree.tokenSlice(variable.ast.mut_token + 1);
+        if (!std.mem.eql(u8, name, root_name) and
+            !std.mem.startsWith(u8, name, "@\"") and !std.mem.startsWith(u8, root_name, "@\"")) return false;
+        const declaration = (try frame.resolver.analyser.lookupSymbolGlobal(
+            frame.handle, name, tree.tokenStart(token),
+        )) orelse return null;
+        return declaration.handle.eql(frame.handle) and switch (declaration.decl) {
+            .ast_node => |declared| declared == root,
+            else => false,
+        };
+    }
+
+    fn mutableReturnTarget(
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        root: Ast.Node.Index,
+    ) SummaryError!?bool {
+        const tree = &frame.handle.document.tree;
+        var base = node;
+        while (true) switch (tree.nodeTag(base)) {
+            .field_access => base = tree.nodeData(base).node_and_token[0],
+            .array_access => base = tree.nodeData(base).node_and_node[0],
+            .grouped_expression => base = tree.nodeData(base).node_and_token[0],
+            .identifier => return mutableReturnIdentifier(frame, base, root),
+            else => return false,
+        };
+    }
+
+    /// Null means an alias, exposure, or unsupported root use: do not publish
+    /// an absence from this walk. The caller falls back to whole-body sources.
+    fn mutableReturnSources(
+        self: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        root: Ast.Node.Index,
+        use: MutableReturnUse,
+    ) SummaryError!?SourceEligibility {
+        const tree = &frame.handle.document.tree;
+        try self.enterNormalCleanupAt(tree, node);
+        defer self.leaveNormalCleanup();
+        try self.chargeNormalCleanupAt(tree, node);
+        const tag = tree.nodeTag(node);
+        if (tag == .identifier) {
+            // The assignment already authenticated this target's base.
+            if (use == .target) return .absent;
+            const matches = (try mutableReturnIdentifier(frame, node, root)) orelse return null;
+            return if (matches and use == .escape) null else .absent;
+        }
+        if (tree.fullIf(node)) |branch| {
+            var answer = (try self.mutableReturnSources(frame, branch.ast.cond_expr, root, use)) orelse return null;
+            if (answer == .present) return answer;
+            if (try frame.boolValueOfNode(branch.ast.cond_expr)) |condition| {
+                if (condition)
+                    return answer.merge((try self.mutableReturnSources(frame, branch.ast.then_expr, root, use)) orelse return null);
+                const other = branch.ast.else_expr.unwrap() orelse return answer;
+                return answer.merge((try self.mutableReturnSources(frame, other, root, use)) orelse return null);
+            }
+            answer = answer.merge((try self.mutableReturnSources(frame, branch.ast.then_expr, root, use)) orelse return null);
+            if (answer == .present) return answer;
+            if (branch.ast.else_expr.unwrap()) |other|
+                answer = answer.merge((try self.mutableReturnSources(frame, other, root, use)) orelse return null);
+            return answer;
+        }
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
+            .assign_bit_and, .assign_bit_or, .assign_bit_xor,
+            .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap,
+            .assign_add_sat, .assign_sub_sat, .assign_mul_sat,
+            => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const rooted = (try mutableReturnTarget(frame, lhs, root)) orelse return null;
+                var answer: SourceEligibility = if (rooted)
+                    try self.sourceEligibility(frame, rhs, false, true)
+                else
+                    .absent;
+                if (answer == .present) return answer;
+                answer = answer.merge((try self.mutableReturnSources(frame, lhs, root, if (rooted) .target else .escape)) orelse return null);
+                return answer.merge((try self.mutableReturnSources(frame, rhs, root, .escape)) orelse return null);
+            },
+            .field_access, .grouped_expression => {
+                return self.mutableReturnSources(frame, tree.nodeData(node).node_and_token[0], root, use);
+            },
+            .array_access => {
+                const base, const index = tree.nodeData(node).node_and_node;
+                const answer = (try self.mutableReturnSources(frame, base, root, use)) orelse return null;
+                if (answer == .present) return answer;
+                return answer.merge((try self.mutableReturnSources(frame, index, root, .escape)) orelse return null);
+            },
+            else => {},
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
+            var answer = (try self.mutableReturnSources(frame, call.ast.fn_expr, root, .escape)) orelse return null;
+            if (answer == .present) return answer;
+            for (call.ast.params) |argument| {
+                answer = answer.merge((try self.mutableReturnSources(frame, argument, root, .escape)) orelse return null);
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        const child_use: MutableReturnUse = switch (tag) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon,
+            .@"while", .while_simple, .while_cont,
+            .@"switch", .switch_comma, .switch_case, .switch_case_inline,
+            .switch_case_one, .switch_case_inline_one,
+            .@"return", .@"break", .@"defer", .@"errdefer",
+            .@"try", .@"catch", .@"orelse",
+            .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap,
+            .add_sat, .sub_sat, .mul_sat, .bit_and, .bit_or, .bit_xor,
+            .bool_and, .bool_or, .bool_not, .equal_equal, .bang_equal,
+            .less_than, .less_or_equal, .greater_than, .greater_or_equal,
+            => if (use == .target) .escape else use,
+            else => .escape,
+        };
+        var children = engine.AstIterator.init(tree, node);
+        var answer: SourceEligibility = .absent;
+        while (children.next(tree)) |child| {
+            answer = answer.merge((try self.mutableReturnSources(frame, child, root, child_use)) orelse return null);
+            if (answer == .present) return answer;
+        }
+        return answer;
+    }
+
+    fn returnSourceEligibilityUncached(
+        self: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        node: Ast.Node.Index,
+        returns: bool,
+    ) SummaryError!SourceEligibility {
+        const tree = &frame.handle.document.tree;
+        const tag = tree.nodeTag(node);
+        if (tag == .fn_decl) return .absent;
+        if (tag == .@"return") {
+            const value = tree.nodeData(node).opt_node.unwrap() orelse return .absent;
+            return self.returnSourceEligibility(frame, value, false);
+        }
+        if (tree.fullIf(node)) |branch| {
+            if (try frame.boolValueOfNode(branch.ast.cond_expr)) |condition| {
+                if (condition) return self.returnSourceEligibility(frame, branch.ast.then_expr, returns);
+                const other = branch.ast.else_expr.unwrap() orelse return .absent;
+                return self.returnSourceEligibility(frame, other, returns);
+            }
+            var answer = try self.returnSourceEligibility(frame, branch.ast.then_expr, returns);
+            if (answer == .present) return answer;
+            if (branch.ast.else_expr.unwrap()) |other|
+                answer = answer.merge(try self.returnSourceEligibility(frame, other, returns));
+            return answer;
+        }
+        if (tree.fullSwitch(node)) |selection| {
+            var answer: SourceEligibility = .absent;
+            for (selection.ast.cases) |case_node| {
+                try self.chargeNormalCleanupAt(tree, case_node);
+                const prong = tree.fullSwitchCase(case_node) orelse continue;
+                answer = answer.merge(try self.returnSourceEligibility(frame, prong.ast.target_expr, returns));
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        if (returns) {
+            // Visit only the control skeleton that can contain value returns.
+            // Do not descend into statements' initializers, operands or calls.
+            switch (tag) {
+                .block, .block_semicolon, .block_two, .block_two_semicolon,
+                .@"while", .while_simple, .while_cont, .@"for", .for_simple,
+                .@"switch", .switch_comma, .switch_case, .switch_case_inline,
+                .switch_case_one, .switch_case_inline_one, .@"catch", .@"orelse",
+                => {},
+                else => return .absent,
+            }
+            var children = engine.AstIterator.init(tree, node);
+            var answer: SourceEligibility = .absent;
+            while (children.next(tree)) |child| {
+                answer = answer.merge(try self.returnSourceEligibility(frame, child, true));
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        if (tag == .identifier) {
+            const token = tree.nodeMainToken(node);
+            if (std.mem.eql(u8, tree.tokenSlice(token), "undefined")) return .present;
+            const declaration = (try frame.resolver.analyser.lookupSymbolGlobal(
+                frame.handle, tree.tokenSlice(token), tree.tokenStart(token),
+            )) orelse return .absent;
+            const declared = switch (declaration.decl) {
+                .ast_node => |value| value,
+                .optional_payload => |capture| {
+                    if (!declaration.handle.eql(frame.handle)) return .absent;
+                    // Admission only: settled replay selects these payload
+                    // bytes and decides MAY/ALL without a positive proof.
+                    return self.returnSourceEligibility(frame, capture.condition, false);
+                },
+                else => return .absent,
+            };
+            const owner_tree = &declaration.handle.document.tree;
+            const variable = owner_tree.fullVarDecl(declared) orelse return .absent;
+            const initial = variable.ast.init_node.unwrap() orelse return .absent;
+            var mutable_body: ?Ast.Node.Index = null;
+            if (!declaration.isConst()) {
+                if (!declaration.handle.eql(frame.handle)) return .absent;
+                if (try frame.enclosingFunctionAt(owner_tree.nodeMainToken(declared))) |local_function| {
+                    const reached_function = (try frame.enclosingFunctionAt(token)) orelse return .absent;
+                    if (local_function != reached_function) return .absent;
+                    mutable_body = tokens.bodyOf(tree, local_function);
+                }
+            }
+            const owner: TypeResolver.ResolutionFrame = .{
+                .resolver = frame.resolver,
+                .handle = declaration.handle,
+                .container_type = declaration.container_type orelse
+                    if (declaration.handle.eql(frame.handle)) frame.container_type else null,
+                .actual_type = if (declaration.handle.eql(frame.handle)) frame.actual_type else null,
+            };
+            const initial_source = try self.returnSourceEligibility(owner, initial, false);
+            if (initial_source == .present) return initial_source;
+            // Later writes can introduce a source into local storage. This
+            // only admits replay; settled states must still prove its bytes.
+            if (mutable_body) |body|
+                return initial_source.merge(try self.mutableReturnSourceEligibility(frame, body, declared));
+            return initial_source;
+        }
+        if (tag == .field_access) {
+            const base, const selector = tree.nodeData(node).node_and_token;
+            const owner = (try frame.resolveValueOfNode(base)) orelse return .absent;
+            if (owner.is_type_val and owner.data == .container) {
+                const declaration = (try owner.lookupSymbol(&frame.resolver.analyser, tree.tokenSlice(selector))) orelse return .absent;
+                if (!declaration.isConst()) return .absent;
+                const declared = switch (declaration.decl) {
+                    .ast_node => |value| value,
+                    else => return .absent,
+                };
+                const owner_tree = &declaration.handle.document.tree;
+                const variable = owner_tree.fullVarDecl(declared) orelse return .absent;
+                const initial = variable.ast.init_node.unwrap() orelse return .absent;
+                return self.returnSourceEligibility(frame.resolver.frameForContainer(owner.data.container), initial, false);
+            }
+            // An inline immutable value can contain a hole. A pointer cannot
+            // authenticate the bytes of its pointee.
+            const ty = (try frame.typeOfNode(base)) orelse return .absent;
+            if (frame.resolver.typeTag(ty) != .@"struct" and
+                frame.resolver.typeTag(ty) != .@"union") return .absent;
+            return self.returnSourceEligibility(frame, base, false);
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.builtinCallParams(&buffer, node)) |arguments| {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            // Only value casts forward bytes; type/metadata operands cannot
+            // make a call eligible for negative runtime-byte replay.
+            if (arguments.len == 2 and std.mem.eql(u8, name, "@as"))
+                return self.returnSourceEligibility(frame, arguments[1], false);
+            if (arguments.len == 1 and
+                (std.mem.eql(u8, name, "@intCast") or std.mem.eql(u8, name, "@floatCast") or
+                    std.mem.eql(u8, name, "@bitCast") or std.mem.eql(u8, name, "@truncate") or
+                    std.mem.eql(u8, name, "@splat")))
+                return self.returnSourceEligibility(frame, arguments[0], false);
+            return .absent;
+        }
+        if (TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
+            const declaring = if (tree == self.tree and frame.handle.module == self.module_id)
+                self
+            else
+                &(try grow_analysis_mod.sourceDocument(self, frame.handle, frame.resolver.ctx)).cache;
+            const canonical = (try declaring.returnCallAt(call.queryToken(tree, node), frame)) orelse return .absent;
+            return self.diagnosticReturnSeed(canonical, frame);
+        }
+        if (tree.fullStructInit(&buffer, node)) |literal| {
+            var answer: SourceEligibility = .absent;
+            for (literal.ast.fields) |value| {
+                answer = answer.merge(try self.returnSourceEligibility(frame, value, false));
+                if (answer == .present) return answer;
+            }
+            const ty = if (literal.ast.type_expr == .none)
+                (try frame.expectedTypeOfNode(node)) orelse return answer
+            else
+                (try frame.typeOfNode(node)) orelse return answer;
+            var actual = (try frame.resolver.normalizedType(ty)) orelse return answer;
+            while (frame.resolver.typeTag(actual) == .optional or
+                frame.resolver.typeTag(actual) == .error_union)
+            {
+                try self.chargeNormalCleanupAt(tree, node);
+                actual = (try frame.resolver.normalizedType(frame.resolver.childType(actual) orelse return answer)) orelse return answer;
+            }
+            if (actual.data != .container) return answer;
+            const owner = frame.resolver.frameForContainer(actual.data.container);
+            const owner_tree = &owner.handle.document.tree;
+            const container = owner_tree.fullContainerDecl(&buffer, actual.data.container.scope_handle.toNode()) orelse return answer;
+            for (container.ast.members) |member| {
+                try self.chargeNormalCleanupAt(owner_tree, member);
+                const field = owner_tree.fullContainerField(member) orelse continue;
+                const initial = field.ast.value_expr.unwrap() orelse continue;
+                var supplied = false;
+                for (literal.ast.fields) |value| {
+                    try self.chargeNormalCleanupAt(tree, value);
+                    const first = tree.firstToken(value);
+                    if (first >= 3 and tree.tokenTag(first - 1) == .equal and
+                        tree.tokenTag(first - 2) == .identifier and tree.tokenTag(first - 3) == .period and
+                        std.mem.eql(u8, tree.tokenSlice(first - 2), owner_tree.tokenSlice(field.ast.main_token)))
+                    {
+                        supplied = true;
+                        break;
+                    }
+                }
+                if (supplied) continue;
+                answer = answer.merge(try self.returnSourceEligibility(owner, initial, false));
+                if (answer == .present) return answer;
+            }
+            return answer;
+        }
+        // Value operands only. Addresses, pointees, unknown builtins and
+        // mutable declarations are intentionally not negative sources.
+        switch (tag) {
+            .grouped_expression, .@"try", .@"catch", .@"orelse",
+            .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap,
+            .add_sat, .sub_sat, .mul_sat, .bit_and, .bit_or, .bit_xor,
+            .array_mult,
+            .array_init, .array_init_comma, .array_init_one, .array_init_one_comma,
+            .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma,
+            => {},
+            else => return .absent,
+        }
+        var children = engine.AstIterator.init(tree, node);
+        var answer: SourceEligibility = .absent;
+        while (children.next(tree)) |child| {
+            answer = answer.merge(try self.returnSourceEligibility(frame, child, false));
+            if (answer == .present) return answer;
+        }
+        return answer;
+    }
+
+    fn replayFailureIdle(self: *FileCache) bool {
+        return self.summary_visiting.count() == 0 and
+            self.resolved_declaration_visiting.count() == 0 and
+            self.cleanup_visiting.count() == 0 and
+            self.method_scalar_reads_visiting.count() == 0 and
+            self.store_value_visiting.count() == 0 and
+            self.return_defined_visiting.count() == 0 and
+            self.return_source_visiting.count() == 0 and
+            self.array_source_visiting.count() == 0 and
+            self.fresh_visiting.count() == 0 and
+            self.preserving_visiting.count() == 0 and
+            self.return_storage_state.active.count() == 0 and
+            self.return_storage_state.formal_active.count() == 0 and
+            self.cleanup_demand == .all;
+    }
+
+    fn replayFailureMemoAllowed(self: *FileCache, declaring: *FileCache) bool {
+        if (cleanup_budget.depth != 0 or !self.replayFailureIdle() or
+            !declaring.replayFailureIdle()) return false;
+        const root = if (self.grow_state) |state| state.owner else self;
+        const effects = &root.effects_state;
+        if (effects.queries != 0 or effects.depth != 0 or effects.remaining != null or
+            effects.global_walk != null or effects.active.count() != 0) return false;
+        // A scoped effect answer may have depended on an outer unfinished
+        // proof. It must not be transported to another scope by a failure.
+        var scoped = effects.scoped.valueIterator();
+        while (scoped.next()) |entry| {
+            if (entry.epoch == effects.epoch) return false;
+        }
+        if (self.grow_state) |state| {
+            if (state.queries != 0 or state.open != 0 or state.active.count() != 0) return false;
+            var documents = state.documents.valueIterator();
+            while (documents.next()) |document| {
+                if (!document.*.cache.replayFailureIdle()) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Completed memo tables are monotone. Count all tables, including new
+    /// ones added to these states, but not failures (which prove no fact).
+    fn replayMemoTableEntries(state: anytype) usize {
+        var total: usize = 0;
+        inline for (std.meta.fields(@TypeOf(state.*))) |field| {
+            if (comptime std.mem.eql(u8, field.name, "return_replay_failures") or
+                std.mem.eql(u8, field.name, "exhausted") or
+                // Canonical resolution does not spend the cleanup allowance.
+                std.mem.eql(u8, field.name, "return_calls") or
+                std.mem.eql(u8, field.name, "actual_callees")) continue;
+            if (comptime @typeInfo(field.type) == .@"struct") {
+                if (comptime @hasDecl(field.type, "count")) {
+                    total += @field(state.*, field.name).count();
+                }
+            }
+        }
+        return total;
+    }
+
+    fn replayFileMemoEntries(self: *FileCache) usize {
+        return replayMemoTableEntries(self) +
+            replayMemoTableEntries(&self.alias_state) +
+            replayMemoTableEntries(&self.return_storage_state) +
+            replayMemoTableEntries(&self.effects_state) +
+            self.effects_state.verdict_count +
+            self.address_proof_generation + @intFromBool(self.transitive_resolved) +
+            (if (self.address_uses) |uses| uses.count() else 0) +
+            (if (self.exact_spans) |spans| spans.count() else 0);
+    }
+
+    fn replayMemoEntries(self: *FileCache, declaring: *FileCache) usize {
+        var total = self.replayFileMemoEntries();
+        var has_declaring = declaring == self;
+        if (self.grow_state) |state| {
+            total += replayMemoTableEntries(state);
+            var documents = state.documents.valueIterator();
+            while (documents.next()) |document| {
+                const cache = &document.*.cache;
+                if (cache != self) total += cache.replayFileMemoEntries();
+                has_declaring = has_declaring or cache == declaring;
+            }
+        }
+        if (!has_declaring) total += declaring.replayFileMemoEntries();
+        return total;
+    }
+
+    fn replayFileExhaustedEntries(self: *FileCache) usize {
+        return self.alias_state.exhausted.count() + self.effects_state.exhausted.count();
+    }
+
+    /// Failure caches can shorten a nested walk too. Keep their stamp separate
+    /// so removing a failure and adding a completed fact cannot cancel out.
+    fn replayExhaustedEntries(self: *FileCache, declaring: *FileCache) usize {
+        var total = self.replayFileExhaustedEntries();
+        var has_declaring = declaring == self;
+        if (self.grow_state) |state| {
+            var documents = state.documents.valueIterator();
+            while (documents.next()) |document| {
+                const cache = &document.*.cache;
+                if (cache != self) total += cache.replayFileExhaustedEntries();
+                has_declaring = has_declaring or cache == declaring;
+            }
+        }
+        if (!has_declaring) total += declaring.replayFileExhaustedEntries();
+        return total;
     }
 
     fn callResultValueAt(
@@ -2001,10 +3470,11 @@ pub const FileCache = struct {
         token: Ast.TokenIndex,
         caller_frame: ?TypeResolver.ResolutionFrame,
         diagnostic: bool,
+        resolved: ?*const ActualCallSummary,
     ) anyerror!bool {
         self.beginNormalCleanup();
         defer self.endNormalCleanup();
-        const canonical = (try self.actualCallSummaryAt(token, caller_frame)) orelse return false;
+        const canonical = if (resolved) |actual| actual.* else (try self.returnCallAt(token, caller_frame)) orelse return false;
         const origin = self.cleanup_origin orelse self;
         const callee = canonical.callee;
         const key = resolvedCleanupKey(callee.reference, callee.declaration);
@@ -2013,22 +3483,67 @@ pub const FileCache = struct {
         if (origin.return_defined_visiting.contains(key.declaration)) return false;
         const declaring = (try canonical.declaringCache(self)) orelse return false;
         const body = tokens.bodyOf(callee.tree, callee.declaration) orelse return false;
+        const failure_key: ReplayFailureKey = .{
+            .callee = key,
+            .remaining = cleanup_budget.remaining,
+            .depth = cleanup_budget.depth,
+        };
+        const can_memo_failure = origin.replayFailureMemoAllowed(declaring);
+        const memo_entries = if (can_memo_failure) origin.replayMemoEntries(declaring) else 0;
+        const exhausted_entries = if (can_memo_failure) origin.replayExhaustedEntries(declaring) else 0;
+        if (can_memo_failure) {
+            if (origin.return_replay_failures.get(failure_key)) |failed| {
+                if (failed.memo_entries == memo_entries and failed.exhausted_entries == exhausted_entries) {
+                    // Replay preserves the spent allowance and raw inner
+                    // site, but the current caller owns the reported error.
+                    try declaring.enterNormalCleanup(body);
+                    defer declaring.leaveNormalCleanup();
+                    cleanup_budget.remaining = failed.remaining;
+                    return self.cleanupBudgetFailureAt(
+                        failed.site.tree,
+                        failed.diagnostic.limit,
+                        failed.diagnostic.limit_value,
+                        failed.site.node,
+                    );
+                }
+                _ = origin.return_replay_failures.remove(failure_key);
+            }
+        }
+        const guard = if (can_memo_failure) call_summary_mod.PendingGuard.begin() else null;
+        const saved_failure_site = replay_failure_site;
+        if (can_memo_failure) replay_failure_site = null;
+        defer {
+            if (guard) |pending| _ = pending.end();
+            if (can_memo_failure) replay_failure_site = saved_failure_site;
+        }
+        errdefer |err| {
+            if (can_memo_failure and err == error.AnalysisBudgetExceeded) {
+                if (budget_mod.peek()) |failure| {
+                    if ((failure.limit == .normal_cleanup_nodes or failure.limit == .normal_cleanup_depth) and
+                        origin.replayFailureMemoAllowed(declaring) and
+                        origin.replayMemoEntries(declaring) == memo_entries and
+                        origin.replayExhaustedEntries(declaring) == exhausted_entries)
+                    {
+                        if (replay_failure_site) |site| {
+                            origin.return_replay_failures.put(origin.gpa, failure_key, .{
+                                .site = site,
+                                .diagnostic = failure,
+                                .remaining = cleanup_budget.remaining,
+                                .memo_entries = memo_entries,
+                                .exhausted_entries = exhausted_entries,
+                            }) catch {};
+                        }
+                    }
+                }
+            }
+        }
         try declaring.enterNormalCleanup(body);
         defer declaring.leaveNormalCleanup();
         try origin.return_defined_visiting.put(origin.gpa, key.declaration, {});
         defer _ = origin.return_defined_visiting.remove(key.declaration);
         // Deferred mutation remains uncertified. Diagnostic return snapshots
         // still retain bytes evaluated before those actions run.
-        var token_index = callee.tree.firstToken(body);
-        const last = callee.tree.lastToken(body);
-        var has_defer = false;
-        while (token_index <= last) : (token_index += 1) {
-            try declaring.chargeNormalCleanup(body);
-            switch (callee.tree.tokenTag(token_index)) {
-                .keyword_defer, .keyword_errdefer => has_defer = true,
-                else => {},
-            }
-        }
+        const has_defer = (try self.returnReplaySyntax(callee)).has_defer;
         // CFG node IDs belong to the declaring document, not the caller.
         // Keep the callee's actual bindings, but lower with its own resolver.
         const resolver = declaring.zls orelse return false;
@@ -2057,6 +3572,7 @@ pub const FileCache = struct {
         }
         var defined = true;
         var undefined_value = false;
+        var all_undefined = true;
         const parameters = callee.reference.actual_type.data.function.parameters;
         const parameter_locals = try origin.gpa.alloc(?cfg_mod.LocalId, parameters.len);
         defer origin.gpa.free(parameter_locals);
@@ -2090,6 +3606,7 @@ pub const FileCache = struct {
             .path = declaring.file_path,
             .return_defined = &defined,
             .return_undefined = &undefined_value,
+            .return_all_undefined = &all_undefined,
             .return_bytes = &bytes,
             .parameter_stores = .{ .locals = parameter_locals, .stores = &stores },
             .summary_cache = declaring,
@@ -2098,6 +3615,7 @@ pub const FileCache = struct {
         try origin.return_defined_summaries.put(origin.gpa, key, .{
             .defined = defined,
             .may_undefined = undefined_value,
+            .all_undefined = all_undefined,
             .stores = stores,
             .bytes = bytes,
         });
@@ -2212,7 +3730,7 @@ pub const FileCache = struct {
         caller_frame: ?TypeResolver.ResolutionFrame,
         diagnostic: bool,
     ) SummaryError!?ArraySource {
-        const canonical = (try self.actualCallSummaryAt(token, caller_frame)) orelse return null;
+        const canonical = (try self.returnCallAt(token, caller_frame)) orelse return null;
         const declaring = (try canonical.declaringCache(self)) orelse return null;
         const origin = self.cleanup_origin orelse self;
         const declaration = resolvedCleanupKey(canonical.callee.reference, canonical.callee.declaration).declaration;
@@ -2240,6 +3758,9 @@ pub const FileCache = struct {
         const returned = tree.nodeData(statement).opt_node.unwrap() orelse return null;
         const source = (try self.arrayReturnSourceExpression(canonical, returned)) orelse return null;
         if (!mutating or diagnostic) return source;
+        // Mutation coverage needs the real receiver offset; forwarding does
+        // not need a body-effect summary.
+        const store_canonical = (try self.actualCallSummaryAt(token, caller_frame)) orelse return null;
         // Only a formal-rooted inline field can be related to a mutating
         // caller-visible store. The same must-write proof rejects early
         // returns, missing switch arms and unknown invalidating operations.
@@ -2254,11 +3775,12 @@ pub const FileCache = struct {
             if (!std.mem.eql(u8, name, tree.tokenSlice(tree.nodeMainToken(root)))) continue;
             var caller: ?DefiniteStoreProof = null;
             const chain = [1]StoreVisit{.{ .tree = tree, .declaration = canonical.callee.declaration }};
-            const coverage = (try self.definiteParameterStore(canonical, canonical.callee.call_node, parameter_index, &caller, &chain)) orelse return null;
+            const coverage = (try self.definiteParameterStore(store_canonical, store_canonical.callee.call_node, parameter_index, &caller, &chain)) orelse return null;
             const proof: DefiniteStoreProof = .{
                 .tree = tree,
                 .frame = (declaring.zls orelse return null).frameForFunction(canonical.callee.reference),
                 .call_node = canonical.callee.call_node,
+                .call_tree = self.tree,
             };
             const field = (try storeFieldIndex(&proof, name, coverage.field_names[0..coverage.field_count], returned)) orelse return null;
             if (!coverage.covered[field]) return null;
@@ -2383,10 +3905,18 @@ pub const FileCache = struct {
         var buffer: [2]Ast.Node.Index = undefined;
         const call = TypeResolver.CallOperands.full(self.tree, &buffer, call_node) orelse return;
         const token = call.queryToken(self.tree, call_node);
-        const canonical = (try self.actualCallSummaryAt(token, self.cleanup_frame)) orelse return;
-        _ = try self.callResultValueAt(token, canonical.callee.caller_frame, true);
+        const canonical = (try self.returnCallAt(token, self.cleanup_frame)) orelse return;
         const origin = self.cleanup_origin orelse self;
         const key = resolvedCleanupKey(canonical.callee.reference, canonical.callee.declaration);
+        if (!origin.return_defined_summaries.contains(key)) {
+            self.beginNormalCleanup();
+            defer self.endNormalCleanup();
+            const body = tokens.bodyOf(canonical.callee.tree, canonical.callee.declaration) orelse return;
+            const resolver = if (canonical.callee.caller_frame) |frame| frame.resolver else self.zls orelse return;
+            const seed = try self.sourceEligibility(resolver.frameForFunction(canonical.callee.reference), body, true, true);
+            if (seed != .present) return;
+            _ = try self.callResultValueAt(token, canonical.callee.caller_frame, true, &canonical);
+        }
         const verdict = origin.return_defined_summaries.get(key) orelse return;
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(canonical.callee.tree, &proto_buffer, canonical.callee.declaration) orelse return;
@@ -2436,6 +3966,41 @@ pub const FileCache = struct {
         return if (use.undefined_field_count != 0) use else null;
     }
 
+    fn directCElementTarget(
+        self: *FileCache,
+        canonical: ActualCallSummary,
+        parameter: u32,
+        actual: Ast.Node.Index,
+    ) SummaryError!?struct { index: u64, value_type: TypeResolver.ActualType } {
+        const resolver = self.zls orelse return null;
+        const formals = canonical.callee.reference.actual_type.data.function.parameters;
+        if (parameter >= formals.len) return null;
+        const pointer = (try resolver.normalizedType(formals[parameter].type)) orelse return null;
+        if (resolver.pointerSize(pointer) != .c) return null;
+        const pointee = (try resolver.normalizedType(resolver.childType(pointer) orelse return null)) orelse return null;
+        const frame = canonical.callee.caller_frame orelse resolver.resolutionFrame();
+        var proof: DefiniteStoreProof = .{ .tree = self.tree, .frame = frame, .call_node = canonical.callee.call_node, .call_tree = self.tree };
+        var root = actual;
+        var index: u64 = 0;
+        var stop: ?u64 = null;
+        if (self.tree.nodeTag(actual) == .address_of) {
+            root = self.tree.nodeData(actual).node;
+        } else if (self.tree.fullSlice(actual)) |slice| {
+            root = slice.ast.sliced;
+            index = (try definiteStoreInteger(&proof, slice.ast.start)) orelse return null;
+            if (slice.ast.end.unwrap()) |end| stop = (try definiteStoreInteger(&proof, end)) orelse return null;
+        } else return null;
+        if (self.tree.nodeTag(root) != .identifier) return null;
+        const raw = (try frame.typeOfNode(root)) orelse return null;
+        const array = (try resolver.normalizedType(raw)) orelse return null;
+        if (resolver.typeTag(array) != .array) return null;
+        const extent = (try definiteStoreArrayCount(&proof, root)) orelse return null;
+        if (index >= extent or (stop != null and (stop.? > extent or index >= stop.?))) return null;
+        const element = (try resolver.normalizedType(resolver.childType(array) orelse return null)) orelse return null;
+        if (!element.eql(pointee)) return null;
+        return .{ .index = index, .value_type = element };
+    }
+
     /// Fail closed unless an exact argument reaches a source declaration with
     /// a straight-line complete store. Mutation summaries are may-effects and
     /// cannot establish this must-effect. No declaration spelling is trusted.
@@ -2446,6 +4011,7 @@ pub const FileCache = struct {
     /// wrapper credits exactly the stores its delegate proves. Only the
     /// success path is credited: an error return is not a store.
     fn definiteAddressWrite(self: *FileCache, use: *AddressUse) SummaryError!bool {
+        use.may_written_stores.count = 0;
         if (!use.may_write) return false;
         switch (self.tree.nodeTag(use.operand)) {
             .identifier => {},
@@ -2462,7 +4028,7 @@ pub const FileCache = struct {
         try self.chargeNormalCleanup(call_node);
         var call_buffer: [2]Ast.Node.Index = undefined;
         const call = TypeResolver.CallOperands.full(self.tree, &call_buffer, call_node) orelse return false;
-        const canonical = (try self.actualCallSummaryAt(call.queryToken(self.tree, call_node), null)) orelse return false;
+        const canonical = (try self.actualCallSummaryAt(call.queryToken(self.tree, call_node), self.cleanup_frame)) orelse return false;
         if (use.success_bool != null) {
             const resolver = self.zls orelse return false;
             const frame = canonical.callee.caller_frame orelse resolver.resolutionFrame();
@@ -2496,19 +4062,39 @@ pub const FileCache = struct {
         var caller_proof: ?DefiniteStoreProof = null;
         const chain = [1]StoreVisit{.{ .tree = tree, .declaration = canonical.callee.declaration }};
         const proved_coverage = try self.definiteParameterStoreOnSuccess(canonical, call_node, parameter_index, &caller_proof, &chain, use.success_bool);
-        if (proved_coverage == null) {
-            const written = (try self.parameterStoreCoverage(canonical, call_node, parameter_index, &caller_proof, &chain, use.success_bool, &use.written_inputs, &use.written_reads)) orelse return false;
-            use.location_written = written.complete;
-            return use.location_written;
+        if (proved_coverage) |coverage| {
+            use.definite_write = coverage.complete;
+            for (coverage.field_names[0..coverage.field_count], coverage.covered[0..coverage.field_count]) |path, covered| {
+                if (!covered) continue;
+                use.fields[use.field_count] = path;
+                use.field_count += 1;
+            }
+            if (use.definite_write and !use.physical_store_only) return true;
         }
-        const coverage = proved_coverage.?;
-        use.definite_write = coverage.complete;
-        for (coverage.field_names[0..coverage.field_count], coverage.covered[0..coverage.field_count]) |path, covered| {
+        // Partial value certification can still omit definitely written fields.
+        // Preserve its certificates and credit only the remaining physical writes.
+        use.may_written_stores.count = 0;
+        const c_element = try self.directCElementTarget(canonical, parameter_index, use.address_node);
+        if (c_element) |target| {
+            use.location_element_index = target.index;
+            use.location_value_type = target.value_type;
+        }
+        const written = (try self.parameterStoreCoverage(canonical, call_node, parameter_index, &caller_proof, &chain, use.success_bool, &use.written_inputs, &use.written_reads, &use.may_written_stores, use, c_element != null)) orelse
+            return use.field_count != 0 or use.may_written_stores.count != 0;
+        use.location_written = written.complete;
+        use.whole_source = if (written.complete) written.whole_source else null;
+        for (written.field_names[0..written.field_count], written.covered[0..written.field_count], 0..) |path, covered, slot| {
             if (!covered) continue;
-            use.fields[use.field_count] = path;
-            use.field_count += 1;
+            const certified = for (use.fields[0..use.field_count]) |field| {
+                if (std.mem.eql(u8, path, field)) break true;
+            } else false;
+            if (certified and !use.physical_store_only) continue;
+            use.location_fields[use.location_field_count] = path;
+            use.location_field_sources[use.location_field_count] = use.location_field_sources[slot];
+            use.location_field_dependencies[use.location_field_count] = written.written_dependencies[slot];
+            use.location_field_count += 1;
         }
-        return use.definite_write or use.field_count != 0;
+        return use.field_count != 0 or use.location_written or use.location_field_count != 0;
     }
 
     /// Nested callees followed from one wrapper body. Deeper chains abstain.
@@ -2670,6 +4256,7 @@ pub const FileCache = struct {
             .tree = tree,
             .frame = frame,
             .call_node = call_node,
+            .call_tree = self.tree,
         };
         var result: PreservingCallWrite = .{ .whole_payload = whole_payload };
         var dependency_count: usize = 0;
@@ -2807,9 +4394,9 @@ pub const FileCache = struct {
         node: Ast.Node.Index,
         depth: u32,
     ) SummaryError!bool {
-        try self.chargeNormalCleanup(proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
         if (depth == 64)
-            return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+            return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         const tree = proof.tree;
         switch (tree.nodeTag(node)) {
             .address_of => return false,
@@ -2901,7 +4488,7 @@ pub const FileCache = struct {
         selected: Ast.TokenIndex,
         stored_parameter: ?*Ast.TokenIndex,
     ) SummaryError!bool {
-        try self.chargeNormalCleanup(proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
         const tree = proof.tree;
         const body = tokens.bodyOf(tree, declaration) orelse return false;
         var body_buffer: [2]Ast.Node.Index = undefined;
@@ -2985,7 +4572,14 @@ pub const FileCache = struct {
         field_count: usize = 0,
         field_names: [128][]const u8 = undefined,
         covered: [128]bool = @splat(false),
+        written_dependencies: [128]WrittenDependencies = @splat(.{}),
+        whole_dependencies: WrittenDependencies = .{},
+        computed_sources: u8 = 0,
+        computed_original_alternative: bool = true,
+        computed_opaque_alternative: bool = false,
+        computed_overflow: bool = false,
         complete: bool = false,
+        whole_source: ?WholeStoreSource = null,
     };
 
     /// Include parent fields and nested inline-struct fields. Pointer and array
@@ -2996,9 +4590,10 @@ pub const FileCache = struct {
         fields: *[128][]const u8,
         defaults: *[128]?Ast.Node.Index,
         coverage: *StoreCoverage,
+        call_tree: *const Ast,
         call_node: Ast.Node.Index,
     ) SummaryError!bool {
-        return self.storeCoverageFieldsAt(pointee, "", fields, defaults, coverage, call_node);
+        return self.storeCoverageFieldsAt(pointee, "", fields, defaults, coverage, call_tree, call_node, false);
     }
 
     fn storeCoverageFieldsAt(
@@ -3008,11 +4603,13 @@ pub const FileCache = struct {
         fields: *[128][]const u8,
         defaults: *[128]?Ast.Node.Index,
         coverage: *StoreCoverage,
+        call_tree: *const Ast,
         call_node: Ast.Node.Index,
+        physical: bool,
     ) SummaryError!bool {
-        try self.chargeNormalCleanup(call_node);
+        try self.chargeNormalCleanupAt(call_tree, call_node);
         const resolver = self.zls orelse return false;
-        const normalized = (try resolver.normalizedType(actual)) orelse return false;
+        const normalized = (try resolver.normalizedType(actual)) orelse return physical;
         if (resolver.typeTag(normalized) != .@"struct") return true;
         if (normalized.data != .container) return false;
         const container = normalized.data.container.scope_handle;
@@ -3033,11 +4630,17 @@ pub const FileCache = struct {
             coverage.field_names[index] = path;
             defaults[index] = field.ast.value_expr.unwrap();
             coverage.field_count += 1;
-            const type_node = field.ast.type_expr.unwrap() orelse return false;
-            const child = (try frame.typeOfNode(type_node)) orelse return false;
+            const type_node = field.ast.type_expr.unwrap() orelse {
+                if (physical) continue;
+                return false;
+            };
+            const child = (try frame.typeOfNode(type_node)) orelse {
+                if (physical) continue;
+                return false;
+            };
             // Recursive inline values cannot form a finite Zig type. The
             // existing field bound also caps this source-directed traversal.
-            if (!try self.storeCoverageFieldsAt(child, path, fields, defaults, coverage, call_node)) return false;
+            if (!try self.storeCoverageFieldsAt(child, path, fields, defaults, coverage, call_tree, call_node, physical)) return false;
         }
         return true;
     }
@@ -3081,16 +4684,35 @@ pub const FileCache = struct {
             const path = coverage.field_names[index];
             var children = false;
             var complete = true;
-            for (coverage.field_names[index + 1 .. coverage.field_count], coverage.covered[index + 1 .. coverage.field_count]) |candidate, covered| {
+            var descendant_dependencies: WrittenDependencies = .{};
+            for (coverage.field_names[index + 1 .. coverage.field_count], coverage.covered[index + 1 .. coverage.field_count], coverage.written_dependencies[index + 1 .. coverage.field_count]) |candidate, covered, dependencies| {
                 if (candidate.len <= path.len or candidate[path.len] != '.' or !std.mem.startsWith(u8, candidate, path)) continue;
                 children = true;
                 complete = complete and covered;
+                descendant_dependencies.merge(dependencies);
             }
-            if (children) coverage.covered[index] = complete;
+            if (children) {
+                coverage.covered[index] = complete;
+                coverage.written_dependencies[index] = descendant_dependencies;
+            }
         }
         if (coverage.field_count == 0) return;
         coverage.complete = true;
-        for (coverage.covered[0..coverage.field_count]) |covered| coverage.complete = coverage.complete and covered;
+        coverage.whole_dependencies = .{};
+        for (coverage.covered[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |covered, dependencies| {
+            coverage.complete = coverage.complete and covered;
+            if (covered) coverage.whole_dependencies.merge(dependencies);
+        }
+    }
+
+    fn recordWrittenStoreField(coverage: *StoreCoverage, index: usize, dependencies: WrittenDependencies) void {
+        const path = coverage.field_names[index];
+        for (coverage.field_names[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |candidate, *recipe| {
+            if (std.mem.eql(u8, candidate, path) or
+                (candidate.len > path.len and candidate[path.len] == '.' and std.mem.startsWith(u8, candidate, path)))
+                recipe.* = dependencies;
+        }
+        refreshStoreCoverage(coverage);
     }
 
     /// Which part of the proof's own pointee a nested actual designates.
@@ -3135,6 +4757,10 @@ pub const FileCache = struct {
             if (size != .one) return null;
             ty = (try resolver.normalizedType(resolver.childType(ty) orelse return null)) orelse return null;
         }
+        return definiteStoreArrayTypeCount(resolver, ty);
+    }
+
+    fn definiteStoreArrayTypeCount(resolver: *TypeResolver, ty: TypeResolver.ActualType) ?u64 {
         return switch (ty.data) {
             .array => |array| array.elem_count,
             .ip_index => switch (resolver.ctx.ip.indexToKey(ty.ipIndex() orelse return null)) {
@@ -3208,7 +4834,9 @@ pub const FileCache = struct {
             if (tree.nodeTag(body) != .assign) return false;
             const lhs, const rhs = tree.nodeData(body).node_and_node;
             if (tree.nodeTag(lhs) != .deref or !storeNames(tree, tree.nodeData(lhs).node, capture_name)) return false;
+            lexical.written_dependencies = .{};
             if (try self.definiteStoreValue(&lexical, rhs, 0) != .defined) return false;
+            coverage.whole_dependencies = lexical.written_dependencies;
             coverage.complete = true;
             return true;
         }
@@ -3267,8 +4895,9 @@ pub const FileCache = struct {
         @memcpy(chain[0..visiting.len], visiting);
         chain[visiting.len] = .{ .tree = nested.callee.tree, .declaration = nested.callee.declaration };
         var caller: ?DefiniteStoreProof = lexical;
-        const written = (try self.definiteParameterStore(nested, call_node, selected, &caller, chain[0 .. visiting.len + 1])) orelse return false;
+        const written = (try declaring.definiteParameterStore(nested, nested_call, selected, &caller, chain[0 .. visiting.len + 1])) orelse return false;
         if (!written.complete) return false;
+        coverage.whole_dependencies = written.whole_dependencies;
         coverage.complete = true;
         return true;
     }
@@ -3323,7 +4952,7 @@ pub const FileCache = struct {
         visiting: []const StoreVisit,
         success_bool: ?bool,
     ) SummaryError!?StoreCoverage {
-        return self.parameterStoreCoverage(canonical, call_node, parameter_index, caller, visiting, success_bool, null, null);
+        return self.parameterStoreCoverage(canonical, call_node, parameter_index, caller, visiting, success_bool, null, null, null, null, false);
     }
 
     fn parameterStoreCoverage(
@@ -3336,6 +4965,9 @@ pub const FileCache = struct {
         success_bool: ?bool,
         written_inputs: ?*[8]?Ast.Node.Index,
         written_reads: ?*[8]?WrittenRead,
+        may_written_stores: ?*WrittenMayStores,
+        computed_use: ?*AddressUse,
+        physical_c_element: bool,
     ) SummaryError!?StoreCoverage {
         try self.chargeNormalCleanup(call_node);
         const tree = canonical.callee.tree;
@@ -3360,7 +4992,9 @@ pub const FileCache = struct {
         if (pointer_size != .one and pointer_size != .c and pointer_size != .slice) return null;
         const child = resolver.childType(pointer) orelse return null;
         const pointee = (try resolver.normalizedType(child)) orelse return null;
-        if (pointer_size == .c) {
+        // Authenticated physical C element recipes bypass this gate.
+        // All certificates retain the extent check.
+        if (pointer_size == .c and !physical_c_element) {
             // A scalar C pointee is not the whole storage of *[N]T actuals,
             // including constant slices. Enforce extent before any caller can
             // publish or memoize the successful-store certificate.
@@ -3378,26 +5012,64 @@ pub const FileCache = struct {
         var fields: [128][]const u8 = undefined;
         var defaults: [128]?Ast.Node.Index = @splat(null);
         var coverage: StoreCoverage = .{ .pointee = pointee };
-        if (!try self.storeCoverageFields(pointee, &fields, &defaults, &coverage, call_node)) return null;
+        const inputs = written_inputs orelse if (caller.*) |parent| parent.written_inputs else null;
+        const reads = written_reads orelse if (caller.*) |parent| parent.written_reads else null;
+        const fields_known = if (inputs != null)
+            try self.storeCoverageFieldsAt(pointee, "", &fields, &defaults, &coverage, self.tree, call_node, true)
+        else try self.storeCoverageFields(pointee, &fields, &defaults, &coverage, self.tree, call_node);
+        if (!fields_known) return null;
         const name = tree.tokenSlice(parameter_token orelse return null);
         const body = tree.nodeData(canonical.callee.declaration).node_and_node[1];
         switch (tree.nodeTag(body)) {
             .block, .block_semicolon, .block_two, .block_two_semicolon => {},
             else => return null,
         }
+        var dependencies_complete = true;
+        var local_templates: ComputedStoreBuilders = .{};
+        const templates = if (computed_use != null) &local_templates else
+            if (caller.*) |parent| parent.computed_templates else null;
+        var output_argument_buffer: [2]Ast.Node.Index = undefined;
+        const output_actual = if (caller.* != null or written_inputs != null)
+            try canonical.callArgumentFor(self, &output_argument_buffer, parameter_index)
+        else
+            null;
+        const identity_output = if (caller.*) |parent| parent.identity_output orelse output_actual else output_actual;
+        var identity_output_prefix: ?[]const u8 = if (written_inputs != null) "" else null;
+        if (caller.*) |parent| {
+            identity_output_prefix = if (output_actual) |actual|
+                try self.outputArgumentPrefix(&parent, actual)
+            else
+                null;
+        }
+        const identity_inputs = if (caller.*) |parent| parent.identity_inputs orelse written_inputs else written_inputs;
+        const identity_tree = if (caller.*) |parent| parent.identity_tree orelse
+            (if (written_inputs != null) self.tree else null) else
+            (if (written_inputs != null) self.tree else null);
         var proof: DefiniteStoreProof = .{
             .tree = tree,
             .frame = frame,
             .canonical = canonical,
             .caller = caller,
             .caller_cache = self,
+            .identity_inputs = identity_inputs,
+            .identity_tree = identity_tree,
+            .identity_input_boundary = written_inputs != null,
+            .identity_output = identity_output,
+            .identity_output_prefix = identity_output_prefix,
             .call_node = call_node,
-            .written_inputs = written_inputs,
-            .written_reads = written_reads,
+            .call_tree = self.tree,
+            .written_inputs = inputs,
+            .written_reads = reads,
+            .written_input_boundary = written_inputs != null,
+            .may_written_stores = may_written_stores,
+            .computed_templates = templates,
+            .written_dependencies_complete = if (written_inputs != null) &dependencies_complete else
+                if (caller.*) |parent| parent.written_dependencies_complete else null,
         };
         const context: StoreBodyContext = .{
             .canonical = canonical,
             .call_node = call_node,
+            .call_tree = self.tree,
             .name = name,
             .fields = fields[0..coverage.field_count],
             .defaults = defaults[0..coverage.field_count],
@@ -3407,15 +5079,84 @@ pub const FileCache = struct {
         proof.out_name = name;
         proof.out_fields = context.fields;
         proof.out_coverage = &coverage;
+        if (templates != null and computed_use == null) if (caller.*) |parent| {
+            if (parent.out_name) |parent_name| if (parent.out_coverage) |prior| {
+                var argument_buffer: [2]Ast.Node.Index = undefined;
+                const actual = (try canonical.callArgumentFor(self, &argument_buffer, parameter_index)) orelse return null;
+                const target = try storeTarget(&parent, parent_name, parent.out_fields, actual);
+                if (target != null and target.? == .whole and prior.pointee.eql(coverage.pointee)) {
+                    coverage.whole_source = prior.whole_source;
+                    coverage.computed_sources = prior.computed_sources;
+                    coverage.computed_original_alternative = prior.computed_original_alternative;
+                    coverage.computed_opaque_alternative = prior.computed_opaque_alternative;
+                    coverage.computed_overflow = prior.computed_overflow;
+                }
+            };
+        };
         var exits: ?StoreCoverage = null;
-        const falls_through = (try self.definiteStoreBody(&context, &proof, body, &coverage, &exits)) orelse return null;
-        if (falls_through) intersectStoreExit(&exits, coverage);
+        const falls_through = try self.definiteStoreBody(&context, &proof, body, &coverage, &exits);
+        // Exhaustion declines positive credit, not already authenticated slots.
+        if (proof.written_dependencies_complete) |complete| if (!complete.*) {
+            if (may_written_stores) |stores| {
+                for (coverage.field_names[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |path, recipe| {
+                    if (!recipe.isEmpty()) _ = stores.add(path, recipe);
+                }
+                if (exits) |final| {
+                    for (final.field_names[0..final.field_count], final.written_dependencies[0..final.field_count]) |path, recipe| {
+                        if (!recipe.isEmpty()) _ = stores.add(path, recipe);
+                    }
+                }
+            }
+            return null;
+        };
+        if (falls_through orelse return null) intersectStoreExit(&exits, coverage);
+        if (computed_use) |use| {
+            const final = exits orelse return null;
+            const root = computedCoverageBase(&final);
+            var selected_reads: u8 = if (final.field_count == 0) final.whole_dependencies.reads else 0;
+            for (final.covered[0..final.field_count], final.written_dependencies[0..final.field_count]) |covered, recipe| {
+                if (covered) selected_reads |= recipe.reads;
+            }
+            for (use.may_written_stores.dependencies[0..use.may_written_stores.count]) |recipe| {
+                selected_reads |= recipe.reads;
+            }
+            var consume_root = final.complete;
+            if (!final.complete) {
+                for (final.field_names[0..final.field_count], final.covered[0..final.field_count], 0..) |path, covered, slot| {
+                    if (!covered) continue;
+                    var memo: [8]?ComputedFieldRecipe = @splat(null);
+                    const recipe = computedFieldRecipe(&local_templates, root, path, &memo);
+                    consume_root = consume_root or recipe.needs_root;
+                    if (!recipe.needs_root) {
+                        use.location_field_sources[slot] = recipe.source;
+                        selected_reads |= recipe.source.projections;
+                    }
+                }
+                if (consume_root) {
+                    @memset(use.location_field_sources[0..final.field_count], null);
+                }
+            }
+            const published = !final.computed_overflow and
+                try local_templates.publish(self, root, consume_root, reads.?, selected_reads, use);
+            use.location_computed_complete = published;
+            use.location_computed_sources = if (published and consume_root) root.computations else 0;
+            use.location_computed_original_alternative = published and consume_root and root.original_alternative;
+            use.location_computed_opaque_alternative = published and consume_root and root.opaque_alternative;
+            if (!published) {
+                for (final.field_names[0..final.field_count], final.written_dependencies[0..final.field_count]) |path, dependencies| {
+                    if (!dependencies.isEmpty()) _ = use.may_written_stores.add(path, dependencies);
+                    if (computedFieldLiteralMay(&local_templates, root.computations, path))
+                        _ = use.may_written_stores.addLiteral(path);
+                }
+            }
+        }
         return exits;
     }
 
     const StoreBodyContext = struct {
         canonical: ActualCallSummary,
         call_node: Ast.Node.Index,
+        call_tree: *const Ast,
         name: []const u8,
         fields: []const []const u8,
         defaults: []const ?Ast.Node.Index,
@@ -3425,11 +5166,23 @@ pub const FileCache = struct {
         value_label: ?Ast.TokenIndex = null,
         loop_proof: ?*const DefiniteStoreProof = null,
         loop_coverage: ?*const StoreCoverage = null,
+        loop_body: ?Ast.Node.Index = null,
+        loop_node: ?Ast.Node.Index = null,
     };
 
     fn intersectStoreCoverage(target: *StoreCoverage, other: StoreCoverage) void {
+        if (target.whole_source != null or other.whole_source != null)
+            target.whole_source = WholeStoreSource.merge(target.whole_source orelse .{}, other.whole_source orelse .{});
         target.complete = target.complete and other.complete;
-        for (target.covered[0..target.field_count], other.covered[0..other.field_count]) |*mine, theirs| mine.* = mine.* and theirs;
+        target.whole_dependencies.merge(other.whole_dependencies);
+        target.computed_sources |= other.computed_sources;
+        target.computed_original_alternative = target.computed_original_alternative or other.computed_original_alternative;
+        target.computed_opaque_alternative = target.computed_opaque_alternative or other.computed_opaque_alternative;
+        target.computed_overflow = target.computed_overflow or other.computed_overflow;
+        for (target.covered[0..target.field_count], other.covered[0..other.field_count], target.written_dependencies[0..target.field_count], other.written_dependencies[0..other.field_count]) |*mine, theirs, *dependencies, incoming| {
+            mine.* = mine.* and theirs;
+            dependencies.merge(incoming);
+        }
     }
 
     fn intersectStoreExit(exits: *?StoreCoverage, coverage: StoreCoverage) void {
@@ -3440,24 +5193,56 @@ pub const FileCache = struct {
     /// A disagreement cannot establish a defined source on the merged path.
     fn mergeStoreProof(target: *DefiniteStoreProof, other: *const DefiniteStoreProof, count: usize) bool {
         target.binding_count = count;
+        target.written_dependencies.merge(other.written_dependencies);
         for (target.bindings[0..count], other.bindings[0..count]) |*mine, theirs| {
+            mine.written_dependencies.merge(theirs.written_dependencies);
+            if (theirs.aggregate_source) |source| {
+                mine.aggregate_source = if (mine.aggregate_source) |current|
+                    WholeStoreSource.merge(current, source)
+                else
+                    source;
+            }
+            mine.value_nonidentity = mine.value_nonidentity or theirs.value_nonidentity;
+            mine.computed_sources |= theirs.computed_sources;
+            mine.computed_original_alternative = mine.computed_original_alternative or theirs.computed_original_alternative;
+            mine.computed_opaque_alternative = mine.computed_opaque_alternative or theirs.computed_opaque_alternative;
             if (mine.value != theirs.value) mine.value = .undefined_value;
             mine.complete_value = mine.complete_value and theirs.complete_value;
+            mine.literal_undefined = mine.literal_undefined and theirs.literal_undefined;
+            mine.literal_may_undefined = mine.literal_may_undefined or theirs.literal_may_undefined;
             if (mine.formal_alias != theirs.formal_alias) mine.formal_alias = null;
+            if (mine.aggregate_source != null or theirs.aggregate_source != null)
+                mine.aggregate_source = WholeStoreSource.merge(mine.aggregate_source orelse .{}, theirs.aggregate_source orelse .{});
         }
         for (target.pointees[0..target.pointee_count]) |*pointee| {
             const name = target.tree.tokenSlice(pointee.token);
-            const theirs = other.findStorePointee(name) orelse .unknown;
-            if (pointee.value != theirs) pointee.value = .unknown;
+            const theirs = other.findStorePointeeEntry(name);
+            if (pointee.value != (if (theirs) |entry| entry.value else .unknown))
+                pointee.value = .unknown;
+            pointee.computed = mergeComputedPointeeState(
+                pointee.computed, if (theirs) |entry| entry.computed else null,
+            );
         }
         for (other.pointees[0..other.pointee_count]) |pointee| {
             const name = other.tree.tokenSlice(pointee.token);
-            if (target.findStorePointee(name) == null and !target.setStorePointee(pointee.token, .unknown)) return false;
+            if (target.findStorePointee(name) == null) {
+                if (!target.setStorePointee(pointee.token, .unknown)) return false;
+                target.pointees[target.pointee_count - 1].computed =
+                    mergeComputedPointeeState(null, pointee.computed);
+            }
         }
         for (target.field_facts[0..target.field_fact_count]) |*fact| {
             const name = target.tree.tokenSlice(fact.token);
-            const theirs = other.findStoreField(name, fact.path) orelse .unknown;
-            if (fact.value != theirs) fact.value = .unknown;
+            if (other.findStoreFieldFact(name, fact.path)) |theirs| {
+                fact.written_dependencies.merge(theirs.written_dependencies);
+                if (fact.value != theirs.value) fact.value = .unknown;
+            } else {
+                fact.value = .unknown;
+            }
+        }
+        for (other.field_facts[0..other.field_fact_count]) |fact| {
+            if (!fact.fallback_recipe) continue;
+            if (!recordComputedFallbackFact(target, fact.token, fact.path, fact.written_dependencies, fact.fallback_literal_may)) return false;
         }
         return true;
     }
@@ -3486,7 +5271,7 @@ pub const FileCache = struct {
         const declaration = owner_tree.fullContainerDecl(&buffer, actual.data.container.scope_handle.toNode()) orelse return false;
         const wanted = tree.tokenSlice(tree.nodeMainToken(variant));
         for (declaration.ast.members) |member| {
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             const field = owner_tree.fullContainerField(member) orelse continue;
             if (!std.mem.eql(u8, owner_tree.tokenSlice(field.ast.main_token), wanted)) continue;
             const type_node = field.ast.type_expr.unwrap() orelse return false;
@@ -3504,6 +5289,149 @@ pub const FileCache = struct {
         return false;
     }
 
+    fn passiveStoreExpression(self: *FileCache, proof: *const DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!bool {
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
+        switch (proof.tree.nodeTag(node)) {
+            .identifier, .number_literal, .char_literal, .enum_literal,
+            .grouped_expression, .array_access, .field_access,
+            .negation, .bit_not, .bool_not, .add, .sub, .mul, .div, .mod,
+            .bit_and, .bit_or, .bit_xor, .shl, .shr,
+            .equal_equal, .bang_equal, .less_than, .greater_than,
+            .less_or_equal, .greater_or_equal, .bool_and, .bool_or,
+            => {},
+            else => return false,
+        }
+        var children = engine.AstIterator.init(proof.tree, node);
+        while (children.next(proof.tree)) |child| {
+            if (!try self.passiveStoreExpression(proof, child, depth + 1)) return false;
+        }
+        return true;
+    }
+
+    /// One source/control-authenticated resume, not a loop fixed point:
+    /// the first if arm changes scalar locals, clears its boolean selector,
+    /// then continues. The next iteration skips that arm and runs a passive
+    /// field-store suffix ending in a void return. Calls, aliases, extra
+    /// control flow and mutated source storage are outside this evidence.
+    fn recordContinueMayStores(
+        self: *FileCache,
+        context: *const StoreBodyContext,
+        proof: *const DefiniteStoreProof,
+        before: *const DefiniteStoreProof,
+        continued: Ast.Node.Index,
+    ) SummaryError!void {
+        const stores = proof.may_written_stores orelse return;
+        if (!proof.written_input_boundary or context.success_bool != null) return;
+        const tree = proof.tree;
+        const body = context.loop_body orelse return;
+        const loop_node = context.loop_node orelse return;
+        const function_body = tokens.bodyOf(tree, context.canonical.callee.declaration) orelse return;
+        var prefix = engine.AstIterator.init(tree, function_body);
+        var reached_loop = false;
+        while (prefix.next(tree)) |statement| {
+            if (statement == loop_node) {
+                reached_loop = true;
+                break;
+            }
+            if (tree.fullVarDecl(statement)) |variable| {
+                const initial = variable.ast.init_node.unwrap() orelse return;
+                if (try definiteStoreKind(proof, initial) != .scalar or
+                    !try self.passiveStoreExpression(proof, initial, 0)) return;
+            } else if (tree.nodeTag(statement) == .assign) {
+                const lhs, const rhs = tree.nodeData(statement).node_and_node;
+                if (tree.nodeTag(lhs) != .identifier or
+                    try definiteStoreKind(proof, lhs) != .scalar or
+                    proof.findIndex(tree.tokenSlice(tree.nodeMainToken(lhs))) == null or
+                    !try self.passiveStoreExpression(proof, rhs, 0)) return;
+            } else return;
+        }
+        if (!reached_loop) return;
+        switch (tree.nodeTag(body)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => return,
+        }
+        var statements = engine.AstIterator.init(tree, body);
+        const first = statements.next(tree) orelse return;
+        const branch = tree.fullIf(first) orelse return;
+        if (branch.payload_token != null or branch.error_token != null or
+            branch.ast.else_expr != .none or tree.nodeTag(branch.ast.cond_expr) != .identifier) return;
+        if ((try proof.frame.isBoolType(branch.ast.cond_expr)) != true) return;
+        const selector_name = tree.tokenSlice(tree.nodeMainToken(branch.ast.cond_expr));
+        const selector = before.findIndex(selector_name) orelse return;
+        if (before.bindings[selector].formal_alias != null) return;
+        switch (tree.nodeTag(branch.ast.then_expr)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => return,
+        }
+        var arm = engine.AstIterator.init(tree, branch.ast.then_expr);
+        var selector_false = false;
+        var found_continue = false;
+        while (arm.next(tree)) |statement| {
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+            if (statement == continued) {
+                if (arm.next(tree) != null) return;
+                found_continue = true;
+                break;
+            }
+            if (tree.nodeTag(statement) != .assign) return;
+            const lhs, const rhs = tree.nodeData(statement).node_and_node;
+            if (tree.nodeTag(lhs) != .identifier or
+                try definiteStoreKind(proof, lhs) != .scalar or
+                !try self.passiveStoreExpression(proof, rhs, 0)) return;
+            const assigned = before.findIndex(tree.tokenSlice(tree.nodeMainToken(lhs))) orelse return;
+            if (before.bindings[assigned].formal_alias != null) return;
+            if (assigned == selector) {
+                selector_false = tree.nodeTag(rhs) == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(rhs)), "false");
+            }
+        }
+        if (!found_continue or !selector_false) return;
+
+        var recipes: [128]WrittenDependencies = @splat(.{});
+        var returned = false;
+        while (statements.next(tree)) |statement| {
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+            if (tree.nodeTag(statement) == .@"return") {
+                if (tree.nodeData(statement).opt_node != .none or statements.next(tree) != null) return;
+                returned = true;
+                break;
+            }
+            if (tree.nodeTag(statement) != .assign) return;
+            const lhs, const rhs = tree.nodeData(statement).node_and_node;
+            if (try definiteStoreKind(proof, lhs) != .scalar) return;
+            const field = (try storeFieldIndex(proof, context.name, context.fields, lhs)) orelse return;
+            var recipe: WrittenDependencies = .{};
+            switch (tree.nodeTag(rhs)) {
+                .number_literal, .char_literal, .enum_literal => {},
+                .identifier => {
+                    const name = tree.tokenSlice(tree.nodeMainToken(rhs));
+                    if (!std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false") and
+                        !std.mem.eql(u8, name, "null"))
+                    {
+                        const binding = proof.findIndex(name) orelse return;
+                        if (binding >= before.binding_count or
+                            proof.bindings[binding].token != before.bindings[binding].token or
+                            proof.bindings[binding].formal_alias != null or
+                            try definiteStoreKind(proof, rhs) != .scalar) return;
+                        // Only a saved source lineage changed by this resume
+                        // contributes an alternative; old/global inputs do not.
+                        if (!proof.bindings[binding].written_dependencies.eql(before.bindings[binding].written_dependencies))
+                            recipe = proof.bindings[binding].written_dependencies;
+                    }
+                },
+                else => return,
+            }
+            // A later unconditional scalar overwrite replaces its source.
+            recipes[field] = recipe;
+        }
+        if (!returned) return;
+        for (context.fields, recipes[0..context.fields.len]) |path, recipe| {
+            if (recipe.inputs == 0 and recipe.reads == 0) continue;
+            if (!stores.add(path, recipe)) return;
+        }
+    }
+
     /// `true` falls through; `false` exits. Null is an unsupported proof.
     /// Branches carry independent lexical state and coverage. Their successful
     /// returns join the exit meet, not the continuing statement's state.
@@ -3515,8 +5443,8 @@ pub const FileCache = struct {
         coverage: *StoreCoverage,
         exits: *?StoreCoverage,
     ) SummaryError!?bool {
-        try self.chargeNormalCleanup(context.call_node);
-        try self.enterNormalCleanup(context.call_node);
+        try self.chargeNormalCleanupAt(context.call_tree, context.call_node);
+        try self.enterNormalCleanupAt(context.call_tree, context.call_node);
         defer self.leaveNormalCleanup();
         const tree = proof.tree;
         proof.out_coverage = coverage;
@@ -3572,20 +5500,47 @@ pub const FileCache = struct {
                 const initial = context.loop_coverage orelse return null;
                 if (tree.lastToken(node) != tree.nodeMainToken(node) or
                     coverage.complete != initial.complete or coverage.field_count != initial.field_count or
-                    !std.mem.eql(bool, coverage.covered[0..coverage.field_count], initial.covered[0..initial.field_count])) return null;
+                    !std.mem.eql(bool, coverage.covered[0..coverage.field_count], initial.covered[0..initial.field_count]) or
+                    !WholeStoreSource.equal(coverage.whole_source, initial.whole_source)) return null;
+                if (!coverage.whole_dependencies.eql(initial.whole_dependencies)) return null;
+                if (coverage.computed_sources != initial.computed_sources or
+                    coverage.computed_original_alternative != initial.computed_original_alternative or
+                    coverage.computed_opaque_alternative != initial.computed_opaque_alternative or
+                    coverage.computed_overflow != initial.computed_overflow) return null;
+                for (coverage.written_dependencies[0..coverage.field_count], initial.written_dependencies[0..initial.field_count]) |current, original| {
+                    if (!current.eql(original)) return null;
+                }
                 for (before.bindings[0..before.binding_count], proof.bindings[0..before.binding_count]) |original, current| {
                     if (original.value != current.value or original.complete_value != current.complete_value or
-                        original.formal_alias != current.formal_alias) return null;
+                        original.formal_alias != current.formal_alias or
+                        !WholeStoreSource.equal(original.aggregate_source, current.aggregate_source) or
+                        original.value_nonidentity != current.value_nonidentity or
+                        !original.written_dependencies.eql(current.written_dependencies) or
+                        original.computed_sources != current.computed_sources or
+                        original.literal_undefined != current.literal_undefined or
+                        original.literal_may_undefined != current.literal_may_undefined or
+                        original.computed_original_alternative != current.computed_original_alternative or
+                        original.computed_opaque_alternative != current.computed_opaque_alternative)
+                    {
+                        try self.recordContinueMayStores(context, proof, before, node);
+                        return null;
+                    }
                 }
                 if (before.pointee_count != proof.pointee_count) return null;
                 for (before.pointees[0..before.pointee_count]) |original| {
                     const name = tree.tokenSlice(original.token);
-                    if (proof.findStorePointee(name) != original.value) return null;
+                    const current = proof.findStorePointeeEntry(name) orelse return null;
+                    if (current.value != original.value or
+                        !ComputedPointeeState.equal(original.computed, current.computed)) return null;
                 }
                 if (before.field_fact_count != proof.field_fact_count) return null;
                 for (before.field_facts[0..before.field_fact_count]) |original| {
                     const name = tree.tokenSlice(original.token);
-                    if (proof.findStoreField(name, original.path) != original.value) return null;
+                    const current = proof.findStoreFieldFact(name, original.path) orelse return null;
+                    if (current.value != original.value or
+                        !current.written_dependencies.eql(original.written_dependencies) or
+                        current.fallback_recipe != original.fallback_recipe or
+                        current.fallback_literal_may != original.fallback_literal_may) return null;
                 }
                 return false;
             },
@@ -3662,6 +5617,8 @@ pub const FileCache = struct {
             var looping_context = context.*;
             looping_context.loop_proof = &before;
             looping_context.loop_coverage = &initial;
+            looping_context.loop_body = loop.ast.then_expr;
+            looping_context.loop_node = node;
             const continuing = (try self.definiteStoreBody(&looping_context, proof, loop.ast.then_expr, coverage, exits)) orelse return null;
             // A body fallthrough also restarts the loop; only proven
             // terminating paths and unchanged bare continues are supported.
@@ -3690,16 +5647,31 @@ pub const FileCache = struct {
             if (std.mem.eql(u8, tree.tokenSlice(declaration.ast.mut_token + 1), context.name)) return null;
             const value = declaration.ast.init_node.unwrap() orelse return null;
             const alias = try self.definiteStoreFormalAlias(proof, value);
-            const verdict = try self.definiteStoreValue(proof, value, 0);
+            proof.written_dependencies = .{};
+            const evaluated = try self.definiteStoreValueWithComputed(proof, value, 0);
+            const verdict = evaluated.value;
             if (verdict == .unknown or !proof.bind(declaration.ast.mut_token + 1, verdict)) return null;
-            proof.bindings[proof.binding_count - 1].complete_value =
+            const binding = &proof.bindings[proof.binding_count - 1];
+            binding.written_dependencies = proof.written_dependencies;
+            binding.aggregate_source = evaluated.computed.source;
+            binding.computed_sources = evaluated.computed.computations;
+            binding.computed_original_alternative = evaluated.computed.original_alternative;
+            binding.computed_opaque_alternative = evaluated.computed.opaque_alternative;
+            binding.value_nonidentity = evaluated.computed.value_nonidentity;
+            binding.literal_undefined = evaluated.literal_undefined;
+            binding.literal_may_undefined = evaluated.literal_may_undefined;
+            binding.complete_value =
                 verdict == .defined and try definiteStoreKind(proof, value) == .aggregate;
-            proof.bindings[proof.binding_count - 1].formal_alias = alias;
+            binding.formal_alias = alias;
+            copyComputedFallbackFacts(proof, evaluated.computed.fallback_token, binding.token);
             return true;
         }
         if (tree.nodeTag(node) != .assign) {
             if (storeCall(tree, node)) |nested_call| {
-                if (!try self.definiteNestedStore(proof, context.canonical, context.call_node, context.name, context.fields, nested_call, context.visiting, coverage, node != nested_call) and proof.written_inputs == null) return null;
+                if (!try self.definiteNestedStore(proof, context.canonical, context.call_node, context.name, context.fields, nested_call, context.visiting, coverage, node != nested_call)) {
+                    if (proof.written_inputs == null) return null;
+                    try self.definiteStoreEscapes(proof, nested_call, 0);
+                }
                 return true;
             }
             var builtin_buffer: [2]Ast.Node.Index = undefined;
@@ -3710,7 +5682,9 @@ pub const FileCache = struct {
             return true;
         }
         const lhs, const rhs = tree.nodeData(node).node_and_node;
-        const verdict = try self.definiteStoreValue(proof, rhs, 0);
+        proof.written_dependencies = .{};
+        const evaluated = try self.definiteStoreValueWithComputed(proof, rhs, 0);
+        const verdict = evaluated.value;
         if (verdict == .unknown) return null;
         if (tree.nodeTag(lhs) == .identifier) {
             const token = tree.nodeMainToken(lhs);
@@ -3721,6 +5695,15 @@ pub const FileCache = struct {
             proof.invalidateStoreFields(tree.tokenSlice(token));
             binding.complete_value = false;
             binding.value = verdict;
+            binding.written_dependencies = proof.written_dependencies;
+            binding.aggregate_source = evaluated.computed.source;
+            binding.computed_sources = evaluated.computed.computations;
+            binding.computed_original_alternative = evaluated.computed.original_alternative;
+            binding.computed_opaque_alternative = evaluated.computed.opaque_alternative;
+            binding.value_nonidentity = evaluated.computed.value_nonidentity;
+            binding.literal_undefined = evaluated.literal_undefined;
+            binding.literal_may_undefined = evaluated.literal_may_undefined;
+            copyComputedFallbackFacts(proof, evaluated.computed.fallback_token, binding.token);
             return true;
         }
         // Nested coverage joins require no-poison must certificates. Without
@@ -3738,10 +5721,33 @@ pub const FileCache = struct {
                 // The RHS already has a complete defined-value proof. A
                 // defined aggregate store cannot poison this other output.
                 if (!(try self.definiteStoreOtherFormal(proof, base) orelse false)) return null;
-                if (!proof.setStorePointee(tree.nodeMainToken(base), .defined)) return null;
+                if (proof.computed_templates != null) {
+                    if (!try self.recordOtherPointeeStore(proof, lhs, rhs, evaluated)) return null;
+                } else if (!proof.setStorePointee(tree.nodeMainToken(base), .defined)) return null;
                 return true;
             }
+            coverage.whole_dependencies = proof.written_dependencies;
+            setComputedStoreWholeReplacement(proof, coverage, evaluated);
+            if (proof.computed_templates) |builders| {
+                for (coverage.field_names[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |path, *dependencies| {
+                    dependencies.* = computedFieldDependencies(builders, coverage.computed_sources, path);
+                }
+            } else {
+                @memset(coverage.written_dependencies[0..coverage.field_count], proof.written_dependencies);
+            }
             if (proof.written_inputs != null) {
+                if (proof.computed_templates == null) {
+                    coverage.whole_source = null;
+                    switch (proof.frame.resolver.typeTag(coverage.pointee) orelse return null) {
+                        .@"struct", .@"union", .array, .vector => {
+                            coverage.whole_source = .{};
+                            if (try wholeStoreType(proof, rhs)) |source_type| {
+                                if (source_type.eql(coverage.pointee)) coverage.whole_source = evaluated.computed.source orelse WholeStoreSource{};
+                            }
+                        },
+                        else => {}, // Scalars retain their separate dependency recipe.
+                    }
+                }
                 @memset(coverage.covered[0..coverage.field_count], true);
                 coverage.complete = true;
                 if (!proof.setStorePointee(tree.nodeMainToken(base), .defined)) return null;
@@ -3766,6 +5772,7 @@ pub const FileCache = struct {
                                 .tree = &default_frame.handle.document.tree,
                                 .frame = default_frame,
                                 .call_node = context.call_node,
+                                .call_tree = context.call_tree,
                             };
                             if (try self.definiteStoreValue(&default_proof, default_value, 1) != .defined) return null;
                         }
@@ -3779,10 +5786,65 @@ pub const FileCache = struct {
         }
         if (tree.nodeTag(lhs) == .field_access) {
             const field_root = tokens.rootIdentifier(tree, lhs) orelse return null;
-            if (proof.find(tree.tokenSlice(tree.nodeMainToken(field_root))) != null) return null;
+            if (proof.computed_templates != null and
+                !std.mem.eql(u8, proof.formalName(tree.tokenSlice(tree.nodeMainToken(field_root))), context.name) and
+                (try self.definiteStoreOtherFormal(proof, field_root) orelse false))
+                return try self.recordOtherPointeeStore(proof, lhs, rhs, evaluated);
+            if (proof.find(tree.tokenSlice(tree.nodeMainToken(field_root)))) |binding| {
+                if (proof.computed_templates == null or binding.formal_alias != null) return null;
+                const resolver = proof.frame.resolver;
+                const actual = (try proof.frame.typeOfNode(field_root)) orelse return null;
+                const ty = (try resolver.normalizedType(actual)) orelse return null;
+                var fields: [128][]const u8 = undefined;
+                var defaults: [128]?Ast.Node.Index = @splat(null);
+                var mapped: StoreCoverage = .{ .pointee = ty };
+                if (!try self.storeCoverageFields(ty, &fields, &defaults, &mapped, proof.call_tree, proof.call_node)) return null;
+                const selected = (try storeFieldIndex(proof, tree.tokenSlice(tree.nodeMainToken(field_root)), fields[0..mapped.field_count], lhs)) orelse return null;
+                const path = fields[selected];
+                const base_state: ComputedStoreBase = .{
+                    .source = binding.aggregate_source,
+                    .computations = binding.computed_sources,
+                    .original_alternative = binding.computed_original_alternative,
+                    .opaque_alternative = binding.computed_opaque_alternative,
+                };
+                if (!proof.setStoreField(tree.nodeMainToken(field_root), path, verdict, proof.written_dependencies)) return null;
+                const write = try self.computedStoreWriteForValue(
+                    proof, path, rhs, evaluated, proof.written_dependencies, false, null, null,
+                );
+                if (appendComputedFieldStoreWrite(proof, base_state, write, evaluated.computed, fields[0..mapped.field_count])) |result| {
+                    binding.aggregate_source = result.source;
+                    binding.computed_sources = result.computations;
+                    binding.computed_original_alternative = result.original_alternative;
+                    binding.computed_opaque_alternative = result.opaque_alternative;
+                } else {
+                    binding.computed_opaque_alternative = true;
+                    _ = recordComputedFallbackFact(proof, binding.token, path, write.dependencies, write.literal_undefined or write.literal_may_undefined);
+                }
+                binding.value_nonidentity = true;
+                return true;
+            }
             if (try storeFieldIndex(proof, context.name, context.fields, lhs)) |index| {
+                const prior_base = computedCoverageBase(coverage);
+                // A selected overwrite is not a whole-parent identity.
+                if (coverage.whole_source != null) coverage.whole_source = .{};
                 coverStoreField(coverage, index);
-                refreshStoreCoverage(coverage);
+                recordWrittenStoreField(coverage, index, proof.written_dependencies);
+                if (proof.computed_templates != null) {
+                    const write = try self.computedStoreWriteForValue(
+                        proof, context.fields[index], rhs, evaluated, proof.written_dependencies, false, null, null,
+                    );
+                    if (appendComputedFieldStoreWrite(proof, prior_base, write, evaluated.computed, context.fields)) |result| {
+                        coverage.whole_source = result.source;
+                        coverage.computed_sources = result.computations;
+                        coverage.computed_original_alternative = result.original_alternative;
+                        coverage.computed_opaque_alternative = result.opaque_alternative;
+                    } else {
+                        coverage.computed_overflow = true;
+                        if (write.literal_undefined or write.literal_may_undefined) {
+                            if (proof.may_written_stores) |stores| _ = stores.addLiteral(context.fields[index]);
+                        }
+                    }
+                }
                 if (coverage.complete) {
                     const root = tokens.rootIdentifier(tree, lhs) orelse return null;
                     if (!proof.setStorePointee(tree.nodeMainToken(root), .defined)) return null;
@@ -3797,6 +5859,11 @@ pub const FileCache = struct {
             const root = tokens.rootIdentifier(tree, base) orelse return null;
             if (!(try self.definiteStoreOtherFormal(proof, root) orelse false) or
                 try self.definiteStoreValue(proof, index, 0) != .defined) return null;
+            // Typed physical recipes retain intrinsic poison as a selected byte
+            // write. The strict scalar RHS admission below remains unchanged.
+            if (proof.computed_templates != null and
+                !std.mem.eql(u8, proof.formalName(tree.tokenSlice(tree.nodeMainToken(root))), context.name))
+                return try self.recordOtherPointeeStore(proof, lhs, rhs, evaluated);
             const actual = (try proof.frame.typeOfNode(rhs)) orelse return null;
             const normalized = (try proof.frame.resolver.normalizedType(actual)) orelse return null;
             switch (proof.frame.resolver.typeTag(normalized) orelse return null) {
@@ -3809,6 +5876,719 @@ pub const FileCache = struct {
         }
         return null;
     }
+
+    fn wholeStoreType(proof: *const DefiniteStoreProof, node: Ast.Node.Index) SummaryError!?TypeResolver.ActualType {
+        const actual = (try proof.frame.typeOfNode(node)) orelse return null;
+        const normalized = (try proof.frame.resolver.normalizedType(actual)) orelse return null;
+        switch (proof.frame.resolver.typeTag(normalized) orelse return null) {
+            .@"struct", .@"union", .array, .vector => return normalized,
+            else => return null,
+        }
+    }
+
+    fn storeProjectionType(proof: *const DefiniteStoreProof, node: Ast.Node.Index) SummaryError!?TypeResolver.ActualType {
+        const actual = (try proof.frame.typeOfNode(node)) orelse return null;
+        return proof.frame.resolver.normalizedType(actual);
+    }
+
+    fn passiveWholeStorePlace(self: *FileCache, proof: *const DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!bool {
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth == 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        switch (proof.tree.nodeTag(node)) {
+            .identifier => return !std.mem.eql(u8, proof.tree.tokenSlice(proof.tree.nodeMainToken(node)), "undefined"),
+            .grouped_expression => return self.passiveWholeStorePlace(proof, proof.tree.nodeData(node).node_and_token[0], depth + 1),
+            .field_access => {
+                const owner = proof.tree.nodeData(node).node_and_token[0];
+                const owner_type = (try wholeStoreType(proof, owner)) orelse return false;
+                const tag = proof.frame.resolver.typeTag(owner_type) orelse return false;
+                if (tag != .@"struct" and tag != .@"union") return false;
+                return self.passiveWholeStorePlace(proof, owner, depth + 1);
+            },
+            else => return false,
+        }
+    }
+
+    /// Follow syntactic by-value identities into the original caller's AST.
+    /// Dependency masks are neither consulted nor used as copying authority.
+    fn wholeStoreSource(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!?WholeStoreSource {
+        const inputs = proof.identity_inputs orelse return null;
+        _ = proof.identity_tree orelse return null;
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth == 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        if (proof.tree.nodeTag(node) == .field_access) {
+            if (try wholeStoreType(proof, node) != null)
+                return self.wholeStoreFieldSource(proof, node, depth + 1);
+            if (!try self.passiveWholeStorePlace(proof, node, depth + 1)) return null;
+            const path = (try self.storeProjectionPath(proof.tree, node)) orelse return null;
+            const root = tokens.rootIdentifier(proof.tree, node) orelse return null;
+            const base = (try self.wholeStoreSource(proof, root, depth + 1)) orelse return null;
+            const source = (try self.wholeStoreFieldSourceProjection(proof, base, path, node)) orelse return null;
+            return if (source.sources != 0 or source.projections != 0) source else null;
+        }
+        if (try wholeStoreType(proof, node) == null) {
+            if (!proof.identity_leaf) return null;
+            var literal_buffer: [2]Ast.Node.Index = undefined;
+            if (proof.tree.fullStructInit(&literal_buffer, node) == null and
+                proof.tree.fullArrayInit(&literal_buffer, node) == null) return null;
+            const expected = (try proof.frame.expectedTypeOfNode(node)) orelse return null;
+            const actual = (try proof.frame.resolver.normalizedType(expected)) orelse return null;
+            switch (proof.frame.resolver.typeTag(actual) orelse return null) {
+                .@"struct", .@"union", .array, .vector => {},
+                else => return null,
+            }
+        }
+        if (proof.identity_leaf) {
+            // Only an exact caller argument slot proves whole-value identity.
+            for (inputs, 0..) |*entry, index| {
+                if (entry.* == node) return .{ .sources = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+            }
+            for (inputs, 0..) |*entry, index| {
+                if (entry.* != null) continue;
+                entry.* = node;
+                return .{ .sources = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+            }
+            return wholeStoreSourceOverflow(proof);
+        }
+        if (!try self.passiveWholeStorePlace(proof, node, depth)) return WholeStoreSource{};
+        if (proof.tree.nodeTag(node) == .grouped_expression)
+            return self.wholeStoreSource(proof, proof.tree.nodeData(node).node_and_token[0], depth + 1);
+        if (proof.tree.nodeTag(node) == .field_access)
+            return self.wholeStoreFieldSource(proof, node, depth + 1);
+        if (proof.tree.nodeTag(node) != .identifier) return WholeStoreSource{};
+        const name = proof.tree.tokenSlice(proof.tree.nodeMainToken(node));
+        if (proof.findIndex(name)) |binding| {
+            const source = proof.bindings[binding].aggregate_source;
+            const is_formal = binding < proof.parameter_count and proof.bindings[binding].formal_alias == null;
+            if (source) |identity| return identity;
+            if (!is_formal) return WholeStoreSource{};
+            // A formal without a recipe must still map through the actual call
+            // edge; its local binding is not a source identity.
+        }
+        const canonical = proof.canonical orelse return WholeStoreSource{};
+        const caller_cache = proof.caller_cache orelse return WholeStoreSource{};
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(proof.tree, &proto_buffer, canonical.callee.declaration) orelse return WholeStoreSource{};
+        var parameters = proto.iterate(proof.tree);
+        var parameter_index: u32 = 0;
+        while (parameters.next()) |parameter| : (parameter_index += 1) {
+            const token = parameter.name_token orelse continue;
+            if (!std.mem.eql(u8, name, proof.tree.tokenSlice(token))) continue;
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const actual = (try canonical.callArgumentFor(caller_cache, &argument_buffer, parameter_index)) orelse return WholeStoreSource{};
+            if (proof.identity_input_boundary) {
+                const resolver = caller_cache.zls orelse return WholeStoreSource{};
+                var leaf: DefiniteStoreProof = .{
+                    .tree = originTree(proof),
+                    .frame = canonical.callee.caller_frame orelse resolver.resolutionFrame(),
+                    .call_node = actual,
+                    .call_tree = caller_cache.tree,
+                    .identity_inputs = inputs,
+                    .identity_tree = originTree(proof),
+                    .identity_input_boundary = true,
+                    .identity_leaf = true,
+                    .written_inputs = proof.written_inputs,
+                    .written_reads = proof.written_reads,
+                };
+                return caller_cache.wholeStoreSource(&leaf, actual, depth + 1);
+            }
+            const caller = proof.caller orelse return WholeStoreSource{};
+            if (caller.*) |*parent| {
+                // The origin table is shared, but each AST node stays paired with
+                // the cache that owns it. Do not copy identities from dependencies.
+                parent.identity_inputs = inputs;
+                parent.identity_tree = originTree(proof);
+                return caller_cache.wholeStoreSource(parent, actual, depth + 1);
+            }
+            return WholeStoreSource{};
+        }
+        return WholeStoreSource{};
+    }
+
+    fn originTree(proof: *const DefiniteStoreProof) *const Ast {
+        return proof.identity_tree orelse proof.tree;
+    }
+
+    fn wholeStoreSourceOverflow(proof: *DefiniteStoreProof) WholeStoreSource {
+        if (proof.written_dependencies_complete) |complete| complete.* = false;
+        return .{};
+    }
+
+    fn storeProjectionPath(self: *FileCache, tree: *const Ast, node: Ast.Node.Index) SummaryError!?[]const u8 {
+        var fields: [32][]const u8 = undefined;
+        var count: usize = 0;
+        var current = node;
+        while (true) {
+            switch (tree.nodeTag(current)) {
+                .grouped_expression => current = tree.nodeData(current).node_and_token[0],
+                .field_access => {
+                    const base, const field = tree.nodeData(current).node_and_token;
+                    const raw = tree.tokenSlice(field);
+                    // Quoted identifiers need decoded field names. Until the
+                    // resolver supplies one, abstain rather than store a raw path.
+                    if (std.mem.startsWith(u8, raw, "@\"")) return null;
+                    if (count == fields.len) return null;
+                    fields[count] = raw;
+                    count += 1;
+                    current = base;
+                },
+                else => break,
+            }
+        }
+        if (count == 0) return "";
+        if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+        const arena = self.summary_arena.?.allocator();
+        var path: []const u8 = "";
+        while (count != 0) {
+            count -= 1;
+            path = if (path.len == 0)
+                try arena.dupe(u8, fields[count])
+            else
+                try std.fmt.allocPrint(arena, "{s}.{s}", .{ path, fields[count] });
+        }
+        return path;
+    }
+
+    fn appendStoreProjectionPath(self: *FileCache, prefix: []const u8, suffix: []const u8) SummaryError![]const u8 {
+        if (suffix.len == 0) return prefix;
+        if (prefix.len == 0) return suffix;
+        if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+        return std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}.{s}", .{ prefix, suffix });
+    }
+
+    fn addIdentityProjectionRead(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        argument: Ast.Node.Index,
+        relative_path: []const u8,
+        source_node: Ast.Node.Index,
+    ) SummaryError!?WholeStoreSource {
+        _ = self;
+        const reads = proof.written_reads orelse {
+            if (proof.written_inputs != null) return wholeStoreSourceOverflow(proof);
+            return WholeStoreSource{};
+        };
+        const source_type = try storeProjectionType(proof, source_node) orelse return WholeStoreSource{};
+        const is_array = proof.frame.resolver.typeTag(source_type) == .array;
+        const extent = if (is_array) try definiteStoreArrayCount(proof, source_node) else null;
+        var slot: ?usize = null;
+        for (reads, 0..) |*entry, index| {
+            if (entry.*) |read| {
+                if (read.identity_projection and !read.output_read and read.argument == argument and
+                    read.relative_path != null and std.mem.eql(u8, read.relative_path.?, relative_path)) {
+                    slot = index;
+                    break;
+                }
+            } else if (slot == null) slot = index;
+        }
+        const index = slot orelse return wholeStoreSourceOverflow(proof);
+        const existing = reads[index];
+        if (existing == null) reads[index] = .{
+            .argument = argument,
+            .tree = originTree(proof),
+            .node = argument,
+            .identity_projection = true,
+            .relative_path = relative_path,
+            .is_array = is_array,
+            .array_extent = extent,
+            .value_type = source_type,
+        } else if (!existing.?.identity_projection or existing.?.output_read) return WholeStoreSource{};
+        return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+    }
+
+    fn wholeStoreFieldSourceProjection(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        base: WholeStoreSource,
+        suffix: []const u8,
+        source_node: Ast.Node.Index,
+    ) SummaryError!?WholeStoreSource {
+        if (suffix.len == 0) return base;
+        var result: WholeStoreSource = .{ .opaque_alternative = base.opaque_alternative };
+        var sources = base.sources;
+        while (sources != 0) {
+            const index: usize = @intCast(@ctz(sources));
+            sources &= sources - 1;
+            const argument = (proof.identity_inputs orelse return WholeStoreSource{})[index] orelse return wholeStoreSourceOverflow(proof);
+            const projected = (try self.addIdentityProjectionRead(proof, argument, suffix, source_node)) orelse return WholeStoreSource{};
+            result.projections |= projected.projections;
+        }
+        var projections = base.projections;
+        while (projections != 0) {
+            const index: usize = @intCast(@ctz(projections));
+            projections &= projections - 1;
+            const reads = proof.written_reads orelse return wholeStoreSourceOverflow(proof);
+            const prior = reads[index] orelse return wholeStoreSourceOverflow(proof);
+            if (prior.output_read) {
+                const output_prefix = try self.appendStoreProjectionPath(prior.output_prefix orelse "", suffix);
+                const projected = (try self.addOutputProjectionRead(proof, prior, output_prefix, source_node)) orelse return WholeStoreSource{};
+                result.projections |= projected.projections;
+            } else {
+                const path = try self.appendStoreProjectionPath(prior.relative_path orelse "", suffix);
+                const projected = (try self.addIdentityProjectionRead(proof, prior.argument, path, source_node)) orelse return WholeStoreSource{};
+                result.projections |= projected.projections;
+            }
+        }
+        return result;
+    }
+
+    fn addOutputProjectionRead(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        prior: WrittenRead,
+        output_prefix: []const u8,
+        source_node: Ast.Node.Index,
+    ) SummaryError!?WholeStoreSource {
+        _ = self;
+        const reads = proof.written_reads orelse {
+            if (proof.written_inputs != null) return wholeStoreSourceOverflow(proof);
+            return WholeStoreSource{};
+        };
+        const value_type = try wholeStoreType(proof, source_node) orelse return WholeStoreSource{};
+        const is_array = proof.frame.resolver.typeTag(value_type) == .array;
+        const extent = if (is_array) try definiteStoreArrayCount(proof, source_node) else null;
+        var slot: ?usize = null;
+        for (reads, 0..) |entry, index| {
+            if (entry) |read| {
+                if (read.output_read and read.argument == prior.argument and read.output_base != null and
+                    prior.output_base != null and ComputedStoreBase.equal(read.output_base.?, prior.output_base.?) and read.output_prefix != null and
+                    std.mem.eql(u8, read.output_prefix.?, output_prefix)) {
+                    slot = index;
+                    break;
+                }
+            } else if (slot == null) slot = index;
+        }
+        const index = slot orelse return wholeStoreSourceOverflow(proof);
+        if (reads[index] == null) reads[index] = .{
+            .argument = prior.argument,
+            .tree = prior.tree,
+            .node = prior.node,
+            .identity_projection = true,
+            .relative_path = "",
+            .value_type = value_type,
+            .is_array = is_array,
+            .array_extent = extent,
+            .output_read = true,
+            .output_prefix = output_prefix,
+            .output_base = prior.output_base,
+        };
+        return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+    }
+
+    /// Exact aggregate field/array source recipes. This function creates only
+    /// identity slots; dependency masks never authorize a copy.
+    fn wholeStoreFieldSource(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!?WholeStoreSource {
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth == 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        if (proof.tree.nodeTag(node) == .grouped_expression)
+            return self.wholeStoreFieldSource(proof, proof.tree.nodeData(node).node_and_token[0], depth + 1);
+        if (proof.computed_templates != null and proof.tree.nodeTag(node) == .array_access) {
+            const base, const index_node = proof.tree.nodeData(node).node_and_node;
+            if (proof.tree.nodeTag(base) == .identifier) {
+                const actual = (try proof.frame.typeOfNode(base)) orelse return null;
+                const array = (try proof.frame.resolver.normalizedType(actual)) orelse return null;
+                if (proof.frame.resolver.typeTag(array) == .array) {
+                    const name = proof.tree.tokenSlice(proof.tree.nodeMainToken(base));
+                    if (proof.findIndex(name)) |binding_index| {
+                        const bound = proof.bindings[binding_index];
+                        const index = try definiteStoreInteger(proof, index_node);
+                        const extent = (try definiteStoreArrayCount(proof, base)) orelse return null;
+                        if (index != null and index.? >= extent) return null;
+                        const child_raw = (try proof.frame.typeOfNode(node)) orelse return null;
+                        const child = (try proof.frame.resolver.normalizedType(child_raw)) orelse return null;
+                        const path = if (index) |selected| blk: {
+                            if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+                            break :blk try std.fmt.allocPrint(self.summary_arena.?.allocator(), "[{d}]", .{selected});
+                        } else "";
+                        const source = try self.computedPointeeReadSource(proof, base, path, child, .{
+                            .source = bound.aggregate_source,
+                            .computations = bound.computed_sources,
+                            .original_alternative = bound.computed_original_alternative,
+                            .opaque_alternative = bound.computed_opaque_alternative,
+                        }, index == null);
+                        proof.written_dependencies.reads |= source.projections;
+                        return source;
+                    }
+                }
+            }
+        }
+        // Modified whole pointees carry exact byte sources, never certificates.
+        if (proof.tree.nodeTag(node) == .deref) {
+            const base = proof.tree.nodeData(node).node;
+            if (proof.tree.nodeTag(base) == .identifier) {
+                const name = proof.tree.tokenSlice(proof.tree.nodeMainToken(base));
+                if (proof.findStorePointeeEntry(name)) |entry| if (entry.computed) |state| {
+                    const actual = (try proof.frame.typeOfNode(node)) orelse return null;
+                    const value_type = (try proof.frame.resolver.normalizedType(actual)) orelse return null;
+                    const source = try self.computedPointeeReadSource(
+                        proof, node, "", value_type, state.base, false,
+                    );
+                    // Computed scalar consumers read these selected bytes as dependencies.
+                    proof.written_dependencies.reads |= source.projections;
+                    return source;
+                };
+            }
+        }
+        const source_type = (try wholeStoreType(proof, node)) orelse {
+            if (proof.tree.nodeTag(node) != .field_access) return null;
+            return self.wholeStoreSource(proof, node, depth + 1);
+        };
+        const path = (try self.storeProjectionPath(proof.tree, node)) orelse return WholeStoreSource{};
+        const root = tokens.rootIdentifier(proof.tree, node) orelse return WholeStoreSource{};
+        const root_name = proof.tree.tokenSlice(proof.tree.nodeMainToken(root));
+        // Output pointee reads use only the authenticated output formal and
+        // its applicable COW base; arbitrary pointer pointees remain opaque.
+        if (proof.out_name) |out_name| {
+            if (std.mem.eql(u8, proof.formalName(root_name), out_name) and
+                (proof.tree.nodeTag(node) == .deref or proof.tree.nodeTag(node) == .field_access))
+                return self.outputStoreReadSource(proof, node, path, source_type, depth + 1);
+        }
+        if (proof.tree.nodeTag(node) == .deref)
+            return self.aggregateStoreReadSource(proof, node, source_type, depth + 1);
+        if (!try self.passiveWholeStorePlace(proof, node, depth)) return WholeStoreSource{};
+        if (path.len == 0) return self.wholeStoreSource(proof, node, depth + 1);
+        if (proof.identity_leaf) {
+            return self.addIdentityProjectionRead(proof, node, "", node);
+        }
+        if (proof.findIndex(root_name)) |binding| {
+            if (proof.bindings[binding].aggregate_source) |base|
+                return self.wholeStoreFieldSourceProjection(proof, base, path, node);
+            const is_formal = binding < proof.parameter_count and proof.bindings[binding].formal_alias == null;
+            if (!is_formal) return WholeStoreSource{};
+        }
+        const base = (try self.wholeStoreSource(proof, root, depth + 1)) orelse return null;
+        return self.wholeStoreFieldSourceProjection(proof, base, path, node);
+    }
+
+    fn mergeComputedPointeeState(
+        first: ?ComputedPointeeState,
+        second: ?ComputedPointeeState,
+    ) ?ComputedPointeeState {
+        const witness = first orelse second orelse return null;
+        const left = if (first) |state| state.base else ComputedStoreBase{ .source = witness.original };
+        const right = if (second) |state| state.base else ComputedStoreBase{ .source = witness.original };
+        return .{
+            .original = witness.original,
+            .base = .{
+                .source = if (left.source != null or right.source != null)
+                    WholeStoreSource.merge(
+                        left.source orelse .{ .opaque_alternative = false },
+                        right.source orelse .{ .opaque_alternative = false },
+                    ) else null,
+                .computations = left.computations | right.computations,
+                .opaque_alternative = left.opaque_alternative or right.opaque_alternative,
+            },
+        };
+    }
+
+    /// Reserve an exact original-pointee read; lowering must authenticate its backing.
+    fn originalPointeeReadSource(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        root: Ast.Node.Index,
+        pointee: TypeResolver.ActualType,
+    ) SummaryError!WholeStoreSource {
+        const argument = (try self.originatingWrittenArgument(proof, root, 0)) orelse
+            return WholeStoreSource{};
+        const reads = proof.written_reads orelse return wholeStoreSourceOverflow(proof);
+        var slot: ?usize = null;
+        for (reads, 0..) |entry, index| {
+            if (entry) |prior| {
+                if (prior.pointee_read and prior.argument == argument and
+                    prior.value_type != null and prior.value_type.?.eql(pointee))
+                    return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+            } else if (slot == null) slot = index;
+        }
+        const index = slot orelse return wholeStoreSourceOverflow(proof);
+        const is_array = proof.frame.resolver.typeTag(pointee) == .array;
+        reads[index] = .{
+            .argument = argument,
+            .tree = originTree(proof),
+            .node = argument,
+            .pointee_read = true,
+            .relative_path = "",
+            .value_type = pointee,
+            .is_array = is_array,
+            .array_extent = if (is_array) try definiteStoreArrayCount(proof, root) else null,
+        };
+        return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+    }
+
+    /// Compose non-output formal stores into the same bounded immutable COW pool.
+    fn recordOtherPointeeStore(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        lhs: Ast.Node.Index,
+        rhs: Ast.Node.Index,
+        evaluated: DefiniteStoreResult,
+    ) SummaryError!bool {
+        const tree = proof.tree;
+        const root = tokens.rootIdentifier(tree, lhs) orelse return false;
+        const name = proof.formalName(tree.tokenSlice(tree.nodeMainToken(root)));
+        const resolver = proof.frame.resolver;
+        const actual = (try proof.frame.typeOfNode(root)) orelse return false;
+        const pointer = (try resolver.normalizedType(actual)) orelse return false;
+        if (resolver.pointerSize(pointer) != .one) return false;
+        const child = (try resolver.normalizedType(resolver.childType(pointer) orelse return false)) orelse return false;
+        switch (resolver.typeTag(child) orelse return false) {
+            .@"struct", .@"union", .array, .vector => {},
+            .int, .float, .bool, .@"enum" => {
+                if (tree.nodeTag(lhs) != .deref) return false;
+            },
+            else => {
+                // Every resolved runtime whole-pointee value uses the same byte
+                // recipe. Selected writes still require an aggregate layout.
+                if (tree.nodeTag(lhs) != .deref) return false;
+            },
+        }
+        const previous = proof.findStorePointeeEntry(name);
+        const state: ComputedPointeeState = if (previous) |entry|
+            entry.computed orelse .{ .original = .{}, .base = .{ .opaque_alternative = true } }
+        else blk: {
+            const original = try self.originalPointeeReadSource(proof, root, child);
+            break :blk .{ .original = original, .base = .{ .source = original } };
+        };
+        var fields: [128][]const u8 = undefined;
+        var defaults: [128]?Ast.Node.Index = @splat(null);
+        var mapped: StoreCoverage = .{ .pointee = child };
+        if (!try self.storeCoverageFields(child, &fields, &defaults, &mapped, proof.call_tree, proof.call_node)) return false;
+        var path: []const u8 = "";
+        var array_index: ?u64 = null;
+        switch (tree.nodeTag(lhs)) {
+            .deref => {},
+            .field_access => {
+                const index = (try storeFieldIndex(proof, name, fields[0..mapped.field_count], lhs)) orelse return false;
+                path = fields[index];
+            },
+            .array_access => {
+                const base, const index = tree.nodeData(lhs).node_and_node;
+                const extent = (try definiteStoreArrayCount(proof, base)) orelse return false;
+                array_index = (try definiteStoreInteger(proof, index)) orelse return false;
+                if (array_index.? >= extent) return false;
+                path = (try self.storeProjectionPath(tree, base)) orelse return false;
+            },
+            else => return false,
+        }
+        var write = try self.computedStoreWriteForValue(
+            proof, path, rhs, evaluated, proof.written_dependencies, false, null, array_index,
+        );
+        const child_tag = resolver.typeTag(child);
+        var boxed_optional = false;
+        if (tree.nodeTag(lhs) == .deref and
+            (child_tag == .optional or child_tag == .error_union))
+        {
+            if (try proof.frame.typeOfNode(rhs)) |source_actual| {
+                if (try resolver.normalizedType(source_actual)) |source_type| {
+                    const source_tag = resolver.typeTag(source_type);
+                    // Intrinsic undefined initializes the whole wrapper, not a
+                    // success payload; only actual boxing repairs the tag.
+                    boxed_optional = child_tag == .optional and source_tag != null and
+                        source_tag != .optional and source_tag != .undefined;
+                    if (child_tag == .error_union and source_tag != .error_union and
+                        source_tag != null and source_tag != .error_set and write.literal_undefined)
+                    {
+                        // A success payload hole is not an entirely undefined wrapper.
+                        write.literal_undefined = false;
+                        write.literal_may_undefined = true;
+                    }
+                }
+            }
+        }
+        var composed: ComputedStoreBase = if (array_index != null)
+            .{ .computations = appendComputedStoreWrite(proof, state.base, write) orelse return false }
+        else appendComputedFieldStoreWrite(
+            proof, state.base, write, evaluated.computed, fields[0..mapped.field_count],
+        ) orelse return false;
+        if (boxed_optional) {
+            // Boxing keeps the tag defined even when its payload bytes are undefined.
+            // This repairs the negative ledger only, never a value certificate.
+            composed = .{ .computations = appendComputedStoreWrite(proof, composed, .{
+                .path = "$optional-tag",
+            }) orelse return false };
+        }
+        // This recipe transports byte diagnostics only. It grants no pointee certificate.
+        if (!proof.setStorePointee(tree.nodeMainToken(root), .unknown)) return false;
+        for (proof.pointees[0..proof.pointee_count]) |*entry| {
+            if (std.mem.eql(u8, tree.tokenSlice(entry.token), name)) {
+                entry.computed = .{ .original = state.original, .base = composed };
+                return true;
+            }
+        }
+        unreachable;
+    }
+
+    fn computedPointeeReadSource(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        node: Ast.Node.Index,
+        prefix: []const u8,
+        source_type: TypeResolver.ActualType,
+        base: ComputedStoreBase,
+        output_index_read: bool,
+    ) SummaryError!WholeStoreSource {
+        _ = self;
+        const reads = proof.written_reads orelse return wholeStoreSourceOverflow(proof);
+        var slot: ?usize = null;
+        for (reads, 0..) |entry, index| {
+            if (entry) |prior| {
+                if (prior.output_read and prior.output_index_read == output_index_read and
+                    prior.tree == proof.tree and prior.node == node and
+                    prior.output_base != null and ComputedStoreBase.equal(prior.output_base.?, base) and
+                    prior.output_prefix != null and std.mem.eql(u8, prior.output_prefix.?, prefix))
+                    return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+            } else if (slot == null) slot = index;
+        }
+        const index = slot orelse return wholeStoreSourceOverflow(proof);
+        const is_array = proof.frame.resolver.typeTag(source_type) == .array;
+        reads[index] = .{
+            .argument = node,
+            .tree = proof.tree,
+            .node = node,
+            .identity_projection = true,
+            .relative_path = "",
+            .value_type = source_type,
+            .is_array = is_array,
+            .array_extent = if (is_array) try definiteStoreArrayCount(proof, node) else null,
+            .output_read = true,
+            .output_index_read = output_index_read,
+            .output_prefix = prefix,
+            .output_base = base,
+        };
+        return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+    }
+
+    fn aggregateStoreReadSource(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        node: Ast.Node.Index,
+        source_type: TypeResolver.ActualType,
+        depth: u32,
+    ) SummaryError!?WholeStoreSource {
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        const base = proof.tree.nodeData(node).node;
+        if (proof.tree.nodeTag(base) != .identifier) return WholeStoreSource{};
+        const name = proof.formalName(proof.tree.tokenSlice(proof.tree.nodeMainToken(base)));
+        // Modified non-output pointees use their exact COW state, never the
+        // original caller identity. Untracked whole stores still abstain.
+        if (proof.findStorePointeeEntry(name)) |entry| {
+            if (entry.computed) |state|
+                return try self.computedPointeeReadSource(proof, node, "", source_type, state.base, false);
+            return WholeStoreSource{};
+        }
+        const raw = (try proof.frame.typeOfNode(base)) orelse return WholeStoreSource{};
+        const pointer = (try proof.frame.resolver.normalizedType(raw)) orelse return WholeStoreSource{};
+        if (proof.frame.resolver.pointerSize(pointer) != .one) return WholeStoreSource{};
+        const raw_child = proof.frame.resolver.childType(pointer) orelse return WholeStoreSource{};
+        const child = (try proof.frame.resolver.normalizedType(raw_child)) orelse return WholeStoreSource{};
+        if (!child.eql(source_type)) return WholeStoreSource{};
+        const origin = (try self.originatingWrittenArgument(proof, base, depth + 1)) orelse return WholeStoreSource{};
+        const saved_projection = proof.read_projection;
+        defer proof.read_projection = saved_projection;
+        proof.read_projection = node;
+        if (!try proof.recordWrittenRead(origin)) return wholeStoreSourceOverflow(proof);
+        const reads = proof.written_reads orelse return WholeStoreSource{};
+        // Match the exact authenticated AST read just registered. A singleton
+        // dependency is not an identity premise and is never consulted here.
+        for (reads, 0..) |entry, index| if (entry) |selected| {
+            if (selected.argument == origin and selected.tree == proof.tree and selected.node == node and
+                selected.value_type != null and selected.value_type.?.eql(source_type))
+                return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+        };
+        return WholeStoreSource{};
+    }
+
+    fn outputArgumentPrefix(
+        self: *FileCache,
+        caller: *const DefiniteStoreProof,
+        argument: Ast.Node.Index,
+    ) SummaryError!?[]const u8 {
+        var node = argument;
+        while (self.tree.nodeTag(node) == .grouped_expression)
+            node = self.tree.nodeData(node).node_and_token[0];
+        if (self.tree.nodeTag(node) == .address_of)
+            return self.storeProjectionPath(self.tree, self.tree.nodeData(node).node);
+        if (self.tree.nodeTag(node) != .identifier) return null;
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        if (caller.out_name) |out_name| {
+            if (std.mem.eql(u8, caller.formalName(name), out_name)) return "";
+        }
+        if (caller.findIndex(name)) |binding| {
+            if (caller.bindings[binding].formal_alias) |alias| {
+                if (caller.out_name) |out_name| {
+                    if (std.mem.eql(u8, self.tree.tokenSlice(alias), out_name)) return "";
+                }
+            }
+        }
+        return null;
+    }
+
+    fn outputStoreReadSource(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        node: Ast.Node.Index,
+        path: []const u8,
+        source_type: TypeResolver.ActualType,
+        depth: u32,
+    ) SummaryError!?WholeStoreSource {
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth == 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        const argument = proof.identity_output orelse return WholeStoreSource{};
+        const coverage = proof.out_coverage orelse return WholeStoreSource{};
+        const builders = proof.computed_templates orelse return WholeStoreSource{};
+        var base = computedCoverageBase(coverage);
+        var prefix = path;
+        var current = proof;
+        var memo: [8]?u8 = .{null} ** 8;
+        while (current.caller) |caller_link| {
+            if (caller_link.*) |*parent| {
+                const parent_coverage = parent.out_coverage orelse break;
+                const root_prefix = current.identity_output_prefix orelse return WholeStoreSource{};
+                memo = .{null} ** 8;
+                base = rebaseComputedStoreBase(current, base, computedCoverageBase(parent_coverage), root_prefix, parent.out_fields, builders.count, &memo) orelse return WholeStoreSource{};
+                prefix = (try self.mapOutputReadPrefix(parent.out_fields, root_prefix, prefix)) orelse return WholeStoreSource{};
+                current = parent;
+            } else break;
+        }
+        const reads = proof.written_reads orelse return wholeStoreSourceOverflow(proof);
+        var slot: ?usize = null;
+        for (reads, 0..) |entry, index| {
+            if (entry) |read| {
+                if (read.output_read and read.argument == argument and read.output_prefix != null and
+                    std.mem.eql(u8, read.output_prefix.?, prefix) and read.value_type != null and
+                    read.value_type.?.eql(source_type) and read.output_base != null and
+                    ComputedStoreBase.equal(read.output_base.?, base)) {
+                    slot = index;
+                    break;
+                }
+            } else if (slot == null) slot = index;
+        }
+        const index = slot orelse return wholeStoreSourceOverflow(proof);
+        if (reads[index] == null) reads[index] = .{
+            .argument = argument,
+            .tree = originTree(proof),
+            .node = argument,
+            .identity_projection = true,
+            .relative_path = "",
+            .value_type = source_type,
+            .is_array = proof.frame.resolver.typeTag(source_type) == .array,
+            .array_extent = if (proof.frame.resolver.typeTag(source_type) == .array) try definiteStoreArrayCount(proof, node) else null,
+            .output_read = true,
+            .output_prefix = prefix,
+            .output_base = base,
+        };
+        return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
+    }
+
+    fn mapOutputReadPrefix(self: *FileCache, fields: []const []const u8, prefix: []const u8, suffix: []const u8) SummaryError!?[]const u8 {
+        const path = try self.appendStoreProjectionPath(prefix, suffix);
+        if (path.len == 0) return path;
+        for (fields) |candidate| {
+            if (std.mem.eql(u8, candidate, path) or
+                (candidate.len > path.len and candidate[path.len] == '.' and std.mem.startsWith(u8, candidate, path))) return path;
+        }
+        return null;
+    }
+
 
     /// Only a direct copy of a pointer formal retains its exact identity.
     /// Rebinding and escaping that local make the body proof abstain.
@@ -3829,7 +6609,7 @@ pub const FileCache = struct {
         const proto = tokens.fnProto(proof.tree, &buffer, canonical.callee.declaration) orelse return null;
         var parameters = proto.iterate(proof.tree);
         while (parameters.next()) |parameter| {
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             const token = parameter.name_token orelse continue;
             if (std.mem.eql(u8, proof.tree.tokenSlice(token), name)) return token;
         }
@@ -3849,7 +6629,7 @@ pub const FileCache = struct {
         const name = proof.formalName(root_name);
         var parameters = proto.iterate(proof.tree);
         while (parameters.next()) |parameter| {
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             const token = parameter.name_token orelse continue;
             if (std.mem.eql(u8, proof.tree.tokenSlice(token), name)) return true;
         }
@@ -3923,28 +6703,57 @@ pub const FileCache = struct {
         var chain: [max_store_call_depth + 1]StoreVisit = undefined;
         @memcpy(chain[0..visiting.len], visiting);
         chain[visiting.len] = .{ .tree = nested.callee.tree, .declaration = nested.callee.declaration };
-        const stored = (try self.definiteParameterStore(nested, call_node, delegate.index, &state, chain[0 .. visiting.len + 1])) orelse return false;
+        const stored = (try declaring.definiteParameterStore(nested, nested_call, delegate.index, &state, chain[0 ..visiting.len + 1])) orelse return false;
         switch (delegate.target) {
             .unknown_field => return false,
             .whole => {
                 if (!stored.pointee.eql(coverage.pointee) or stored.field_count != coverage.field_count) return false;
-                for (coverage.covered[0..coverage.field_count], stored.covered[0..coverage.field_count]) |*mine, theirs| {
+                for (coverage.covered[0..coverage.field_count], stored.covered[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count], stored.written_dependencies[0..stored.field_count]) |*mine, theirs, *dependencies, incoming| {
                     mine.* = mine.* or theirs or stored.complete;
+                    if (theirs or stored.complete) dependencies.* = incoming;
+                }
+                if (stored.complete) coverage.whole_dependencies = stored.whole_dependencies;
+                if (proof.computed_templates != null) {
+                    coverage.whole_source = stored.whole_source;
+                    coverage.computed_sources = stored.computed_sources;
+                    coverage.computed_original_alternative = stored.computed_original_alternative;
+                    coverage.computed_opaque_alternative = stored.computed_opaque_alternative;
+                    coverage.computed_overflow = coverage.computed_overflow or stored.computed_overflow;
                 }
                 coverage.complete = coverage.complete or stored.complete;
+                if (stored.complete) coverage.whole_source = stored.whole_source
+                else if (coverage.whole_source != null) coverage.whole_source = .{};
             },
             .field => |field_index| {
+                if (coverage.whole_source != null) coverage.whole_source = .{};
                 if (field_index >= coverage.field_count) return false;
                 if (stored.complete) {
                     coverStoreField(coverage, field_index);
-                } else {
-                    const prefix = coverage.field_names[field_index];
-                    for (stored.field_names[0..stored.field_count], stored.covered[0..stored.field_count]) |suffix, written| {
-                        if (!written) continue;
-                        for (coverage.field_names[0..coverage.field_count], coverage.covered[0..coverage.field_count]) |candidate, *covered| {
-                            if (candidate.len == prefix.len + 1 + suffix.len and
-                                candidate[prefix.len] == '.' and std.mem.startsWith(u8, candidate, prefix) and
-                                std.mem.eql(u8, candidate[prefix.len + 1 ..], suffix)) covered.* = true;
+                    recordWrittenStoreField(coverage, field_index, stored.whole_dependencies);
+                }
+                const prefix = coverage.field_names[field_index];
+                if (proof.computed_templates) |builders| {
+                    const parent_base = computedCoverageBase(coverage);
+                    var memo: [8]?u8 = .{null} ** 8;
+                    const rebased = rebaseComputedStoreBase(proof, computedCoverageBase(&stored), parent_base, prefix, coverage.field_names[0..coverage.field_count], builders.count, &memo);
+                    if (rebased) |base| {
+                        coverage.whole_source = base.source;
+                        coverage.computed_sources = base.computations;
+                        coverage.computed_original_alternative = base.original_alternative;
+                        coverage.computed_opaque_alternative = base.opaque_alternative;
+                    } else {
+                        builders.overflow = true;
+                        coverage.computed_overflow = true;
+                    }
+                }
+                for (stored.field_names[0..stored.field_count], stored.covered[0..stored.field_count], stored.written_dependencies[0..stored.field_count]) |suffix, written, dependencies| {
+                    if (!written) continue;
+                    for (coverage.field_names[0..coverage.field_count], coverage.covered[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |candidate, *covered, *recipe| {
+                        if (candidate.len == prefix.len + 1 + suffix.len and
+                            candidate[prefix.len] == '.' and std.mem.startsWith(u8, candidate, prefix) and
+                            std.mem.eql(u8, candidate[prefix.len + 1 ..], suffix)) {
+                            covered.* = true;
+                            recipe.* = dependencies;
                         }
                     }
                 }
@@ -3998,6 +6807,52 @@ pub const FileCache = struct {
     }
 
     const DefiniteStoreValue = enum { defined, undefined_value, unknown };
+    const ComputedStoreState = struct {
+        source: ?WholeStoreSource = null,
+        computations: u8 = 0,
+        original_alternative: bool = false,
+        opaque_alternative: bool = false,
+        value_nonidentity: bool = false,
+        literal_undefined: bool = false,
+        literal_may_undefined: bool = false,
+        fallback_token: ?Ast.TokenIndex = null,
+
+
+        fn merge(self: *ComputedStoreState, other: ComputedStoreState) void {
+            if (other.source) |source| {
+                self.source = if (self.source) |current|
+                    WholeStoreSource.merge(current, source)
+                else
+                    source;
+            }
+            self.computations |= other.computations;
+            self.original_alternative = self.original_alternative or other.original_alternative;
+            self.opaque_alternative = self.opaque_alternative or other.opaque_alternative;
+            self.value_nonidentity = self.value_nonidentity or other.value_nonidentity;
+            self.literal_undefined = self.literal_undefined and other.literal_undefined;
+            self.literal_may_undefined = self.literal_may_undefined or other.literal_may_undefined;
+        }
+
+    };
+
+    const DefiniteStoreResult = struct {
+        value: DefiniteStoreValue,
+        raw_value: DefiniteStoreValue,
+        literal_undefined: bool = false,
+        literal_may_undefined: bool = false,
+        computed: ComputedStoreState = .{},
+    };
+
+    const ComputedPointeeState = struct {
+        original: WholeStoreSource,
+        base: ComputedStoreBase,
+
+        fn equal(first: ?ComputedPointeeState, second: ?ComputedPointeeState) bool {
+            if (first == null or second == null) return first == null and second == null;
+            return WholeStoreSource.equal(first.?.original, second.?.original) and
+                ComputedStoreBase.equal(first.?.base, second.?.base);
+        }
+    };
 
     /// Ephemeral lexical facts for this proof, not another call summary.
     /// A binding holds the value at this statement, never its initializer's
@@ -4011,79 +6866,164 @@ pub const FileCache = struct {
         /// Formal-to-actual mapping must use it, never the callee's cache.
         caller_cache: ?*FileCache = null,
         call_node: Ast.Node.Index,
+        /// `call_node` remains the originating caller site through nested proofs.
+        call_tree: *const Ast,
         out_name: ?[]const u8 = null,
         out_fields: []const []const u8 = &.{},
         out_coverage: ?*StoreCoverage = null,
         written_inputs: ?*[8]?Ast.Node.Index = null,
         written_reads: ?*[8]?WrittenRead = null,
+        /// Only this formal-to-actual edge owns originating-caller AST slots.
+        /// Inherited table pointers never establish a second slot namespace.
+        written_input_boundary: bool = false,
+        may_written_stores: ?*WrittenMayStores = null,
+        written_dependencies: WrittenDependencies = .{},
+        written_dependencies_complete: ?*bool = null,
+        identity_inputs: ?*[8]?Ast.Node.Index = null,
+        identity_tree: ?*const Ast = null,
+        identity_input_boundary: bool = false,
+        /// Original destination actual; never used as the call_node's AST owner.
+        identity_output: ?Ast.Node.Index = null,
+        identity_output_prefix: ?[]const u8 = null,
+        identity_leaf: bool = false,
         read_projection: ?Ast.Node.Index = null,
         collect_written_inputs: bool = true,
+        computed_templates: ?*ComputedStoreBuilders = null,
+        computed_result: ComputedStoreState = .{},
+
         bindings: [128]struct {
             token: Ast.TokenIndex,
             value: DefiniteStoreValue,
+            written_dependencies: WrittenDependencies = .{},
+            computed_sources: u8 = 0,
+            computed_original_alternative: bool = false,
+            computed_opaque_alternative: bool = false,
             /// Complete source-proven aggregates, never arbitrary literals.
             complete_value: bool = false,
             /// Immutable integer-overflow builtins produce two scalar slots.
             overflow_tuple: bool = false,
             formal_alias: ?Ast.TokenIndex = null,
+            aggregate_source: ?WholeStoreSource = null,
+            value_nonidentity: bool = false,
+            literal_undefined: bool = false,
+            literal_may_undefined: bool = false,
         } = undefined,
         binding_count: usize = 0,
 
         parameter_count: usize = 0,
-        pointees: [128]struct { token: Ast.TokenIndex, value: DefiniteStoreValue } = undefined,
+        pointees: [128]struct {
+            token: Ast.TokenIndex,
+            value: DefiniteStoreValue,
+            computed: ?ComputedPointeeState = null,
+        } = undefined,
         pointee_count: usize = 0,
-        field_facts: [128]struct { token: Ast.TokenIndex, path: []const u8, value: DefiniteStoreValue } = undefined,
+        field_facts: [128]struct {
+            token: Ast.TokenIndex,
+            path: []const u8,
+            value: DefiniteStoreValue,
+            written_dependencies: WrittenDependencies = .{},
+            fallback_literal_may: bool = false,
+            fallback_recipe: bool = false,
+        } = undefined,
         field_fact_count: usize = 0,
 
-        fn recordWrittenRead(proof: *DefiniteStoreProof, argument: Ast.Node.Index) bool {
+        fn recordWrittenRead(proof: *DefiniteStoreProof, argument: Ast.Node.Index) SummaryError!bool {
             if (!proof.collect_written_inputs) return true;
             const reads = proof.written_reads orelse return false;
             const node = proof.read_projection orelse return false;
-            for (reads) |*entry| {
+            for (reads, 0..) |*entry, slot| {
                 if (entry.*) |read| {
-                    if (read.argument == argument and read.tree == proof.tree and read.node == node) return true;
+                    if (read.argument != argument or read.tree != proof.tree or read.node != node) continue;
                 } else {
-                    entry.* = .{ .argument = argument, .tree = proof.tree, .node = node };
-                    return true;
+                    const actual = (try proof.frame.typeOfNode(node)) orelse return false;
+                    const ty = (try proof.frame.resolver.normalizedType(actual)) orelse return false;
+                    const is_array = proof.frame.resolver.typeTag(ty) == .array;
+                    entry.* = .{
+                        .argument = argument,
+                        .tree = proof.tree,
+                        .node = node,
+                        .value_type = ty,
+                        .is_array = is_array,
+                        .array_extent = if (is_array) try definiteStoreArrayCount(proof, node) else null,
+                    };
                 }
+                proof.written_dependencies.reads |= @as(u8, 1) << @intCast(slot);
+                return true;
             }
+            if (proof.written_dependencies_complete) |complete| complete.* = false;
             return false;
         }
 
-        fn findStoreField(proof: *const DefiniteStoreProof, name: []const u8, path: []const u8) ?DefiniteStoreValue {
+        fn findStoreFieldFact(proof: *const DefiniteStoreProof, name: []const u8, path: []const u8) ?*const @TypeOf(proof.field_facts[0]) {
             const binding = proof.findIndex(name) orelse return null;
             const token = proof.bindings[binding].token;
-            for (proof.field_facts[0..proof.field_fact_count]) |fact| {
-                if (fact.token == token and std.mem.eql(u8, fact.path, path)) return fact.value;
+            for (proof.field_facts[0..proof.field_fact_count]) |*fact| {
+                if (fact.token == token and std.mem.eql(u8, fact.path, path)) return fact;
             }
             return null;
         }
 
-        fn setStoreField(proof: *DefiniteStoreProof, token: Ast.TokenIndex, path: []const u8, value: DefiniteStoreValue) bool {
+        fn findStoreField(proof: *const DefiniteStoreProof, name: []const u8, path: []const u8) ?DefiniteStoreValue {
+            const fact = proof.findStoreFieldFact(name, path) orelse return null;
+            return fact.value;
+        }
+
+        fn setStoreField(proof: *DefiniteStoreProof, token: Ast.TokenIndex, path: []const u8, value: DefiniteStoreValue, dependencies: WrittenDependencies) bool {
             const binding = proof.findIndex(proof.tree.tokenSlice(token)) orelse return false;
+            proof.bindings[binding].aggregate_source = null;
             const root = proof.bindings[binding].token;
+            proof.bindings[binding].literal_undefined = false;
+            proof.bindings[binding].literal_may_undefined = false;
+            proof.bindings[binding].value_nonidentity = true;
             for (proof.field_facts[0..proof.field_fact_count]) |*fact| {
                 if (fact.token == root and std.mem.eql(u8, fact.path, path)) {
                     fact.value = value;
+                    fact.written_dependencies = dependencies;
+                    fact.fallback_recipe = false;
+                    fact.fallback_literal_may = false;
                     return true;
                 }
             }
             if (proof.field_fact_count == proof.field_facts.len) return false;
-            proof.field_facts[proof.field_fact_count] = .{ .token = root, .path = path, .value = value };
+            proof.field_facts[proof.field_fact_count] = .{ .token = root, .path = path, .value = value, .written_dependencies = dependencies };
             proof.field_fact_count += 1;
             return true;
         }
 
+        fn weakenLiteralStoreBinding(proof: *DefiniteStoreProof, index: usize) void {
+            const binding = &proof.bindings[index];
+            if (index < proof.parameter_count or binding.token == 0 or
+                proof.tree.tokenTag(binding.token - 1) != .keyword_var) return;
+            binding.literal_may_undefined = binding.literal_may_undefined or binding.literal_undefined;
+            binding.literal_undefined = false;
+        }
+
         fn invalidateStoreFields(proof: *DefiniteStoreProof, name: []const u8) void {
             const binding = proof.findIndex(name) orelse return;
+            proof.bindings[binding].aggregate_source = null;
+            proof.weakenLiteralStoreBinding(binding);
             const token = proof.bindings[binding].token;
             for (proof.field_facts[0..proof.field_fact_count]) |*fact| {
-                if (fact.token == token) fact.value = .unknown;
+                if (fact.token == token) {
+                    fact.value = .unknown;
+                    fact.written_dependencies = .{};
+                    fact.fallback_recipe = false;
+                    fact.fallback_literal_may = false;
+                }
             }
         }
 
         fn invalidateAllStoreFields(proof: *DefiniteStoreProof) void {
-            for (proof.field_facts[0..proof.field_fact_count]) |*fact| fact.value = .unknown;
+            for (proof.bindings[0..proof.binding_count], 0..) |*binding, index| {
+                binding.aggregate_source = null;
+                proof.weakenLiteralStoreBinding(index);
+            }
+            for (proof.field_facts[0..proof.field_fact_count]) |*fact| {
+                fact.value = .unknown;
+                fact.written_dependencies = .{};
+                fact.fallback_recipe = false;
+                fact.fallback_literal_may = false;
+            }
         }
 
         fn formalName(proof: *const DefiniteStoreProof, name: []const u8) []const u8 {
@@ -4091,6 +7031,17 @@ pub const FileCache = struct {
                 if (proof.bindings[index].formal_alias) |token| return proof.tree.tokenSlice(token);
             }
             return name;
+        }
+
+        fn findStorePointeeEntry(
+            proof: *const DefiniteStoreProof,
+            name: []const u8,
+        ) ?*const @TypeOf(proof.pointees[0]) {
+            const formal = proof.formalName(name);
+            for (proof.pointees[0..proof.pointee_count]) |*entry| {
+                if (std.mem.eql(u8, proof.tree.tokenSlice(entry.token), formal)) return entry;
+            }
+            return null;
         }
 
         fn findStorePointee(proof: *const DefiniteStoreProof, name: []const u8) ?DefiniteStoreValue {
@@ -4116,6 +7067,7 @@ pub const FileCache = struct {
             for (proof.pointees[0..proof.pointee_count]) |*pointee| {
                 if (std.mem.eql(u8, proof.tree.tokenSlice(pointee.token), name)) {
                     pointee.value = value;
+                    pointee.computed = null;
                     return true;
                 }
             }
@@ -4126,7 +7078,20 @@ pub const FileCache = struct {
         }
 
         fn invalidateStorePointees(proof: *DefiniteStoreProof) void {
-            for (proof.pointees[0..proof.pointee_count]) |*pointee| pointee.value = .unknown;
+            // Revoke identity even in physical mode, before its early return.
+            for (proof.bindings[0..proof.binding_count]) |*binding| binding.aggregate_source = null;
+            if (proof.out_coverage) |coverage| {
+                if (coverage.whole_source != null) coverage.whole_source = .{};
+            }
+            for (proof.pointees[0..proof.pointee_count]) |*pointee| {
+                pointee.value = .unknown;
+                if (pointee.computed) |*state| {
+                    // An uncertain effect may replace the bytes, but cannot erase
+                    // the prior negative alternative or grant a positive identity.
+                    state.original = .{};
+                    state.base.opaque_alternative = true;
+                }
+            }
             if (proof.written_inputs != null) return;
             if (proof.out_coverage) |coverage| {
                 coverage.complete = false;
@@ -4137,9 +7102,17 @@ pub const FileCache = struct {
         fn bind(proof: *DefiniteStoreProof, token: Ast.TokenIndex, value: DefiniteStoreValue) bool {
             if (proof.binding_count == proof.bindings.len) return false;
             for (proof.field_facts[0..proof.field_fact_count]) |*fact| {
-                if (fact.token == token) fact.value = .unknown;
+                if (fact.token == token) {
+                    fact.value = .unknown;
+                    fact.written_dependencies = .{};
+                    fact.fallback_recipe = false;
+                    fact.fallback_literal_may = false;
+                }
             }
-            proof.bindings[proof.binding_count] = .{ .token = token, .value = value };
+            proof.bindings[proof.binding_count] = .{
+                .token = token, .value = value,
+                .written_dependencies = proof.written_dependencies,
+            };
             proof.binding_count += 1;
             return true;
         }
@@ -4174,7 +7147,7 @@ pub const FileCache = struct {
     ) SummaryError!?DefiniteStoreProof {
         const tree = self.tree;
         const resolver = self.zls orelse return null;
-        const declaration = tokens.enclosingFnDecl(tree, tree.nodeMainToken(call_node)) orelse return null;
+        const declaration = self.enclosingFunctionAt(tree, tree.nodeMainToken(call_node)) orelse return null;
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return null;
         const body = tokens.bodyOf(tree, declaration) orelse return null;
@@ -4182,6 +7155,7 @@ pub const FileCache = struct {
             .tree = tree,
             .frame = caller_frame orelse resolver.resolutionFrame(),
             .call_node = call_node,
+            .call_tree = self.tree,
         };
         var parameters = proto.iterate(tree);
         while (parameters.next()) |parameter| {
@@ -4218,16 +7192,22 @@ pub const FileCache = struct {
             if (tree.firstToken(statement) > horizon) return null;
             if (tree.fullVarDecl(statement)) |variable| {
                 const value = variable.ast.init_node.unwrap() orelse return null;
+                const literal_undefined = try self.literalStoreUndefined(&proof, value, 0);
+                const literal_may_undefined = literal_undefined or try self.literalStoreMayUndefined(&proof, value, 0);
                 const verdict = try self.definiteStoreValue(&proof, value, 0);
                 if (verdict == .unknown) {
-                    for (proof.bindings[proof.parameter_count..proof.binding_count]) |*binding| {
+                    for (proof.bindings[proof.parameter_count..proof.binding_count], proof.parameter_count..) |*binding, index| {
                         binding.value = .undefined_value;
                         binding.complete_value = false;
+                        proof.weakenLiteralStoreBinding(index);
+                        binding.written_dependencies = .{};
                     }
                     proof.invalidateAllStoreFields();
                     proof.invalidateStorePointees();
                 }
                 if (!proof.bind(variable.ast.mut_token + 1, verdict)) return null;
+                proof.bindings[proof.binding_count - 1].literal_undefined = literal_undefined;
+                proof.bindings[proof.binding_count - 1].literal_may_undefined = literal_may_undefined;
                 proof.bindings[proof.binding_count - 1].complete_value =
                     verdict == .defined and try definiteStoreKind(&proof, value) == .aggregate;
                 continue;
@@ -4266,12 +7246,16 @@ pub const FileCache = struct {
             }
             if (tree.nodeTag(statement) == .assign) {
                 const lhs, const rhs = tree.nodeData(statement).node_and_node;
+                const literal_undefined = try self.literalStoreUndefined(&proof, rhs, 0);
+                const literal_may_undefined = literal_undefined or try self.literalStoreMayUndefined(&proof, rhs, 0);
                 const verdict = try self.definiteStoreValue(&proof, rhs, 0);
                 if (tree.nodeTag(lhs) == .identifier and verdict != .unknown) {
                     if (proof.find(tree.tokenSlice(tree.nodeMainToken(lhs)))) |binding| {
                         proof.invalidateStoreFields(tree.tokenSlice(tree.nodeMainToken(lhs)));
                         binding.value = verdict;
                         binding.complete_value = false;
+                        binding.literal_undefined = literal_undefined;
+                        binding.literal_may_undefined = literal_may_undefined;
                         continue;
                     }
                 }
@@ -4290,9 +7274,11 @@ pub const FileCache = struct {
                 if (builtin != null and builtin.?.tag == .set_float_mode and arguments.len == 1 and
                     tree.nodeTag(arguments[0]) == .enum_literal) continue;
             }
-            for (proof.bindings[proof.parameter_count..proof.binding_count]) |*binding| {
+            for (proof.bindings[proof.parameter_count..proof.binding_count], proof.parameter_count..) |*binding, index| {
                 binding.value = .undefined_value;
                 binding.complete_value = false;
+                proof.weakenLiteralStoreBinding(index);
+                binding.written_dependencies = .{};
             }
             proof.invalidateAllStoreFields();
             proof.invalidateStorePointees();
@@ -4302,23 +7288,32 @@ pub const FileCache = struct {
     }
 
     fn definiteStoreEscapes(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!void {
-        try self.chargeNormalCleanup(proof.call_node);
-        if (depth == 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth == 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         if (proof.tree.nodeTag(node) == .address_of) {
             if (tokens.rootIdentifier(proof.tree, proof.tree.nodeData(node).node)) |root| {
                 const name = proof.tree.tokenSlice(proof.tree.nodeMainToken(root));
+                const prior_source = if (proof.find(name)) |binding| binding.aggregate_source else null;
                 proof.invalidateStoreFields(name);
                 if (proof.find(name)) |binding| {
                     binding.value = .undefined_value;
                     binding.complete_value = false;
                     binding.formal_alias = null;
+                    binding.written_dependencies = .{};
+                    const raw = if (proof.computed_templates != null) try proof.frame.typeOfNode(root) else null;
+                    const ty = if (raw) |actual| try proof.frame.resolver.normalizedType(actual) else null;
+                    if (ty != null and proof.frame.resolver.typeTag(ty.?) == .array) {
+                        // An opaque call may write; it cannot erase prior poison.
+                        binding.aggregate_source = prior_source;
+                        binding.computed_opaque_alternative = true;
+                    }
                 }
             }
         }
         var children = engine.AstIterator.init(proof.tree, node);
         while (children.next(proof.tree)) |child| try self.definiteStoreEscapes(proof, child, depth + 1);
     }
-    fn setStoreFieldNode(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index, value: DefiniteStoreValue) SummaryError!bool {
+    fn setStoreFieldNode(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index, value: DefiniteStoreValue, dependencies: WrittenDependencies) SummaryError!bool {
         const root = tokens.rootIdentifier(proof.tree, node) orelse return false;
         const token = proof.tree.nodeMainToken(root);
         const name = proof.tree.tokenSlice(token);
@@ -4330,9 +7325,73 @@ pub const FileCache = struct {
         var fields: [128][]const u8 = undefined;
         var defaults: [128]?Ast.Node.Index = @splat(null);
         var coverage: StoreCoverage = .{ .pointee = ty };
-        if (!try self.storeCoverageFields(ty, &fields, &defaults, &coverage, proof.call_node)) return false;
+        if (!try self.storeCoverageFields(ty, &fields, &defaults, &coverage, proof.call_tree, proof.call_node)) return false;
         const index = (try storeFieldIndex(proof, name, fields[0..coverage.field_count], node)) orelse return false;
-        return proof.setStoreField(token, fields[index], value);
+        return proof.setStoreField(token, fields[index], value, dependencies);
+    }
+
+    /// A C scalar store changes one authenticated local array element, never its extent.
+    fn localCElementCallEffect(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        canonical: ActualCallSummary,
+        state: *?DefiniteStoreProof,
+        parameter: u32,
+        pointer: TypeResolver.ActualType,
+        actual: Ast.Node.Index,
+        chain: []const StoreVisit,
+    ) SummaryError!?bool {
+        if (proof.written_inputs == null or proof.computed_templates == null or
+            proof.frame.resolver.pointerSize(pointer) != .c) return null;
+        const tree = proof.tree;
+        var root = actual;
+        var index: u64 = 0;
+        if (tree.nodeTag(actual) == .address_of) {
+            root = tree.nodeData(actual).node;
+        } else if (tree.fullSlice(actual)) |slice| {
+            root = slice.ast.sliced;
+            index = (try definiteStoreInteger(proof, slice.ast.start)) orelse return null;
+            if (slice.ast.end.unwrap()) |end| {
+                const stop = (try definiteStoreInteger(proof, end)) orelse return null;
+                if (index >= stop) return null;
+            }
+        } else return null;
+        if (tree.nodeTag(root) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(root));
+        const binding = proof.find(name) orelse return null;
+        if (binding.formal_alias != null) return null;
+        const raw = (try proof.frame.typeOfNode(root)) orelse return null;
+        const array = (try proof.frame.resolver.normalizedType(raw)) orelse return null;
+        if (proof.frame.resolver.typeTag(array) != .array) return null;
+        const extent = (try definiteStoreArrayCount(proof, root)) orelse return null;
+        if (index >= extent) return null;
+        const element_raw = proof.frame.resolver.childType(array) orelse return null;
+        const element = (try proof.frame.resolver.normalizedType(element_raw)) orelse return null;
+        const pointee_raw = proof.frame.resolver.childType(pointer) orelse return null;
+        const pointee = (try proof.frame.resolver.normalizedType(pointee_raw)) orelse return null;
+        if (!element.eql(pointee)) return null;
+        const stored = (try self.parameterStoreCoverage(
+            canonical, canonical.callee.call_node, parameter, state, chain, null, null, null, null, null, true,
+        )) orelse return false;
+        if (!stored.complete) return false;
+        const source = try self.computedPointeeReadSource(proof, root, "", element, computedCoverageBase(&stored), false);
+        const base: ComputedStoreBase = .{
+            .source = binding.aggregate_source,
+            .computations = binding.computed_sources,
+            .original_alternative = binding.computed_original_alternative,
+            .opaque_alternative = binding.computed_opaque_alternative,
+        };
+        const handle = appendComputedStoreWrite(proof, base, .{
+            .path = "", .array_index = index, .source = source,
+        }) orelse return false;
+        binding.aggregate_source = null;
+        binding.computed_sources = handle;
+        binding.computed_original_alternative = false;
+        binding.computed_opaque_alternative = false;
+        binding.literal_undefined = false;
+        binding.literal_may_undefined = false;
+        binding.value_nonidentity = true;
+        return true;
     }
 
     /// Apply only callee-certified stores to exact caller places. A partial
@@ -4344,8 +7403,8 @@ pub const FileCache = struct {
         state: *?DefiniteStoreProof,
         depth: u32,
     ) SummaryError!bool {
-        try self.chargeNormalCleanup(proof.call_node);
-        if (depth >= 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         const resolver = proof.frame.resolver;
         const formals = canonical.callee.reference.actual_type.data.function.parameters;
         const tree = canonical.callee.tree;
@@ -4356,12 +7415,21 @@ pub const FileCache = struct {
             if (resolver.pointerSize(ty) == null) continue;
             const parameter: u32 = @intCast(raw);
             const actual = (try canonical.callArgumentFor(self, &buffer, parameter)) orelse return false;
+            if (try self.localCElementCallEffect(proof, canonical, state, parameter, ty, actual, &chain)) |applied| {
+                if (!applied) {
+                    try self.definiteStoreEscapes(proof, actual, 0);
+                    return false;
+                }
+                continue;
+            }
             const addressed = proof.tree.nodeTag(actual) == .address_of;
             const operand = if (addressed) proof.tree.nodeData(actual).node else actual;
             const root = tokens.rootIdentifier(proof.tree, operand) orelse return false;
             const token = proof.tree.nodeMainToken(root);
             const name = proof.tree.tokenSlice(token);
-            const coverage = (try self.definiteParameterStore(canonical, proof.call_node, parameter, state, &chain)) orelse {
+            // This proof keeps the outer diagnostic site. The nested store
+            // must instead enter with its actual caller document's call node.
+            const coverage = (try self.definiteParameterStore(canonical, canonical.callee.call_node, parameter, state, &chain)) orelse {
                 try self.definiteStoreEscapes(proof, actual, 0);
                 return false;
             };
@@ -4370,11 +7438,13 @@ pub const FileCache = struct {
                 const binding = proof.find(name) orelse continue;
                 binding.value = if (coverage.complete) .defined else .undefined_value;
                 binding.complete_value = coverage.complete;
-                for (coverage.field_names[0..coverage.field_count], coverage.covered[0..coverage.field_count]) |path, written| {
-                    if (written and !proof.setStoreField(token, path, .defined)) return false;
+                if (coverage.complete) binding.written_dependencies = coverage.whole_dependencies;
+                for (coverage.field_names[0..coverage.field_count], coverage.covered[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |path, written, dependencies| {
+                    if (written and !proof.setStoreField(token, path, .defined, dependencies)) return false;
                 }
+                binding.aggregate_source = if (coverage.complete) coverage.whole_source else null;
             } else if (addressed and proof.tree.nodeTag(operand) == .field_access) {
-                if (coverage.complete and !try self.setStoreFieldNode(proof, operand, .defined)) return false;
+                if (coverage.complete and !try self.setStoreFieldNode(proof, operand, .defined, coverage.whole_dependencies)) return false;
             } else if (!addressed and proof.tree.nodeTag(operand) == .identifier) {
                 const prior = proof.findStorePointee(name);
                 if (coverage.complete or (prior orelse .unknown) == .defined) {
@@ -4419,7 +7489,17 @@ pub const FileCache = struct {
             else => .unresolved,
         };
     }
-    /// Evaluate a resolved scalar-return body in its caller's lexical state.
+    fn definiteStoreCallReturnAllowed(proof: *const DefiniteStoreProof, node: Ast.Node.Index) SummaryError!bool {
+        if (try definiteStoreKind(proof, node) == .scalar) return true;
+        // The strict scalar proof still declines aggregate returns. Physical
+        // transport can retain an optional's existing immutable result recipe.
+        if (proof.written_inputs == null or proof.computed_templates == null) return false;
+        const ty = (try proof.frame.typeOfNode(node)) orelse return false;
+        const normalized = (try proof.frame.resolver.normalizedType(ty)) orelse return false;
+        return proof.frame.resolver.typeTag(normalized) == .optional;
+    }
+
+    /// Evaluate a resolved scalar or physical optional-return body in its caller's lexical state.
     /// Calls with unsupported effects never preserve local dependency facts.
     fn definiteStoreCallValue(
         self: *FileCache,
@@ -4428,8 +7508,8 @@ pub const FileCache = struct {
         depth: u32,
         selected_success: bool,
     ) SummaryError!DefiniteStoreValue {
-        try self.chargeNormalCleanup(proof.call_node);
-        if (depth >= 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         const declaring = if (proof.canonical) |canonical|
             (try canonical.declaringCache(self)) orelse return .unknown
         else
@@ -4460,21 +7540,42 @@ pub const FileCache = struct {
             .caller = &state,
             .caller_cache = declaring,
             .call_node = proof.call_node,
+            .call_tree = proof.call_tree,
+            .written_inputs = proof.written_inputs,
+            .written_reads = proof.written_reads,
+            .written_dependencies_complete = proof.written_dependencies_complete,
+            .computed_templates = proof.computed_templates,
+            .identity_inputs = proof.identity_inputs,
+            .identity_tree = proof.identity_tree,
         };
         var parameters = proto.iterate(tree);
         var parameter_index: u32 = 0;
         while (parameters.next()) |parameter| : (parameter_index += 1) {
             const token = parameter.name_token orelse continue;
             const actual = (try canonical.callArgumentFor(declaring, &buffer, parameter_index)) orelse return .unknown;
-            const verdict = try declaring.definiteStoreValue(&state.?, actual, depth + 1);
+            const aggregate_source = try declaring.wholeStoreSource(&state.?, actual, depth + 1);
+            callee.written_dependencies = .{};
+            const literal_undefined = proof.computed_templates != null and
+                try declaring.literalStoreUndefined(&state.?, actual, depth + 1);
+            const literal_may_undefined = literal_undefined or (proof.computed_templates != null and
+                try declaring.literalStoreMayUndefined(&state.?, actual, depth + 1));
+            const verdict = try self.definiteCallerStoreValue(&callee, declaring, &state.?, actual, depth + 1);
             if (verdict == .unknown or !callee.bind(token, verdict)) return .unknown;
+            callee.bindings[callee.binding_count - 1].literal_undefined = literal_undefined;
+            callee.bindings[callee.binding_count - 1].literal_may_undefined = literal_may_undefined;
+            callee.bindings[callee.binding_count - 1].aggregate_source = aggregate_source;
         }
         callee.parameter_count = callee.binding_count;
         const body = tokens.bodyOf(tree, canonical.callee.declaration) orelse return .unknown;
         var result: DefiniteStoreValue = .defined;
+        var result_dependencies: WrittenDependencies = .{};
+        var result_literal_all = true;
+        var result_literal_may = false;
+        var result_computed: ComputedStoreState = .{};
+        var result_value_seen = false;
         var statements = engine.AstIterator.init(tree, body);
         while (statements.next(tree)) |statement| {
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             if (tree.fullIf(statement)) |branch| {
                 if (branch.payload_token != null or branch.error_token != null or
                     branch.ast.else_expr != .none or tree.nodeTag(branch.ast.then_expr) != .@"return") return .unknown;
@@ -4492,9 +7593,20 @@ pub const FileCache = struct {
                     if (condition == true) return .unknown;
                     continue;
                 }
-                if (try definiteStoreKind(&callee, value) != .scalar) return .unknown;
+                if (!try definiteStoreCallReturnAllowed(&callee, value)) return .unknown;
                 var returned_state = callee;
-                const verdict = try declaring.definiteStoreValue(&returned_state, value, depth + 1);
+                returned_state.written_dependencies = .{};
+                const evaluated = try declaring.definiteStoreValueWithComputed(&returned_state, value, depth + 1);
+                const verdict = evaluated.value;
+                result_literal_all = result_literal_all and evaluated.literal_undefined;
+                result_literal_may = result_literal_may or evaluated.literal_may_undefined;
+                var returned_computed = evaluated.computed;
+                if (returned_computed.source == null and returned_computed.computations == 0 and
+                    !returned_computed.original_alternative and !returned_computed.opaque_alternative)
+                    returned_computed.opaque_alternative = true;
+                if (result_value_seen) result_computed.merge(returned_computed) else result_computed = returned_computed;
+                result_value_seen = true;
+                result_dependencies.merge(returned_state.written_dependencies);
                 if (verdict == .unknown) return .unknown;
                 if (verdict != .defined) result = .undefined_value;
                 if (condition == true) break;
@@ -4503,8 +7615,19 @@ pub const FileCache = struct {
             if (tree.nodeTag(statement) == .@"return") {
                 if (tree.nodeData(statement).opt_node.unwrap()) |value| {
                     if (tree.nodeTag(value) == .error_value or
-                        try definiteStoreKind(&callee, value) != .scalar) return .unknown;
-                    const verdict = try declaring.definiteStoreValue(&callee, value, depth + 1);
+                        !try definiteStoreCallReturnAllowed(&callee, value)) return .unknown;
+                    callee.written_dependencies = .{};
+                    const evaluated = try declaring.definiteStoreValueWithComputed(&callee, value, depth + 1);
+                    const verdict = evaluated.value;
+                    result_literal_all = result_literal_all and evaluated.literal_undefined;
+                    result_literal_may = result_literal_may or evaluated.literal_may_undefined;
+                    var returned_computed = evaluated.computed;
+                    if (returned_computed.source == null and returned_computed.computations == 0 and
+                        !returned_computed.original_alternative and !returned_computed.opaque_alternative)
+                        returned_computed.opaque_alternative = true;
+                    if (result_value_seen) result_computed.merge(returned_computed) else result_computed = returned_computed;
+                    result_value_seen = true;
+                    result_dependencies.merge(callee.written_dependencies);
                     if (verdict == .unknown) return .unknown;
                     if (verdict != .defined) result = .undefined_value;
                 }
@@ -4512,8 +7635,17 @@ pub const FileCache = struct {
             }
             if (tree.fullVarDecl(statement)) |variable| {
                 const value = variable.ast.init_node.unwrap() orelse return .unknown;
-                const verdict = try declaring.definiteStoreValue(&callee, value, depth + 1);
+                callee.written_dependencies = .{};
+                const evaluated = try declaring.definiteStoreValueWithComputed(&callee, value, depth + 1);
+                const verdict = evaluated.value;
                 if (verdict == .unknown or !callee.bind(variable.ast.mut_token + 1, verdict)) return .unknown;
+                callee.bindings[callee.binding_count - 1].literal_undefined = evaluated.literal_undefined;
+                callee.bindings[callee.binding_count - 1].literal_may_undefined = evaluated.literal_may_undefined;
+                callee.bindings[callee.binding_count - 1].aggregate_source = evaluated.computed.source;
+                callee.bindings[callee.binding_count - 1].computed_sources = evaluated.computed.computations;
+                callee.bindings[callee.binding_count - 1].computed_original_alternative = evaluated.computed.original_alternative;
+                callee.bindings[callee.binding_count - 1].computed_opaque_alternative = evaluated.computed.opaque_alternative;
+                callee.bindings[callee.binding_count - 1].value_nonidentity = evaluated.computed.value_nonidentity;
                 callee.bindings[callee.binding_count - 1].complete_value =
                     verdict == .defined and try definiteStoreKind(&callee, value) == .aggregate;
                 if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
@@ -4532,7 +7664,9 @@ pub const FileCache = struct {
             }
             if (tree.nodeTag(statement) == .assign) {
                 const lhs, const rhs = tree.nodeData(statement).node_and_node;
-                const verdict = try declaring.definiteStoreValue(&callee, rhs, depth + 1);
+                callee.written_dependencies = .{};
+                const evaluated = try declaring.definiteStoreValueWithComputed(&callee, rhs, depth + 1);
+                const verdict = evaluated.value;
                 if (verdict == .unknown) return .unknown;
                 if (tree.nodeTag(lhs) == .identifier) {
                     const name = tree.tokenSlice(tree.nodeMainToken(lhs));
@@ -4541,6 +7675,14 @@ pub const FileCache = struct {
                     callee.invalidateStoreFields(name);
                     binding.complete_value = false;
                     binding.value = verdict;
+                    binding.written_dependencies = callee.written_dependencies;
+                    binding.literal_undefined = evaluated.literal_undefined;
+                    binding.literal_may_undefined = evaluated.literal_may_undefined;
+                    binding.aggregate_source = evaluated.computed.source;
+                    binding.computed_sources = evaluated.computed.computations;
+                    binding.computed_original_alternative = evaluated.computed.original_alternative;
+                    binding.computed_opaque_alternative = evaluated.computed.opaque_alternative;
+                    binding.value_nonidentity = evaluated.computed.value_nonidentity;
                     continue;
                 }
                 // Only an explicit formal's inline fields or pointee may be
@@ -4549,7 +7691,7 @@ pub const FileCache = struct {
                     const root = tokens.rootIdentifier(tree, lhs) orelse return .unknown;
                     const index = callee.findIndex(tree.tokenSlice(tree.nodeMainToken(root))) orelse return .unknown;
                     if (index >= callee.parameter_count or verdict != .defined or
-                        !try declaring.setStoreFieldNode(&callee, lhs, verdict)) return .unknown;
+                        !try declaring.setStoreFieldNode(&callee, lhs, verdict, callee.written_dependencies)) return .unknown;
                     continue;
                 }
                 if (tree.nodeTag(lhs) != .deref) return .unknown;
@@ -4572,8 +7714,43 @@ pub const FileCache = struct {
         // Argument evaluation can mutate caller locals too. Preserve its exact
         // post-evaluation facts before applying the callee's own stores.
         proof.* = state.?;
+        proof.written_dependencies.merge(result_dependencies);
         if (!try declaring.definiteStoreCallEffects(proof, canonical, &state, depth)) return .unknown;
+        proof.computed_result = result_computed;
+        proof.computed_result.literal_undefined = result_value_seen and result_literal_all;
+        proof.computed_result.literal_may_undefined = result_literal_may;
         return result;
+    }
+
+    fn originatingWrittenArgument(
+        self: *FileCache,
+        proof: *const DefiniteStoreProof,
+        node: Ast.Node.Index,
+        depth: u32,
+    ) SummaryError!?Ast.Node.Index {
+        if (depth >= 64) return null;
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        var selected = node;
+        if (proof.tree.nodeTag(selected) == .address_of) selected = proof.tree.nodeData(selected).node;
+        if (proof.tree.nodeTag(selected) != .identifier) return null;
+        const name = proof.formalName(proof.tree.tokenSlice(proof.tree.nodeMainToken(selected)));
+        const canonical = proof.canonical orelse return null;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(proof.tree, &proto_buffer, canonical.callee.declaration) orelse return null;
+        var parameters = proto.iterate(proof.tree);
+        var index: u32 = 0;
+        while (parameters.next()) |parameter| : (index += 1) {
+            const token = parameter.name_token orelse continue;
+            if (!std.mem.eql(u8, proof.tree.tokenSlice(token), name)) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const caller_cache = proof.caller_cache orelse self;
+            const argument = (try canonical.callArgumentFor(caller_cache, &buffer, index)) orelse return null;
+            if (proof.written_input_boundary) return argument;
+            const caller_slot = proof.caller orelse return null;
+            const caller = if (caller_slot.*) |*state| state else return null;
+            return caller_cache.originatingWrittenArgument(caller, argument, depth + 1);
+        }
+        return null;
     }
 
     fn definiteStoreDeref(
@@ -4582,11 +7759,20 @@ pub const FileCache = struct {
         base: Ast.Node.Index,
         depth: u32,
     ) SummaryError!DefiniteStoreValue {
-        try self.chargeNormalCleanup(proof.call_node);
-        if (depth >= 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         const tree = proof.tree;
         if (tree.nodeTag(base) != .identifier) return .unknown;
         const name = proof.formalName(tree.tokenSlice(tree.nodeMainToken(base)));
+        if (proof.collect_written_inputs) if (proof.out_name) |output| {
+            if (std.mem.eql(u8, name, output)) if (proof.out_coverage) |coverage| {
+                if (coverage.complete) {
+                    proof.written_dependencies.merge(coverage.whole_dependencies);
+                } else if (proof.written_reads != null) {
+                    _ = try self.definiteStoreValueInner(proof, base, depth + 1);
+                }
+            };
+        };
         if (proof.findStorePointee(name)) |value| return value;
         if (proof.out_name) |output| {
             if (std.mem.eql(u8, name, output)) {
@@ -4606,13 +7792,15 @@ pub const FileCache = struct {
                 const caller_cache = proof.caller_cache orelse self;
                 const argument = (try canonical.callArgumentFor(caller_cache, &buffer, index)) orelse return .unknown;
                 if (proof.written_reads != null) {
-                    return if (proof.recordWrittenRead(argument)) .defined else .unknown;
+                    const origin = try self.originatingWrittenArgument(proof, base, depth + 1);
+                    if (origin) |actual|
+                        return if (try proof.recordWrittenRead(actual)) .defined else .unknown;
                 }
                 const caller = proof.caller orelse return .unknown;
                 if (caller.* == null) caller.* = try caller_cache.definiteStoreCaller(proof.call_node, canonical.callee.caller_frame);
                 const state = if (caller.*) |*value| value else return .undefined_value;
                 if (state.tree.nodeTag(argument) == .address_of)
-                    return caller_cache.definiteStoreValue(state, state.tree.nodeData(argument).node, depth + 1);
+                    return self.definiteCallerStoreValue(proof, caller_cache, state, state.tree.nodeData(argument).node, depth + 1);
                 if (index == 0 and canonical.argument_offset == 1) {
                     const actual_type = (try state.frame.typeOfNode(argument)) orelse return .unknown;
                     const actual = (try state.frame.resolver.normalizedType(actual_type)) orelse return .unknown;
@@ -4643,8 +7831,8 @@ pub const FileCache = struct {
         base: Ast.Node.Index,
         depth: u32,
     ) SummaryError!DefiniteStoreValue {
-        try self.chargeNormalCleanup(proof.call_node);
-        if (depth >= 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         if (proof.overflowTupleBinding(base) != null)
             return self.definiteStoreValue(proof, base, depth + 1);
         const ty = (try proof.frame.typeOfNode(base)) orelse return .unknown;
@@ -4673,7 +7861,7 @@ pub const FileCache = struct {
         node: Ast.Node.Index,
         depth: u32,
     ) SummaryError!DefiniteStoreValue {
-        try self.chargeNormalCleanup(proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
         const tree = proof.tree;
         const resolver = proof.frame.resolver;
         var buffer: [2]Ast.Node.Index = undefined;
@@ -4692,13 +7880,14 @@ pub const FileCache = struct {
             actual = (try resolver.normalizedType(actual)) orelse return .unknown;
             const tag = resolver.typeTag(actual) orelse return .unknown;
             if (tag != .optional and tag != .error_union) break;
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             type_depth += 1;
-            if (type_depth == 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+            if (type_depth == 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
             actual = resolver.childType(actual) orelse return .unknown;
         }
         const tag = resolver.typeTag(actual) orelse return .unknown;
         if (tag != .array and tag != .@"struct") return .unknown;
+        var array_extent: ?u64 = null;
         if (tag == .array) {
             const count: u64 = switch (actual.data) {
                 .array => |info| blk: {
@@ -4715,17 +7904,58 @@ pub const FileCache = struct {
                 else => return .unknown,
             };
             if (count != values.len) return .unknown;
+            array_extent = count;
         } else if (structure == null or actual.data != .container) return .unknown;
 
-        // Evaluate explicit payloads once, in source order, before defaults.
-        // An undefined payload cannot hide a later unknown effect.
+        // Evaluate explicit payloads once, in source order. The physical
+        // recipe borrows only the resulting source/dependency facts.
+        const collect_recipe = proof.computed_templates != null and values.len <= 128;
+        if (proof.computed_templates != null and values.len > 128) {
+            proof.computed_templates.?.overflow = true;
+            proof.computed_result = .{ .opaque_alternative = true, .value_nonidentity = true };
+        }
+        var evaluated_values: [128]DefiniteStoreResult = undefined;
+        var value_dependencies: [128]WrittenDependencies = undefined;
         var result: DefiniteStoreValue = .defined;
-        for (values) |value| {
-            const verdict = try self.definiteStoreValue(proof, value, depth + 1);
+        for (values, 0..) |value, index| {
+            var verdict: DefiniteStoreValue = undefined;
+            if (collect_recipe) {
+                const saved_dependencies = proof.written_dependencies;
+                proof.written_dependencies = .{};
+                const evaluated = try self.definiteStoreValueWithComputed(proof, value, depth + 1);
+                const dependencies = proof.written_dependencies;
+                proof.written_dependencies = saved_dependencies;
+                proof.written_dependencies.merge(dependencies);
+                evaluated_values[index] = evaluated;
+                value_dependencies[index] = dependencies;
+                verdict = evaluated.value;
+            } else {
+                verdict = try self.definiteStoreValue(proof, value, depth + 1);
+            }
             if (verdict == .unknown) return .unknown;
             if (verdict == .undefined_value) result = .undefined_value;
         }
-        if (tag == .array) return result;
+        if (tag == .array) {
+            if (collect_recipe) {
+                var writes: [128]ComputedStoreWrite = undefined;
+                var write_count: usize = 0;
+                for (values, 0..) |value, index| {
+                    const component = try self.computedStoreWriteForValue(
+                        proof,
+                        "",
+                        value,
+                        evaluated_values[index],
+                        value_dependencies[index],
+                        true,
+                        array_extent,
+                        @intCast(index),
+                    );
+                    if (!appendComputedComponent(proof, tree.nodeMainToken(node), &writes, &write_count, component, evaluated_values[index].computed)) break;
+                }
+                setComputedStoreConstructor(proof, node, writes[0..write_count], true, array_extent);
+            }
+            return result;
+        }
 
         const frame = resolver.frameForContainer(actual.data.container);
         const owner_tree = &frame.handle.document.tree;
@@ -4733,9 +7963,11 @@ pub const FileCache = struct {
         const declaration = owner_tree.fullContainerDecl(&declaration_buffer, actual.data.container.scope_handle.toNode()) orelse return .unknown;
         if (values.len > proof.bindings.len) return .unknown;
         var supplied: [128]bool = @splat(false);
+        var writes: [128]ComputedStoreWrite = undefined;
+        var write_count: usize = 0;
         var field_count: usize = 0;
         for (declaration.ast.members) |member| {
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             const field = owner_tree.fullContainerField(member) orelse continue;
             if (field.ast.tuple_like or field_count == supplied.len) return .unknown;
             field_count += 1;
@@ -4743,31 +7975,69 @@ pub const FileCache = struct {
             const field_type = (try frame.typeOfNode(field_type_node)) orelse return .unknown;
             _ = (try resolver.normalizedType(field_type)) orelse return .unknown;
             const name = owner_tree.tokenSlice(field.ast.main_token);
-            var explicit = false;
+            var explicit_index: ?usize = null;
             for (values, 0..) |value, index| {
-                try self.chargeNormalCleanup(proof.call_node);
+                try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
                 const first = tree.firstToken(value);
                 if (first < 3 or tree.tokenTag(first - 1) != .equal or
                     tree.tokenTag(first - 2) != .identifier or tree.tokenTag(first - 3) != .period or
                     !std.mem.eql(u8, tree.tokenSlice(first - 2), name)) continue;
-                if (explicit or supplied[index]) return .unknown;
+                if (explicit_index != null or supplied[index]) return .unknown;
                 supplied[index] = true;
-                explicit = true;
+                explicit_index = index;
             }
-            if (explicit) continue;
+            if (explicit_index) |index| {
+                if (collect_recipe) {
+                    const component = try self.computedStoreWriteForValue(
+                        proof,
+                        name,
+                        values[index],
+                        evaluated_values[index],
+                        value_dependencies[index],
+                        false,
+                        null,
+                        null,
+                    );
+                    _ = appendComputedComponent(proof, tree.nodeMainToken(node), &writes, &write_count, component, evaluated_values[index].computed);
+                }
+                continue;
+            }
             const default = field.ast.value_expr.unwrap() orelse return .unknown;
             var default_proof: DefiniteStoreProof = .{
                 .tree = owner_tree,
                 .frame = frame,
                 .call_node = proof.call_node,
+                .call_tree = proof.call_tree,
+                .computed_templates = proof.computed_templates,
             };
-            const verdict = try self.definiteStoreValue(&default_proof, default, depth + 1);
+            const default_evaluated = if (collect_recipe)
+                try self.definiteStoreValueWithComputed(&default_proof, default, depth + 1)
+            else
+                null;
+            const verdict = if (default_evaluated) |evaluated|
+                evaluated.value
+            else
+                try self.definiteStoreValue(&default_proof, default, depth + 1);
             if (verdict == .unknown) return .unknown;
             if (verdict == .undefined_value) result = .undefined_value;
+            if (collect_recipe) {
+                const component = try self.computedStoreWriteForValue(
+                    &default_proof,
+                    name,
+                    default,
+                    default_evaluated.?,
+                    default_proof.written_dependencies,
+                    false,
+                    null,
+                    null,
+                );
+                _ = appendComputedComponent(proof, tree.nodeMainToken(node), &writes, &write_count, component, default_evaluated.?.computed);
+            }
         }
         for (supplied[0..values.len]) |matched| {
             if (!matched) return .unknown;
         }
+        if (collect_recipe) setComputedStoreConstructor(proof, node, writes[0..write_count], false, null);
         return result;
     }
 
@@ -4791,7 +8061,7 @@ pub const FileCache = struct {
             return .unknown;
         const wanted = proof.tree.tokenSlice(selector);
         for (members) |member| {
-            try self.chargeNormalCleanup(proof.call_node);
+            try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
             var initializer: ?Ast.Node.Index = null;
             if (tree.fullVarDecl(member)) |declaration| {
                 if (!std.mem.eql(u8, tree.tokenSlice(declaration.ast.mut_token + 1), wanted)) continue;
@@ -4809,10 +8079,37 @@ pub const FileCache = struct {
                 if (std.mem.eql(u8, tree.tokenSlice(token), wanted)) return .defined;
                 continue;
             }
-            var member_proof: DefiniteStoreProof = .{ .tree = tree, .frame = owner, .call_node = proof.call_node };
+            var member_proof: DefiniteStoreProof = .{
+                .tree = tree,
+                .frame = owner,
+                .call_node = proof.call_node,
+                .call_tree = proof.call_tree,
+            };
             return try self.definiteStoreValue(&member_proof, initializer.?, depth + 1);
         }
         return .unknown;
+    }
+
+    fn definiteCallerStoreValue(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        caller_cache: *FileCache,
+        caller: *DefiniteStoreProof,
+        node: Ast.Node.Index,
+        depth: u32,
+    ) SummaryError!DefiniteStoreValue {
+        _ = self;
+        const saved = caller.written_dependencies;
+        const collecting = caller.collect_written_inputs;
+        caller.written_dependencies = .{};
+        caller.collect_written_inputs = collecting and proof.collect_written_inputs;
+        defer {
+            caller.written_dependencies = saved;
+            caller.collect_written_inputs = collecting;
+        }
+        const value = try caller_cache.definiteStoreValue(caller, node, depth);
+        if (proof.collect_written_inputs) proof.written_dependencies.merge(caller.written_dependencies);
+        return value;
     }
 
     /// Pure scalar expressions distinguish an undefined dependency from an
@@ -4823,10 +8120,811 @@ pub const FileCache = struct {
         node: Ast.Node.Index,
         depth: u32,
     ) SummaryError!DefiniteStoreValue {
-        const value = try self.definiteStoreValueInner(proof, node, depth);
-        // Location mode proves that a store occurs, not its value. Negative
-        // replay and the recorded RHS inputs carry undefined-byte evidence.
-        return if (proof.written_inputs != null) .defined else value;
+        return (try self.definiteStoreValueWithComputed(proof, node, depth)).value;
+    }
+
+    fn literalStoreUndefined(self: *FileCache, proof: *const DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!bool {
+        return self.literalStoreUndefinedMode(proof, node, depth, false);
+    }
+
+    fn literalStoreMayUndefined(self: *FileCache, proof: *const DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!bool {
+        return self.literalStoreUndefinedMode(proof, node, depth, true);
+    }
+
+    /// A failed strict certificate is not a poison witness. Only explicit
+    /// literal syntax or a saved, scoped literal witness can answer true.
+    const LiteralStoreBox = struct {
+        kind: enum { optional_payload, error_payload, unsupported_payload },
+        value_node: Ast.Node.Index,
+    };
+
+    fn literalStoreBoxing(proof: *const DefiniteStoreProof, node: Ast.Node.Index) SummaryError!?LiteralStoreBox {
+        const tree = proof.tree;
+        var value_node = node;
+        while (tree.nodeTag(value_node) == .grouped_expression)
+            value_node = tree.nodeData(value_node).node_and_token[0];
+        if (tree.nodeTag(value_node) == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value_node)), "undefined")) return null;
+        const actual_raw = (try proof.frame.typeOfNode(node)) orelse return null;
+        const actual = (try proof.frame.resolver.normalizedType(actual_raw)) orelse return null;
+        const expected_raw = (try proof.frame.expectedTypeOfNode(node)) orelse actual_raw;
+        const expected = (try proof.frame.resolver.normalizedType(expected_raw)) orelse return null;
+        // Interned and structural wrappers use the same semantic queries.
+        const expected_tag = proof.frame.resolver.typeTag(expected) orelse return null;
+        const actual_tag = proof.frame.resolver.typeTag(actual) orelse return null;
+        const wrapper = switch (expected_tag) {
+            .optional, .error_union => expected,
+            else => switch (actual_tag) { .optional, .error_union => actual, else => return null },
+        };
+        var value_type = actual;
+        if (actual.eql(wrapper)) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const arguments = tree.builtinCallParams(&buffer, node) orelse return null;
+            const builtin = std.zig.BuiltinFn.list.get(tree.tokenSlice(tree.nodeMainToken(node))) orelse return null;
+            if (builtin.tag != .as or arguments.len != 2) return null;
+            value_node = arguments[1];
+            while (tree.nodeTag(value_node) == .grouped_expression)
+                value_node = tree.nodeData(value_node).node_and_token[0];
+            // Expected-type resolution can type this literal as the wrapper.
+            if (tree.nodeTag(value_node) == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value_node)), "undefined")) return null;
+            const value_raw = (try proof.frame.typeOfNode(value_node)) orelse return null;
+            value_type = (try proof.frame.resolver.normalizedType(value_raw)) orelse return null;
+            // An identity cast does not construct or repair a wrapper tag.
+            if (value_type.eql(wrapper)) return null;
+        }
+        const wrapper_tag = proof.frame.resolver.typeTag(wrapper) orelse return null;
+        const payload = proof.frame.resolver.childType(wrapper) orelse return null;
+        const child = (try proof.frame.resolver.normalizedType(payload)) orelse return null;
+        if (!value_type.eql(child)) return .{ .kind = .unsupported_payload, .value_node = value_node };
+        return .{
+            .kind = switch (wrapper_tag) {
+                .optional => .optional_payload,
+                .error_union => .error_payload,
+                else => unreachable,
+            },
+            .value_node = value_node,
+        };
+    }
+
+    fn literalStoreUndefinedMode(self: *FileCache, proof: *const DefiniteStoreProof, node: Ast.Node.Index, depth: u32, may: bool) SummaryError!bool {
+        const literal = try self.literalStoreUndefinedValueMode(proof, node, depth, may);
+        if (!literal or may) return literal;
+        return try literalStoreBoxing(proof, node) == null;
+    }
+
+    fn literalStoreUndefinedValueMode(
+        self: *FileCache,
+        proof: *const DefiniteStoreProof,
+        node: Ast.Node.Index,
+        depth: u32,
+        may: bool,
+    ) SummaryError!bool {
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        const tree = proof.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (std.mem.eql(u8, name, "undefined")) return true;
+                const binding = &proof.bindings[proof.findIndex(name) orelse return false];
+                return binding.literal_undefined or (may and binding.literal_may_undefined);
+            },
+            .grouped_expression => return self.literalStoreUndefinedMode(proof, tree.nodeData(node).node_and_token[0], depth + 1, may),
+            .bool_not, .negation, .bit_not => return self.literalStoreUndefinedMode(proof, tree.nodeData(node).node, depth + 1, may),
+            .@"if" => {
+                const branch = tree.fullIf(node) orelse return false;
+                if (!try self.literalStorePassive(proof, branch.ast.cond_expr, depth + 1)) return false;
+                if (try proof.frame.boolValueOfNode(branch.ast.cond_expr)) |condition| {
+                    const selected = if (condition) branch.ast.then_expr else branch.ast.else_expr.unwrap() orelse return false;
+                    return self.literalStoreUndefinedMode(proof, selected, depth + 1, may);
+                }
+                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+                const left = try self.literalStoreUndefinedMode(proof, branch.ast.then_expr, depth + 1, may);
+                if (may and left) return true;
+                if (!may and !left) return false;
+                return self.literalStoreUndefinedMode(proof, otherwise, depth + 1, may);
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                const first = literalStoreBuiltinFirst(tree, node) orelse return false;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const arguments = tree.builtinCallParams(&buffer, node) orelse return false;
+                if (arguments.len <= first) return false;
+                for (arguments[first..]) |argument| if (!try self.literalStorePassive(proof, argument, depth + 1)) return false;
+                for (arguments[first..]) |argument| if (try self.literalStoreUndefinedMode(proof, argument, depth + 1, may)) return true;
+                return false;
+            },
+            .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor,
+            .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat,
+            .equal_equal, .bang_equal, .less_than, .less_or_equal, .greater_than, .greater_or_equal => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                if (!try self.literalStorePassive(proof, lhs, depth + 1) or
+                    !try self.literalStorePassive(proof, rhs, depth + 1)) return false;
+                return try self.literalStoreUndefinedMode(proof, lhs, depth + 1, may) or
+                    try self.literalStoreUndefinedMode(proof, rhs, depth + 1, may);
+            },
+            else => return false,
+        }
+    }
+
+    /// Reject runtime calls before consulting saved flags: an earlier effect
+    /// could have repaired the very source the passive probe would read.
+    fn literalStoreBuiltinFirst(tree: *const Ast, node: Ast.Node.Index) ?usize {
+        const builtin = std.zig.BuiltinFn.list.get(tree.tokenSlice(tree.nodeMainToken(node))) orelse return null;
+        return switch (builtin.tag) {
+            .as => 1,
+            .int_cast, .float_cast, .bit_cast, .float_from_int, .int_from_float, .truncate,
+            .int_from_bool, .int_from_enum, .enum_from_int, .int_from_ptr, .ptr_from_int,
+            .abs, .sqrt, .byte_swap, .bit_reverse, .clz, .ctz, .pop_count,
+            .min, .max, .div_exact, .div_floor, .div_trunc, .mod, .rem,
+            .floor, .ceil, .trunc, .round, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10 => 0,
+            else => null,
+        };
+    }
+
+    fn literalStorePassive(self: *FileCache, proof: *const DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!bool {
+        try self.chargeNormalCleanupAt(proof.tree, node);
+        if (depth >= 64) return self.cleanupBudgetFailureAt(proof.tree, .normal_cleanup_depth, 64, node);
+        const tree = proof.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier, .number_literal, .char_literal, .string_literal, .enum_literal => return true,
+            .grouped_expression => return self.literalStorePassive(proof, tree.nodeData(node).node_and_token[0], depth + 1),
+            .bool_not, .negation, .bit_not, .deref => return self.literalStorePassive(proof, tree.nodeData(node).node, depth + 1),
+            .field_access => return self.literalStorePassive(proof, tree.nodeData(node).node_and_token[0], depth + 1),
+            .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor,
+            .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat,
+            .equal_equal, .bang_equal, .less_than, .less_or_equal, .greater_than, .greater_or_equal,
+            .bool_and, .bool_or, .array_access => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                return try self.literalStorePassive(proof, lhs, depth + 1) and
+                    try self.literalStorePassive(proof, rhs, depth + 1);
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                const first = literalStoreBuiltinFirst(tree, node) orelse return false;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const arguments = tree.builtinCallParams(&buffer, node) orelse return false;
+                if (arguments.len <= first) return false;
+                for (arguments[first..]) |argument| if (!try self.literalStorePassive(proof, argument, depth + 1)) return false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn definiteStoreValueWithComputed(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        node: Ast.Node.Index,
+        depth: u32,
+    ) SummaryError!DefiniteStoreResult {
+        const saved = proof.computed_result;
+        defer proof.computed_result = saved;
+        proof.computed_result = .{};
+        const source_before = if (proof.computed_templates != null)
+            try self.wholeStoreFieldSource(proof, node, depth)
+        else
+            null;
+        const literal_undefined = proof.computed_templates != null and
+            try self.literalStoreUndefined(proof, node, depth);
+        const literal_may_undefined = literal_undefined or (proof.computed_templates != null and
+            try self.literalStoreMayUndefined(proof, node, depth));
+        const raw = try self.definiteStoreValueInner(proof, node, depth);
+        const boxing = if (proof.computed_templates != null and
+            (literal_may_undefined or proof.computed_result.literal_undefined or proof.computed_result.literal_may_undefined))
+            try literalStoreBoxing(proof, node)
+        else null;
+        if (boxing) |boxed| {
+            const returned_payload_all = proof.computed_result.literal_undefined;
+            proof.computed_result.literal_undefined = false;
+            proof.computed_result.literal_may_undefined = true;
+            if (boxed.kind == .optional_payload) {
+                const payload_all = returned_payload_all or try self.literalStoreUndefinedValueMode(proof, boxed.value_node, depth, false);
+                const payload_may = payload_all or literal_may_undefined or proof.computed_result.literal_may_undefined;
+                const writes = [_]ComputedStoreWrite{
+                    .{ .path = "", .literal_undefined = payload_all, .literal_may_undefined = payload_may, .opaque_alternative = !payload_all },
+                    .{ .path = "$optional-tag" },
+                };
+                if (proof.computed_templates.?.add(.{ .whole_value = true, .writes = &writes })) |handle| {
+                    proof.computed_result = .{ .computations = handle, .value_nonidentity = true, .literal_may_undefined = true };
+                } else {
+                    proof.computed_result = .{ .opaque_alternative = true, .value_nonidentity = true, .literal_may_undefined = true };
+                }
+            }
+        }
+        if (literal_undefined and proof.computed_templates != null and proof.computed_result.computations == 0) {
+            var actual = try proof.frame.expectedTypeOfNode(node);
+            if (actual == null) actual = try proof.frame.typeOfNode(node);
+            if (actual) |ty| if (try proof.frame.resolver.normalizedType(ty)) |normalized| {
+                const tag = proof.frame.resolver.typeTag(normalized);
+                if (tag == .@"struct" or tag == .array or tag == .optional or tag == .error_union) {
+                    const write = [_]ComputedStoreWrite{.{ .path = "", .literal_undefined = true }};
+                    const extent = if (tag == .array) definiteStoreArrayTypeCount(proof.frame.resolver, normalized) else null;
+                    if (proof.computed_templates.?.add(.{
+                        .whole_value = true, .writes = &write,
+                        .is_array = tag == .array, .array_extent = extent,
+                    })) |handle| {
+                        proof.computed_result = .{ .computations = handle, .value_nonidentity = true };
+                    } else {
+                        const token = proof.tree.nodeMainToken(node);
+                        _ = recordComputedFallbackFact(proof, token, "", .{}, true);
+                        proof.computed_result.fallback_token = token;
+                    }
+                }
+            };
+        }
+        if (proof.computed_result.source == null and proof.computed_result.computations == 0 and
+            !proof.computed_result.original_alternative and !proof.computed_result.value_nonidentity)
+            proof.computed_result.source = source_before;
+        if (proof.computed_templates != null and proof.computed_result.source == null and
+            proof.computed_result.computations == 0 and !proof.computed_result.original_alternative and
+            raw != .defined and !literal_undefined)
+            proof.computed_result.opaque_alternative = true;
+        return .{
+            .value = if (proof.written_inputs != null) .defined else raw,
+            .raw_value = raw,
+            .literal_undefined = boxing == null and (literal_undefined or proof.computed_result.literal_undefined),
+            .literal_may_undefined = literal_may_undefined or proof.computed_result.literal_may_undefined,
+            .computed = proof.computed_result,
+        };
+    }
+
+
+    fn computedStoreWriteForValue(
+        self: *FileCache,
+        proof: *DefiniteStoreProof,
+        path: []const u8,
+        node: Ast.Node.Index,
+        evaluated: DefiniteStoreResult,
+        dependencies: WrittenDependencies,
+        is_array: bool,
+        array_extent: ?u64,
+        array_index: ?u64,
+    ) SummaryError!ComputedStoreWrite {
+        _ = self;
+        _ = proof;
+        _ = node;
+        const source = evaluated.computed.source;
+        const literal_undefined = source == null and evaluated.literal_undefined;
+        return .{
+            .path = path,
+            .array_index = array_index,
+            .dependencies = dependencies,
+            .source = source,
+            .literal_undefined = literal_undefined,
+            .literal_may_undefined = source == null and evaluated.literal_may_undefined,
+            .opaque_alternative = source == null and !literal_undefined and
+                (evaluated.raw_value != .defined or evaluated.computed.computations != 0 or
+                    evaluated.computed.opaque_alternative),
+            .is_array = is_array,
+            .array_extent = array_extent,
+        };
+    }
+    fn appendComputedComponent(
+        proof: *DefiniteStoreProof,
+        constructor_token: Ast.TokenIndex,
+        writes: *[128]ComputedStoreWrite,
+        count: *usize,
+        component: ComputedStoreWrite,
+        state: ComputedStoreState,
+    ) bool {
+        const builders = proof.computed_templates orelse return false;
+        if (count.* == writes.len) {
+            builders.overflow = true;
+            return false;
+        }
+        const parent = count.*;
+        writes[parent] = component;
+        count.* += 1;
+        if (state.fallback_token != null and component.array_index == null) {
+            const token = state.fallback_token.?;
+            writes[parent].dependencies = .{};
+            const fact_count = proof.field_fact_count;
+            for (0..fact_count) |index| {
+                const fact = proof.field_facts[index];
+                if (fact.token != token or !fact.fallback_recipe) continue;
+                const path = if (fact.path.len == 0)
+                    component.path
+                else
+                    computedMappedPrefix(proof.out_fields, component.path, fact.path) orelse continue;
+                if (!recordComputedFallbackFact(proof, constructor_token, path, fact.written_dependencies, fact.fallback_literal_may)) break;
+            }
+        }
+        if (state.computations == 0) return true;
+        if (@popCount(state.computations) != 1 or state.source != null or
+            state.original_alternative or state.opaque_alternative)
+        {
+            builders.overflow = true;
+            return false;
+        }
+        const child_index: usize = @intCast(@ctz(state.computations));
+        const child = builders.values[child_index] orelse {
+            builders.overflow = true;
+            return false;
+        };
+        if (!child.whole_value or child.writes.len > writes.len - count.*) {
+            builders.overflow = true;
+            return false;
+        }
+        writes[parent].dependencies = .{};
+        writes[parent].literal_undefined = false;
+        writes[parent].literal_may_undefined = false;
+        writes[parent].is_array = child.is_array;
+        writes[parent].array_extent = child.array_extent;
+        if (child.is_array and child.array_extent != null and child.array_extent.? != 0) {
+            var entirely_literal = child.writes.len == child.array_extent.?;
+            for (child.writes) |write| {
+                entirely_literal = entirely_literal and write.parent == null and
+                    write.array_index != null and write.literal_undefined;
+            }
+            if (entirely_literal) {
+                writes[parent].literal_undefined = true;
+                writes[parent].opaque_alternative = false;
+            }
+        }
+        const offset = count.*;
+        for (child.writes, 0..) |write, index| {
+            writes[offset + index] = write;
+            writes[offset + index].parent = if (write.parent) |relative|
+                @intCast(offset + relative)
+            else
+                @intCast(parent);
+        }
+        count.* += child.writes.len;
+        return true;
+    }
+
+    fn setComputedStoreConstructor(
+        proof: *DefiniteStoreProof,
+        node: Ast.Node.Index,
+        writes: []const ComputedStoreWrite,
+        is_array: bool,
+        array_extent: ?u64,
+    ) void {
+        const builders = proof.computed_templates orelse return;
+        const handle = builders.add(.{
+            .whole_value = true,
+            .writes = writes,
+            .is_array = is_array,
+            .array_extent = array_extent,
+        }) orelse {
+            const token = proof.tree.nodeMainToken(node);
+            for (writes, 0..) |write, index| {
+                if (write.array_index != null) continue;
+                if (write.dependencies.isEmpty() and !write.literal_undefined and !write.literal_may_undefined) continue;
+                if (write.parent == null) {
+                    if (write.path.len != 0 and !recordComputedFallbackFact(proof, token, write.path, write.dependencies, write.literal_undefined or write.literal_may_undefined)) break;
+                    continue;
+                }
+                // Borrow the authenticated mapped path; do not allocate or
+                // taint the entire parent with one flattened child's recipe.
+                for (proof.out_fields) |path| {
+                    if (!computedWriteMatchesPath(writes, index, path)) continue;
+                    if (!recordComputedFallbackFact(proof, token, path, write.dependencies, write.literal_undefined or write.literal_may_undefined)) break;
+                }
+            }
+            proof.computed_result = .{
+                .opaque_alternative = true,
+                .value_nonidentity = true,
+                .fallback_token = token,
+            };
+            return;
+        };
+        proof.computed_result = .{
+            .computations = handle,
+            .value_nonidentity = true,
+        };
+    }
+
+    fn recordComputedFallbackFact(
+        proof: *DefiniteStoreProof,
+        token: Ast.TokenIndex,
+        path: []const u8,
+        dependencies: WrittenDependencies,
+        literal_may: bool,
+    ) bool {
+        for (proof.field_facts[0..proof.field_fact_count]) |*fact| {
+            if (fact.token != token or !std.mem.eql(u8, fact.path, path)) continue;
+            fact.written_dependencies.merge(dependencies);
+            fact.fallback_literal_may = fact.fallback_literal_may or literal_may;
+            fact.fallback_recipe = true;
+            return true;
+        }
+        if (proof.field_fact_count == proof.field_facts.len) return false;
+        proof.field_facts[proof.field_fact_count] = .{
+            .token = token,
+            .path = path,
+            .value = .unknown,
+            .written_dependencies = dependencies,
+            .fallback_literal_may = literal_may,
+            .fallback_recipe = true,
+        };
+        proof.field_fact_count += 1;
+        return true;
+    }
+
+    fn copyComputedFallbackFacts(proof: *DefiniteStoreProof, source: ?Ast.TokenIndex, destination: Ast.TokenIndex) void {
+        const token = source orelse return;
+        if (token == destination) return;
+        const count = proof.field_fact_count;
+        for (0..count) |index| {
+            const fact = proof.field_facts[index];
+            if (fact.token != token) continue;
+            if (!recordComputedFallbackFact(proof, destination, fact.path, fact.written_dependencies, fact.fallback_literal_may)) return;
+        }
+    }
+
+    fn setComputedStoreWholeReplacement(
+        proof: *DefiniteStoreProof,
+        coverage: *StoreCoverage,
+        evaluated: DefiniteStoreResult,
+    ) void {
+        const builders = proof.computed_templates orelse return;
+        if (evaluated.computed.fallback_token) |token| {
+            coverage.computed_overflow = true;
+            if (proof.may_written_stores) |stores| {
+                for (proof.field_facts[0..proof.field_fact_count]) |fact| {
+                    if (fact.token != token or !fact.fallback_recipe) continue;
+                    for (coverage.field_names[0..coverage.field_count]) |path| {
+                        if (fact.path.len != 0 and !std.mem.eql(u8, path, fact.path)) continue;
+                        if (!fact.written_dependencies.isEmpty()) _ = stores.add(path, fact.written_dependencies);
+                        if (fact.fallback_literal_may) _ = stores.addLiteral(path);
+                    }
+                }
+            }
+        }
+        var state = evaluated.computed;
+        const scalar = if (proof.frame.resolver.typeTag(coverage.pointee)) |tag| switch (tag) {
+            .@"struct", .@"union", .array, .vector, .optional, .error_union => false,
+            else => true,
+        } else false;
+        if (scalar and state.source == null and state.computations == 0 and
+            !state.original_alternative and !evaluated.literal_undefined and
+            !evaluated.literal_may_undefined and !proof.written_dependencies.isEmpty())
+        {
+            const write = [_]ComputedStoreWrite{.{
+                .path = "", .dependencies = proof.written_dependencies,
+                .opaque_alternative = state.opaque_alternative,
+            }};
+            if (builders.add(.{ .whole_value = true, .writes = &write })) |handle| {
+                state = .{ .computations = handle, .value_nonidentity = true };
+            } else {
+                coverage.computed_overflow = true;
+            }
+        }
+        if (state.source == null and state.computations == 0 and
+            !state.original_alternative and !state.opaque_alternative)
+        {
+            if (evaluated.literal_undefined or evaluated.literal_may_undefined) {
+                const write = [_]ComputedStoreWrite{.{
+                    .path = "",
+                    .literal_undefined = evaluated.literal_undefined,
+                    .literal_may_undefined = evaluated.literal_may_undefined,
+                    .opaque_alternative = !evaluated.literal_undefined,
+                }};
+                if (builders.add(.{ .whole_value = true, .writes = &write })) |handle| {
+                    state = .{ .computations = handle, .value_nonidentity = true };
+                } else {
+                    state.opaque_alternative = true;
+                    state.value_nonidentity = true;
+                    coverage.computed_overflow = true;
+                    if (proof.may_written_stores) |stores| {
+                        for (coverage.field_names[0..coverage.field_count]) |path| _ = stores.addLiteral(path);
+                    }
+                }
+            } else {
+                state.opaque_alternative = true;
+                state.value_nonidentity = true;
+            }
+        }
+        coverage.whole_source = state.source;
+        coverage.computed_sources = state.computations;
+        coverage.computed_original_alternative = state.original_alternative;
+        coverage.computed_opaque_alternative = state.opaque_alternative;
+    }
+
+    fn computedWriteMatchesPath(writes: []const ComputedStoreWrite, index: usize, path: []const u8) bool {
+        const write = writes[index];
+        if (write.array_index != null) return false;
+        if (!std.mem.endsWith(u8, path, write.path)) return false;
+        const leading = path.len - write.path.len;
+        if (write.parent) |parent| {
+            if (parent >= index or leading == 0 or path[leading - 1] != '.') return false;
+            return computedWriteMatchesPath(writes, parent, path[0 .. leading - 1]);
+        }
+        return leading == 0;
+    }
+
+    fn computedWriteMatchesLeaf(writes: []const ComputedStoreWrite, index: usize, path: []const u8, leaf: []const u8) bool {
+        const write = writes[index];
+        if (write.array_index != null or !std.mem.endsWith(u8, path, leaf)) return false;
+        const leading = path.len - leaf.len;
+        if (write.parent) |parent| {
+            if (parent >= index or leading == 0 or path[leading - 1] != '.') return false;
+            return computedWriteMatchesPath(writes, parent, path[0 .. leading - 1]);
+        }
+        return leading == 0;
+    }
+
+    fn computedWriteOverlapsField(writes: []const ComputedStoreWrite, index: usize, path: []const u8) bool {
+        const effective = if (writes[index].array_index != null)
+            writes[index].parent orelse return true
+        else
+            index;
+        if (effective >= writes.len) return true;
+        var ancestor = path;
+        while (true) {
+            if (computedWriteMatchesPath(writes, effective, ancestor)) return true;
+            if (ancestor.len == 0) break;
+            ancestor = if (std.mem.lastIndexOfScalar(u8, ancestor, '.')) |dot| ancestor[0..dot] else "";
+        }
+        var descendant = effective;
+        while (true) {
+            if (computedWriteMatchesPath(writes, descendant, path)) return true;
+            var leaf = writes[descendant].path;
+            while (std.mem.lastIndexOfScalar(u8, leaf, '.')) |dot| {
+                leaf = leaf[0..dot];
+                if (computedWriteMatchesLeaf(writes, descendant, path, leaf)) return true;
+            }
+            const parent = writes[descendant].parent orelse break;
+            if (parent >= descendant) return true;
+            descendant = parent;
+        }
+        return false;
+    }
+
+    const ComputedFieldRecipe = struct {
+        source: WholeStoreSource = .{},
+        needs_root: bool = true,
+    };
+
+    /// Identity only: dependency bits do not authorize a physical copy.
+    /// Memoize each immutable result once for this selected physical path.
+    fn computedFieldRecipe(
+        builders: *const ComputedStoreBuilders,
+        base: ComputedStoreBase,
+        path: []const u8,
+        memo: *[8]?ComputedFieldRecipe,
+    ) ComputedFieldRecipe {
+        var result: ?ComputedFieldRecipe = if (base.source != null or base.original_alternative or base.opaque_alternative)
+            ComputedFieldRecipe{}
+        else
+            null;
+        var remaining = base.computations;
+        while (remaining != 0) {
+            const index: usize = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            var arm = memo[index];
+            if (arm == null) {
+                if (index < builders.count) if (builders.values[index]) |node| {
+                    const relative: ?[]const u8 = if (node.output_prefix) |prefix| blk: {
+                        if (std.mem.eql(u8, path, prefix)) break :blk "";
+                        if (path.len <= prefix.len or path[prefix.len] != '.' or
+                            !std.mem.startsWith(u8, path, prefix)) break :blk null;
+                        break :blk path[prefix.len + 1 ..];
+                    } else path;
+                    if (relative) |selected| {
+                        var write_index = node.writes.len;
+                        while (write_index != 0) {
+                            write_index -= 1;
+                            const write = node.writes[write_index];
+                            if (!computedWriteOverlapsField(node.writes, write_index, selected)) continue;
+                            arm = ComputedFieldRecipe{};
+                            if (computedWriteMatchesPath(node.writes, write_index, selected)) {
+                                const source = write.source orelse WholeStoreSource{};
+                                arm.?.source = source;
+                                arm.?.source.opaque_alternative = source.opaque_alternative or write.opaque_alternative or
+                                    write.literal_undefined or write.literal_may_undefined;
+                                arm.?.needs_root = write.literal_undefined or write.literal_may_undefined or write.opaque_alternative or
+                                    (write.source != null and source.sources == 0 and source.projections == 0);
+                            }
+                            break;
+                        }
+                    }
+                    if (arm == null and !node.whole_value) arm = computedFieldRecipe(builders, .{
+                        .source = node.base_source,
+                        .computations = node.base_computations,
+                        .original_alternative = node.base_original_alternative,
+                        .opaque_alternative = node.base_opaque_alternative,
+                    }, path, memo);
+                };
+                if (arm == null) arm = ComputedFieldRecipe{};
+                memo[index] = arm;
+            }
+            result = if (result) |prior| .{
+                .source = WholeStoreSource.merge(prior.source, arm.?.source),
+                .needs_root = prior.needs_root or arm.?.needs_root,
+            } else arm.?;
+        }
+        return result orelse ComputedFieldRecipe{};
+    }
+
+    fn computedFieldDependencies(
+        builders: *const ComputedStoreBuilders,
+        handles: u8,
+        path: []const u8,
+    ) WrittenDependencies {
+        var result: WrittenDependencies = .{};
+        var remaining = handles;
+        while (remaining != 0) {
+            const index: usize = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            if (index >= builders.count) continue;
+            const node = builders.values[index] orelse continue;
+            var arm = computedFieldDependencies(builders, node.base_computations, path);
+            const relative = if (node.output_prefix) |prefix| blk: {
+                if (path.len <= prefix.len or path[prefix.len] != '.' or
+                    !std.mem.startsWith(u8, path, prefix)) break :blk null;
+                break :blk path[prefix.len + 1 ..];
+            } else path;
+            if (relative) |selected| {
+                for (node.writes, 0..) |write, write_index| {
+                    if (computedWriteMatchesPath(node.writes, write_index, selected)) arm = write.dependencies;
+                }
+            }
+            result.merge(arm);
+        }
+        return result;
+    }
+
+    fn computedFieldLiteralMay(
+        builders: *const ComputedStoreBuilders,
+        handles: u8,
+        path: []const u8,
+    ) bool {
+        var result = false;
+        var remaining = handles;
+        while (remaining != 0) {
+            const index: usize = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            if (index >= builders.count) continue;
+            const node = builders.values[index] orelse continue;
+            var arm = computedFieldLiteralMay(builders, node.base_computations, path);
+            const relative: ?[]const u8 = if (node.output_prefix) |prefix| blk: {
+                if (path.len <= prefix.len or path[prefix.len] != '.' or
+                    !std.mem.startsWith(u8, path, prefix)) break :blk null;
+                break :blk path[prefix.len + 1 ..];
+            } else path;
+            if (relative) |selected| {
+                for (node.writes, 0..) |write, write_index| {
+                    const whole = write.parent == null and write.array_index == null and write.path.len == 0;
+                    if (!whole and !computedWriteMatchesPath(node.writes, write_index, selected)) continue;
+                    if (write.literal_undefined or write.literal_may_undefined) {
+                        arm = true;
+                    } else if (!write.opaque_alternative and write.source == null and write.dependencies.isEmpty()) {
+                        arm = false;
+                    }
+                }
+            }
+            result = result or arm;
+        }
+        return result;
+    }
+
+    fn appendComputedFieldStoreWrite(
+        proof: *DefiniteStoreProof,
+        base: ComputedStoreBase,
+        write: ComputedStoreWrite,
+        state: ComputedStoreState,
+        fields: []const []const u8,
+    ) ?ComputedStoreBase {
+        const builders = proof.computed_templates orelse return null;
+        if (state.computations == 0) return .{
+            .computations = appendComputedStoreWrite(proof, base, write) orelse return null,
+        };
+        var memo: [8]?u8 = @splat(null);
+        return rebaseComputedStoreBase(proof, .{
+            .source = state.source,
+            .computations = state.computations,
+            .original_alternative = state.original_alternative,
+            .opaque_alternative = state.opaque_alternative,
+        }, base, write.path, fields, builders.count, &memo);
+    }
+
+    fn appendComputedStoreWrite(
+        proof: *DefiniteStoreProof,
+        base: ComputedStoreBase,
+        write: ComputedStoreWrite,
+    ) ?u8 {
+        const builders = proof.computed_templates orelse return null;
+        const writes = [_]ComputedStoreWrite{write};
+        return builders.add(.{
+            .whole_value = false,
+            .base_source = base.source,
+            .base_computations = base.computations,
+            .base_original_alternative = base.original_alternative,
+            .base_opaque_alternative = base.opaque_alternative,
+            .writes = &writes,
+        });
+    }
+
+    fn computedCoverageBase(coverage: *const StoreCoverage) ComputedStoreBase {
+        return .{
+            .source = coverage.whole_source,
+            .computations = coverage.computed_sources,
+            .original_alternative = coverage.computed_original_alternative,
+            .opaque_alternative = coverage.computed_opaque_alternative,
+        };
+    }
+
+    fn computedMappedPrefix(fields: []const []const u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
+        for (fields) |candidate| {
+            if (candidate.len == prefix.len + 1 + suffix.len and
+                std.mem.startsWith(u8, candidate, prefix) and candidate[prefix.len] == '.' and
+                std.mem.eql(u8, candidate[prefix.len + 1 ..], suffix)) return candidate;
+        }
+        return null;
+    }
+
+    fn rebaseComputedStoreBase(
+        proof: *DefiniteStoreProof,
+        selected: ComputedStoreBase,
+        parent_base: ComputedStoreBase,
+        prefix: []const u8,
+        fields: []const []const u8,
+        original_count: usize,
+        memo: *[8]?u8,
+    ) ?ComputedStoreBase {
+        const builders = proof.computed_templates orelse return null;
+        var result: ComputedStoreBase = .{};
+        if (selected.original_alternative) result = parent_base;
+        if (selected.source != null or selected.opaque_alternative) {
+            const write: ComputedStoreWrite = .{
+                .path = prefix,
+                .source = selected.source,
+                .opaque_alternative = selected.opaque_alternative,
+            };
+            result.computations |= appendComputedStoreWrite(proof, parent_base, write) orelse return null;
+        }
+        var handles = selected.computations;
+        while (handles != 0) {
+            const index: usize = @intCast(@ctz(handles));
+            handles &= handles - 1;
+            if (index >= original_count) return null;
+            if (memo[index]) |rebased| {
+                result.computations |= rebased;
+                continue;
+            }
+            const node = builders.values[index] orelse return null;
+            const mapped_prefix = if (node.output_prefix) |suffix|
+                computedMappedPrefix(fields, prefix, suffix) orelse return null
+            else
+                prefix;
+            var writes: [128]ComputedStoreWrite = undefined;
+            var write_count: usize = 0;
+            var base = parent_base;
+            if (node.whole_value) {
+                if (node.writes.len >= writes.len) return null;
+                writes[0] = .{ .path = mapped_prefix, .opaque_alternative = true, .is_array = node.is_array, .array_extent = node.array_extent };
+                write_count = 1;
+                for (node.writes, 0..) |write, offset| {
+                    writes[write_count + offset] = write;
+                    writes[write_count + offset].parent = if (write.parent) |relative| relative + 1 else 0;
+                }
+                write_count += node.writes.len;
+            } else {
+                const node_base: ComputedStoreBase = .{
+                    .source = node.base_source,
+                    .computations = node.base_computations,
+                    .original_alternative = node.base_original_alternative,
+                    .opaque_alternative = node.base_opaque_alternative,
+                };
+                base = rebaseComputedStoreBase(proof, node_base, parent_base, prefix, fields, original_count, memo) orelse return null;
+                write_count = 0;
+            }
+            const rebased = builders.add(.{
+                .whole_value = false,
+                .base_source = base.source,
+                .base_computations = base.computations,
+                .base_original_alternative = base.original_alternative,
+                .base_opaque_alternative = base.opaque_alternative,
+                .writes = if (node.whole_value) writes[0..write_count] else node.writes,
+                .output_prefix = if (node.whole_value) null else mapped_prefix,
+            }) orelse return null;
+            memo[index] = rebased;
+            result.computations |= rebased;
+        }
+        if (builders.alternativeCount(result) == null) return null;
+        return result;
     }
 
     fn definiteStoreValueInner(
@@ -4835,8 +8933,8 @@ pub const FileCache = struct {
         node: Ast.Node.Index,
         depth: u32,
     ) SummaryError!DefiniteStoreValue {
-        try self.chargeNormalCleanup(proof.call_node);
-        if (depth == 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, proof.call_node);
+        try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
+        if (depth == 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
         const tree = proof.tree;
         switch (tree.nodeTag(node)) {
             .number_literal, .string_literal, .char_literal, .enum_literal => return .defined,
@@ -4846,13 +8944,58 @@ pub const FileCache = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null")) return .defined;
                 if ((try proof.frame.resolveValueOfNode(node))) |value| {
                     if (value.is_type_val) return .defined;
+                    if (value.ipIndex()) |index| {
+                        switch (proof.frame.resolver.ctx.ip.indexToKey(index)) {
+                            .int_u64_value, .int_i64_value, .int_big_value => return .defined,
+                            else => {},
+                        }
+                    }
                 }
-                if (proof.overflowTupleBinding(node)) |binding| return proof.bindings[binding].value;
+                if (proof.overflowTupleBinding(node)) |binding| {
+                    if (proof.collect_written_inputs)
+                        proof.written_dependencies.merge(proof.bindings[binding].written_dependencies);
+                    return proof.bindings[binding].value;
+                }
                 const kind = try definiteStoreKind(proof, node);
                 if (kind == .unresolved) return .undefined_value;
                 if (proof.findIndex(name)) |binding| {
+                    if (proof.collect_written_inputs)
+                        proof.written_dependencies.merge(proof.bindings[binding].written_dependencies);
                     const ty = (try proof.frame.typeOfNode(node)) orelse return .undefined_value;
                     const normalized = (try proof.frame.resolver.normalizedType(ty)) orelse return .undefined_value;
+                    const is_aggregate = kind == .aggregate or
+                        proof.frame.resolver.typeTag(normalized) == .optional or
+                        proof.frame.resolver.typeTag(normalized) == .error_union or
+                        proof.frame.resolver.typeTag(normalized) == .array or
+                        proof.frame.resolver.typeTag(normalized) == .vector or
+                        proof.frame.resolver.pointerSize(normalized) == .slice;
+                    if (is_aggregate and proof.computed_templates != null) {
+                        const bound = proof.bindings[binding];
+                        var computed: ComputedStoreState = .{
+                            .source = bound.aggregate_source,
+                            .computations = bound.computed_sources,
+                            .original_alternative = bound.computed_original_alternative,
+                            .opaque_alternative = bound.computed_opaque_alternative,
+                            .value_nonidentity = bound.value_nonidentity,
+                        };
+                        if (computed.source == null and computed.computations == 0 and
+                            !computed.original_alternative and !computed.opaque_alternative)
+                        {
+                            if (binding < proof.parameter_count) {
+                                computed.source = try self.wholeStoreSource(proof, node, depth);
+                                computed.opaque_alternative = computed.source == null;
+                            } else {
+                                computed.opaque_alternative = true;
+                            }
+                        }
+                        proof.computed_result = computed;
+                        for (proof.field_facts[0..proof.field_fact_count]) |fact| {
+                            if (fact.token == bound.token and fact.fallback_recipe) {
+                                proof.computed_result.fallback_token = bound.token;
+                                break;
+                            }
+                        }
+                    }
                     if (kind == .scalar or binding < proof.parameter_count or proof.bindings[binding].complete_value or
                         proof.frame.resolver.typeTag(normalized) == .array or
                         proof.frame.resolver.typeTag(normalized) == .vector or
@@ -4870,19 +9013,20 @@ pub const FileCache = struct {
                     var argument_buffer: [2]Ast.Node.Index = undefined;
                     const caller_cache = proof.caller_cache orelse self;
                     const argument = (try canonical.callArgumentFor(caller_cache, &argument_buffer, index)) orelse return .undefined_value;
-                    if (proof.written_reads != null and proof.read_projection != null) {
-                        return if (proof.recordWrittenRead(argument)) .defined else .unknown;
+                    if (proof.written_input_boundary and proof.written_reads != null and proof.read_projection != null) {
+                        return if (try proof.recordWrittenRead(argument)) .defined else .unknown;
                     }
-                    if (proof.written_inputs) |inputs| {
+                    if (proof.written_input_boundary) if (proof.written_inputs) |inputs| {
                         if (!proof.collect_written_inputs) return .defined;
-                        var added = false;
-                        for (inputs) |*entry| {
-                            if (entry.* == argument) { added = true; break; }
-                            if (entry.* == null) { entry.* = argument; added = true; break; }
+                        for (inputs, 0..) |*entry, slot| {
+                            if (entry.* != null and entry.* != argument) continue;
+                            entry.* = argument;
+                            proof.written_dependencies.inputs |= @as(u8, 1) << @intCast(slot);
+                            return .defined;
                         }
-                        if (!added) return .undefined_value;
-                        return .defined;
-                    }
+                        if (proof.written_dependencies_complete) |complete| complete.* = false;
+                        return .undefined_value;
+                    };
                     const caller_slot = proof.caller.?;
                     if (caller_slot.* == null) {
                         var caller = (try caller_cache.definiteStoreCaller(proof.call_node, canonical.callee.caller_frame)) orelse return .undefined_value;
@@ -4896,7 +9040,7 @@ pub const FileCache = struct {
                         }
                         caller_slot.* = caller;
                     }
-                    return caller_cache.definiteStoreValue(&caller_slot.*.?, argument, depth + 1);
+                    return self.definiteCallerStoreValue(proof, caller_cache, &caller_slot.*.?, argument, depth + 1);
                 }
                 return .undefined_value;
             },
@@ -4933,15 +9077,40 @@ pub const FileCache = struct {
                 var right_proof = proof.*;
                 left_proof.out_coverage = if (left_coverage) |*coverage| coverage else null;
                 right_proof.out_coverage = if (right_coverage) |*coverage| coverage else null;
-                const left = try self.definiteStoreValue(&left_proof, branch.ast.then_expr, depth + 1);
-                const right = try self.definiteStoreValue(&right_proof, other, depth + 1);
+                const left_result = try self.definiteStoreValueWithComputed(&left_proof, branch.ast.then_expr, depth + 1);
+                const right_result = try self.definiteStoreValueWithComputed(&right_proof, other, depth + 1);
+                const left = left_result.value;
+                const right = right_result.value;
                 if (!mergeStoreProof(&left_proof, &right_proof, original_count)) return .unknown;
                 proof.* = left_proof;
                 proof.out_coverage = output;
+                var left_computed = left_result.computed;
+                var right_computed = right_result.computed;
+                left_computed.literal_undefined = left_result.literal_undefined;
+                right_computed.literal_undefined = right_result.literal_undefined;
+                left_computed.literal_may_undefined = left_result.literal_may_undefined;
+                right_computed.literal_may_undefined = right_result.literal_may_undefined;
+                if (proof.computed_templates != null and try definiteStoreKind(proof, node) == .aggregate) {
+                    if (left_result.literal_undefined and left_computed.computations == 0) {
+                        const write = [_]ComputedStoreWrite{.{ .path = "", .literal_undefined = true }};
+                        left_computed.computations = proof.computed_templates.?.add(.{ .whole_value = true, .writes = &write }) orelse 0;
+                    }
+                    if (right_result.literal_undefined and right_computed.computations == 0) {
+                        const write = [_]ComputedStoreWrite{.{ .path = "", .literal_undefined = true }};
+                        right_computed.computations = proof.computed_templates.?.add(.{ .whole_value = true, .writes = &write }) orelse 0;
+                    }
+                }
+                proof.computed_result = left_computed;
+                proof.computed_result.merge(right_computed);
+                if (left_computed.fallback_token != null or right_computed.fallback_token != null) {
+                    const token = tree.nodeMainToken(node);
+                    copyComputedFallbackFacts(proof, left_computed.fallback_token, token);
+                    copyComputedFallbackFacts(proof, right_computed.fallback_token, token);
+                    proof.computed_result.fallback_token = token;
+                }
                 if (output) |coverage| {
                     coverage.* = left_coverage.?;
-                    coverage.complete = coverage.complete and right_coverage.?.complete;
-                    for (coverage.covered[0..coverage.field_count], right_coverage.?.covered[0..coverage.field_count]) |*mine, theirs| mine.* = mine.* and theirs;
+                    intersectStoreCoverage(coverage, right_coverage.?);
                 }
                 if (left == .unknown or right == .unknown) return .unknown;
                 return if (left == .defined and right == .defined) .defined else .undefined_value;
@@ -4987,7 +9156,7 @@ pub const FileCache = struct {
             .address_of => {
                 var operand = tree.nodeData(node).node;
                 while (tree.nodeTag(operand) == .field_access) {
-                    try self.chargeNormalCleanup(proof.call_node);
+                    try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
                     operand = tree.nodeData(operand).node_and_token[0];
                 }
                 if (tree.nodeTag(operand) != .identifier) return .unknown;
@@ -5059,6 +9228,16 @@ pub const FileCache = struct {
                     {
                         if (try storeFieldIndex(proof, output, proof.out_fields, node)) |index| {
                             const coverage = proof.out_coverage orelse return .undefined_value;
+                            if (proof.collect_written_inputs) {
+                                if (coverage.covered[index]) {
+                                    proof.written_dependencies.merge(coverage.written_dependencies[index]);
+                                } else if (proof.written_reads != null) {
+                                    const saved = proof.read_projection;
+                                    if (saved == null) proof.read_projection = node;
+                                    defer proof.read_projection = saved;
+                                    _ = try self.definiteStoreValueInner(proof, root, depth + 1);
+                                }
+                            }
                             return if (coverage.covered[index]) .defined else .undefined_value;
                         }
                     }
@@ -5066,7 +9245,11 @@ pub const FileCache = struct {
                 for (proof.field_facts[0..proof.field_fact_count]) |fact| {
                     const one = [1][]const u8{fact.path};
                     if (try storeFieldIndex(proof, name, &one, node) != null) {
-                        if (proof.findStoreField(name, fact.path)) |value| return value;
+                        if (proof.findStoreFieldFact(name, fact.path)) |stored| {
+                            if (proof.collect_written_inputs)
+                                proof.written_dependencies.merge(stored.written_dependencies);
+                            return stored.value;
+                        }
                     }
                 }
                 const saved = proof.read_projection;
@@ -5276,7 +9459,7 @@ pub const FileCache = struct {
         const byte = self.tree.tokens.items(.start)[token];
         const line_col = budget_mod.lineCol(self.tree.source, byte);
         var name: budget_mod.NameBuf = .{};
-        if (tokens.enclosingFnDecl(self.tree, token)) |decl| {
+        if (self.enclosingFunctionAt(self.tree, token)) |decl| {
             var buffer: [1]Ast.Node.Index = undefined;
             if (tokens.fnProto(self.tree, &buffer, decl)) |proto| {
                 if (proto.name_token) |name_tok| name.set(self.tree.tokenSlice(name_tok));
@@ -5365,6 +9548,7 @@ pub const FileCache = struct {
         if (self.file_model) |*m| m.deinit();
         if (self.summary_arena) |*a| a.deinit();
         if (self.exact_spans) |*spans| spans.deinit(self.gpa);
+        self.fill_lexical_index.deinit(self.gpa);
         var it = self.bindings.valueIterator();
         while (it.next()) |b| b.deinit();
         self.bindings.deinit(self.gpa);
@@ -5384,6 +9568,12 @@ pub const FileCache = struct {
         }
         self.return_defined_summaries.deinit(self.gpa);
         self.return_defined_visiting.deinit(self.gpa);
+        self.return_replay_failures.deinit(self.gpa);
+        self.return_replay_syntax.deinit(self.gpa);
+        self.return_calls.deinit(self.gpa);
+        self.return_diagnostic_seeds.deinit(self.gpa);
+        self.return_source_eligibility.deinit(self.gpa);
+        self.return_source_visiting.deinit(self.gpa);
         self.array_source_visiting.deinit(self.gpa);
         self.method_scalar_reads.deinit(self.gpa);
         self.method_scalar_reads_visiting.deinit(self.gpa);
@@ -6549,7 +10739,7 @@ pub const FileCache = struct {
             // actual call. Drop them before cloning their dead payloads.
             var metadata = local.?;
             setCleanupOutcomes(&metadata, .{});
-            try declaring.chargeCleanupStorageClone(metadata, body);
+            try declaring.chargeCleanupStorageClone(metadata, declaring.tree, body);
             break :cloned try cloneFnSummary(arena, metadata);
         } else (try self.summaryOfDeclaration(.{
             .tree = reference.tree,
@@ -6686,7 +10876,8 @@ pub const FileCache = struct {
         setCleanupOutcomes(&summary, .{});
         const charge_cache = cleanup_budget.initiating_cache orelse self;
         const charge_node = cleanup_budget.initiating_node orelse @as(Ast.Node.Index, @enumFromInt(0));
-        try charge_cache.chargeCleanupStorageClone(summary, charge_node);
+        const charge_tree = cleanup_budget.initiating_tree orelse self.tree;
+        try charge_cache.chargeCleanupStorageClone(summary, charge_tree, charge_node);
         return try cloneFnSummary(arena, summary);
     }
 
@@ -6872,12 +11063,18 @@ pub const FileCache = struct {
     }
 
     pub fn enterNormalCleanup(self: *FileCache, node: Ast.Node.Index) SummaryError!void {
+        return self.enterNormalCleanupAt(self.tree, node);
+    }
+
+    fn enterNormalCleanupAt(self: *FileCache, tree: *const Ast, node: Ast.Node.Index) SummaryError!void {
         if (cleanup_budget.initiating_cache == null) {
             cleanup_budget.initiating_cache = self;
             cleanup_budget.initiating_node = node;
+            cleanup_budget.initiating_tree = tree;
         }
-        if (cleanup_budget.depth == 64) return self.cleanupBudgetFailure(.normal_cleanup_depth, 64, node);
+        if (cleanup_budget.depth == 64) return self.cleanupBudgetFailureAt(tree, .normal_cleanup_depth, 64, node);
         cleanup_probe_stack[cleanup_budget.depth] = cleanupProbeRow(self, node);
+        cleanup_probe_stack[cleanup_budget.depth].tree = tree;
         cleanup_budget.depth += 1;
     }
 
@@ -6887,49 +11084,66 @@ pub const FileCache = struct {
     }
 
     pub fn chargeNormalCleanup(self: *FileCache, node: Ast.Node.Index) SummaryError!void {
-        if (cleanup_budget.remaining == 0) return self.cleanupBudgetFailure(.normal_cleanup_nodes, 50_000, node);
+        return self.chargeNormalCleanupAt(self.tree, node);
+    }
+
+    /// Source scans can visit admitted declarations outside this cache.
+    /// The budget is shared, but each node keeps its owning document.
+    pub fn chargeNormalCleanupAt(self: *FileCache, tree: *const Ast, node: Ast.Node.Index) SummaryError!void {
+        if (cleanup_budget.remaining == 0)
+            return self.cleanupBudgetFailureAt(tree, .normal_cleanup_nodes, 50_000, node);
         cleanup_budget.remaining -= 1;
     }
 
     /// Charge alternative copies and products before allocating their state.
     pub fn normalCleanupStorageWork(self: *FileCache, node: Ast.Node.Index, units: usize) SummaryError!void {
+        return self.normalCleanupStorageWorkAt(self.tree, node, units);
+    }
+
+    fn normalCleanupStorageWorkAt(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, units: usize) SummaryError!void {
         if (units > cleanup_budget.remaining)
-            return self.cleanupBudgetFailure(.normal_cleanup_nodes, 50_000, node);
+            return self.cleanupBudgetFailureAt(tree, .normal_cleanup_nodes, 50_000, node);
         cleanup_budget.remaining -= @intCast(units);
     }
 
     /// Production clone callers preflight before any summary allocation.
     /// Ordinary declaration clones outside cleanup do not spend this scope.
-    fn chargeCleanupStorageClone(self: *FileCache, summary: fn_summary.FnSummary, node: Ast.Node.Index) SummaryError!void {
+    fn chargeCleanupStorageClone(self: *FileCache, summary: fn_summary.FnSummary, tree: *const Ast, node: Ast.Node.Index) SummaryError!void {
         if (cleanup_budget.queries == 0) return;
         inline for (.{ "normal_success_storage_outcomes", "error_storage_outcomes" }) |name| {
             const outcomes = @field(summary, name);
-            try self.normalCleanupStorageWork(node, outcomes.len);
+            try self.normalCleanupStorageWorkAt(tree, node, outcomes.len);
             for (outcomes) |outcome| {
-                try self.normalCleanupStorageWork(node, outcome.operations.len);
+                try self.normalCleanupStorageWorkAt(tree, node, outcome.operations.len);
                 for (outcome.operations) |operation| {
-                    try self.normalCleanupStorageWork(node, operation.path.path.len);
+                    try self.normalCleanupStorageWorkAt(tree, node, operation.path.path.len);
                     if (operation.allocator) |allocator|
-                        try self.normalCleanupStorageWork(node, allocator.path.len);
+                        try self.normalCleanupStorageWorkAt(tree, node, allocator.path.len);
                 }
             }
         }
     }
 
     fn cleanupBudgetFailure(self: *FileCache, limit: budget_mod.Limit, cap: u32, node: Ast.Node.Index) budget_mod.BudgetError {
-        cleanupProbeFailure(self, node, limit);
+        return self.cleanupBudgetFailureAt(self.tree, limit, cap, node);
+    }
+
+    fn cleanupBudgetFailureAt(self: *FileCache, tree: *const Ast, limit: budget_mod.Limit, cap: u32, node: Ast.Node.Index) budget_mod.BudgetError {
+        if (replay_failure_site == null) replay_failure_site = .{ .tree = tree, .node = node };
+        cleanupProbeFailure(self, tree, node, limit);
         if (cleanup_budget.initiating_cache) |origin| {
-            if (origin != self or cleanup_budget.initiating_node.? != node)
-                return origin.cleanupBudgetFailure(limit, cap, cleanup_budget.initiating_node.?);
+            const initiating_tree = cleanup_budget.initiating_tree.?;
+            if (origin != self or initiating_tree != tree or cleanup_budget.initiating_node.? != node)
+                return origin.cleanupBudgetFailureAt(initiating_tree, limit, cap, cleanup_budget.initiating_node.?);
         }
-        const token = self.tree.nodeMainToken(node);
-        const byte = self.tree.tokens.items(.start)[token];
-        const lc = budget_mod.lineCol(self.tree.source, byte);
+        const token = tree.nodeMainToken(node);
+        const byte = tree.tokens.items(.start)[token];
+        const lc = budget_mod.lineCol(tree.source, byte);
         var name: budget_mod.NameBuf = .{};
-        if (tokens.enclosingFnDecl(self.tree, token)) |declaration| {
+        if (self.enclosingFunctionAt(tree, token)) |declaration| {
             var buffer: [1]Ast.Node.Index = undefined;
-            if (tokens.fnProto(self.tree, &buffer, declaration)) |proto| {
-                if (proto.name_token) |name_token| name.set(self.tree.tokenSlice(name_token));
+            if (tokens.fnProto(tree, &buffer, declaration)) |proto| {
+                if (proto.name_token) |name_token| name.set(tree.tokenSlice(name_token));
             }
         }
         return budget_mod.fail(.{
@@ -6972,7 +11186,7 @@ pub const FileCache = struct {
     pub fn normalCleanupAllocator(self: *FileCache, node: Ast.Node.Index) SummaryError!?fn_summary.ParamPath {
         const allocator = (try self.cleanupFreshAllocatorNode(node)) orelse return null;
         const token = self.tree.firstToken(allocator);
-        const declaration = tokens.enclosingFnDecl(self.tree, token) orelse return null;
+        const declaration = self.enclosingFunctionAt(self.tree, token) orelse return null;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(self.tree, &buffer, declaration) orelse return null;
         const body = tokens.bodyOf(self.tree, declaration) orelse return null;
@@ -7012,7 +11226,7 @@ pub const FileCache = struct {
                 },
                 .identifier => {
                     const token = self.tree.nodeMainToken(expression);
-                    const declaration = tokens.enclosingFnDecl(self.tree, token) orelse return null;
+                    const declaration = self.enclosingFunctionAt(self.tree, token) orelse return null;
                     var proto_buffer: [1]Ast.Node.Index = undefined;
                     const proto = tokens.fnProto(self.tree, &proto_buffer, declaration) orelse return null;
                     const body = tokens.bodyOf(self.tree, declaration) orelse return null;
@@ -7273,7 +11487,7 @@ pub const FileCache = struct {
         const effect_context: call_summary_mod.QueryContext = .{
             .frame = caller_frame,
             .remaining = &cleanup_budget.remaining,
-            .declaration = tokens.enclosingFnDecl(tree, token),
+            .declaration = self.enclosingFunctionAt(tree, token),
         };
         const saved_probe_owners = cleanup_probe_owners;
         const saved_probe_owner_count = cleanup_probe_owner_count;
@@ -7669,7 +11883,7 @@ pub const FileCache = struct {
         parameter: u32,
         field: []const u8,
     ) SummaryError!bool {
-        const declaration = tokens.enclosingFnDecl(self.tree, self.tree.nodeMainToken(store)) orelse return false;
+        const declaration = self.enclosingFunctionAt(self.tree, self.tree.nodeMainToken(store)) orelse return false;
         const body = tokens.bodyOf(self.tree, declaration) orelse return false;
         const key = @intFromEnum(body);
         const writes = self.retained_writes.get(key) orelse blk: {
@@ -9816,8 +14030,36 @@ test "FileCache: active storage clone preflight uses cleanup allowance" {
     _ = budget_mod.take();
     defer _ = budget_mod.take();
     try cache.normalCleanupStorageWork(node, 50_000);
-    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.chargeCleanupStorageClone(summary, node));
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.chargeCleanupStorageClone(summary, &tree, node));
     try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_nodes, budget_mod.take().?.limit);
+}
+
+test "FileCache: foreign storage clone preflight retains initiating node ownership" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "fn caller() void {}", .zig);
+    defer tree.deinit(gpa);
+    var foreign = try Ast.parse(gpa,
+        "const padding = .{" ++ "0," ** 16 ++ "};\nfn foreign() void {}", .zig);
+    defer foreign.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    const node = foreign.rootDecls()[1];
+    try std.testing.expect(@intFromEnum(node) >= tree.nodes.len);
+    const outcomes = [_]fn_summary.StorageOutcome{.{ .operations = &.{} }};
+    const summary = fn_summary.FnSummary{ .normal_success_storage_outcomes = &outcomes };
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    try cache.enterNormalCleanupAt(&foreign, node);
+    defer cache.leaveNormalCleanup();
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    cleanup_budget.remaining = 0;
+    try std.testing.expectError(error.AnalysisBudgetExceeded,
+        cache.chargeCleanupStorageClone(summary, cleanup_budget.initiating_tree.?, cleanup_budget.initiating_node.?));
+    const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_nodes, failure.limit);
+    try std.testing.expectEqualStrings("foreign", failure.function.slice());
+    try std.testing.expectEqual(foreign.tokenStart(foreign.nodeMainToken(node)), failure.byte);
 }
 
 test "FileCache: cleanup freshness requires heap allocation provenance" {
@@ -11160,6 +15402,7 @@ test "FileCache: aggregate literal proof checks actual defaults and array shape"
             .tree = tree,
             .frame = resolver.resolutionFrame(),
             .call_node = value,
+            .call_tree = tree,
         };
         const expected: FileCache.DefiniteStoreValue = if (std.mem.startsWith(u8, name, "safe_"))
             .defined
@@ -11187,6 +15430,7 @@ test "FileCache: computed scalar output proof preserves shared work and depth li
         .tree = &tree,
         .frame = undefined, // The literal proof does not ask a type question.
         .call_node = literal.?,
+        .call_tree = &tree,
     };
     _ = budget_mod.take();
     cache.beginNormalCleanup();
@@ -11386,6 +15630,348 @@ test "FileCache: delegated stores credit receivers, field operands and aggregate
     }
     try std.testing.expectEqual(credited.len + abstained.len, seen);
     try std.testing.expect(correct);
+    try std.testing.expectEqual(@as(u32, 0), cleanup_budget.depth);
+    try std.testing.expectEqual(@as(u32, 0), cleanup_budget.queries);
+}
+
+test "FileCache: foreign diagnostic replay exhaustion retains node ownership" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const callee_source: [:0]const u8 =
+        \\const defaults = @import("./defaults.zig");
+        \\const pad00 = 0;
+        \\const pad01 = 1;
+        \\const pad02 = 2;
+        \\const pad03 = 3;
+        \\const pad04 = 4;
+        \\const pad05 = 5;
+        \\const pad06 = 6;
+        \\const pad07 = 7;
+        \\const pad08 = 8;
+        \\const pad09 = 9;
+        \\const pad10 = 10;
+        \\const pad11 = 11;
+        \\const pad12 = 12;
+        \\const pad13 = 13;
+        \\const pad14 = 14;
+        \\const pad15 = 15;
+        \\pub fn poison() u32 { return undefined; }
+        \\pub fn write(out: *u32) void { out.* = undefined; }
+        \\pub fn omitted() defaults.Value { return .{}; }
+    ;
+    const defaults_source: [:0]const u8 =
+        \\const pad00 = 0;
+        \\const pad01 = 1;
+        \\const pad02 = 2;
+        \\const pad03 = 3;
+        \\const pad04 = 4;
+        \\const pad05 = 5;
+        \\const pad06 = 6;
+        \\const pad07 = 7;
+        \\const pad08 = 8;
+        \\const pad09 = 9;
+        \\const pad10 = 10;
+        \\const pad11 = 11;
+        \\const pad12 = 12;
+        \\const pad13 = 13;
+        \\const pad14 = 14;
+        \\const pad15 = 15;
+        \\pub const Value = struct { value: u32 = undefined };
+    ;
+    const Query = enum { syntax, replay, stores, defaults, initiating_redirect };
+    for (std.enums.values(Query)) |query| {
+        const caller_source: [:0]const u8 = switch (query) {
+            .stores =>
+            \\const foreign = @import("./callee.zig");
+            \\pub fn entry() void { var value: u32 = 1; foreign.write(&value); }
+            ,
+            .defaults =>
+            \\const foreign = @import("./callee.zig");
+            \\pub fn entry() void { _ = foreign.omitted(); }
+            ,
+            else =>
+            \\const foreign = @import("./callee.zig");
+            \\pub fn entry() u32 { return foreign.poison(); }
+            ,
+        };
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "callee.zig", .data = callee_source });
+        try tmp.dir.writeFile(io, .{ .sub_path = "defaults.zig", .data = defaults_source });
+        try tmp.dir.writeFile(io, .{ .sub_path = "caller.zig", .data = caller_source });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+        defer gpa.free(root);
+        const caller_path = try std.fs.path.join(gpa, &.{ root, "caller.zig" });
+        defer gpa.free(caller_path);
+        var context: engine.TypeContext = undefined;
+        try context.init(gpa, io);
+        defer context.deinit();
+        context.store.source_policy = .{ .roots = &.{root} };
+        var resolver: engine.TypeResolver = undefined;
+        try resolver.init(&context, gpa, caller_path, caller_source);
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        var cache = FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        cache.module_id = resolver.handle.module;
+        cache.file_path = caller_path;
+        const wanted = switch (query) {
+            .stores => "write",
+            .defaults => "omitted",
+            else => "poison",
+        };
+        var call_node: ?Ast.Node.Index = null;
+        var token: ?Ast.TokenIndex = null;
+        var address: ?Ast.Node.Index = null;
+        for (tree.nodes.items(.tag), 0..) |tag, raw| {
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            if (tag == .address_of) address = node;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, node) orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(call.ast.fn_expr)), wanted)) continue;
+            call_node = node;
+            token = fresh_storage_mod.calleeQueryToken(tree, call);
+        }
+        // Resolve real imports before spending the cleanup allowance. Keep
+        // return syntax and verdicts cold so the failure is in replay, not lookup.
+        const canonical = (try cache.actualCallSummaryAt(token.?, null)).?;
+        const declaring = (try canonical.declaringCache(&cache)).?;
+        try std.testing.expect(canonical.callee.tree == declaring.tree);
+        try std.testing.expect(declaring.tree != tree);
+        try std.testing.expectEqualStrings(callee_source, declaring.tree.source);
+        var failed_tree = canonical.callee.tree;
+        var failed_node = tokens.bodyOf(failed_tree, canonical.callee.declaration).?;
+        var expected_function: []const u8 = wanted;
+        var default_frame: ?TypeResolver.ResolutionFrame = null;
+        if (query == .defaults) {
+            // Exercise the source predicate in the default's own document.
+            // Its type owner is a third file, not the caller or callee.
+            const declared = canonical.callee.reference.actual_type.data.function.return_value.*;
+            const result = (try resolver.normalizedType(declared)).?;
+            default_frame = resolver.frameForContainer(result.data.container);
+            const scope = result.data.container.scope_handle;
+            failed_tree = &scope.handle.document.tree;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const container = failed_tree.fullContainerDecl(&buffer, scope.toNode()).?;
+            const field = failed_tree.fullContainerField(container.ast.members[0]).?;
+            failed_node = field.ast.value_expr.unwrap().?;
+            expected_function = "";
+            try std.testing.expect(failed_tree != declaring.tree);
+        }
+        // This small fixture must distinguish numeric node ownership: the
+        // foreign node would be out of bounds if read against the caller AST.
+        try std.testing.expect(@intFromEnum(failed_node) >= tree.nodes.len);
+        _ = budget_mod.take();
+        defer _ = budget_mod.take();
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        if (query == .initiating_redirect) {
+            try cache.enterNormalCleanup(call_node.?);
+            defer cache.leaveNormalCleanup();
+            cleanup_budget.remaining = 0;
+            try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultMayBeUndefinedAt(token.?, null));
+            failed_tree = tree;
+            failed_node = call_node.?;
+            expected_function = "entry";
+        } else {
+            cleanup_budget.remaining = 0;
+            try std.testing.expect(cleanup_budget.initiating_cache == null);
+            switch (query) {
+                .syntax => try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultMayBeUndefinedAt(token.?, null)),
+                .defaults => try std.testing.expectError(error.AnalysisBudgetExceeded, cache.returnSourceEligibility(default_frame.?, failed_node, false)),
+                .replay => try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(token.?, null, true, &canonical)),
+                .stores => {
+                    var use: FileCache.AddressUse = .{
+                        .operand = tree.nodeData(address.?).node,
+                        .address_node = address.?,
+                        .call_node = call_node.?,
+                        .may_write = true,
+                    };
+                    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.populateUndefinedAddressStores(&use));
+                    try std.testing.expectEqual(@as(usize, 0), use.undefined_field_count);
+                    try std.testing.expect(!use.definite_write);
+                },
+                .initiating_redirect => unreachable,
+            }
+        }
+        const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+        const expected_byte = failed_tree.tokenStart(failed_tree.nodeMainToken(failed_node));
+        const position = budget_mod.lineCol(failed_tree.source, expected_byte);
+        try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_nodes, failure.limit);
+        try std.testing.expectEqual(@as(u32, 50_000), failure.limit_value);
+        try std.testing.expectEqual(@as(u32, 50_000), failure.reached);
+        try std.testing.expectEqual(expected_byte, failure.byte);
+        try std.testing.expectEqual(position.line, failure.line);
+        try std.testing.expectEqual(position.column, failure.column);
+        try std.testing.expectEqualStrings(expected_function, failure.function.slice());
+        try std.testing.expectEqual(@as(usize, 0), cache.return_defined_summaries.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.return_defined_visiting.count());
+        // A fresh allowance must retry, not read an unfinished replay as a
+        // positive certificate or a cached negative verdict.
+        cache.endNormalCleanup();
+        cache.beginNormalCleanup();
+        if (query == .stores) {
+            var use: FileCache.AddressUse = .{
+                .operand = tree.nodeData(address.?).node,
+                .address_node = address.?,
+                .call_node = call_node.?,
+                .may_write = true,
+            };
+            try cache.populateUndefinedAddressStores(&use);
+            try std.testing.expect(use.undefined_field_count != 0);
+            try std.testing.expect(!use.definite_write);
+        } else {
+            try std.testing.expect(!try cache.callResultDefinedAt(token.?, null));
+            try std.testing.expect(try cache.callResultMayBeUndefinedAt(token.?, null));
+        }
+    }
+}
+
+test "FileCache: foreign nested store literal exhaustion retains node ownership" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const caller_source: [:0]const u8 =
+        "const padding = .{" ++ "0," ** 32 ++ "};\n" ++
+        \\const wrapper = @import("./wrapper.zig");
+        \\pub fn entry() void { var value: u32 = 1; wrapper.write(&value); }
+    ;
+    const wrapper_source: [:0]const u8 =
+        \\const leaf = @import("./leaf.zig");
+        \\pub fn write(out: *u32) void {
+        \\    var local: u32 = 1;
+        \\    leaf.write(&local);
+        \\    out.* = local;
+        \\}
+    ;
+    const leaf_source: [:0]const u8 =
+        "const padding = .{" ++ "0," ** 128 ++ "};\n" ++
+        \\pub fn write(out: *u32) void { out.* = undefined; }
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "caller.zig", .data = caller_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "wrapper.zig", .data = wrapper_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "leaf.zig", .data = leaf_source });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const caller_path = try std.fs.path.join(gpa, &.{ root, "caller.zig" });
+    defer gpa.free(caller_path);
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{root} };
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, caller_path, caller_source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    cache.file_path = caller_path;
+    var address: ?Ast.Node.Index = null;
+    var call_node: ?Ast.Node.Index = null;
+    var canonical: ?FileCache.ActualCallSummary = null;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (tag == .address_of) address = node;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        call_node = node;
+        canonical = try cache.actualCallSummaryAt(call.queryToken(tree, node), null);
+    }
+    const wrapper = (try canonical.?.declaringCache(&cache)).?;
+    try std.testing.expect(@intFromEnum(call_node.?) >= wrapper.tree.nodes.len);
+    var leaf: ?*FileCache = null;
+    const wrapper_frame = wrapper.zls.?.frameForFunction(canonical.?.callee.reference);
+    for (wrapper.tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(wrapper.tree, &buffer, node) orelse continue;
+        const nested = (try wrapper.actualCallSummaryAt(call.queryToken(wrapper.tree, node), wrapper_frame)).?;
+        leaf = (try nested.declaringCache(wrapper)).?;
+    }
+    const leaf_tree = leaf.?.tree;
+    var literal: ?Ast.Node.Index = null;
+    for (leaf_tree.nodes.items(.tag), 0..) |tag, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (tag == .identifier and
+            std.mem.eql(u8, leaf_tree.tokenSlice(leaf_tree.nodeMainToken(node)), "undefined")) literal = node;
+    }
+    try std.testing.expect(@intFromEnum(literal.?) >= tree.nodes.len);
+    const saved_site = replay_failure_site;
+    defer replay_failure_site = saved_site;
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    var allowance: ?u32 = null;
+    var source_allowance: ?u32 = null;
+    // The direct literal is charged first by wholeStoreFieldSource, then by
+    // literalStoreUndefinedValueMode. Select the second consecutive charge.
+    // Each scope retries with fresh lexical state and no positive certificate.
+    for (0..256) |remaining| {
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        replay_failure_site = null;
+        cleanup_budget.remaining = @intCast(remaining);
+        var use: FileCache.AddressUse = .{
+            .operand = tree.nodeData(address.?).node,
+            .address_node = address.?,
+            .call_node = call_node.?,
+            .may_write = true,
+        };
+        _ = cache.definiteAddressWrite(&use) catch |err| {
+            if (err != error.AnalysisBudgetExceeded) return err;
+            try std.testing.expect(!use.definite_write);
+            const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_nodes, failure.limit);
+            try std.testing.expectEqualStrings("entry", failure.function.slice());
+            const site = replay_failure_site orelse return error.TestUnexpectedResult;
+            if (site.tree == leaf_tree and site.node == literal.?) {
+                if (source_allowance) |previous| {
+                    try std.testing.expectEqual(previous + 1, @as(u32, @intCast(remaining)));
+                    allowance = @intCast(remaining);
+                    break;
+                }
+                source_allowance = @intCast(remaining);
+            }
+            continue;
+        };
+        try std.testing.expect(!use.definite_write);
+    }
+    try std.testing.expect(allowance != null);
+    for (0..2) |_| {
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        replay_failure_site = null;
+        cleanup_budget.remaining = allowance.?;
+        var use: FileCache.AddressUse = .{
+            .operand = tree.nodeData(address.?).node,
+            .address_node = address.?,
+            .call_node = call_node.?,
+            .may_write = true,
+        };
+        try std.testing.expectError(error.AnalysisBudgetExceeded, cache.definiteAddressWrite(&use));
+        try std.testing.expect(!use.definite_write);
+        const site = replay_failure_site orelse return error.TestUnexpectedResult;
+        try std.testing.expect(site.tree == leaf_tree and site.node == literal.?);
+        const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("entry", failure.function.slice());
+        try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(call_node.?)), failure.byte);
+    }
+    var retry_result: ?bool = null;
+    for (0..2) |_| {
+        var use: FileCache.AddressUse = .{
+            .operand = tree.nodeData(address.?).node,
+            .address_node = address.?,
+            .call_node = call_node.?,
+            .may_write = true,
+        };
+        const retained = try cache.definiteAddressWrite(&use);
+        if (retry_result) |previous| try std.testing.expectEqual(previous, retained);
+        retry_result = retained;
+        try std.testing.expect(!use.definite_write);
+    }
     try std.testing.expectEqual(@as(u32, 0), cleanup_budget.depth);
     try std.testing.expectEqual(@as(u32, 0), cleanup_budget.queries);
 }
@@ -11813,4 +16399,842 @@ test "FileCache: lexical excluded embed components cannot alias an allowed canon
         try std.testing.expectEqual(@as(?u64, null), try cache.embeddedFileLength(embed));
         try std.testing.expectEqual(@as(usize, 1), cache.embedded_file_lengths.count());
     }
+}
+
+test "FileCache: ordinary completed call identities retain contextual return separation" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\const Safe = struct { const value: u8 = 7; };
+        \\const Poisoned = struct { const value: u8 = undefined; };
+        \\fn leaf(comptime T: type) u8 { return T.value; }
+        \\fn pick(comptime T: type) u8 { return leaf(T); }
+        \\fn safe() u8 { return pick(Safe); }
+        \\fn unsafe() u8 { return pick(Poisoned); }
+        \\fn knownUndefined() u8 { return undefined; }
+        \\fn negativeControl() u8 { return knownUndefined(); }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-completed-return-identity.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    var outer_tokens: [2]Ast.TokenIndex = undefined;
+    var outer_count: usize = 0;
+    var inner_token: ?Ast.TokenIndex = null;
+    var negative_token: ?Ast.TokenIndex = null;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        const token = call.queryToken(tree, node);
+        if (std.mem.eql(u8, tree.tokenSlice(token), "leaf")) inner_token = token;
+        if (std.mem.eql(u8, tree.tokenSlice(token), "knownUndefined")) negative_token = token;
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "pick")) continue;
+        try std.testing.expect(outer_count < outer_tokens.len);
+        outer_tokens[outer_count] = token;
+        outer_count += 1;
+    }
+    try std.testing.expectEqual(outer_tokens.len, outer_count);
+    var calls: [2]FileCache.ActualCallSummary = undefined;
+    for (outer_tokens, 0..) |token, index| {
+        // The ordinary producer finishes first, as in the summary fold.
+        const completed = (try grow_analysis_mod.actualCalleeOf(&cache, token, null)).?;
+        try std.testing.expect(completed.caller_frame == null);
+        calls[index] = (try cache.returnCallAt(token, resolver.resolutionFrame())).?;
+        try std.testing.expect(calls[index].callee.caller_frame != null);
+        try std.testing.expect(calls[index].callee.reference.actual_type.eql(completed.reference.actual_type));
+        try std.testing.expect(cache.actual_callees.get(token).?.?.caller_frame == null);
+    }
+    try std.testing.expect(!calls[0].callee.reference.actual_type.eql(calls[1].callee.reference.actual_type));
+    const ordinary_count = cache.actual_callees.count();
+    var nested: [2]FileCache.ActualCallSummary = undefined;
+    for (calls, 0..) |outer, index| {
+        const frame = resolver.frameForFunction(outer.callee.reference);
+        nested[index] = (try cache.returnCallAt(inner_token.?, frame)).?;
+        try std.testing.expect(nested[index].callee.caller_frame.?.actual_type.?.eql(frame.actual_type.?));
+    }
+    try std.testing.expectEqual(ordinary_count, cache.actual_callees.count());
+    try std.testing.expect(!nested[0].callee.reference.actual_type.eql(nested[1].callee.reference.actual_type));
+    var defined: [2]bool = undefined;
+    var may_undefined: [2]bool = undefined;
+    for (outer_tokens, 0..) |token, index| {
+        defined[index] = try cache.callResultDefinedAt(token, resolver.resolutionFrame());
+        try std.testing.expectEqual(
+            if (index == 0) FileCache.SourceEligibility.absent else FileCache.SourceEligibility.present,
+            try cache.diagnosticReturnSeed(calls[index], resolver.resolutionFrame()),
+        );
+        may_undefined[index] = try cache.callResultMayBeUndefinedAt(token, resolver.resolutionFrame());
+    }
+    try std.testing.expect(!try cache.callResultDefinedAt(negative_token.?, resolver.resolutionFrame()));
+    try std.testing.expect(try cache.callResultMayBeUndefinedAt(negative_token.?, resolver.resolutionFrame()));
+    // Finished positive and negative results remain usable with no work left.
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    cleanup_budget.remaining = 0;
+    for (outer_tokens, 0..) |token, index| {
+        try std.testing.expectEqual(defined[index], try cache.callResultDefinedAt(token, resolver.resolutionFrame()));
+        try std.testing.expectEqual(may_undefined[index], try cache.callResultMayBeUndefinedAt(token, resolver.resolutionFrame()));
+    }
+    try std.testing.expect(!try cache.callResultDefinedAt(negative_token.?, resolver.resolutionFrame()));
+    try std.testing.expect(try cache.callResultMayBeUndefinedAt(negative_token.?, resolver.resolutionFrame()));
+    try std.testing.expectEqual(@as(usize, 0), cache.return_defined_visiting.count());
+    try std.testing.expectEqual(@as(usize, 0), cache.return_source_visiting.count());
+}
+
+test "FileCache: completed source-free return cycles retain exact instantiation separation" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\const Safe = struct { const value: u8 = 7; };
+        \\const Poisoned = struct { const value: u8 = undefined; };
+        \\fn first(comptime T: type, again: bool) u8 {
+        \\    if (again) return second(T, again);
+        \\    return T.value;
+        \\}
+        \\fn second(comptime T: type, again: bool) u8 { return first(T, again); }
+        \\fn safe(again: bool) u8 { return first(Safe, again); }
+        \\fn unsafe(again: bool) u8 { return first(Poisoned, again); }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-source-free-return-cycle.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    var calls: [2]FileCache.ActualCallSummary = undefined;
+    var count: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        if (call.ast.params.len != 2) continue;
+        const argument = tree.tokenSlice(tree.nodeMainToken(call.ast.params[0]));
+        if (!std.mem.eql(u8, argument, "Safe") and !std.mem.eql(u8, argument, "Poisoned")) continue;
+        try std.testing.expect(count < calls.len);
+        calls[count] = (try cache.returnCallAt(call.queryToken(tree, node), resolver.resolutionFrame())).?;
+        count += 1;
+    }
+    try std.testing.expectEqual(calls.len, count);
+    try std.testing.expect(!calls[0].callee.reference.actual_type.eql(calls[1].callee.reference.actual_type));
+    for (calls, 0..) |call, index| {
+        try std.testing.expectEqual(
+            if (index == 0) FileCache.SourceEligibility.absent else FileCache.SourceEligibility.present,
+            try cache.diagnosticReturnSeed(call, resolver.resolutionFrame()),
+        );
+    }
+    // A closed absence is reusable with no allowance. An intermediate cycle
+    // must not hide the poisoned instantiation's source in the same document.
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    cleanup_budget.remaining = 0;
+    for (calls, 0..) |call, index| {
+        try std.testing.expectEqual(
+            if (index == 0) FileCache.SourceEligibility.absent else FileCache.SourceEligibility.present,
+            try cache.diagnosticReturnSeed(call, resolver.resolutionFrame()),
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 0), cache.return_source_visiting.count());
+}
+
+test "FileCache: return replay failures retain allowances contexts and current caller ownership" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\fn hole(comptime poisoned: bool, value: u8) u8 {
+        \\    if (poisoned) return undefined;
+        \\    return value;
+        \\}
+        \\fn first() u8 { return hole(true, 7); }
+        \\fn second() u8 { return hole(true, 7); }
+        \\fn safe() u8 { return hole(false, 7); }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-return-replay-failure.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    var calls: [3]FileCache.ActualCallSummary = undefined;
+    var nodes: [3]Ast.Node.Index = undefined;
+    var query_tokens: [3]Ast.TokenIndex = undefined;
+    var count: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        const token = call.queryToken(tree, node);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "hole")) continue;
+        try std.testing.expect(count < calls.len);
+        calls[count] = (try cache.returnCallAt(token, null)).?;
+        nodes[count] = node;
+        query_tokens[count] = token;
+        count += 1;
+    }
+    try std.testing.expectEqual(calls.len, count);
+    try std.testing.expect(calls[0].callee.reference.actual_type.eql(calls[1].callee.reference.actual_type));
+    try std.testing.expect(!calls[0].callee.reference.actual_type.eql(calls[2].callee.reference.actual_type));
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    const owners = [_][]const u8{ "first", "second", "safe" };
+    for (calls, 0..) |call, index| {
+        cache.beginNormalCleanup();
+        // Source admission can leave the initiating caller set after its
+        // own stack unwinds. A memo must report this caller, not the first.
+        try cache.enterNormalCleanup(nodes[index]);
+        cache.leaveNormalCleanup();
+        cleanup_budget.remaining = 0;
+        try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(query_tokens[index], null, true, &call));
+        const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(owners[index], failure.function.slice());
+        try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(nodes[index])), failure.byte);
+        try std.testing.expectEqual(@as(u32, 0), cleanup_budget.remaining);
+        cache.endNormalCleanup();
+        try std.testing.expectEqual(@as(usize, if (index == 2) 2 else 1), cache.return_replay_failures.count());
+    }
+    // An unequal allowance must walk again, even though both attempts fail.
+    cache.beginNormalCleanup();
+    cleanup_budget.remaining = 1;
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(query_tokens[0], null, true, &calls[0]));
+    try std.testing.expect(budget_mod.take() != null);
+    cache.endNormalCleanup();
+    try std.testing.expectEqual(@as(usize, 3), cache.return_replay_failures.count());
+    // New completed facts must invalidate an old exact-allowance failure:
+    // the same bounded replay can become cheaper after a syntax index settles.
+    const first_key: ReplayFailureKey = .{
+        .callee = resolvedCleanupKey(calls[0].callee.reference, calls[0].callee.declaration),
+        .remaining = 0,
+        .depth = 0,
+    };
+    // Settling a nested failure also changes the work a replay would do.
+    // Its stamp is separate from completed entries to prevent cancellation.
+    try std.testing.expectEqual(@as(usize, 0), cache.return_replay_failures.get(first_key).?.exhausted_entries);
+    try cache.effects_state.exhausted.put(gpa, .{
+        .key = .{
+            .declaration = first_key.callee.declaration,
+            .parameter = 0,
+            .path = 0,
+            .context = null,
+        },
+        .mode = .whole,
+    }, .{ .budget = 50_000, .limit = .normal_cleanup_nodes, .cap = 50_000, .reached = 50_000 });
+    cache.beginNormalCleanup();
+    cleanup_budget.remaining = 0;
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(query_tokens[0], null, true, &calls[0]));
+    _ = budget_mod.take();
+    cache.endNormalCleanup();
+    try std.testing.expectEqual(@as(usize, 1), cache.return_replay_failures.get(first_key).?.exhausted_entries);
+    const old_stamp = cache.return_replay_failures.get(first_key).?.memo_entries;
+    cache.beginNormalCleanup();
+    _ = try cache.returnReplaySyntax(calls[0].callee);
+    cache.endNormalCleanup();
+    cache.beginNormalCleanup();
+    cleanup_budget.remaining = 0;
+    _ = cache.callResultValueAt(query_tokens[0], null, true, &calls[0]) catch |err| retry: {
+        try std.testing.expect(err == error.AnalysisBudgetExceeded);
+        if (cache.return_replay_failures.get(first_key)) |failure|
+            try std.testing.expect(failure.memo_entries != old_stamp);
+        _ = budget_mod.take();
+        break :retry false;
+    };
+    cache.endNormalCleanup();
+    // Fresh allowances can complete. Completed verdicts always win over
+    // an earlier failure, even when the next caller has no work left.
+    const first_may_undefined = try cache.callResultValueAt(query_tokens[0], null, true, &calls[0]);
+    const safe_defined = try cache.callResultValueAt(query_tokens[2], null, false, &calls[2]);
+    try std.testing.expectEqual(@as(usize, 2), cache.return_defined_summaries.count());
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    cleanup_budget.remaining = 0;
+    try std.testing.expectEqual(first_may_undefined, try cache.callResultValueAt(query_tokens[1], null, true, &calls[1]));
+    try std.testing.expectEqual(safe_defined, try cache.callResultValueAt(query_tokens[2], null, false, &calls[2]));
+    try std.testing.expect(budget_mod.take() == null);
+}
+
+test "FileCache: nested replay failures preserve raw sites for outer collectors" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\fn hole() u8 { return undefined; }
+        \\fn caller() u8 { return hole(); }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-nested-replay-site.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    var actual: ?FileCache.ActualCallSummary = null;
+    var caller_node: ?Ast.Node.Index = null;
+    var query_token: ?Ast.TokenIndex = null;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        const token = call.queryToken(tree, node);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "hole")) continue;
+        actual = (try cache.returnCallAt(token, null)).?;
+        caller_node = node;
+        query_token = token;
+    }
+    const call = actual orelse return error.TestUnexpectedResult;
+    const saved_site = replay_failure_site;
+    defer replay_failure_site = saved_site;
+    replay_failure_site = null;
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    for (0..64) |_| try cache.enterNormalCleanup(caller_node.?);
+    defer for (0..64) |_| cache.leaveNormalCleanup();
+    try std.testing.expectError(error.AnalysisBudgetExceeded,
+        cache.callResultValueAt(query_token.?, null, true, &call));
+    // This child does not own the outer collector. Its raw failure must
+    // survive its unwind, while the visible diagnostic keeps the caller.
+    const site = replay_failure_site orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(tree, site.tree);
+    try std.testing.expectEqual(tokens.bodyOf(call.callee.tree, call.callee.declaration).?, site.node);
+    const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("caller", failure.function.slice());
+    try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(caller_node.?)), failure.byte);
+    try std.testing.expectEqual(@as(usize, 0), cache.return_replay_failures.count());
+}
+
+test "FileCache: memoized replay failures outlive nested caches and borrowed demands" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\fn hole() u8 { return undefined; }
+        \\fn first() u8 { return hole(); }
+        \\fn second() u8 { return hole(); }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-replay-failure-lifetime.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    var calls: [2]FileCache.ActualCallSummary = undefined;
+    var nodes: [2]Ast.Node.Index = undefined;
+    var count: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        const token = call.queryToken(tree, node);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "hole")) continue;
+        try std.testing.expect(count < calls.len);
+        calls[count] = (try cache.returnCallAt(token, null)).?;
+        nodes[count] = node;
+        count += 1;
+    }
+    try std.testing.expectEqual(calls.len, count);
+    var foreign = try Ast.parse(gpa, "fn foreign() u8 { return undefined; }", .zig);
+    defer foreign.deinit(gpa);
+    const foreign_node = foreign.rootDecls()[0];
+    const saved_site = replay_failure_site;
+    defer replay_failure_site = saved_site;
+    replay_failure_site = null;
+    _ = budget_mod.take();
+    defer _ = budget_mod.take();
+    const probe_dumped = cleanup_probe_dumped.swap(false, .monotonic);
+    defer cleanup_probe_dumped.store(probe_dumped, .monotonic);
+    const key: ReplayFailureKey = .{
+        .callee = resolvedCleanupKey(calls[0].callee.reference, calls[0].callee.declaration),
+        .remaining = 0,
+        .depth = 0,
+    };
+    cache.beginNormalCleanup();
+    try cache.enterNormalCleanup(nodes[0]);
+    cache.leaveNormalCleanup();
+    cleanup_budget.remaining = 0;
+    {
+        var nested = FileCache.init(gpa, &foreign);
+        defer nested.deinit();
+        const demand = try std.heap.page_allocator.alloc(u32, 1);
+        defer std.heap.page_allocator.free(demand);
+        demand[0] = 3;
+        nested.cleanup_demand = .{ .many = demand };
+        try std.testing.expect(nested.cleanupBudgetFailureAt(
+            &foreign, .normal_cleanup_nodes, 50_000, foreign_node) == error.AnalysisBudgetExceeded);
+        const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("first", failure.function.slice());
+        try cache.return_replay_failures.put(gpa, key, .{
+            .site = replay_failure_site orelse return error.TestUnexpectedResult,
+            .diagnostic = failure,
+            .remaining = cleanup_budget.remaining,
+            .memo_entries = cache.replayMemoEntries(&cache),
+            .exhausted_entries = cache.replayExhaustedEntries(&cache),
+        });
+    }
+    cache.endNormalCleanup();
+    // The nested cache has unwound, and its demand page is now unmapped.
+    // The memo hit must consult only the current live caller cache.
+    replay_failure_site = null;
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    try cache.enterNormalCleanup(nodes[1]);
+    cache.leaveNormalCleanup();
+    cleanup_budget.remaining = 0;
+    const call = calls[1];
+    try std.testing.expectError(error.AnalysisBudgetExceeded,
+        cache.callResultValueAt(tree.nodeMainToken(nodes[1]), null, true, &call));
+    const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("second", failure.function.slice());
+    try std.testing.expectEqual(.normal_cleanup_nodes, failure.limit);
+    try std.testing.expectEqual(@as(u32, 50_000), failure.limit_value);
+    try std.testing.expectEqual(@as(u32, 50_000), failure.reached);
+    try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(nodes[1])), failure.byte);
+    try std.testing.expectEqual(@as(u32, 0), cleanup_budget.remaining);
+    try std.testing.expectEqual(&foreign, replay_failure_site.?.tree);
+    try std.testing.expectEqual(foreign_node, replay_failure_site.?.node);
+}
+
+test "FileCache: computed store result handles retain ordered repairs and bounded alternatives" {
+    var pool: FileCache.ComputedStoreBuilders = .{};
+    const initial = [_]FileCache.ComputedStoreWrite{
+        .{ .path = "safe" },
+        .{ .path = "hole", .literal_undefined = true },
+    };
+    const root = pool.add(.{ .whole_value = true, .writes = &initial }).?;
+    var proof: FileCache.DefiniteStoreProof = .{
+        .tree = undefined,
+        .frame = undefined,
+        .call_node = .root,
+        .call_tree = undefined,
+        .computed_templates = &pool,
+    };
+    const repaired = FileCache.appendComputedStoreWrite(
+        &proof,
+        .{ .computations = root },
+        .{ .path = "hole" },
+    ).?;
+    try std.testing.expect(root != repaired);
+    const root_node = pool.values[@ctz(root)].?;
+    const repair_node = pool.values[@ctz(repaired)].?;
+    try std.testing.expect(root_node.writes[1].literal_undefined);
+    try std.testing.expect(!repair_node.writes[0].literal_undefined);
+    try std.testing.expectEqual(root, repair_node.base_computations);
+    try std.testing.expectEqual(@as(u8, 1), pool.alternativeCount(.{ .computations = repaired }).?);
+    const independent = pool.add(.{ .whole_value = true, .writes = &initial }).?;
+    try std.testing.expectEqual(@as(u8, 2), pool.alternativeCount(.{ .computations = repaired | independent }).?);
+    try std.testing.expect(!pool.overflow);
+    try std.testing.expectEqual(root, independent);
+    var previous = repaired;
+    while (pool.count < 8) {
+        previous = pool.add(.{ .base_computations = previous, .writes = &initial }).?;
+    }
+    try std.testing.expect(pool.add(.{ .base_computations = previous, .writes = &initial }) == null);
+    try std.testing.expect(pool.overflow);
+    try std.testing.expect(root_node.writes[1].literal_undefined);
+}
+
+test "FileCache: computed dependency recipes never taint sibling constructor fields" {
+    var pool: FileCache.ComputedStoreBuilders = .{};
+    const values = [_]FileCache.ComputedStoreWrite{
+        .{ .path = "known", .dependencies = .{ .reads = 1 } },
+        .{ .path = "runtime", .dependencies = .{ .inputs = 2 } },
+    };
+    const root = pool.add(.{ .whole_value = true, .writes = &values }).?;
+    try std.testing.expect((FileCache.computedFieldDependencies(&pool, root, "known")).eql(.{ .reads = 1 }));
+    try std.testing.expect((FileCache.computedFieldDependencies(&pool, root, "runtime")).eql(.{ .inputs = 2 }));
+    try std.testing.expect((FileCache.computedFieldDependencies(&pool, root, "unrelated")).isEmpty());
+}
+
+test "FileCache: computed store expansion abstains at eight alternatives and rejects forward bases" {
+    var eight: FileCache.ComputedStoreBuilders = .{};
+    const supported = [_]FileCache.ComputedStoreWrite{.{
+        .path = "value",
+        .source = .{ .sources = 0xff, .opaque_alternative = false },
+    }};
+    const root = eight.add(.{ .whole_value = true, .writes = &supported }).?;
+    try std.testing.expectEqual(@as(u8, 8), eight.alternativeCount(.{ .computations = root }).?);
+    var nine: FileCache.ComputedStoreBuilders = .{};
+    const unsupported = [_]FileCache.ComputedStoreWrite{.{
+        .path = "value",
+        .source = .{ .sources = 0xff, .opaque_alternative = true },
+    }};
+    try std.testing.expect(nine.add(.{ .whole_value = true, .writes = &unsupported }) == null);
+    try std.testing.expect(nine.overflow);
+    try std.testing.expectEqual(@as(usize, 0), nine.count);
+    var forward: FileCache.ComputedStoreBuilders = .{};
+    try std.testing.expect(forward.add(.{
+        .base_computations = 1,
+        .writes = &supported,
+    }) == null);
+    try std.testing.expect(forward.overflow);
+    try std.testing.expectEqual(@as(usize, 0), forward.count);
+}
+
+test "FileCache: computed literal MAY alternatives obey the expanded eight-arm bound" {
+    const component: FileCache.ComputedStoreWrite = .{
+        .path = "hole",
+        .literal_may_undefined = true,
+        .opaque_alternative = true,
+    };
+    const three = [_]FileCache.ComputedStoreWrite{component} ** 3;
+    var admitted: FileCache.ComputedStoreBuilders = .{};
+    const supported = admitted.add(.{ .whole_value = true, .writes = &three }).?;
+    try std.testing.expectEqual(@as(u8, 8), admitted.alternativeCount(.{ .computations = supported }).?);
+    try std.testing.expect(!admitted.overflow);
+    const four = [_]FileCache.ComputedStoreWrite{component} ** 4;
+    var declined: FileCache.ComputedStoreBuilders = .{};
+    try std.testing.expect(declined.add(.{ .whole_value = true, .writes = &four }) == null);
+    try std.testing.expect(declined.overflow);
+    try std.testing.expectEqual(@as(usize, 0), declined.count);
+    try std.testing.expectEqual(@as(usize, 0), declined.write_count);
+}
+
+test "FileCache: literal ALL already includes MAY without another alternative" {
+    const component: FileCache.ComputedStoreWrite = .{
+        .path = "hole",
+        .literal_undefined = true,
+        .literal_may_undefined = true,
+    };
+    const four = [_]FileCache.ComputedStoreWrite{component} ** 4;
+    var pool: FileCache.ComputedStoreBuilders = .{};
+    const supported = pool.add(.{ .whole_value = true, .writes = &four }).?;
+    try std.testing.expectEqual(@as(u8, 1), pool.alternativeCount(.{ .computations = supported }).?);
+    try std.testing.expectEqual(@as(u16, 1), FileCache.ComputedStoreBuilders.sourceAlternativeCount(null, component));
+    var opaque_component = component;
+    opaque_component.opaque_alternative = true;
+    try std.testing.expectEqual(@as(u16, 2), FileCache.ComputedStoreBuilders.sourceAlternativeCount(null, opaque_component));
+    try std.testing.expect(!pool.overflow);
+}
+
+test "FileCache: publication skips unconsumed roots but retains selected output-read closure" {
+    var pool: FileCache.ComputedStoreBuilders = .{};
+    const writes = [_]FileCache.ComputedStoreWrite{.{ .path = "hole", .literal_undefined = true }};
+    const handle = pool.add(.{ .whole_value = true, .writes = &writes }).?;
+    const root: FileCache.ComputedStoreBase = .{ .computations = handle };
+    // Publication accesses only the arena and allocator. No document or value
+    // lookup participates in this immutable-template ownership test.
+    var owner: FileCache = undefined;
+    owner.gpa = std.testing.allocator;
+    owner.summary_arena = null;
+    defer if (owner.summary_arena) |*arena| arena.deinit();
+    var use: FileCache.AddressUse = undefined;
+    var reads: [8]?FileCache.WrittenRead = @splat(null);
+    try std.testing.expect(try pool.publish(&owner, root, false, &reads, 0, &use));
+    try std.testing.expect(owner.summary_arena == null);
+    for (use.written_computations) |entry| try std.testing.expect(entry == null);
+    reads[0] = .{ .argument = .root, .tree = undefined, .node = .root, .output_base = root };
+    try std.testing.expect(try pool.publish(&owner, root, false, &reads, 1, &use));
+    try std.testing.expect(owner.summary_arena != null);
+    try std.testing.expectEqual(@as(usize, 1), use.written_computations[@ctz(handle)].?.writes.len);
+}
+
+test "FileCache: partial field identities use ordered authenticated sources not dependencies" {
+    var pool: FileCache.ComputedStoreBuilders = .{};
+    const runtime_write = [_]FileCache.ComputedStoreWrite{.{
+        .path = "runtime", .source = .{ .projections = 1, .opaque_alternative = false },
+    }};
+    const first = pool.add(.{ .base_original_alternative = true, .writes = &runtime_write }).?;
+    const sibling_write = [_]FileCache.ComputedStoreWrite{.{ .path = "safe", .dependencies = .{ .reads = 2 } }};
+    const sibling = pool.add(.{ .base_computations = first, .writes = &sibling_write }).?;
+    var memo: [8]?FileCache.ComputedFieldRecipe = @splat(null);
+    const kept = FileCache.computedFieldRecipe(&pool, .{ .computations = sibling }, "runtime", &memo);
+    try std.testing.expectEqual(@as(u8, 1), kept.source.projections);
+    try std.testing.expect(!kept.source.opaque_alternative);
+    try std.testing.expect(!kept.needs_root);
+    memo = @splat(null);
+    const no_identity = FileCache.computedFieldRecipe(&pool, .{ .computations = sibling }, "safe", &memo);
+    try std.testing.expectEqual(@as(u8, 0), no_identity.source.projections);
+    try std.testing.expect(no_identity.source.opaque_alternative);
+    const replacement_write = [_]FileCache.ComputedStoreWrite{.{
+        .path = "runtime", .source = .{ .projections = 4, .opaque_alternative = false },
+    }};
+    const replaced = pool.add(.{ .base_computations = sibling, .writes = &replacement_write }).?;
+    memo = @splat(null);
+    const changed = FileCache.computedFieldRecipe(&pool, .{ .computations = replaced }, "runtime", &memo);
+    try std.testing.expectEqual(@as(u8, 4), changed.source.projections);
+    try std.testing.expect(!changed.source.opaque_alternative);
+    memo = @splat(null);
+    const alternatives = FileCache.computedFieldRecipe(&pool, .{ .computations = sibling | replaced }, "runtime", &memo);
+    try std.testing.expectEqual(@as(u8, 5), alternatives.source.projections);
+    try std.testing.expect(!alternatives.source.opaque_alternative);
+    const child_write = [_]FileCache.ComputedStoreWrite{.{ .path = "runtime.child" }};
+    const modified = pool.add(.{ .base_computations = replaced, .writes = &child_write }).?;
+    memo = @splat(null);
+    const abstained = FileCache.computedFieldRecipe(&pool, .{ .computations = modified }, "runtime", &memo);
+    try std.testing.expectEqual(@as(u8, 0), abstained.source.projections);
+    try std.testing.expect(abstained.source.opaque_alternative);
+    try std.testing.expect(abstained.needs_root);
+}
+
+test "FileCache: computed field replacements retain ordered indexed child recipes" {
+    var pool: FileCache.ComputedStoreBuilders = .{};
+    const children = [_]FileCache.ComputedStoreWrite{
+        .{ .path = "", .array_index = 0, .source = .{ .projections = 1, .opaque_alternative = false } },
+        .{ .path = "", .array_index = 1, .literal_undefined = true },
+    };
+    const child = pool.add(.{ .whole_value = true, .is_array = true, .array_extent = 2, .writes = &children }).?;
+    var proof: FileCache.DefiniteStoreProof = .{
+        .tree = undefined,
+        .frame = undefined,
+        .call_node = .root,
+        .call_tree = undefined,
+        .computed_templates = &pool,
+    };
+    const state: FileCache.ComputedStoreState = .{ .computations = child, .value_nonidentity = true };
+    const fields = [_][]const u8{ "runtime", "spare" };
+    const replaced = FileCache.appendComputedFieldStoreWrite(&proof, .{ .original_alternative = true },
+        .{ .path = "runtime", .opaque_alternative = true, .literal_may_undefined = true }, state, &fields).?;
+    const node = pool.values[@ctz(replaced.computations)].?;
+    try std.testing.expectEqual(@as(usize, 3), node.writes.len);
+    try std.testing.expectEqualStrings("runtime", node.writes[0].path);
+    try std.testing.expect(node.writes[0].is_array);
+    try std.testing.expectEqual(@as(?u64, 2), node.writes[0].array_extent);
+    try std.testing.expect(!node.writes[0].literal_may_undefined);
+    try std.testing.expectEqual(@as(?u7, 0), node.writes[1].parent);
+    try std.testing.expectEqual(@as(?u64, 0), node.writes[1].array_index);
+    try std.testing.expectEqual(@as(u8, 1), node.writes[1].source.?.projections);
+    try std.testing.expectEqual(@as(?u7, 0), node.writes[2].parent);
+    try std.testing.expectEqual(@as(?u64, 1), node.writes[2].array_index);
+    try std.testing.expect(node.writes[2].literal_undefined);
+    var scratch: [128]FileCache.ComputedStoreWrite = undefined;
+    var count: usize = 0;
+    try std.testing.expect(FileCache.appendComputedComponent(&proof, 0, &scratch, &count,
+        .{ .path = "runtime", .opaque_alternative = true, .literal_may_undefined = true }, state));
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expect(!scratch[0].literal_undefined);
+    try std.testing.expect(!scratch[0].literal_may_undefined);
+    try std.testing.expect(scratch[2].literal_undefined);
+}
+
+
+test "FileCache: pointee MAY invalidation retains COW negatives with UNKNOWN" {
+    var inputs: [8]?Ast.Node.Index = @splat(null);
+    var proof: FileCache.DefiniteStoreProof = undefined;
+    proof.binding_count = 0;
+    proof.out_coverage = null;
+    proof.written_inputs = &inputs;
+    proof.pointee_count = 1;
+    proof.pointees[0] = .{
+        .token = 0,
+        .value = .defined,
+        .computed = .{
+            .original = .{ .projections = 1, .opaque_alternative = false },
+            .base = .{ .computations = 2 },
+        },
+    };
+    proof.invalidateStorePointees();
+    const kept = proof.pointees[0].computed.?;
+    try std.testing.expectEqual(FileCache.DefiniteStoreValue.unknown, proof.pointees[0].value);
+    try std.testing.expectEqual(@as(u8, 2), kept.base.computations);
+    try std.testing.expect(kept.base.opaque_alternative);
+    try std.testing.expectEqual(@as(u8, 0), kept.original.projections);
+    try std.testing.expect(kept.original.opaque_alternative);
+}
+
+test "FileCache: callee local C element stores retain selected array holes" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\extern fn opaqueArray(input: *[4]u32) void;
+        \\fn first(out: [*c]u32) void { out.* = 1; }
+        \\fn poison(out: [*c]u32) void { out.* = undefined; }
+        \\fn hole(out: *u32) void { var temp: [4]u32 = undefined; first(&temp); out.* = temp[3]; }
+        \\fn sliceHole(out: *u32) void { var temp: [4]u32 = undefined; first(temp[0..4]); out.* = temp[3]; }
+        \\fn repaired(out: *u32) void { var temp: [4]u32 = undefined; first(&temp); out.* = temp[0]; }
+        \\fn sliceRepaired(out: *u32) void { var temp: [4]u32 = undefined; first(temp[0..4]); out.* = temp[0]; }
+        \\fn initialized(out: *u32) void { var temp: [4]u32 = .{1, 2, 3, 4}; first(&temp); out.* = temp[3]; }
+        \\fn unknown(out: *u32) void { var temp: [4]u32 = undefined; opaqueArray(&temp); first(&temp); out.* = temp[3]; }
+        \\fn poisoned(out: *u32) void { var temp: [4]u32 = .{1, 2, 3, 4}; poison(&temp); out.* = temp[0]; }
+        \\fn initializedOpaque(out: *u32) void { var temp: [4]u32 = .{1, 2, 3, 4}; opaqueArray(&temp); first(&temp); out.* = temp[3]; }
+        \\fn repairedOpaque(out: *u32) void { var temp: [4]u32 = undefined; opaqueArray(&temp); first(&temp); out.* = temp[0]; }
+        \\fn runtimeHole(out: *u32, index: usize) void { var temp: [4]u32 = undefined; first(&temp); out.* = temp[index % 4]; }
+        \\fn runtimeInitialized(out: *u32, index: usize) void { var temp: [4]u32 = .{1, 2, 3, 4}; first(&temp); out.* = temp[index % 4]; }
+        \\fn runtimeFrozenHole(out: *u32, index: usize) void { var temp: [4]u32 = undefined; first(&temp); const selected = temp[index % 4]; temp = .{1, 2, 3, 4}; out.* = selected; }
+        \\fn runtimeFrozenSafe(out: *u32, index: usize) void { var temp: [4]u32 = .{1, 2, 3, 4}; first(&temp); const selected = temp[index % 4]; temp = undefined; out.* = selected; }
+        \\fn unsafe_hole() u32 { var result: u32 = undefined; hole(&result); return result; }
+        \\fn unsafe_slice() u32 { var result: u32 = undefined; sliceHole(&result); return result; }
+        \\fn safe_repaired() u32 { var result: u32 = undefined; repaired(&result); return result; }
+        \\fn safe_slice_repaired() u32 { var result: u32 = undefined; sliceRepaired(&result); return result; }
+        \\fn safe_initialized() u32 { var result: u32 = undefined; initialized(&result); return result; }
+        \\fn unsafe_opaque() u32 { var result: u32 = undefined; unknown(&result); return result; }
+        \\fn safe_initialized_opaque() u32 { var result: u32 = undefined; initializedOpaque(&result); return result; }
+        \\fn safe_repaired_opaque() u32 { var result: u32 = undefined; repairedOpaque(&result); return result; }
+        \\fn unsafe_poisoned() u32 { var result: u32 = undefined; poisoned(&result); return result; }
+        \\fn unsafe_runtime(index: usize) u32 { var result: u32 = undefined; runtimeHole(&result, index); return result; }
+        \\fn safe_runtime(index: usize) u32 { var result: u32 = undefined; runtimeInitialized(&result, index); return result; }
+        \\fn unsafe_runtime_frozen(index: usize) u32 { var result: u32 = undefined; runtimeFrozenHole(&result, index); return result; }
+        \\fn safe_runtime_frozen(index: usize) u32 { var result: u32 = undefined; runtimeFrozenSafe(&result, index); return result; }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-callee-local-c-hole.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .address_of) continue;
+        const operand = tree.nodeData(@as(Ast.Node.Index, @enumFromInt(raw))).node;
+        const root = tokens.rootIdentifier(tree, operand) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(root)), "temp")) continue;
+        const use = (try cache.addressUseAt(tree.nodeMainToken(root))) orelse continue;
+        try std.testing.expect(!use.definite_write);
+        if (use.location_element_index) |index| {
+            try std.testing.expectEqual(@as(u64, 0), index);
+            try std.testing.expect(use.location_written);
+        }
+    }
+    var correct = true;
+    for (tree.rootDecls()) |declaration| {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &buffer, declaration) orelse continue;
+        const name = tree.tokenSlice(proto.name_token orelse continue);
+        const safe = std.mem.startsWith(u8, name, "safe_");
+        if (!safe and !std.mem.startsWith(u8, name, "unsafe_")) continue;
+        var graph = (try cfg_builder_mod.lowerFunctionFullWithZls(
+            gpa, tree, declaration, &@import("../config.zig").Default, &cache, &resolver,
+        )).?;
+        defer graph.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(@import("../problem.zig").Problem) = .empty;
+        defer {
+            for (problems.items) |*problem| problem.deinit(gpa);
+            problems.deinit(gpa);
+        }
+        try @import("../flow/worklist.zig").check(
+            gpa, &graph, .{ .path = "/tmp/zbc-callee-local-c-hole.zig" }, &problems,
+        );
+        var read_token: ?Ast.TokenIndex = null;
+        var token = tree.firstToken(declaration);
+        while (token <= tree.lastToken(declaration)) : (token += 1) {
+            if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), "result"))
+                read_token = token;
+        }
+        const byte = tree.tokens.items(.start)[read_token.?];
+        try std.testing.expect(tree.tokenTag(read_token.? - 1) == .keyword_return);
+        const return_byte = tree.tokens.items(.start)[read_token.? - 1];
+        var reported = false;
+        for (problems.items) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= return_byte and problem.start.byte <= byte)
+                reported = true;
+        }
+        if (reported == safe) {
+            std.debug.print("local C caller {s}: expected use-undefined={any}, found {any}\n", .{ name, !safe, reported });
+            correct = false;
+        }
+    }
+    try std.testing.expect(correct);
+}
+
+test "FileCache: conditional scalar physical writes do not grant poisoned input certificates" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\fn seed(accept: bool, out: *u32) bool { if (!accept) return false; out.* = 1; return true; }
+        \\fn definedCaller() u32 { const accept: bool = true; var value: u32 = undefined; if (!seed(accept, &value)) return 0; return value; }
+        \\fn poisonedCaller() u32 { const accept: bool = undefined; var value: u32 = undefined; if (!seed(accept, &value)) return 0; return value; }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-conditional-scalar-physical.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.module_id = resolver.handle.module;
+    const tree = cache.tree;
+    var addresses: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .address_of) continue;
+        const operand = tree.nodeData(@as(Ast.Node.Index, @enumFromInt(raw))).node;
+        const use = (try cache.addressUseOnBooleanAt(tree.nodeMainToken(operand), true)).?;
+        try std.testing.expectEqual(addresses == 0, use.definite_write);
+        // A strict certificate can omit diagnostic-only recipe publication.
+        if (!use.definite_write) {
+            try std.testing.expect(use.location_written);
+            try std.testing.expect(use.location_computed_complete);
+        }
+        addresses += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), addresses);
+}
+
+test "FileCache: syntax routed return keys retain every contextual distinction" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "fn f() void {}", .zig);
+    defer tree.deinit(gpa);
+    var other_tree = try Ast.parse(gpa, "fn f() void {}", .zig);
+    defer other_tree.deinit(gpa);
+    var resolver: TypeResolver = undefined;
+    var other_resolver: TypeResolver = undefined;
+    const narrow: TypeResolver.ActualTypeID = .{
+        .data = .{ .ip_index = .{ .type = .u8_type, .index = null } },
+        .is_type_val = false,
+    };
+    const wide: TypeResolver.ActualTypeID = .{
+        .data = .{ .ip_index = .{ .type = .u16_type, .index = null } },
+        .is_type_val = false,
+    };
+    const base: FileCache.ReturnCallKey = .{
+        .token = 1,
+        .resolver = &resolver,
+        .tree = &tree,
+        .module = @enumFromInt(0),
+        .callable = narrow,
+        .container = narrow,
+    };
+    var keys = [_]FileCache.ReturnCallKey{base} ** 9;
+    keys[1].callable = wide;
+    keys[2].container = wide;
+    keys[3].callable = null;
+    keys[4].container = null;
+    keys[5].token = 2;
+    keys[6].module = @enumFromInt(1);
+    keys[7].resolver = &other_resolver;
+    keys[8].tree = &other_tree;
+    // Deliberate routing collisions must not combine actual instantiations.
+    const routing: FileCache.ReturnCallKeyContext = .{};
+    try std.testing.expectEqual(routing.hash(keys[0]), routing.hash(keys[1]));
+    try std.testing.expectEqual(routing.hash(keys[0]), routing.hash(keys[2]));
+    var calls: std.HashMapUnmanaged(FileCache.ReturnCallKey, usize, FileCache.ReturnCallKeyContext, 80) = .empty;
+    defer calls.deinit(gpa);
+    for (keys, 0..) |key, value| try calls.put(gpa, key, value);
+    try std.testing.expectEqual(keys.len, calls.count());
+    for (keys, 0..) |key, value| try std.testing.expectEqual(value, calls.get(key).?);
+
+    const source: FileCache.ReturnSourceKey = .{
+        .frame = base, .node = @enumFromInt(1), .returns = true,
+    };
+    var sources = [_]FileCache.ReturnSourceKey{source} ** 6;
+    sources[1].returns = false;
+    sources[2].stores = true;
+    sources[3].mutation_root = @enumFromInt(1);
+    sources[4].mutation_root = @enumFromInt(2);
+    sources[5].node = @enumFromInt(2);
+    var answers: std.HashMapUnmanaged(FileCache.ReturnSourceKey, usize, FileCache.ReturnSourceKeyContext, 80) = .empty;
+    defer answers.deinit(gpa);
+    for (sources, 0..) |key, value| try answers.put(gpa, key, value);
+    try std.testing.expectEqual(sources.len, answers.count());
+    for (sources, 0..) |key, value| try std.testing.expectEqual(value, answers.get(key).?);
 }

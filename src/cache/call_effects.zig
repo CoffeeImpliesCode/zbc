@@ -48,7 +48,7 @@ pub const Scan = struct {
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
     bindings: *const LocalBindings,
-    frames: [64]Frame = undefined,
+    frames: [64]Frame = @splat(.{ .children = .{ .array = @splat(.none) } }),
     depth: usize = 1,
     visited: u32 = 0,
     pending: ?Ast.Node.Index = null,

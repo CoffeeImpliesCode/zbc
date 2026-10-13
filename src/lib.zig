@@ -383,6 +383,14 @@ test "lib API: canonical imported enum tag values prove complete lookup tables" 
         \\    inline for (std.meta.fields(ops.Sparse)) |field| result[field.value] = 1;
         \\    return result;
         \\}
+        \\pub fn selected() u8 {
+        \\    const result = hole();
+        \\    return result[1];
+        \\}
+        \\pub fn written() u8 {
+        \\    const result = complete();
+        \\    return result[0];
+        \\}
         \\fn hooksForOp(op: ops.Op) u8 { return @intFromEnum(op); }
     ;
     try tmp.dir.writeFile(tio, .{ .sub_path = "consumer.zig", .data = source });
@@ -399,7 +407,7 @@ test "lib API: canonical imported enum tag values prove complete lookup tables" 
     for ([_]struct { function: []const u8, warns: bool }{
         .{ .function = "pub fn complete()", .warns = false },
         .{ .function = "pub fn aliasComplete()", .warns = false },
-        .{ .function = "pub fn hole()", .warns = true },
+        .{ .function = "pub fn hole()", .warns = false },
     }) |case| {
         const function = std.mem.indexOf(u8, source, case.function).?;
         const returned = std.mem.indexOfPos(u8, source, function, "return result").?;
@@ -408,6 +416,18 @@ test "lib API: canonical imported enum tag values prove complete lookup tables" 
         for (analysis.problems) |problem| {
             if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
                 problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expectEqual(case.warns, reported);
+    }
+    for ([_]struct { needle: []const u8, warns: bool }{
+        .{ .needle = "return result[1]", .warns = true },
+        .{ .needle = "return result[0]", .warns = false },
+    }) |case| {
+        const start = std.mem.indexOf(u8, source, case.needle).?;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= start and problem.start.byte < start + case.needle.len) reported = true;
         }
         try std.testing.expectEqual(case.warns, reported);
     }
@@ -426,9 +446,7 @@ test "lib API: imported enum fields fix runtime array fill extent" {
         \\};
         ,
     });
-    try tmp.dir.writeFile(tio, .{
-        .sub_path = "consumer.zig",
-        .data =
+    const source =
         \\const icons = @import("icons.zig");
         \\const Icon = icons.widget.Icon;
         \\const count = @typeInfo(Icon).@"enum".fields.len;
@@ -443,8 +461,13 @@ test "lib API: imported enum fields fix runtime array fill extent" {
         \\    for (documents[0..2], 0..) |document, i| values[i] = document;
         \\    return values;
         \\}
-        ,
-    });
+        \\pub fn selected() u8 {
+        \\    const result = hole();
+        \\    _ = result[0];
+        \\    return result[2];
+        \\}
+    ;
+    try tmp.dir.writeFile(tio, .{ .sub_path = "consumer.zig", .data = source });
     const root = try tmp.dir.realPathFileAlloc(tio, ".", gpa);
     defer gpa.free(root);
     const path = try std.fs.path.join(gpa, &.{ root, "consumer.zig" });
@@ -455,13 +478,22 @@ test "lib API: imported enum fields fix runtime array fill extent" {
     const analysis = try analyzeEscape(&session, path, &DefaultConfig);
     defer freeAnalysis(gpa, analysis);
     try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
-    var saw_hole = false;
-    for (analysis.problems) |problem| {
-        if (!std.mem.eql(u8, problem.rule_id, "use-undefined")) continue;
-        try std.testing.expect(problem.start.line >= 10);
-        saw_hole = true;
+    for ([_]struct { needle: []const u8, ordinal: usize = 0, warns: bool }{
+        .{ .needle = "return values", .warns = false },
+        .{ .needle = "return values", .ordinal = 1, .warns = false },
+        .{ .needle = "_ = result[0]", .warns = false },
+        .{ .needle = "return result[2]", .warns = true },
+    }) |case| {
+        var start: usize = 0;
+        for (0..case.ordinal + 1) |_| start = std.mem.indexOfPos(u8, source, start, case.needle).? + case.needle.len;
+        start -= case.needle.len;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= start and problem.start.byte < start + case.needle.len) reported = true;
+        }
+        try std.testing.expectEqual(case.warns, reported);
     }
-    try std.testing.expect(saw_hole);
 }
 
 test "lib API: an imported source width failure cannot return a clean result" {
@@ -1126,10 +1158,14 @@ test "a comptime var type value is not the immutable parameter binding" {
         \\    }
         \\    return result;
         \\}
+        \\pub fn selected(base: u32) u32 {
+        \\    const result = mutableType(base);
+        \\    return result.right;
+        \\}
     );
     defer freeAnalysis(gpa, analysis);
     const problems = analysis.problems;
-    try expectRuleOnlyAtLine(problems, "use-undefined", 9);
+    try expectRuleOnlyAtLine(problems, "use-undefined", 13);
 }
 
 test "the same enumeration without inline is still a runtime zero-trip hazard" {

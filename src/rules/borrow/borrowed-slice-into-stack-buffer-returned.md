@@ -36,21 +36,37 @@ return stripped;
 
 ## Why the detector is precise
 
-- The buffer must be a stack array declaration:
-  `var <buf>: [<N>]<T> = undefined;`.  Heap allocations,
-  parameters, struct fields don't match.
-- The parsing call must be of the form `<T>.parse(<args>)` where
-  `<args>` mentions one of the stack buffers.  Other-named
-  parsing methods (`decode`, `unpack`) aren't matched —
-  `parse` is the conventional name for the
-  text-in / structured-out shape that aliases.
-- The parse result must be `return`-ed for the bug to actually
-  surface; locally-used parse results don't fire.
+The rule follows returned storage through calls, local copies, and aggregate
+fields. It distinguishes an address from an address-free value copy.
+Scalar cell addresses belong to `stack-escape`. Derived pointer and slice
+loans belong to this rule.
+
+### Allocator backing storage
+
+An allocator's context pointer is not necessarily its allocation storage.
+`ArenaAllocator.allocator()` stores `&arena` in the allocator header.
+The allocated bytes come from `arena.child_allocator`, not the local arena
+struct. `DebugAllocator` uses its `backing_allocator` in the same way.
+The detector authenticates these accessor declarations against the toolchain
+source. An accessor name alone does not establish storage provenance.
+
+Returning heap-backed slices together with a moved arena does not borrow the
+current frame. Returning `&arena`, or an allocator header containing that
+address, still borrows the local arena.
+
+`FixedBufferAllocator` allocations follow its `buffer` field. A local array
+there remains a stack loan. A caller-owned buffer does not borrow the current
+frame merely because its allocator header is local. An arena or debug
+allocator with a stack-backed child allocator retains that stack loan.
+`stackFallback` can allocate from its inline local buffer and remains a
+stack-storage provider.
+
+Unresolved storage and mutation walks cannot establish that a heap allocator's
+context pointer escaped. They retain its allocation backing channel instead.
+This does not remove loans from directly returned allocator headers.
 
 ## Limitations
 
-- Only catches `<T>.parse(...)` calls — other aliasing parser
-  names are out of scope.
-- Doesn't track flow through intermediate locals (`const tmp =
-  ver; return tmp;` — would fire because `ver` is mentioned in
-  the return).
+This rule detects frame-storage escapes, not every allocator lifetime error.
+For example, freeing heap storage before returning it is a separate problem.
+Deep copies must preserve loans carried by pointer-bearing elements.

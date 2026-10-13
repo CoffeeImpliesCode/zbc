@@ -48,6 +48,9 @@ pub const Config = config_mod.Config;
 
 pub const BlockId = abstract_state.BlockId;
 pub const LocalId = abstract_state.LocalId;
+/// Reserved diagnostic path: an optional has no source-level fields.
+pub const diagnostic_optional_tag = "$optional-tag";
+
 /// Identity of an `if` condition within one function.  Two `if`s
 /// reading the same condition get the same id, so the transfer can
 /// remember which paths had it true — see
@@ -109,6 +112,10 @@ pub const StmtKind = union(enum) {
         value_inputs: [8]?ValueInput = .{null} ** 8,
         /// Lifetime copies may reinterpret bytes instead of copying array slots.
         array_copy: bool = true,
+        value_has_undefined_origin: bool = false,
+        entire_source_undefined: bool = true,
+        value_entirely_undefined: bool = false,
+        result_is_computation: bool = false,
     },
 
     /// `LHS = RHS;` — overwrite local with new RHS.
@@ -119,6 +126,10 @@ pub const StmtKind = union(enum) {
         value_defined: bool = false,
         value_inputs: [8]?ValueInput = .{null} ** 8,
         array_copy: bool = true,
+        value_has_undefined_origin: bool = false,
+        entire_source_undefined: bool = true,
+        value_entirely_undefined: bool = false,
+        result_is_computation: bool = false,
     },
 
     /// Require a boolean condition on this path.
@@ -130,12 +141,20 @@ pub const StmtKind = union(enum) {
         index: IndexTerm,
         modulo: ?ModuloIndex = null,
         name: ?[]const u8 = null,
+        /// Stable fixed-array field identity; dynamic indices are not keys.
+        field_array: ?[]const u8 = null,
         scaled: ?abstract_state.ScaledElement = null,
     },
     indexed_write: struct {
         array: LocalId,
         index: IndexTerm,
+        /// Evaluated LHS snapshot and arithmetic shape, for byte masks only.
+        diagnostic_index: ?IndexTerm = null,
+        diagnostic_scaled: ?abstract_state.ScaledElement = null,
+        diagnostic_stride: ?struct { period: u64, offset: u64 } = null,
         rhs_kind: ExprKind,
+        /// A following precise constructor mask owns these diagnostic bytes.
+        diagnostic_children_follow: bool = false,
         /// Literal element lifetime path, borrowed from source.
         name: ?[]const u8 = null,
         /// Stable fixed-array field identity; dynamic indices are not keys.
@@ -144,8 +163,15 @@ pub const StmtKind = union(enum) {
         /// retain their reads but cannot establish initialized coverage.
         inputs: [8]?LocalId = .{null} ** 8,
         selected_inputs: [8]?ValueInput = .{null} ** 8,
+        /// An appended old-element obligation certifies coverage, not the RHS.
+        /// Inputs before this slot remain actual value dependencies.
+        certificate_only_input: ?u4 = null,
         all_elements: bool = false,
         defined: bool = false,
+        value_has_undefined_origin: bool = false,
+        entire_source_undefined: bool = true,
+        value_entirely_undefined: bool = false,
+        result_is_computation: bool = false,
     },
     counter_step: struct { local: LocalId, step: i8 },
     compare_assume: Comparison,
@@ -153,8 +179,12 @@ pub const StmtKind = union(enum) {
     /// Existing exhaustive-fill proofs commit coverage explicitly.
     array_complete: struct {
         array: LocalId,
+        /// Whole location coverage is not necessarily a value certificate.
+        value_defined: bool = true,
         inputs: [8]?LocalId = .{null} ** 8,
         selected_inputs: [8]?ValueInput = .{null} ** 8,
+        value_has_undefined_origin: bool = false,
+        value_entirely_undefined: bool = false,
     },
     /// A natural-exit loop unconditionally wrote every slot in [start, end).
     /// Written bytes are separate from the optional strict value certificate.
@@ -166,10 +196,20 @@ pub const StmtKind = union(enum) {
         selected_inputs: [8]?ValueInput = .{null} ** 8,
         value_defined: bool = true,
         value_has_undefined_origin: bool = false,
+        /// Exact zero-offset enumeration copy; replay bytes, not certificates.
+        diagnostic_source: ?LocalId = null,
     },
     /// A canonical helper's successful return proves this count of stores.
-    /// No unknown/MAY write can emit this certificate.
-    array_prefix: struct { array: LocalId, count: LocalId, inputs: [8]?LocalId = .{null} ** 8, scale: u64 = 1 },
+    /// Seeded local append loops use a separate diagnostic-only branch below.
+    array_prefix: struct {
+        array: LocalId,
+        count: LocalId,
+        inputs: [8]?LocalId = .{null} ** 8,
+        scale: u64 = 1,
+        /// A local seed-one append shape. Transfer checks the initial written
+        /// slot and retains only diagnostic bytes plus its exact last selector.
+        seeded_append: bool = false,
+    },
     /// A successful zero-based memset initializes only its defined count.
     /// Count and fill dependencies remain reads, never helper-return proofs.
     array_memset_prefix: struct {
@@ -178,6 +218,8 @@ pub const StmtKind = union(enum) {
         rhs_kind: ExprKind,
         defined: bool = false,
         selected_inputs: [8]?ValueInput = .{null} ** 8,
+        value_has_undefined_origin: bool = false,
+        entire_source_undefined: bool = true,
     },
     /// A selected pointer-free array value copies actual source coverage.
     /// Unknown sources remain uncertified even when their bytes were written.
@@ -189,6 +231,17 @@ pub const StmtKind = union(enum) {
         /// Vector coercions and bit casts require the entire source payload.
         /// Their elements are not a one-to-one initialization map.
         whole_payload: bool = false,
+        /// Layout-changing computations cannot reuse source element repairs.
+        layout_change: bool = false,
+        /// Byte transport alone: retain holes and repairs without certifying
+        /// the copied values or changing lifetime/resource identities.
+        diagnostic_only: bool = false,
+        /// Capture byte replay changes only negative masks and physical repairs.
+        /// It must not change value, array, pointer, or lifetime certificates.
+        mask_only: bool = false,
+        /// Optional captures omit the enclosing tag's diagnostic bytes.
+        optional_payload: bool = false,
+        target_field: ?[]const u8 = null,
     },
 
     /// `<receiver>.deinit()` on an arena.  Marks the arena dead.
@@ -235,6 +288,20 @@ pub const StmtKind = union(enum) {
         /// Replayed byte facts must not replace a resource/lifetime origin.
         /// An empty path denotes the whole value, or a pointer's pointee.
         diagnostic_only: bool = false,
+        /// A possible source-proved poisoned store, never a write/repair credit.
+        /// Unknown inputs have no effect; existing byte masks remain intact.
+        may_write_only: bool = false,
+        /// A settled whole-byte negative proof, not a value certificate.
+        entire_value_undefined: bool = false,
+        /// A replayed base witness does not overwrite its separately copied holes.
+        preserve_undefined_descendants: bool = false,
+        /// Return replay describes the value's bytes, even for a pointer value.
+        /// Other empty pointer paths describe pointee storage.
+        whole_value_bytes: bool = false,
+        value_has_undefined_origin: bool = false,
+        entire_source_undefined: bool = true,
+        result_is_computation: bool = false,
+        aggregate_value: bool = false,
     },
 
     /// `g.free(obj.field)` / `g.destroy(obj.field)` — kill a field's
@@ -259,6 +326,13 @@ pub const StmtKind = union(enum) {
         name: []const u8,
         /// An inline aggregate prefix checks lifetime, not sibling payload.
         lifetime_only: bool = false,
+        /// Whole aggregate transport reads no selected member. It still
+        /// rejects an entirely undefined value and retains all byte holes.
+        aggregate_transport: bool = false,
+        /// A scalar unwrap consumes payload bytes despite tag-mask children.
+        optional_payload: bool = false,
+        /// Optional tag selection is independent of the lifetime field path.
+        optional_tag_path: ?[]const u8 = null,
     },
 
     /// Additional value-position borrow in a returned aggregate. The origin
@@ -285,6 +359,14 @@ pub const StmtKind = union(enum) {
         /// Snapshot of constructor bytes, used only by negative return replay.
         /// It supplies no returned-value or lifetime certificate.
         diagnostic_source: ?LocalId = null,
+        /// Negative-only tag selection; null retains settled whole-byte origins.
+        /// Payload boxing can exclude tag bytes without certifying the payload.
+        tag_may_undefined: ?bool = null,
+        tag_source: ?LocalId = null,
+        value_has_undefined_origin: bool = false,
+        entire_source_undefined: bool = true,
+        value_entirely_undefined: bool = false,
+        result_is_computation: bool = false,
         /// `return undefined;` written literally — canonical sentinel
         /// for comptime-gated branches (e.g. `if (comptime X) return
         /// undefined;` in bindgen stubs).  The author is explicitly
@@ -309,9 +391,13 @@ pub const StmtKind = union(enum) {
         /// The write goes through an element of the slice `target`, so its
         /// ptr/len words are unchanged. Element coverage is still revoked.
         payload_only: bool = false,
+        /// Selected slice-element placement constrains diagnostics only.
+        diagnostic_index: ?IndexTerm = null,
         /// A source-proven element mutation preserves only existing complete
         /// coverage, and only when its actual value dependencies are defined.
         preserves_complete_array: bool = false,
+        /// Complete physical recipes replay scoped writes after revocation.
+        preserves_diagnostic_base: bool = false,
         preserve_inputs: [8]?ValueInput = .{null} ** 8,
         /// Byte-source dependencies used only by the diagnostic.
         diagnostic_inputs: [2]?ValueInput = .{null} ** 2,
@@ -364,6 +450,8 @@ pub const StmtKind = union(enum) {
         /// Iteration selects a value from this live array/slice backing.
         value_source: ?LocalId = null,
         value_defined: bool = true,
+        /// By-value captures retain strict source obligations before reset.
+        value_inputs: [8]?ValueInput = .{null} ** 8,
     },
     use: struct {
         local: LocalId,
@@ -372,6 +460,9 @@ pub const StmtKind = union(enum) {
         /// The receiver's pointer header and resource lifetime are still
         /// checked. This flag never proves an initialization write.
         from_method_call: bool = false,
+        /// Select a proved optional tag origin without changing lifetime checks.
+        tag_only: bool = false,
+        optional_payload: bool = false,
     },
     /// A bare `if (COND)` whose condition carries a [GuardId].  The
     /// arm that COND holds records that fact; the arm it does not
@@ -510,6 +601,7 @@ pub const Cfg = struct {
     /// Runtime member names for diagnostic byte completeness. Locals borrow
     /// these arrays; field-name bytes borrow source or owned_paths.
     owned_field_layouts: [][]const []const u8 = &.{},
+    owned_index_domains: [][]u64 = &.{},
 
     pub fn deinit(self: *Cfg, gpa: std.mem.Allocator) void {
         for (self.blocks) |b| {
@@ -525,6 +617,8 @@ pub const Cfg = struct {
         gpa.free(self.owned_stack_loans);
         for (self.owned_field_layouts) |fields| gpa.free(fields);
         gpa.free(self.owned_field_layouts);
+        for (self.owned_index_domains) |domain| gpa.free(domain);
+        gpa.free(self.owned_index_domains);
     }
 };
 
@@ -545,6 +639,12 @@ pub const LocalInfo = struct {
     /// Selected data-valued projections need payload facts, not merely an
     /// initialized pointer or descriptor. Unrelated locals do not pay for it.
     tracks_array_payload: bool = false,
+    tracks_optional_tag: bool = false,
+    /// A switch selector's diagnostic observes its union tag, not payload bytes.
+    /// Its full value_inputs remain unchanged for strict certificates.
+    diagnostic_tag_only: bool = false,
+    diagnostic_tag_may_undefined: ?bool = null,
+    diagnostic_tag_guard: ?LocalId = null,
     /// The binding's actual value type is scalar, not a metatype or an
     /// aggregate/pointer header. Its runtime definedness uses value_inputs.
     tracks_scalar_value: bool = false,
@@ -555,6 +655,8 @@ pub const LocalInfo = struct {
     /// Only its `value` member has this intrinsic scalar type certificate.
     /// Live field definedness remains a separate transfer-state fact.
     is_enum_field_capture: bool = false,
+    /// Authenticated reflected tag domain; never a fill certificate.
+    enum_value_indices: ?[]const u64 = null,
     /// True for a declared pointer spelling or an actual resolved non-slice
     /// pointer type (including aliases). Typically a `*Self` parameter.
     /// The pointee lives in the

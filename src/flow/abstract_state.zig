@@ -73,6 +73,7 @@ pub const Comparison = struct {
 
 const ElementKey = struct { array: LocalId, index: u64 };
 const PrefixKey = struct { array: LocalId, counter: LocalId };
+const DiagnosticIndexBound = struct { index: LocalId, counter: LocalId, offset: i8 = 0 };
 /// Bounded prefixes also constrain the counter. Capped prefixes cover
 /// [0, min(max(counter + offset, 0), extent)) without constraining it.
 const SymbolicPrefix = struct { offset: i8, extent: u64, capped: bool = false, scale: u64 = 1 };
@@ -496,8 +497,20 @@ pub const AbstractState = struct {
     /// Diagnostic taint, separate from missing value certificates.
     may_undefined_values: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
     undefined_field_values: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
+    /// Exact all-undefined field bases; scoped mutations can defeat a query.
+    /// MAY taint never creates one of these negative certificates.
+    entire_undefined_fields: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
+    /// A positive-byte write on any incoming path prevents a whole-undefined
+    /// transport proof, even when an intersection drops the precise write.
+    partial_undefined_values: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
+    /// Every byte of a scalar computation or copied value is proved undefined.
+    /// This negative proof never supplies a positive value certificate.
+    entire_undefined_values: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
     /// Byte-write witnesses, independent of value/resource certificates.
     written_fields: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
+    /// Possible positive writes suppress inherited holes only in their scope.
+    /// Unlike written_fields, these are unioned and never certify coverage.
+    uncertain_byte_writes: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
     /// `*T` out-parameter writes that carried a heap origin.  Keyed
     /// by the out-param local; value is the HeapId of the most
     /// recently written value.  Checked at function exit
@@ -517,6 +530,9 @@ pub const AbstractState = struct {
     scalar_values: std.AutoArrayHashMapUnmanaged(LocalId, u64) = .empty,
     nonnegative_locals: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
     comparisons: std.ArrayListUnmanaged(Comparison) = .empty,
+    /// Runtime selector guards for physical byte witnesses only. These are
+    /// neither numeric solver premises nor positive value certificates.
+    diagnostic_index_bounds: std.AutoArrayHashMapUnmanaged(DiagnosticIndexBound, void) = .empty,
 
     pub fn deinit(self: *AbstractState, gpa: std.mem.Allocator) void {
         self.locals.deinit(gpa);
@@ -527,7 +543,11 @@ pub const AbstractState = struct {
         self.unknown_values.deinit(gpa);
         self.may_undefined_values.deinit(gpa);
         self.undefined_field_values.deinit(gpa);
+        self.entire_undefined_fields.deinit(gpa);
+        self.partial_undefined_values.deinit(gpa);
+        self.entire_undefined_values.deinit(gpa);
         self.written_fields.deinit(gpa);
+        self.uncertain_byte_writes.deinit(gpa);
         self.out_param_writes.deinit(gpa);
         self.facts.deinit(gpa);
         self.exact_elements.deinit(gpa);
@@ -538,6 +558,7 @@ pub const AbstractState = struct {
         self.scalar_values.deinit(gpa);
         self.nonnegative_locals.deinit(gpa);
         self.comparisons.deinit(gpa);
+        self.diagnostic_index_bounds.deinit(gpa);
     }
 
     /// Forget every field record belonging to `parent`.
@@ -553,15 +574,89 @@ pub const AbstractState = struct {
         retainWhere(&self.unknown_field_values, parent, fieldNotOwnedBy);
         _ = self.unknown_values.swapRemove(parent);
         _ = self.may_undefined_values.swapRemove(parent);
+        _ = self.partial_undefined_values.swapRemove(parent);
+        _ = self.entire_undefined_values.swapRemove(parent);
         retainWhere(&self.undefined_field_values, parent, fieldNotOwnedBy);
+        retainWhere(&self.entire_undefined_fields, parent, fieldNotOwnedBy);
         retainWhere(&self.written_fields, parent, fieldNotOwnedBy);
+        retainWhere(&self.uncertain_byte_writes, parent, fieldNotOwnedBy);
+    }
+
+    pub fn entireUndefinedFieldPrefix(
+        self: *const AbstractState,
+        parent: LocalId,
+        path: []const u8,
+    ) ?usize {
+        var prefix: ?usize = null;
+        for (self.entire_undefined_fields.keys()) |key| {
+            if (key.parent != parent) continue;
+            const matched = diagnosticFieldPrefix(key.name, path) orelse continue;
+            if (prefix == null or matched > prefix.?) prefix = matched;
+        }
+        return prefix;
+    }
+
+    /// Selected rebinds discard covered proofs, not untouched siblings.
+    /// Remaining ancestor bases are checked against scoped mutations at use.
+    pub fn forgetEntireUndefinedField(self: *AbstractState, key: FieldKey) void {
+        var index: usize = 0;
+        while (index < self.entire_undefined_fields.count()) {
+            const old = self.entire_undefined_fields.keys()[index];
+            if (old.parent == key.parent and diagnosticFieldPrefix(key.name, old.name) != null) {
+                _ = self.entire_undefined_fields.swapRemoveAt(index);
+            } else index += 1;
+        }
+    }
+
+    pub fn forgetEntireUndefinedFields(self: *AbstractState, parent: LocalId) void {
+        retainWhere(&self.entire_undefined_fields, parent, fieldNotOwnedBy);
+    }
+
+    pub fn bindEntireUndefinedField(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        key: FieldKey,
+        entire: bool,
+    ) !void {
+        self.forgetEntireUndefinedField(key);
+        if (!entire) return;
+        try self.entire_undefined_fields.putContext(gpa, key, {}, .{});
+        // These are certificate records, not exceptions to the new exact
+        // whole-byte guarantee. Keep both their origins and their unknownness.
+        for (self.unknown_field_values.keys()) |child| {
+            if (child.parent != key.parent or
+                diagnosticFieldPrefix(key.name, child.name) == null) continue;
+            try self.entire_undefined_fields.putContext(gpa, child, {}, .{});
+        }
+    }
+
+    pub fn copyEntireUndefinedFields(
+        self: *AbstractState,
+        gpa: std.mem.Allocator,
+        target: LocalId,
+        source: LocalId,
+    ) !void {
+        if (target == source) return;
+        const count = self.entire_undefined_fields.count();
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const key = self.entire_undefined_fields.keys()[index];
+            if (key.parent == source)
+                try self.entire_undefined_fields.putContext(
+                    gpa, .{ .parent = target, .name = key.name }, {}, .{},
+                );
+        }
     }
 
     /// A whole-location write removes prior undefined bytes, not certificates
     /// or resource identities retained for the other rules.
     pub fn forgetUndefinedBytes(self: *AbstractState, parent: LocalId) void {
         _ = self.may_undefined_values.swapRemove(parent);
+        _ = self.partial_undefined_values.swapRemove(parent);
+        _ = self.entire_undefined_values.swapRemove(parent);
         retainWhere(&self.undefined_field_values, parent, fieldNotOwnedBy);
+        retainWhere(&self.entire_undefined_fields, parent, fieldNotOwnedBy);
+        retainWhere(&self.uncertain_byte_writes, parent, fieldNotOwnedBy);
         for (self.fields.keys(), self.fields.values()) |key, *origin| {
             if (key.parent == parent and origin.* == .undef) origin.* = .plain;
         }
@@ -588,7 +683,11 @@ pub const AbstractState = struct {
         try copyMap(@TypeOf(self.unknown_values), &self.unknown_values, &src.unknown_values, gpa);
         try copyMap(@TypeOf(self.may_undefined_values), &self.may_undefined_values, &src.may_undefined_values, gpa);
         try copyMap(@TypeOf(self.undefined_field_values), &self.undefined_field_values, &src.undefined_field_values, gpa);
+        try copyMap(@TypeOf(self.entire_undefined_fields), &self.entire_undefined_fields, &src.entire_undefined_fields, gpa);
+        try copyMap(@TypeOf(self.partial_undefined_values), &self.partial_undefined_values, &src.partial_undefined_values, gpa);
+        try copyMap(@TypeOf(self.entire_undefined_values), &self.entire_undefined_values, &src.entire_undefined_values, gpa);
         try copyMap(@TypeOf(self.written_fields), &self.written_fields, &src.written_fields, gpa);
+        try copyMap(@TypeOf(self.uncertain_byte_writes), &self.uncertain_byte_writes, &src.uncertain_byte_writes, gpa);
         try copyMap(@TypeOf(self.out_param_writes), &self.out_param_writes, &src.out_param_writes, gpa);
         try self.facts.cloneFrom(&src.facts, gpa);
         try copyMap(@TypeOf(self.exact_elements), &self.exact_elements, &src.exact_elements, gpa);
@@ -601,6 +700,7 @@ pub const AbstractState = struct {
         try self.comparisons.ensureTotalCapacity(gpa, src.comparisons.items.len);
         self.comparisons.clearRetainingCapacity();
         self.comparisons.appendSliceAssumeCapacity(src.comparisons.items);
+        try copyMap(@TypeOf(self.diagnostic_index_bounds), &self.diagnostic_index_bounds, &src.diagnostic_index_bounds, gpa);
     }
 
     /// Drop every fact the target block can no longer observe, so two
@@ -654,7 +754,11 @@ pub const AbstractState = struct {
         retainWhere(&self.unknown_values, keep, isRetained);
         retainWhere(&self.may_undefined_values, keep, isRetained);
         retainWhere(&self.undefined_field_values, keep, fieldParentIsRetained);
+        retainWhere(&self.entire_undefined_fields, keep, fieldParentIsRetained);
+        retainWhere(&self.partial_undefined_values, keep, isRetained);
+        retainWhere(&self.entire_undefined_values, keep, isRetained);
         retainWhere(&self.written_fields, keep, fieldParentIsRetained);
+        retainWhere(&self.uncertain_byte_writes, keep, fieldParentIsRetained);
         self.projectInitialization(keep);
 
         // An allocation record is only observable while something still
@@ -702,7 +806,11 @@ pub const AbstractState = struct {
         for (self.unknown_values.keys()) |local| if (!isRetained(keep, local)) return false;
         for (self.may_undefined_values.keys()) |local| if (!isRetained(keep, local)) return false;
         for (self.undefined_field_values.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.entire_undefined_fields.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.partial_undefined_values.keys()) |local| if (!isRetained(keep, local)) return false;
+        for (self.entire_undefined_values.keys()) |local| if (!isRetained(keep, local)) return false;
         for (self.written_fields.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.uncertain_byte_writes.keys()) |key| if (!isRetained(keep, key.parent)) return false;
         for (self.out_param_writes.keys()) |out| if (!isRetained(live_out_params, out)) return false;
         if (!self.initializationProjectionIsIdentity(keep)) return false;
         // A handful of allocation records against a handful of origins:
@@ -871,14 +979,17 @@ pub const AbstractState = struct {
 
     /// Unknown payloads do not report. Only reached undefined bytes do.
     pub fn fieldValueMayBeUndefined(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
+        if (self.fieldBytesAreUnknown(parent, path)) return false;
         const repaired_prefix = self.writtenFieldPrefix(parent, path);
         for (self.undefined_field_values.keys()) |key| {
             if (key.parent != parent) continue;
-            if (fieldPathPrefix(key.name, path)) {
-                if (repaired_prefix == null or repaired_prefix.? < key.name.len) return true;
-            } else if (fieldPathPrefix(path, key.name)) {
+            if (diagnosticFieldPrefix(key.name, path)) |negative_prefix| {
+                if (self.scopedRepairOverridesPattern(parent, key.name, path)) continue;
+                if (repaired_prefix == null or repaired_prefix.? <= negative_prefix) return true;
+            } else if (diagnosticFieldPrefix(path, key.name) != null) {
                 const repair = self.writtenFieldPrefix(parent, key.name);
-                if (repair == null or repair.? < key.name.len) return true;
+                const negative_prefix = diagnosticFieldPrefix(key.name, key.name).?;
+                if (repair == null or repair.? <= negative_prefix) return true;
             }
         }
         if (repaired_prefix == null) {
@@ -887,10 +998,63 @@ pub const AbstractState = struct {
         }
         for (self.fields.keys(), self.fields.values()) |key, origin| {
             if (key.parent != parent or origin != .undef) continue;
-            if (fieldPathPrefix(key.name, path) and repaired_prefix == null) return true;
-            if (fieldPathPrefix(path, key.name) and self.writtenFieldPrefix(parent, key.name) == null) return true;
+            if (diagnosticFieldPrefix(key.name, path) != null and repaired_prefix == null)
+                return true;
+            if (diagnosticFieldPrefix(path, key.name) != null and
+                self.writtenFieldPrefix(parent, key.name) == null) return true;
         }
         return false;
+    }
+
+    pub fn fieldBytesAreUnknown(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
+        const entire = self.entireUndefinedFieldPrefix(parent, path);
+        // A separately settled selected hole is stronger than inherited
+        // whole-seed uncertainty. Precise later effects retain their scope.
+        for (self.undefined_field_values.keys()) |negative| {
+            if (negative.parent != parent or negative.name.len == 0) continue;
+            if (diagnosticFieldPrefix(negative.name, path) != null) return false;
+        }
+        if (diagnosticArrayRange(path)) |slot| {
+            if (!slot.range and slot.length == path.len and
+                self.undefined_elements.contains(.{ .array = parent, .index = slot.start })) return false;
+        }
+        for (self.uncertain_byte_writes.keys()) |key| {
+            if (key.parent != parent) continue;
+            const matched = diagnosticFieldPrefix(key.name, path) orelse continue;
+            if (entire == null or entire.? < matched) return true;
+        }
+        return false;
+    }
+
+    /// Bounds describe possible placement, not an exhaustive fill proof.
+    pub fn diagnosticWriteRange(self: *const AbstractState, index: IndexTerm, extent: u64) struct { start: u64, end: u64 } {
+        var bounds = self.termBounds(index);
+        // A runtime endpoint's integer domain bounds possible writes even
+        // when it cannot establish a strict initialization certificate.
+        for (self.comparisons.items) |original| {
+            for ([_]Comparison{ original, reverseComparison(original) }) |comparison| {
+                if (!termSameBase(index, comparison.lhs) or comparison.rhs != .local) continue;
+                const domain = self.integerDomainBounds(comparison.rhs.local.local);
+                const offset = termOffset(comparison.rhs) + termOffset(index) - termOffset(comparison.lhs);
+                const endpoint = domain.offset(offset);
+                if (endpoint.upper) |upper| switch (comparison.op) {
+                    .lt => bounds.upper = @min(bounds.upper orelse upper, upper - 1),
+                    .le, .eq => bounds.upper = @min(bounds.upper orelse upper, upper),
+                    else => {},
+                };
+                if (endpoint.lower) |lower| switch (comparison.op) {
+                    .gt => bounds.lower = @max(bounds.lower orelse lower, lower + 1),
+                    .ge, .eq => bounds.lower = @max(bounds.lower orelse lower, lower),
+                    else => {},
+                };
+            }
+        }
+        const lower = bounds.lower orelse 0;
+        const upper = bounds.upper orelse @as(i128, extent) - 1;
+        return .{
+            .start = @intCast(@min(@as(i128, extent), @max(0, lower))),
+            .end = @intCast(@min(@as(i128, extent), @max(0, upper + 1))),
+        };
     }
 
     pub fn fieldBytesAreWritten(self: *const AbstractState, parent: LocalId, path: []const u8) bool {
@@ -900,28 +1064,249 @@ pub const AbstractState = struct {
     fn writtenFieldPrefix(self: *const AbstractState, parent: LocalId, path: []const u8) ?usize {
         var prefix: ?usize = null;
         for (self.written_fields.keys()) |key| {
-            if (key.parent != parent or !fieldPathPrefix(key.name, path)) continue;
-            if (prefix == null or key.name.len > prefix.?) prefix = key.name.len;
+            if (key.parent != parent) continue;
+            const matched = self.diagnosticWrittenPrefix(key.name, path) orelse continue;
+            if (prefix == null or matched > prefix.?) prefix = matched;
         }
         return prefix;
     }
 
+    /// A scoped write repairs only the queried bytes it covers, not every
+    /// original hole in the containing negative pattern.
+    fn scopedRepairOverridesPattern(
+        self: *const AbstractState,
+        parent: LocalId,
+        negative: []const u8,
+        path: []const u8,
+    ) bool {
+        var offset: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, negative, offset, '[')) |at| {
+            const suffix = negative[at..];
+            const repeated = diagnosticRepeatedRange(suffix) != null;
+            const range = diagnosticArrayRange(suffix);
+            if (repeated or (range != null and range.?.range)) {
+                const scope_length = if (diagnosticRepeatedRange(suffix)) |pattern| pattern.length else range.?.length;
+                for (self.written_fields.keys()) |key| {
+                    if (key.parent != parent or key.name.len <= at or
+                        !std.mem.startsWith(u8, key.name, negative[0..at])) continue;
+                    if (diagnosticArrayRange(key.name[at..]) == null) continue;
+                    // An equal or enclosing repair is not a more specific
+                    // overwrite of a hole replayed in the same snapshot.
+                    if (diagnosticFieldPrefix(key.name, negative) != null) continue;
+                    if (diagnosticFieldPrefix(negative[0 .. at + scope_length], key.name) == null or
+                        diagnosticFieldPrefix(key.name, path) == null) continue;
+                    return true;
+                }
+                return false;
+            }
+            offset = at + 1;
+        }
+        return false;
+    }
+
+    fn diagnosticWrittenPrefix(
+        self: *const AbstractState,
+        prefix: []const u8,
+        path: []const u8,
+    ) ?usize {
+        if (diagnosticFieldPrefix(prefix, path)) |matched| return matched;
+        const symbolic = diagnosticFieldSymbolicRange(prefix) orelse return null;
+        if (!std.mem.startsWith(u8, path, prefix[0..symbolic.offset])) return null;
+        const selected = diagnosticArrayRange(path[symbolic.offset..]) orelse return null;
+        if (!self.diagnosticSymbolicRangeCovers(
+            symbolic.range, .{ .constant = selected.end - 1 },
+        )) return null;
+        const expected_suffix = prefix[symbolic.offset + symbolic.range.length ..];
+        const selected_suffix = path[symbolic.offset + selected.length ..];
+        const suffix = diagnosticFieldPrefix(expected_suffix, selected_suffix) orelse return null;
+        return symbolic.offset + selected.length + suffix - 1;
+    }
+
+    /// A real branch supplies index<count. Accept only an exact selector
+    /// of an existing bounded physical prefix, never an opaque call proof.
+    pub fn recordDiagnosticIndexBound(self: *AbstractState, gpa: std.mem.Allocator, index: LocalId, counter: LocalId) !void {
+        for (self.written_fields.keys()) |key| {
+            const symbolic = diagnosticFieldSymbolicRange(key.name) orelse continue;
+            const range = symbolic.range;
+            if (range.counter == counter and range.scale == 1 and range.offset == 0 and !range.capped) {
+                try self.diagnostic_index_bounds.put(gpa, .{ .index = index, .counter = counter }, {});
+                return;
+            }
+        }
+    }
+
+    fn diagnosticSymbolicRangeCovers(
+        self: *const AbstractState,
+        range: DiagnosticSymbolicRange,
+        index: IndexTerm,
+    ) bool {
+        if (range.scale == 1 and range.offset == 0 and !range.capped and index == .local and
+            self.diagnostic_index_bounds.contains(.{
+                .index = index.local.local, .counter = range.counter, .offset = index.local.offset,
+            }))
+        {
+            // The seeded append producer proves 1<=count<=extent physically.
+            // This exact last-slot selector does not add numeric premises.
+            if (index.local.local == range.counter and index.local.offset == -1) return true;
+            if (index.local.offset == 0 and self.provesNonNegative(index)) return true;
+        }
+        if (!self.provesNonNegative(index)) return false;
+        if (!self.provesLessThan(index, .{ .constant = range.extent })) return false;
+        const count: IndexTerm = .{ .local = .{ .local = range.counter, .offset = range.offset } };
+        if (range.scale == 1) return self.provesLessThan(index, count);
+        if (self.concreteTerm(index)) |known| {
+            return self.provesLessThan(.{ .constant = known / range.scale }, count);
+        }
+        const lower = self.termBounds(count).lower orelse return false;
+        if (lower <= 0 or lower > std.math.maxInt(u64)) return false;
+        const bytes = std.math.mul(u64, @intCast(lower), range.scale) catch range.extent;
+        return self.provesLessThan(index, .{ .constant = @min(bytes, range.extent) });
+    }
+
+    /// Internal counter-bearing byte witnesses are not solver/value facts.
+    pub fn fieldRangeBytesAreWritten(
+        self: *const AbstractState,
+        parent: LocalId,
+        path: []const u8,
+        index: IndexTerm,
+    ) bool {
+        if (index == .unknown) return false;
+        for (self.undefined_field_values.keys()) |key| {
+            if (key.parent != parent or !fieldPathPrefix(path, key.name) or
+                key.name.len <= path.len) continue;
+            if (diagnosticRepeatedRange(key.name[path.len..])) |repeated| {
+                if (!self.diagnosticRepeatedMayContain(repeated, index)) continue;
+                if (self.fieldValueMayBeUndefined(parent, key.name)) return false;
+                continue;
+            }
+            const hole = diagnosticArrayRange(key.name[path.len..]) orelse continue;
+            if (self.provesComparison(.{
+                .lhs = index, .rhs = .{ .constant = hole.start }, .op = .lt,
+            }) or self.provesComparison(.{
+                .lhs = index, .rhs = .{ .constant = hole.end }, .op = .ge,
+            })) continue;
+            if (self.fieldValueMayBeUndefined(parent, key.name)) return false;
+        }
+        if (path.len == 0) {
+            for (self.undefined_elements.keys()) |hole| {
+                if (hole.array == parent and !self.provesComparison(.{
+                    .lhs = index, .rhs = .{ .constant = hole.index }, .op = .ne,
+                })) return false;
+            }
+        }
+        for (self.written_fields.keys()) |key| {
+            if (key.parent != parent) continue;
+            if (diagnosticFieldPrefix(key.name, path) != null) return true;
+            if (!fieldPathPrefix(path, key.name) or key.name.len <= path.len) continue;
+            const suffix = key.name[path.len..];
+            if (diagnosticRepeatedRange(suffix)) |repeated| {
+                if (repeated.length == suffix.len and self.diagnosticRepeatedCovers(repeated, index))
+                    return true;
+                continue;
+            }
+            if (diagnosticSymbolicRange(suffix)) |range| {
+                if (range.length == suffix.len and self.diagnosticSymbolicRangeCovers(range, index))
+                    return true;
+            } else if (diagnosticArrayRange(suffix)) |range| {
+                if (range.length != suffix.len) continue;
+                if (self.provesComparison(.{
+                    .lhs = index, .rhs = .{ .constant = range.start }, .op = .ge,
+                }) and self.provesLessThan(index, .{ .constant = range.end })) return true;
+            }
+        }
+        return false;
+    }
+
+    fn diagnosticRepeatedCovers(self: *const AbstractState, repeated: DiagnosticRepeatedRange, index: IndexTerm) bool {
+        if (repeated.period == 1)
+            return self.provesNonNegative(index) and self.provesLessThan(index, .{ .constant = repeated.extent });
+        const bounds = self.termBounds(index);
+        const lower = bounds.lower orelse return false;
+        const upper = bounds.upper orelse return false;
+        if (lower < 0 or lower != upper or upper >= repeated.extent) return false;
+        return @as(u64, @intCast(lower)) % repeated.period == repeated.offset;
+    }
+
+    fn diagnosticRepeatedMayContain(self: *const AbstractState, repeated: DiagnosticRepeatedRange, index: IndexTerm) bool {
+        const bounds = self.termBounds(index);
+        const lower = bounds.lower orelse return true;
+        const upper = bounds.upper orelse return true;
+        if (upper < 0 or lower >= repeated.extent) return false;
+        if (lower != upper) return true;
+        return lower >= 0 and @as(u64, @intCast(lower)) % repeated.period == repeated.offset;
+    }
+
+    pub fn forgetDiagnosticCounterRanges(self: *AbstractState, counter: LocalId) void {
+        var index: usize = 0;
+        while (index < self.written_fields.count()) {
+            const key = self.written_fields.keys()[index];
+            const symbolic = diagnosticFieldSymbolicRange(key.name) orelse {
+                index += 1;
+                continue;
+            };
+            if (symbolic.range.counter == counter) {
+                _ = self.written_fields.swapRemoveAt(index);
+            } else index += 1;
+        }
+    }
+
     pub fn bindWrittenField(self: *AbstractState, gpa: std.mem.Allocator, key: FieldKey, may_undefined: bool) !void {
+        self.forgetEntireUndefinedField(key);
+        if (!may_undefined and key.name.len != 0 and (self.locals.get(key.parent) orelse .plain) == .undef)
+            try self.partial_undefined_values.put(gpa, key.parent, {});
+        if (!may_undefined) _ = self.entire_undefined_values.swapRemove(key.parent);
         var index: usize = 0;
         while (index < self.written_fields.count()) {
             const old = self.written_fields.keys()[index];
-            if (old.parent == key.parent and fieldPathPrefix(key.name, old.name)) {
+            if (old.parent == key.parent and diagnosticFieldPrefix(key.name, old.name) != null) {
                 _ = self.written_fields.swapRemoveAt(index);
             } else index += 1;
         }
         index = 0;
         while (index < self.undefined_field_values.count()) {
             const old = self.undefined_field_values.keys()[index];
-            if (old.parent == key.parent and fieldPathPrefix(key.name, old.name)) {
+            if (old.parent == key.parent and diagnosticFieldPrefix(key.name, old.name) != null) {
                 _ = self.undefined_field_values.swapRemoveAt(index);
             } else index += 1;
         }
+        index = 0;
+        while (index < self.uncertain_byte_writes.count()) {
+            const old = self.uncertain_byte_writes.keys()[index];
+            const selected = diagnosticArrayRange(key.name);
+            const possible = diagnosticArrayRange(old.name);
+            // A singleton positive alternative must survive path joins.
+            // A later negative store or an enclosing overwrite still clears it.
+            const singleton_alternative = !may_undefined and selected != null and possible != null and
+                !selected.?.range and possible.?.range and selected.?.start == possible.?.start and
+                selected.?.end == possible.?.end and
+                std.mem.eql(u8, key.name[selected.?.length..], old.name[possible.?.length..]);
+            if (old.parent == key.parent and !singleton_alternative and diagnosticFieldPrefix(key.name, old.name) != null) {
+                _ = self.uncertain_byte_writes.swapRemoveAt(index);
+            } else index += 1;
+        }
         if (!may_undefined) try self.written_fields.putContext(gpa, key, {}, .{});
+    }
+
+    /// The array base excludes sparse child holes, which copies replay next.
+    pub fn fieldArrayBaseMayBeUndefined(
+        self: *const AbstractState,
+        parent: LocalId,
+        path: []const u8,
+    ) bool {
+        const repair = self.writtenFieldPrefix(parent, path);
+        for (self.undefined_field_values.keys()) |key| {
+            if (key.parent != parent) continue;
+            const negative = diagnosticFieldPrefix(key.name, path) orelse continue;
+            if (repair == null or repair.? <= negative) return true;
+        }
+        if (repair != null or self.fieldArrayBaseIsDefined(parent, path)) return false;
+        if (self.may_undefined_values.contains(parent)) return true;
+        if (self.locals.get(parent)) |origin| if (origin == .undef) return true;
+        for (self.fields.keys(), self.fields.values()) |key, origin| {
+            if (key.parent == parent and origin == .undef and
+                diagnosticFieldPrefix(key.name, path) != null) return true;
+        }
+        return false;
     }
 
     pub fn forgetWrittenFields(self: *AbstractState, parent: LocalId) void {
@@ -979,6 +1364,7 @@ pub const AbstractState = struct {
     }
 
     pub fn bindFieldValue(self: *AbstractState, gpa: std.mem.Allocator, key: FieldKey, defined: bool) !void {
+        self.forgetEntireUndefinedField(key);
         if (defined) try self.bindWrittenField(gpa, key, false);
         var index: usize = 0;
         while (index < self.unknown_field_values.count()) {
@@ -1020,6 +1406,9 @@ pub const AbstractState = struct {
         array: LocalId,
         count: u64,
     ) !void {
+        if (count != 0 and (self.locals.get(array) orelse .plain) == .undef)
+            try self.partial_undefined_values.put(gpa, array, {});
+        if (count != 0) _ = self.entire_undefined_values.swapRemove(array);
         try self.fixed_prefixes.put(gpa, array, count);
     }
 
@@ -1034,6 +1423,9 @@ pub const AbstractState = struct {
     ) !void {
         std.debug.assert(start <= end);
         if (start == end) return;
+        if ((self.locals.get(array) orelse .plain) == .undef)
+            try self.partial_undefined_values.put(gpa, array, {});
+        _ = self.entire_undefined_values.swapRemove(array);
         var hole_index: usize = 0;
         while (hole_index < self.undefined_elements.count()) {
             const hole = self.undefined_elements.keys()[hole_index];
@@ -1052,6 +1444,9 @@ pub const AbstractState = struct {
         index: u64,
         initialized: bool,
     ) !void {
+        if (initialized and (self.locals.get(array) orelse .plain) == .undef)
+            try self.partial_undefined_values.put(gpa, array, {});
+        if (initialized) _ = self.entire_undefined_values.swapRemove(array);
         const key: ElementKey = .{ .array = array, .index = index };
         if (!initialized) {
             // A base initializer survives except for the selected sparse hole.
@@ -1202,6 +1597,7 @@ pub const AbstractState = struct {
 
     pub fn forgetInitializationArray(self: *AbstractState, array: LocalId) void {
         retainWhere(&self.written_fields, array, fieldNotOwnedPayload);
+        retainWhere(&self.entire_undefined_fields, array, fieldNotOwnedPayload);
         _ = self.complete_arrays.swapRemove(array);
         _ = self.fixed_prefixes.swapRemove(array);
         retainWhere(&self.exact_elements, array, elementNotOwnedBy);
@@ -1210,6 +1606,7 @@ pub const AbstractState = struct {
     }
 
     pub fn forgetInitializationLocal(self: *AbstractState, local: LocalId) void {
+        self.forgetDiagnosticCounterRanges(local);
         _ = self.scalar_values.swapRemove(local);
         _ = self.nonnegative_locals.swapRemove(local);
         retainWhere(&self.symbolic_prefixes, local, prefixCounterIsNot);
@@ -1218,9 +1615,11 @@ pub const AbstractState = struct {
 
     pub fn forgetAllComparisons(self: *AbstractState) void {
         self.comparisons.clearRetainingCapacity();
+        self.diagnostic_index_bounds.clearRetainingCapacity();
     }
 
     fn forgetComparisonsLocal(self: *AbstractState, local: LocalId) void {
+        retainWhere(&self.diagnostic_index_bounds, local, diagnosticBoundDoesNotName);
         var index: usize = 0;
         while (index < self.comparisons.items.len) {
             const premise = self.comparisons.items[index];
@@ -1467,6 +1866,7 @@ pub const AbstractState = struct {
         local: LocalId,
         step: i8,
     ) !void {
+        self.forgetDiagnosticCounterRanges(local);
         if (step != 1 and step != -1) {
             self.forgetInitializationLocal(local);
             return;
@@ -1522,6 +1922,17 @@ pub const AbstractState = struct {
                 grew = retainLocal(keep, key.counter) or grew;
             }
         }
+        for (self.written_fields.keys()) |key| {
+            const symbolic = diagnosticFieldSymbolicRange(key.name) orelse continue;
+            if (isRetained(keep, key.parent))
+                grew = retainLocal(keep, symbolic.range.counter) or grew;
+        }
+        for (self.diagnostic_index_bounds.keys()) |bound| {
+            if (isRetained(keep, bound.index) or isRetained(keep, bound.counter)) {
+                grew = retainLocal(keep, bound.index) or grew;
+                grew = retainLocal(keep, bound.counter) or grew;
+            }
+        }
         for (self.comparisons.items) |comparison| {
             if (termIsRetained(keep, comparison.lhs) or termIsRetained(keep, comparison.rhs)) {
                 grew = retainTerm(keep, comparison.lhs) or grew;
@@ -1532,6 +1943,7 @@ pub const AbstractState = struct {
     }
 
     fn projectInitialization(self: *AbstractState, keep: []const u8) void {
+        retainWhere(&self.diagnostic_index_bounds, keep, diagnosticBoundIsRetained);
         retainWhere(&self.exact_elements, keep, elementIsRetained);
         retainWhere(&self.undefined_elements, keep, elementIsRetained);
         retainWhere(&self.complete_arrays, keep, isRetained);
@@ -1551,6 +1963,7 @@ pub const AbstractState = struct {
     }
 
     fn initializationProjectionIsIdentity(self: *const AbstractState, keep: []const u8) bool {
+        for (self.diagnostic_index_bounds.keys()) |bound| if (!diagnosticBoundIsRetained(keep, bound)) return false;
         for (self.exact_elements.keys()) |key| if (!elementIsRetained(keep, key)) return false;
         for (self.undefined_elements.keys()) |key| if (!elementIsRetained(keep, key)) return false;
         for (self.complete_arrays.keys()) |key| if (!isRetained(keep, key)) return false;
@@ -1698,6 +2111,7 @@ pub const AbstractState = struct {
                 changed = true;
             }
         }
+        changed = intersectPredicates(@TypeOf(self.diagnostic_index_bounds), &self.diagnostic_index_bounds, &other.diagnostic_index_bounds) or changed;
         changed = intersectPredicates(@TypeOf(self.scalar_values), &self.scalar_values, &other.scalar_values) or changed;
         index = 0;
         while (index < self.nonnegative_locals.count()) {
@@ -1710,6 +2124,14 @@ pub const AbstractState = struct {
         return changed;
     }
 };
+
+fn diagnosticBoundDoesNotName(local: LocalId, bound: DiagnosticIndexBound) bool {
+    return bound.index != local and bound.counter != local;
+}
+
+fn diagnosticBoundIsRetained(keep: []const u8, bound: DiagnosticIndexBound) bool {
+    return isRetained(keep, bound.index) and isRetained(keep, bound.counter);
+}
 
 fn elementNotOwnedBy(array: LocalId, key: ElementKey) bool {
     return key.array != array;
@@ -2018,7 +2440,147 @@ fn nextFieldPathByte(path: []const u8, index: *usize, quoted: *bool, escaped: *b
     return null;
 }
 
-fn fieldPathPrefix(prefix: []const u8, path: []const u8) bool {
+/// Compact byte-coverage path emitted only by negative return replay.
+/// Certificate predicates do not interpret this diagnostic range.
+pub fn diagnosticArrayPrefixEnd(path: []const u8) ?u64 {
+    if (path.len < 6 or !std.mem.startsWith(u8, path, "[0..") or path[path.len - 1] != ']') return null;
+    return std.fmt.parseInt(u64, path[4 .. path.len - 1], 10) catch null;
+}
+
+pub const DiagnosticArrayRange = struct {
+    start: u64,
+    end: u64,
+    length: usize,
+    range: bool,
+};
+
+pub const DiagnosticRepeatedRange = struct {
+    offset: u64,
+    period: u64,
+    extent: u64,
+    length: usize,
+};
+
+/// Repetition stores one diagnostic pattern, never one fact per array slot.
+pub fn diagnosticRepeatedRange(path: []const u8) ?DiagnosticRepeatedRange {
+    if (!std.mem.startsWith(u8, path, "[%")) return null;
+    const close = std.mem.indexOfScalar(u8, path, ']') orelse return null;
+    var parts = std.mem.splitScalar(u8, path[2..close], ':');
+    const offset = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    const period = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    const extent = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    if (parts.next() != null or period == 0 or offset >= period or offset >= extent) return null;
+    return .{ .offset = offset, .period = period, .extent = extent, .length = close + 1 };
+}
+
+pub const DiagnosticSymbolicRange = struct {
+    counter: LocalId,
+    scale: u64,
+    offset: i8,
+    extent: u64,
+    capped: bool,
+    length: usize,
+};
+
+pub fn diagnosticSymbolicRange(path: []const u8) ?DiagnosticSymbolicRange {
+    if (!std.mem.startsWith(u8, path, "[0..$")) return null;
+    const close = std.mem.indexOfScalar(u8, path, ']') orelse return null;
+    var parts = std.mem.splitScalar(u8, path[5..close], ':');
+    const counter = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
+    const scale = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    const offset = std.fmt.parseInt(i8, parts.next() orelse return null, 10) catch return null;
+    const extent = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    const capped = std.fmt.parseInt(u8, parts.next() orelse return null, 10) catch return null;
+    if (parts.next() != null or scale == 0 or offset < -1 or offset > 1 or capped > 1)
+        return null;
+    return .{
+        .counter = @enumFromInt(counter), .scale = scale, .offset = offset,
+        .extent = extent, .capped = capped == 1, .length = close + 1,
+    };
+}
+
+pub fn diagnosticFieldSymbolicRange(path: []const u8) ?struct {
+    offset: usize,
+    range: DiagnosticSymbolicRange,
+} {
+    var quoted = false;
+    var escaped = false;
+    for (path, 0..) |byte, index| {
+        if (byte == '"' and !escaped) quoted = !quoted;
+        if (!quoted and byte == '[') {
+            if (diagnosticSymbolicRange(path[index..])) |range|
+                return .{ .offset = index, .range = range };
+        }
+        const was_escaped = escaped;
+        escaped = quoted and byte == '\\' and !was_escaped;
+    }
+    return null;
+}
+
+/// A compact diagnostic range never becomes a value certificate.
+pub fn diagnosticArrayRange(path: []const u8) ?DiagnosticArrayRange {
+    if (path.len == 0 or path[0] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, path, ']') orelse return null;
+    const content = path[1..close];
+    if (std.mem.indexOf(u8, content, "..")) |separator| {
+        const start = std.fmt.parseInt(
+            u64, std.mem.trim(u8, content[0..separator], " \t\r\n"), 10,
+        ) catch return null;
+        const end = std.fmt.parseInt(
+            u64, std.mem.trim(u8, content[separator + 2 ..], " \t\r\n"), 10,
+        ) catch return null;
+        if (start >= end) return null;
+        return .{ .start = start, .end = end, .length = close + 1, .range = true };
+    }
+    const index = std.fmt.parseInt(u64, std.mem.trim(u8, content, " \t\r\n"), 10) catch return null;
+    const end = std.math.add(u64, index, 1) catch return null;
+    return .{ .start = index, .end = end, .length = close + 1, .range = false };
+}
+
+/// Match byte witnesses, including interval containment, without changing
+/// the strict field-path certificate language.
+pub fn diagnosticFieldPrefix(prefix: []const u8, path: []const u8) ?usize {
+    if (prefix.len == 0) return 0;
+    var left: usize = 0;
+    var right: usize = 0;
+    var left_quoted = false;
+    var right_quoted = false;
+    var left_escaped = false;
+    var right_escaped = false;
+    var ranged = false;
+    while (nextFieldPathByte(prefix, &left, &left_quoted, &left_escaped)) |byte| {
+        const actual = nextFieldPathByte(path, &right, &right_quoted, &right_escaped) orelse return null;
+        if (actual != byte) return null;
+        if (byte == '[' and !left_quoted and !right_quoted) {
+            if (diagnosticRepeatedRange(prefix[left - 1 ..])) |expected| {
+                if (diagnosticRepeatedRange(path[right - 1 ..])) |selected| {
+                    if (expected.period != selected.period or expected.offset != selected.offset or
+                        selected.extent > expected.extent) return null;
+                    right += selected.length - 1;
+                } else {
+                    const selected = diagnosticArrayRange(path[right - 1 ..]) orelse return null;
+                    if ((selected.range and expected.period != 1) or selected.end > expected.extent or
+                        selected.start % expected.period != expected.offset) return null;
+                    right += selected.length - 1;
+                }
+                left += expected.length - 1;
+                ranged = true;
+            } else if (diagnosticArrayRange(prefix[left - 1 ..])) |expected| {
+                const selected = diagnosticArrayRange(path[right - 1 ..]) orelse return null;
+                if (selected.start < expected.start or selected.end > expected.end) return null;
+                left += expected.length - 1;
+                right += selected.length - 1;
+                ranged = ranged or expected.range;
+            }
+        }
+    }
+    const matched = right;
+    const next = nextFieldPathByte(path, &right, &right_quoted, &right_escaped);
+    if (next != null and next.? != '.' and next.? != '[') return null;
+    return matched - @intFromBool(ranged);
+}
+
+pub fn fieldPathPrefix(prefix: []const u8, path: []const u8) bool {
     if (prefix.len == 0) return true;
     var left: usize = 0;
     var right: usize = 0;
@@ -2068,6 +2630,27 @@ pub fn join(
     // when BOTH paths carry it.  Nothing above or below may insert one.
     var changed = self.facts.joinFrom(&other.facts);
     changed = (try self.joinInitialization(other, gpa)) or changed;
+    // Exact negative certificates require a covered scope on both paths.
+    // Prefix containment keeps the narrower already interned key. A repair
+    // covering that exact scope defeats ALL; descendant repairs can still
+    // coexist with an ancestor byte-base retained for selected holes.
+    for (other.entire_undefined_fields.keys()) |key| {
+        if (self.entireUndefinedFieldPrefix(key.parent, key.name) == null or
+            self.fieldBytesAreWritten(key.parent, key.name) or
+            other.fieldBytesAreWritten(key.parent, key.name)) continue;
+        const entry = try self.entire_undefined_fields.getOrPutContext(gpa, key, .{});
+        if (!entry.found_existing) changed = true;
+    }
+    var entire_index: usize = 0;
+    while (entire_index < self.entire_undefined_fields.count()) {
+        const key = self.entire_undefined_fields.keys()[entire_index];
+        if (other.entireUndefinedFieldPrefix(key.parent, key.name) == null or
+            self.fieldBytesAreWritten(key.parent, key.name) or
+            other.fieldBytesAreWritten(key.parent, key.name)) {
+            _ = self.entire_undefined_fields.swapRemoveAt(entire_index);
+            changed = true;
+        } else entire_index += 1;
+    }
     for (other.written_fields.keys()) |key| {
         if (!self.fieldBytesAreWritten(key.parent, key.name)) continue;
         const entry = try self.written_fields.getOrPutContext(gpa, key, .{});
@@ -2088,6 +2671,17 @@ pub fn join(
     for (other.undefined_field_values.keys()) |key| {
         const entry = try self.undefined_field_values.getOrPutContext(gpa, key, .{});
         if (!entry.found_existing) changed = true;
+    }
+    for (other.partial_undefined_values.keys()) |local| {
+        const entry = try self.partial_undefined_values.getOrPut(gpa, local);
+        if (!entry.found_existing) changed = true;
+    }
+    var entire_value_index: usize = 0;
+    while (entire_value_index < self.entire_undefined_values.count()) {
+        if (!other.entire_undefined_values.contains(self.entire_undefined_values.keys()[entire_value_index])) {
+            _ = self.entire_undefined_values.swapRemoveAt(entire_value_index);
+            changed = true;
+        } else entire_value_index += 1;
     }
     for (self.locals.keys(), self.locals.values()) |local, origin| {
         if (origin == .undef) {
@@ -2139,6 +2733,10 @@ pub fn join(
     }
     for (other.unknown_field_values.keys()) |key| {
         const entry = try self.unknown_field_values.getOrPutContext(gpa, key, .{});
+        if (!entry.found_existing) changed = true;
+    }
+    for (other.uncertain_byte_writes.keys()) |key| {
+        const entry = try self.uncertain_byte_writes.getOrPutContext(gpa, key, .{});
         if (!entry.found_existing) changed = true;
     }
     for (other.unknown_values.keys()) |local| {
@@ -3047,4 +3645,27 @@ test "integer domains: wide signed identity contributes neither endpoint" {
     try std.testing.expect(!state.provesLessThan(term, .{ .constant = std.math.maxInt(u64) }));
     try std.testing.expect(state.termBounds(term).lower == null);
     try std.testing.expect(state.termBounds(term).upper == null);
+}
+
+test "diagnostic masks: covering and shorter prefix repairs stay scoped" {
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    for ([_][]const u8{ "[0..3]", "[0..1]" }, 0..) |repair, ordinal| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        try state.bindWrittenField(gpa, .{ .parent = array, .name = "[0..4]" }, false);
+        try state.bindWrittenField(gpa, .{ .parent = array, .name = "[0..2]" }, true);
+        try state.undefined_field_values.putContext(gpa, .{ .parent = array, .name = "[0..2]" }, {}, .{});
+        try state.unknown_field_values.putContext(gpa, .{ .parent = array, .name = "[0..2]" }, {}, .{});
+        try state.unknown_values.put(gpa, array, {});
+        try std.testing.expect(state.fieldValueMayBeUndefined(array, "[0]"));
+        try std.testing.expect(state.fieldValueMayBeUndefined(array, "[1]"));
+        try state.bindWrittenField(gpa, .{ .parent = array, .name = repair }, false);
+        try std.testing.expect(!state.fieldValueMayBeUndefined(array, "[0]"));
+        try std.testing.expectEqual(ordinal == 1, state.fieldValueMayBeUndefined(array, "[1]"));
+        try std.testing.expect(!state.fieldValueMayBeUndefined(array, "[2]"));
+        try std.testing.expect(!state.fieldValueMayBeUndefined(array, "[3]"));
+        // Diagnostic repairs do not manufacture initialized-value certificates.
+        try std.testing.expect(!state.fieldValueIsDefined(array, ""));
+    }
 }

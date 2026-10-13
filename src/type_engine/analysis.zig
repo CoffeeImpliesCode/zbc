@@ -6786,22 +6786,10 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
 /// read under, which is what turns a bare `T` or a bare `comptime n` into
 /// the argument the caller actually passed.
 ///
-/// Two shapes reach this, and only these two.  Either the container's scope
-/// is inside the name's scope — the generic's own body, `value: T`.  Or the
-/// name's scope is a DIRECT child of the container's scope — a member, so
-/// `read` is written inside the struct `Box` returned and its own function
-/// scope hangs directly off that struct's scope.  That second shape is the
-/// one a one-directional walk missed.
-///
-/// The DIRECT parent is the whole point.  Anything merely nested beneath the
-/// container — a block-local item, a nested fn, a callee nothing names —
-/// is more than one level down and stays unframed, so it keeps answering
-/// unknown.
-///
-/// Attaching cannot invent a binding either way.  Both substitutions
-/// consulted later are keyed by the tokens THIS container binds, so a
-/// declaration that mentions none of them is unaffected: a wider match
-/// costs work, never a wrong answer.
+/// Also retain the frame for block-local declarations in the queried method.
+/// Both the query and declaration must belong to that same function, whose
+/// immediate namespace is this container. Nested functions do not inherit
+/// the enclosing method's bindings.
 fn withEnclosingContainer(options: ResolveOptions, hit: ScopedSymbol) Error!DeclWithHandle {
     const container = options.container_type orelse return hit.decl;
     if (hit.decl.container_type != null) return hit.decl;
@@ -6847,21 +6835,26 @@ fn withEnclosingContainer(options: ResolveOptions, hit: ScopedSymbol) Error!Decl
     if (scope_handle.scope != .root and
         !try scopeEncloses(hit.decl.handle, hit.scope, scope_handle.scope))
     {
-        // The container's scope is not inside the name's scope.  The one
-        // remaining case is MEMBERSHIP: a member of the container is written
-        // IN its scope, so a method's own function scope has the container's
-        // scope as its DIRECT parent — `read` is declared inside the struct
-        // `Box` returned, which is why walking up from the container never
-        // reached it and the frame was dropped.
-        //
-        // Requiring the DIRECT parent is what separates a member from
-        // anything merely nested beneath: a block-local item, a nested fn, or
-        // a callee nothing names sits deeper than one level and stays
-        // unframed, so it keeps answering unknown.
         const document_scope = try hit.decl.handle.getDocumentScope();
         const parent = document_scope.getScopeParent(hit.scope).unwrap() orelse
             return hit.decl;
-        if (parent != scope_handle.scope) return hit.decl;
+        if (parent != scope_handle.scope) {
+            const tree = &hit.decl.handle.document.tree;
+            const declaration_function = innermostScopeAtIndexWithTag(
+                document_scope,
+                tree.tokenStart(hit.decl.nameToken()),
+                .initOne(.function),
+            ).unwrap() orelse return hit.decl;
+            if (!options.node_handle.handle.eql(hit.decl.handle)) return hit.decl;
+            const query_function = innermostScopeAtIndexWithTag(
+                document_scope,
+                tree.tokenStart(tree.nodeMainToken(options.node_handle.node)),
+                .initOne(.function),
+            ).unwrap() orelse return hit.decl;
+            if (query_function != declaration_function or
+                document_scope.getScopeParent(declaration_function).unwrap() != scope_handle.scope)
+                return hit.decl;
+        }
     }
 
     return .{

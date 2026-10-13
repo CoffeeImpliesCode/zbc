@@ -3067,44 +3067,73 @@ fn nearestBranchClause(
     anchor: TokenIndex,
     exact: ?TokenIndex,
 ) ?BranchClause {
-    const gate = exact orelse anchor;
-    // A branch node's main token IS its `if` / `while` / `for` /
-    // `switch` keyword, so a node starting after the gate cannot hold
-    // the clause and is skipped without a `full*` call.
-    const main_tokens = tree.nodes.items(.main_token);
-    // Only this fn's own body can bind a name one of its expressions
-    // reads, and the parser emits that body as one contiguous run of
-    // nodes, so the walk covers that run instead of the whole array.
-    // Without that bound the whole array is walked: that is what this
-    // replaces, not a new correctness claim.
-    const body = fnBodyNodes(tree, proto);
-    var found: ?BranchClause = null;
-    var idx: u32 = if (body) |b| b.first else 1;
-    while (idx < tree.nodes.len) : (idx += 1) {
-        const main = main_tokens[idx];
-        if (body) |b| {
-            // The bound is the subtree's own index, not a token's.
-            // Nodes are NOT main-token sorted: a nested `if` is
-            // emitted after its own children, and so is the
-            // container a struct-declared fn sits in — so leaving the
-            // run on a token would truncate the walk on a node this
-            // body owns.  The gate below still filters one node at a
-            // time for the same reason.
-            if (idx > b.end) break;
-        }
-        if (main > gate) continue;
-        const node: Ast.Node.Index = @enumFromInt(idx);
-        if (tree.fullIf(node)) |n| {
-            considerIf(tree, n, name, anchor, exact, &found);
-        } else if (tree.fullWhile(node)) |n| {
-            considerWhile(tree, n, name, anchor, exact, &found);
-        } else if (tree.fullFor(node)) |n| {
-            considerFor(tree, n, name, anchor, exact, &found);
-        } else if (tree.fullSwitch(node)) |n| {
-            considerSwitch(tree, n, name, anchor, exact, &found);
-        }
+    var start_node: Ast.Node.Index = .root;
+    var body_first: usize = 1;
+    var body_end: usize = tree.nodes.len - 1;
+    if (fnBodyNodes(tree, proto)) |body| {
+        start_node = @enumFromInt(body.first - 1);
+        body_first = body.first;
+        body_end = body.end;
     }
+
+    var found: ?BranchClause = null;
+    nearestBranchClauseOnPath(
+        tree,
+        start_node,
+        exact orelse anchor,
+        body_first,
+        body_end,
+        name,
+        anchor,
+        exact,
+        &found,
+    );
     return found;
+}
+
+/// A clause can answer only when it owns the exact binding token or contains
+/// the use token, so inspect branch nodes on the target's AST ancestor path.
+fn nearestBranchClauseOnPath(
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    target: TokenIndex,
+    body_first: usize,
+    body_end: usize,
+    name: []const u8,
+    anchor: TokenIndex,
+    exact: ?TokenIndex,
+    found: *?BranchClause,
+) void {
+    var current = node;
+    while (true) {
+        const node_index = @intFromEnum(current);
+        if (node_index >= body_first and node_index <= body_end) {
+            if (tree.fullIf(current)) |n| {
+                considerIf(tree, n, name, anchor, exact, found);
+            } else if (tree.fullWhile(current)) |n| {
+                considerWhile(tree, n, name, anchor, exact, found);
+            } else if (tree.fullFor(current)) |n| {
+                considerFor(tree, n, name, anchor, exact, found);
+            } else if (tree.fullSwitch(current)) |n| {
+                considerSwitch(tree, n, name, anchor, exact, found);
+            }
+        }
+
+        var children = CleanupIterator.init(tree, current);
+        var candidate: ?Ast.Node.Index = null;
+        var candidate_first: TokenIndex = 0;
+        while (children.next(tree)) |child| {
+            const first = tree.firstToken(child);
+            if (first > target) continue;
+            if (candidate == null or first > candidate_first) {
+                candidate = child;
+                candidate_first = first;
+            }
+        }
+        const child = candidate orelse return;
+        if (tree.lastToken(child) < target) return;
+        current = child;
+    }
 }
 
 /// The nodes one fn's BODY occupies in `tree.nodes`: the first index of
@@ -3133,9 +3162,8 @@ fn nearestBranchClause(
 /// the `struct` keyword's token.  Truncating on tokens would drop a
 /// node the body owns; truncating on indices cannot.
 ///
-/// `null` is the honest answer for a proto no `fn_decl` owns — an
-/// `extern fn`, a fn type spelled in a field — and the walk then covers
-/// the whole array, which is what was already correct for them.
+/// `null` means no source body owns this proto — an `extern fn` or fn type.
+/// The caller then starts the containment descent at the AST root.
 fn fnBodyNodes(
     tree: *const Ast,
     proto: Ast.full.FnProto,
@@ -5721,11 +5749,101 @@ test "nearestBranchClause: sibling prongs keep separate identities and scopes" {
     defer tree.deinit(testing.allocator);
     var buf: [1]Ast.Node.Index = undefined;
     const proto = firstFnProtoAndBody(&tree, &buf)[0];
+    const ScanOracle = struct {
+        fn find(
+            ast: *const Ast,
+            function_proto: Ast.full.FnProto,
+            name: []const u8,
+            anchor: TokenIndex,
+            exact: ?TokenIndex,
+        ) ?BranchClause {
+            const gate = exact orelse anchor;
+            const main_tokens = ast.nodes.items(.main_token);
+            const body = fnBodyNodes(ast, function_proto);
+            var found: ?BranchClause = null;
+            var idx: u32 = if (body) |b| b.first else 1;
+            while (idx < ast.nodes.len) : (idx += 1) {
+                if (body) |b| {
+                    if (idx > b.end) break;
+                }
+                if (main_tokens[idx] > gate) continue;
+                const node: Ast.Node.Index = @enumFromInt(idx);
+                if (ast.fullIf(node)) |n| {
+                    considerIf(ast, n, name, anchor, exact, &found);
+                } else if (ast.fullWhile(node)) |n| {
+                    considerWhile(ast, n, name, anchor, exact, &found);
+                } else if (ast.fullFor(node)) |n| {
+                    considerFor(ast, n, name, anchor, exact, &found);
+                } else if (ast.fullSwitch(node)) |n| {
+                    considerSwitch(ast, n, name, anchor, exact, &found);
+                }
+            }
+            return found;
+        }
+    };
     const capture_a = (try nthIdentifier(&tree, "value", 0)).?;
     const use_a = (try nthIdentifier(&tree, "value", 1)).?;
     const use_nested = (try nthIdentifier(&tree, "value", 2)).?;
     const capture_b = (try nthIdentifier(&tree, "value", 3)).?;
     const use_b = (try nthIdentifier(&tree, "value", 4)).?;
+    for (tree.tokens.items(.tag), 0..) |tag, raw| {
+        if (tag != .identifier) continue;
+        const token: TokenIndex = @intCast(raw);
+        const name = tree.tokenSlice(token);
+        try testing.expectEqual(
+            ScanOracle.find(&tree, proto, name, token, null),
+            nearestBranchClause(&tree, proto, name, token, null),
+        );
+        try testing.expectEqual(
+            ScanOracle.find(&tree, proto, name, token, token),
+            nearestBranchClause(&tree, proto, name, token, token),
+        );
+    }
+    const branch_forms_source =
+        \\fn branches(maybe: anytype, items: anytype, next: anytype) void {
+        \\    const success = if (maybe) |if_value| {
+        \\        if (if_value) |nested_value| {
+        \\            _ = nested_value;
+        \\        } else |nested_error| {
+        \\            _ = nested_error;
+        \\        }
+        \\        _ = if_value;
+        \\    } else |if_error| {
+        \\        _ = if_error;
+        \\    };
+        \\    const loop = while (next()) |while_value| {
+        \\        _ = while_value;
+        \\        break;
+        \\    } else 0;
+        \\    const iteration = for (items) |for_value| {
+        \\        _ = for_value;
+        \\    } else 0;
+        \\    switch (maybe) {
+        \\        0 => |switch_value| { _ = switch_value; },
+        \\        else => {},
+        \\    }
+        \\    _ = success;
+        \\    _ = loop;
+        \\    _ = iteration;
+        \\}
+    ;
+    var branch_forms = try parse(branch_forms_source);
+    defer branch_forms.deinit(testing.allocator);
+    var branch_forms_buf: [1]Ast.Node.Index = undefined;
+    const branch_forms_proto = firstFnProtoAndBody(&branch_forms, &branch_forms_buf)[0];
+    for (branch_forms.tokens.items(.tag), 0..) |tag, raw| {
+        if (tag != .identifier) continue;
+        const token: TokenIndex = @intCast(raw);
+        const name = branch_forms.tokenSlice(token);
+        try testing.expectEqual(
+            ScanOracle.find(&branch_forms, branch_forms_proto, name, token, null),
+            nearestBranchClause(&branch_forms, branch_forms_proto, name, token, null),
+        );
+        try testing.expectEqual(
+            ScanOracle.find(&branch_forms, branch_forms_proto, name, token, token),
+            nearestBranchClause(&branch_forms, branch_forms_proto, name, token, token),
+        );
+    }
 
     // Each use names ITS OWN prong's capture.  The two `|value|` are
     // two declarations with two scopes — a walk that resolved the

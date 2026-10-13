@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const Ast = std.zig.Ast;
+const AstIterator = @import("type_engine").AstIterator;
 
 pub const TokenIndex = Ast.TokenIndex;
 pub const TokenTag = std.zig.Token.Tag;
@@ -611,26 +612,31 @@ pub fn forEachFnCached(
     }
 }
 
-/// Find the innermost `fn_decl` node that contains `tok`.
-/// Returns null when no fn_decl covers the token (e.g. top-level code).
-/// When nested fns are present, returns the one with the largest
-/// firstToken (the deepest match).
+/// Find the innermost `fn_decl` node on the AST path containing `tok`.
+/// AST siblings have ordered, disjoint spans, so each level selects the
+/// last child starting before `tok` and checks only that child's end.
 pub fn enclosingFnDecl(tree: *const Ast, tok: TokenIndex) ?Ast.Node.Index {
-    var idx: u32 = 1;
-    var best: ?Ast.Node.Index = null;
-    var best_first: TokenIndex = 0;
-    while (idx < tree.nodes.len) : (idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        const f = tree.firstToken(node);
-        const l = tree.lastToken(node);
-        if (tok < f or tok > l) continue;
-        if (best == null or f > best_first) {
-            best = node;
-            best_first = f;
+    var node: Ast.Node.Index = .root;
+    var found: ?Ast.Node.Index = null;
+    while (true) {
+        if (tree.nodeTag(node) == .fn_decl) found = node;
+
+        var children = AstIterator.init(tree, node);
+        var candidate: ?Ast.Node.Index = null;
+        var candidate_first: TokenIndex = 0;
+        while (children.next(tree)) |child| {
+            const first = tree.firstToken(child);
+            if (first > tok) continue;
+            if (candidate == null or first > candidate_first) {
+                candidate = child;
+                candidate_first = first;
+            }
         }
+
+        const child = candidate orelse return found;
+        if (tree.lastToken(child) < tok) return found;
+        node = child;
     }
-    return best;
 }
 
 /// True iff the body `[body_first..body_last]` (inclusive `{` ... `}`)
@@ -966,4 +972,64 @@ test "RuntimeUse: ranges that touch are one range, and a gap is not covered" {
     try std.testing.expect(!index.excludes(nthToken(&tree, "middle", 0).?));
     try std.testing.expect(index.excludes(nthToken(&tree, "_", 1).?));
     try std.testing.expect(!index.excludes(nthToken(&tree, "x", 0).?));
+}
+
+test "enclosingFnDecl descent agrees with scan for every token" {
+    const Oracle = struct {
+        fn enclosing(tree: *const Ast, tok: TokenIndex) ?Ast.Node.Index {
+            var idx: u32 = 1;
+            var best: ?Ast.Node.Index = null;
+            var best_first: TokenIndex = 0;
+            while (idx < tree.nodes.len) : (idx += 1) {
+                const node: Ast.Node.Index = @enumFromInt(idx);
+                if (tree.nodeTag(node) != .fn_decl) continue;
+                const first = tree.firstToken(node);
+                const last = tree.lastToken(node);
+                if (tok < first or tok > last) continue;
+                if (best == null or first > best_first) {
+                    best = node;
+                    best_first = first;
+                }
+            }
+            return best;
+        }
+    };
+    const gpa = std.testing.allocator;
+    const source =
+        \\fn outer(value: u32) void {
+        \\    const Local = struct {
+        \\        fn nested(inner: u32) void {
+        \\            _ = inner;
+        \\        }
+        \\        const Inner = struct { fn deep() void {} };
+        \\    };
+        \\    const closure = struct { fn call() void {} };
+        \\    _ = Local;
+        \\    _ = closure;
+        \\    comptime {
+        \\        const CompileTime = struct { fn member() void {} };
+        \\        CompileTime.member();
+        \\    }
+        \\}
+        \\
+        \\test "test block" {
+        \\    const TestType = struct { fn member() void {} };
+        \\    _ = TestType;
+        \\}
+        \\
+        \\comptime {
+        \\    const Top = struct { fn member() void {} };
+        \\    Top.member();
+        \\}
+        \\
+        \\const Container = struct { fn member() void {} };
+    ;
+    var tree = try Ast.parse(gpa, source, .zig);
+    defer tree.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+
+    for (tree.tokens.items(.tag), 0..) |_, raw| {
+        const token: TokenIndex = @intCast(raw);
+        try std.testing.expectEqual(Oracle.enclosing(&tree, token), enclosingFnDecl(&tree, token));
+    }
 }

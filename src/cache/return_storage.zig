@@ -1064,6 +1064,41 @@ const ExpressionWalk = struct {
         return false;
     }
 
+    /// Allocation memory follows a heap allocator's backing allocator, not the
+    /// context pointer in its Allocator header. Header returns still borrow it.
+    fn allocationProviderBorrow(self: *ExpressionWalk, node: Ast.Node.Index, path: []const u8, depth: u8) Error!void {
+        try self.charge();
+        if (depth >= depth_limit) return self.query.depthExhausted(depth);
+        // Resolve the initial provider below, but also join later backing-field
+        // stores. A copied allocator header still points at that mutable field.
+        if (path.len != 0) {
+            const saved = self.payload_load;
+            self.payload_load = true;
+            defer self.payload_load = saved;
+            try self.borrow(node, path, false, depth + 1);
+        }
+        if (try self.query.sourceAt(self.frame, node, path, depth + 1)) |source| {
+            if (source.frame.cache == self.cache and source.frame.declaration == self.frame.declaration and
+                (source.node != node or path.len != 0))
+            {
+                const saved = self.frame;
+                self.frame = source.frame;
+                // Allocator headers keep a live receiver pointer. Observe its
+                // backing field at allocation, not when the header was copied.
+                if (source.frame.invocation == saved.invocation)
+                    self.frame.return_token = saved.return_token;
+                defer self.frame = saved;
+                return self.allocationProviderBorrow(source.node, "", depth + 1);
+            }
+        }
+        if (path.len == 0) {
+            if (try self.query.allocatorBacking(self.frame, node)) |backing| {
+                return self.allocationProviderBorrow(backing.receiver, backing.path, depth + 1);
+            }
+        }
+        if (path.len == 0) try self.borrow(node, "", false, depth + 1);
+    }
+
     /// A std `Allocator` allocation call whose elements hold no address returns
     /// provider memory: only the provider argument can lend it storage. Copied
     /// elements (`dupe`) must also be narrow, since a copy keeps address bits.
@@ -1083,7 +1118,7 @@ const ExpressionWalk = struct {
         } else if (!try self.query.addressFree(element, 0)) return false;
         var buffer: [2]Ast.Node.Index = undefined;
         const provider = (try canonical.callArgumentFor(self.cache, &buffer, primitive.allocator_parameter)) orelse return false;
-        try self.borrow(provider, "", false, depth + 1);
+        try self.allocationProviderBorrow(provider, "", depth + 1);
         return true;
     }
 
@@ -1107,7 +1142,7 @@ const ExpressionWalk = struct {
                 returned.complete = false;
                 continue;
             };
-            try self.borrow(argument, requirement.allocator.path, false, depth + 1);
+            try self.allocationProviderBorrow(argument, requirement.allocator.path, depth + 1);
         }
         try self.providerStores(depth + 1);
         return returned;
@@ -2116,6 +2151,14 @@ const ExpressionWalk = struct {
             const actual = try self.cache.actualCallSummaryAt(token, self.frame.resolution);
             var at_call = self.frame;
             at_call.return_token = tree.firstToken(node);
+            // An unresolved storage/effect walk cannot prove that an SDK heap
+            // allocator's context address escapes. Its allocation channel is
+            // the backing allocator; direct header returns still borrow it.
+            if (self.speculative and !location and path.len == 0) {
+                if (try self.query.allocatorBacking(self.frame, node)) |backing| {
+                    return self.allocationProviderBorrow(backing.receiver, backing.path, depth + 1);
+                }
+            }
             // An authenticated SDK allocation of address-free elements is memory
             // its provider owns. The only storage it can borrow is the provider's,
             // so earlier effects on unrelated arguments cannot reach the result.
@@ -2185,7 +2228,7 @@ const ExpressionWalk = struct {
                                 .remaining = self.query.remaining,
                                 .frame = source.frame.resolution,
                             }, 0)) independent = false;
-                            try self.borrow(source.node, "", false, depth + 1);
+                            try self.allocationProviderBorrow(source.node, "", depth + 1);
                         }
                         if (independent and self.complete and self.loans.items.len == before) return;
                     }
@@ -7049,6 +7092,31 @@ const Query = struct {
         return null;
     }
 
+    /// Authenticate the allocator accessor's SDK declaration, then select the
+    /// actual backing storage rather than its bookkeeping context pointer.
+    /// stackFallback owns inline storage and retains the ordinary frame loan.
+    fn allocatorBacking(self: *Query, frame: Frame, node: Ast.Node.Index) Error!?struct { receiver: Ast.Node.Index, path: []const u8 } {
+        try self.charge();
+        const tree = frame.cache.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call_node = TypeResolver.CallOperands.full(tree, &buffer, node) orelse return null;
+        const canonical = (try frame.cache.actualCallSummaryAt(call_node.queryToken(tree, node), frame.resolution)) orelse return null;
+        const callee = canonical.callee;
+        const name = callee.fn_token + 1;
+        if (name >= callee.tree.tokens.len or callee.tree.tokenTag(name) != .identifier or
+            !std.mem.eql(u8, callee.tree.tokenSlice(name), "allocator")) return null;
+        const path: []const u8 = if (try self.resolver.declaredInToolchainFile(callee.handle, "/std/heap/ArenaAllocator.zig"))
+            "child_allocator"
+        else if (try self.resolver.declaredInToolchainFile(callee.handle, "/std/heap/debug_allocator.zig"))
+            "backing_allocator"
+        else if (try self.resolver.declaredInToolchainFile(callee.handle, "/std/heap/FixedBufferAllocator.zig"))
+            "buffer"
+        else
+            return null;
+        const receiver = (try canonical.callArgumentFor(frame.cache, &buffer, 0)) orelse return null;
+        return .{ .receiver = receiver, .path = path };
+    }
+
     fn allocationOrigin(self: *Query, frame: Frame, allocator: Ast.Node.Index, output: *Output, depth: u32) Error!void {
         try self.charge();
         if (depth >= 64) {
@@ -7065,12 +7133,22 @@ const Query = struct {
         if (try self.sourceAt(frame, allocator, "", depth + 1)) |source| {
             if (source.frame.cache.tree != frame.cache.tree or source.node != allocator or source.frame.invocation != frame.invocation) {
                 const start = output.allocations.items.len;
-                try self.allocationOrigin(source.frame, source.node, output, depth + 1);
+                var at_allocation = source.frame;
+                if (sameFrameBody(source.frame, frame) and source.frame.invocation == frame.invocation)
+                    at_allocation.return_token = frame.return_token;
+                try self.allocationOrigin(at_allocation, source.node, output, depth + 1);
                 for (output.allocations.items[start..]) |*requirement| {
                     if (requirement.source == null) requirement.source = source;
                 }
                 return;
             }
+        }
+        if (try self.allocatorBacking(frame, allocator)) |backing| {
+            if (try self.sourceAt(frame, backing.receiver, backing.path, depth + 1)) |source| {
+                return self.allocationOrigin(source.frame, source.node, output, depth + 1);
+            }
+            output.complete = false;
+            return;
         }
         const walk: @import("fresh_storage.zig").FreshWalk = .{
             .claim = .{ .first = frame.cache.tree.firstToken(allocator), .last = frame.cache.tree.lastToken(allocator) },
@@ -12422,7 +12500,7 @@ test "canonical expression loans: a token index from a call-filled prototype sel
 
 test "canonical expression loans: a copied allocation from an external receiver does not borrow the filled buffer" {
     try std.testing.expect(!try stackPrecisionLoan("canonical", "self.arena.allocator().dupe(u8, buffer[0..len])", "buffer"));
-    try std.testing.expect(try stackPrecisionLoan("leakFixed", "fixed.allocator().dupe(u8, \"abc\")", "fixed"));
+    try std.testing.expect(try stackPrecisionLoan("leakFixed", "fixed.allocator().dupe(u8, \"abc\")", "backing"));
 }
 
 test "canonical expression loans: an address through a pointer member is not a cell of the holder" {
@@ -12726,7 +12804,7 @@ test "canonical expression loans: an address-of literal borrows its elements' va
 test "canonical expression loans: join and concat results are provider memory, not their inputs" {
     try std.testing.expect(!try stackFlowLoan("rootFor", "try std.fs.path.join(cache.gpa, &.{ dir, name })", 0, "dir"));
     try std.testing.expect(!try stackFlowLoan("concatFor", "try std.mem.concat(cache.gpa, u8, &.{ dir, name })", 0, "dir"));
-    try std.testing.expect(try stackFlowLoan("joinLocal", "std.fs.path.join(fixed.allocator(), &.{ a, b })", 0, "fixed"));
+    try std.testing.expect(try stackFlowLoan("joinLocal", "std.fs.path.join(fixed.allocator(), &.{ a, b })", 0, "backing"));
 }
 
 test "canonical expression loans: a swap inside one binding adds no loan to it" {
