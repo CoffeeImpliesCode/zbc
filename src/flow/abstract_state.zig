@@ -72,7 +72,31 @@ pub const Comparison = struct {
 };
 
 const ElementKey = struct { array: LocalId, index: u64 };
-const PrefixKey = struct { array: LocalId, counter: LocalId };
+const PrefixKey = struct {
+    array: LocalId,
+    counter: LocalId,
+    array_path: []const u8 = "",
+    counter_path: []const u8 = "",
+
+    fn counterTerm(self: PrefixKey, offset: i8) IndexTerm {
+        return if (self.counter_path.len == 0)
+            .{ .local = .{ .local = self.counter, .offset = offset } }
+        else
+            .{ .field = .{ .parent = self.counter, .name = self.counter_path, .offset = offset, .is_unsigned = true } };
+    }
+
+    const Context = struct {
+        pub fn hash(_: Context, key: PrefixKey) u32 {
+            return FieldKey.Context.hash(.{}, .{ .parent = key.array, .name = key.array_path }) *% 33 +%
+                FieldKey.Context.hash(.{}, .{ .parent = key.counter, .name = key.counter_path });
+        }
+        pub fn eql(_: Context, a: PrefixKey, b: PrefixKey, _: usize) bool {
+            return a.array == b.array and a.counter == b.counter and
+                std.mem.eql(u8, a.array_path, b.array_path) and
+                std.mem.eql(u8, a.counter_path, b.counter_path);
+        }
+    };
+};
 const DiagnosticIndexBound = struct { index: LocalId, counter: LocalId, offset: i8 = 0 };
 /// Bounded prefixes also constrain the counter. Capped prefixes cover
 /// [0, min(max(counter + offset, 0), extent)) without constraining it.
@@ -526,7 +550,7 @@ pub const AbstractState = struct {
     undefined_elements: std.AutoArrayHashMapUnmanaged(ElementKey, void) = .empty,
     complete_arrays: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
     fixed_prefixes: std.AutoArrayHashMapUnmanaged(LocalId, u64) = .empty,
-    symbolic_prefixes: std.AutoArrayHashMapUnmanaged(PrefixKey, SymbolicPrefix) = .empty,
+    symbolic_prefixes: std.ArrayHashMapUnmanaged(PrefixKey, SymbolicPrefix, PrefixKey.Context, true) = .empty,
     scalar_values: std.AutoArrayHashMapUnmanaged(LocalId, u64) = .empty,
     nonnegative_locals: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty,
     comparisons: std.ArrayListUnmanaged(Comparison) = .empty,
@@ -570,6 +594,7 @@ pub const AbstractState = struct {
     /// it would read as a stale ownership correlation — the back-edge
     /// artifact that fires double-free / UAF on a value no longer there.
     pub fn forgetFields(self: *AbstractState, parent: LocalId) void {
+        retainWhere(&self.symbolic_prefixes, parent, prefixNotFieldOwnedBy);
         retainWhere(&self.fields, parent, fieldNotOwnedBy);
         retainWhere(&self.unknown_field_values, parent, fieldNotOwnedBy);
         _ = self.unknown_values.swapRemove(parent);
@@ -969,7 +994,11 @@ pub const AbstractState = struct {
         while (index < prefix_count) : (index += 1) {
             const key = self.symbolic_prefixes.keys()[index];
             const prefix = self.symbolic_prefixes.values()[index];
-            if (key.array == source) try self.symbolic_prefixes.put(gpa, .{ .array = target, .counter = key.counter }, prefix);
+            if (key.array == source and key.array_path.len == 0) {
+                var copied = key;
+                copied.array = target;
+                try self.symbolic_prefixes.put(gpa, copied, prefix);
+            }
         }
     }
 
@@ -1507,6 +1536,110 @@ pub const AbstractState = struct {
         });
     }
 
+    pub fn setTermSymbolicPrefix(self: *AbstractState, gpa: std.mem.Allocator, array: FieldKey, counter: IndexTerm, offset: i8, extent: u64) !void {
+        const key = termPrefixKey(array, counter) orelse return;
+        std.debug.assert(offset >= -1 and offset <= 1);
+        try self.symbolic_prefixes.put(gpa, key, .{ .offset = offset, .extent = extent });
+    }
+
+    pub fn termSymbolicPrefixOffset(self: *const AbstractState, array: FieldKey, counter: IndexTerm) ?i8 {
+        const key = termPrefixKey(array, counter) orelse return null;
+        const prefix = self.symbolic_prefixes.get(key) orelse return null;
+        return if (prefix.scale == 1) prefix.offset else null;
+    }
+
+
+    pub fn extendTermSymbolicPrefix(self: *AbstractState, array: FieldKey, index: IndexTerm) void {
+        const key = termPrefixKey(array, index) orelse return;
+        const prefix = self.symbolic_prefixes.getPtr(key) orelse return;
+        const offset = termOffset(index);
+        if (prefix.scale == 1 and prefix.offset == offset and offset < 1)
+            prefix.offset += 1;
+    }
+    pub fn hasInitializedFieldElement(self: *const AbstractState, parent: LocalId, path: []const u8, index: IndexTerm) bool {
+        if (!self.provesNonNegative(index)) return false;
+        for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+            if (key.array == parent and std.mem.eql(u8, key.array_path, path) and prefix.scale == 1 and
+                (!prefix.capped or self.provesLessThan(index, .{ .constant = prefix.extent })) and
+                self.provesLessThan(index, key.counterTerm(prefix.offset))) return true;
+        }
+        return false;
+    }
+
+    /// A selected mutation revokes correlations whose array or count overlaps it.
+    pub fn forgetFieldInitialization(self: *AbstractState, field: FieldKey) void {
+        var index: usize = 0;
+        while (index < self.symbolic_prefixes.count()) {
+            const key = self.symbolic_prefixes.keys()[index];
+            if ((key.array == field.parent and pathsOverlap(key.array_path, field.name)) or
+                (key.counter == field.parent and pathsOverlap(key.counter_path, field.name)))
+                _ = self.symbolic_prefixes.swapRemoveAt(index)
+            else
+                index += 1;
+        }
+        self.forgetFieldTermComparisons(field);
+    }
+
+    pub fn stepFieldCounter(self: *AbstractState, gpa: std.mem.Allocator, field: FieldKey, step: i8) !void {
+        _ = gpa;
+        const term: IndexTerm = .{ .field = .{ .parent = field.parent, .name = field.name, .is_unsigned = true } };
+        const valid = (step == -1 and self.provesLessThan(.{ .constant = 0 }, term)) or
+            (step == 1 and self.provesLessThan(term, .{ .constant = std.math.maxInt(u64) }));
+        self.forgetFieldTermComparisons(field);
+        var index: usize = 0;
+        while (index < self.symbolic_prefixes.count()) {
+            const key = self.symbolic_prefixes.keys()[index];
+            if (key.counter != field.parent or !std.mem.eql(u8, key.counter_path, field.name)) {
+                index += 1;
+                continue;
+            }
+            const prefix = &self.symbolic_prefixes.values()[index];
+            const next = @as(i16, prefix.offset) - step;
+            if (!valid or prefix.scale != 1 or next < -1 or (step != -1 and step != 1))
+                _ = self.symbolic_prefixes.swapRemoveAt(index)
+            else {
+                prefix.offset = @intCast(@min(next, 1));
+                index += 1;
+            }
+        }
+    }
+
+    pub fn copyTermCounterValue(self: *AbstractState, gpa: std.mem.Allocator, target: LocalId, source: IndexTerm) !void {
+        if (source == .local and source.local.offset == 0)
+            return self.copyCounterValue(gpa, target, source.local.local);
+        if (source != .field or source.field.offset != 0) {
+            self.forgetInitializationLocal(target);
+            return;
+        }
+        const bounds = self.termBounds(source);
+        self.forgetInitializationLocal(target);
+        if (self.provesNonNegative(source)) try self.nonnegative_locals.put(gpa, target, {});
+        const count = self.symbolic_prefixes.count();
+        for (0..count) |index| {
+            const key = self.symbolic_prefixes.keys()[index];
+            const prefix = self.symbolic_prefixes.values()[index];
+            if (!termSameBase(key.counterTerm(0), source)) continue;
+            var copied = key;
+            copied.counter = target;
+            copied.counter_path = "";
+            try self.symbolic_prefixes.put(gpa, copied, prefix);
+        }
+        const target_term: IndexTerm = .{ .local = .{ .local = target } };
+        if (bounds.lower) |lower| if (lower >= 0 and lower <= std.math.maxInt(u64))
+            try self.comparisons.append(gpa, .{ .lhs = target_term, .rhs = .{ .constant = @intCast(lower) }, .op = .ge });
+        if (bounds.upper) |upper| if (upper >= 0 and upper <= std.math.maxInt(u64))
+            try self.comparisons.append(gpa, .{ .lhs = target_term, .rhs = .{ .constant = @intCast(upper) }, .op = .le });
+    }
+
+    /// Paths are CFG-owned. A value copy supplies both remapped paths so the
+    /// destination count describes the copied bytes, not a mutable alias.
+    pub fn copyPrefixValue(self: *AbstractState, gpa: std.mem.Allocator, target: FieldKey, target_counter: IndexTerm, source: FieldKey, source_counter: IndexTerm) !void {
+        const source_key = termPrefixKey(source, source_counter) orelse return;
+        const target_key = termPrefixKey(target, target_counter) orelse return;
+        const prefix = self.symbolic_prefixes.get(source_key) orelse return;
+        try self.symbolic_prefixes.put(gpa, target_key, prefix);
+    }
+
     pub fn setScaledSymbolicPrefix(self: *AbstractState, gpa: std.mem.Allocator, array: LocalId, counter: LocalId, scale: u64, extent: u64) !void {
         if (scale == 0) return;
         try self.symbolic_prefixes.put(gpa, .{ .array = array, .counter = counter }, .{
@@ -1522,8 +1655,8 @@ pub const AbstractState = struct {
         if (!self.provesNonNegative(index)) return false;
         for (self.undefined_elements.keys()) |hole| if (hole.array == array) return false;
         for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
-            if (key.array == array and prefix.scale == element.scale and prefix.offset == 0 and !prefix.capped and
-                self.provesLessThan(index, .{ .local = .{ .local = key.counter } })) return true;
+            if (key.array == array and key.array_path.len == 0 and prefix.scale == element.scale and prefix.offset == 0 and !prefix.capped and
+                self.provesLessThan(index, key.counterTerm(0))) return true;
         }
         return false;
     }
@@ -1561,8 +1694,10 @@ pub const AbstractState = struct {
         while (index < prefix_count) : (index += 1) {
             const key = self.symbolic_prefixes.keys()[index];
             const prefix = self.symbolic_prefixes.values()[index];
-            if (key.counter == source) {
-                try self.symbolic_prefixes.put(gpa, .{ .array = key.array, .counter = target }, prefix);
+            if (key.counter == source and key.counter_path.len == 0) {
+                var copied = key;
+                copied.counter = target;
+                try self.symbolic_prefixes.put(gpa, copied, prefix);
             }
         }
         const comparison_count = self.comparisons.items.len;
@@ -1641,6 +1776,18 @@ pub const AbstractState = struct {
         }
     }
 
+    pub fn forgetFieldTermComparisons(self: *AbstractState, field: FieldKey) void {
+        var index: usize = 0;
+        while (index < self.comparisons.items.len) {
+            const comparison = self.comparisons.items[index];
+            if ((comparison.lhs == .field and comparison.lhs.field.parent == field.parent and pathsOverlap(comparison.lhs.field.name, field.name)) or
+                (comparison.rhs == .field and comparison.rhs.field.parent == field.parent and pathsOverlap(comparison.rhs.field.name, field.name)))
+                _ = self.comparisons.swapRemove(index)
+            else
+                index += 1;
+        }
+    }
+
     pub fn provesNonNegative(self: *const AbstractState, term: IndexTerm) bool {
         if (!termSupported(term)) return false;
         const bounds = self.termBounds(term);
@@ -1684,11 +1831,9 @@ pub const AbstractState = struct {
         }
         if (self.provesLessThan(index, .{ .constant = self.fixedPrefix(array) })) return true;
         for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
-            if (key.array == array and prefix.scale == 1 and
+            if (key.array == array and key.array_path.len == 0 and prefix.scale == 1 and
                 (!prefix.capped or self.provesLessThan(index, .{ .constant = prefix.extent })) and
-                self.provesLessThan(index, .{
-                    .local = .{ .local = key.counter, .offset = prefix.offset },
-                })) return true;
+                self.provesLessThan(index, key.counterTerm(prefix.offset))) return true;
         }
         return false;
     }
@@ -1700,9 +1845,9 @@ pub const AbstractState = struct {
         }
         if (self.baseComplete(array) or self.fixedPrefix(array) >= count) return true;
         for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
-            if (key.array == array and prefix.scale == 1 and (!prefix.capped or count <= prefix.extent) and self.provesComparison(.{
+            if (key.array == array and key.array_path.len == 0 and prefix.scale == 1 and (!prefix.capped or count <= prefix.extent) and self.provesComparison(.{
                 .lhs = .{ .constant = count },
-                .rhs = .{ .local = .{ .local = key.counter, .offset = prefix.offset } },
+                .rhs = key.counterTerm(prefix.offset),
                 .op = .le,
             })) return true;
         }
@@ -1758,11 +1903,11 @@ pub const AbstractState = struct {
         if (nonnegative) bounds.raiseLower(0);
         if (term == .local) {
             if (self.scalarValue(term.local.local)) |known| bounds.intersect(.{ .lower = known, .upper = known });
-            for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
-                if (key.counter != term.local.local or prefix.capped) continue;
-                bounds.raiseLower(-@as(i128, prefix.offset));
-                bounds.lowerUpper(@as(i128, prefix.extent / prefix.scale) - prefix.offset);
-            }
+        }
+        for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
+            if (!termSameBase(key.counterTerm(0), term) or prefix.capped) continue;
+            bounds.raiseLower(-@as(i128, prefix.offset));
+            bounds.lowerUpper(@as(i128, prefix.extent / prefix.scale) - prefix.offset);
         }
         for (self.comparisons.items) |original| {
             var premise = original;
@@ -1880,7 +2025,7 @@ pub const AbstractState = struct {
         const nonnegative = valid and self.provesNonNegative(term);
         const old_value = self.scalarValue(local);
         for (self.symbolic_prefixes.keys(), self.symbolic_prefixes.values()) |key, prefix| {
-            if (key.counter == local and self.hasInitializedPrefix(key.array, prefix.extent)) {
+            if (key.counter == local and key.counter_path.len == 0 and key.array_path.len == 0 and self.hasInitializedPrefix(key.array, prefix.extent)) {
                 try self.setFixedPrefix(gpa, key.array, prefix.extent);
             }
         }
@@ -1897,7 +2042,7 @@ pub const AbstractState = struct {
         var index: usize = 0;
         while (index < self.symbolic_prefixes.count()) {
             const key = self.symbolic_prefixes.keys()[index];
-            if (key.counter != local) {
+            if (key.counter != local or key.counter_path.len != 0) {
                 index += 1;
                 continue;
             }
@@ -1994,7 +2139,7 @@ pub const AbstractState = struct {
         if (mirror) |prefix| if (prefix.scale != 1) return null;
         // A skipped store at capacity is safe only when that capacity is
         // already initialized. It proves a clipped endpoint, not count<=len.
-        if (self.hasInitializedPrefix(key.array, wanted.extent) and
+        if (key.array_path.len == 0 and self.hasInitializedPrefix(key.array, wanted.extent) and
             (wanted.capped or mirror == null or mirror.?.capped or mirror.?.offset < wanted.offset))
         {
             return .{ .offset = wanted.offset, .capped = true };
@@ -2003,13 +2148,20 @@ pub const AbstractState = struct {
             .offset = @min(prefix.offset, wanted.offset),
             .capped = prefix.capped or wanted.capped,
         };
-        const scalar = self.scalarValue(key.counter) orelse return null;
+        const scalar = if (key.counter_path.len == 0 and self.scalarValue(key.counter) != null)
+            self.scalarValue(key.counter).?
+        else blk: {
+            const bounds = self.termBounds(key.counterTerm(0));
+            if (bounds.lower == null or bounds.upper == null or bounds.lower.? != bounds.upper.? or bounds.lower.? < 0 or
+                bounds.lower.? > std.math.maxInt(u64)) return null;
+            break :blk @as(u64, @intCast(bounds.lower.?));
+        };
         var offset: i8 = wanted.offset;
         while (offset >= -1) : (offset -= 1) {
             const endpoint = @as(i128, scalar) + offset;
             if (!wanted.capped and (endpoint < 0 or endpoint > wanted.extent)) continue;
             const clipped: u64 = @intCast(@min(@max(endpoint, 0), wanted.extent));
-            if (self.hasInitializedPrefix(key.array, clipped)) {
+            if (clipped == 0 or (key.array_path.len == 0 and self.hasInitializedPrefix(key.array, clipped))) {
                 return .{ .offset = offset, .capped = wanted.capped };
             }
         }
@@ -2040,14 +2192,8 @@ pub const AbstractState = struct {
                 changed = true;
             }
         }
-        var comparison_index: usize = 0;
-        while (comparison_index < self.comparisons.items.len) {
-            if (!other.provesComparison(self.comparisons.items[comparison_index])) {
-                _ = self.comparisons.swapRemove(comparison_index);
-                changed = true;
-            } else comparison_index += 1;
-        }
-        // Evaluate inductive candidates before weakening exact scalar/coverage facts.
+        // Retain incoming path predicates until vacuous prefix candidates have
+        // been checked, then discard predicates not proved by both inputs.
         for (other.symbolic_prefixes.keys(), other.symbolic_prefixes.values()) |key, prefix| {
             if (self.symbolic_prefixes.contains(key)) continue;
             if (self.entailedPrefixOffset(key, prefix)) |entailed| {
@@ -2077,6 +2223,13 @@ pub const AbstractState = struct {
                 _ = self.symbolic_prefixes.swapRemoveAt(index);
                 changed = true;
             }
+        }
+        var comparison_index: usize = 0;
+        while (comparison_index < self.comparisons.items.len) {
+            if (!other.provesComparison(self.comparisons.items[comparison_index])) {
+                _ = self.comparisons.swapRemove(comparison_index);
+                changed = true;
+            } else comparison_index += 1;
         }
         index = 0;
         while (index < self.exact_elements.count()) {
@@ -2143,6 +2296,25 @@ fn prefixNotOwnedBy(array: LocalId, key: PrefixKey) bool {
 
 fn prefixCounterIsNot(counter: LocalId, key: PrefixKey) bool {
     return key.counter != counter;
+}
+
+fn prefixNotFieldOwnedBy(parent: LocalId, key: PrefixKey) bool {
+    return !(key.array == parent and key.array_path.len != 0) and
+        !(key.counter == parent and key.counter_path.len != 0);
+}
+
+fn termPrefixKey(array: FieldKey, counter: IndexTerm) ?PrefixKey {
+    return switch (counter) {
+        .local => |term| .{ .array = array.parent, .array_path = array.name, .counter = term.local },
+        .field => |term| .{ .array = array.parent, .array_path = array.name, .counter = term.parent, .counter_path = term.name },
+        else => null,
+    };
+}
+
+fn pathsOverlap(a: []const u8, b: []const u8) bool {
+    return a.len == 0 or b.len == 0 or
+        (std.mem.startsWith(u8, a, b) and (a.len == b.len or a[b.len] == '.' or a[b.len] == '[')) or
+        (std.mem.startsWith(u8, b, a) and (a.len == b.len or b[a.len] == '.' or b[a.len] == '['));
 }
 
 fn elementIsRetained(keep: []const u8, key: ElementKey) bool {
@@ -3668,4 +3840,27 @@ test "diagnostic masks: covering and shorter prefix repairs stay scoped" {
         // Diagnostic repairs do not manufacture initialized-value certificates.
         try std.testing.expect(!state.fieldValueIsDefined(array, ""));
     }
+}
+
+test "field counted prefix: guarded selection snapshots and mutation revoke correlations" {
+    const gpa = std.testing.allocator;
+    const parent: LocalId = @enumFromInt(0);
+    const cursor: LocalId = @enumFromInt(1);
+    const count: IndexTerm = .{ .field = .{ .parent = parent, .name = "len", .is_unsigned = true } };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.setTermSymbolicPrefix(gpa, .{ .parent = parent, .name = "fields" }, count, 0, 4);
+    try std.testing.expect(!state.hasInitializedFieldElement(parent, "fields", count));
+    _ = try state.assumeComparison(gpa, .{ .lhs = count, .rhs = .{ .constant = 0 }, .op = .gt });
+    var selected = count;
+    selected.field.offset = -1;
+    try std.testing.expect(state.hasInitializedFieldElement(parent, "fields", selected));
+    try state.copyTermCounterValue(gpa, cursor, count);
+    try state.stepCounter(gpa, cursor, -1);
+    try std.testing.expect(state.hasInitializedFieldElement(parent, "fields", .{ .local = .{ .local = cursor } }));
+    state.forgetFieldInitialization(.{ .parent = parent, .name = "len" });
+    try std.testing.expect(!state.hasInitializedFieldElement(parent, "fields", selected));
+    try std.testing.expect(state.hasInitializedFieldElement(parent, "fields", .{ .local = .{ .local = cursor } }));
+    state.forgetFieldInitialization(.{ .parent = parent, .name = "fields[0]" });
+    try std.testing.expect(!state.hasInitializedFieldElement(parent, "fields", .{ .local = .{ .local = cursor } }));
 }

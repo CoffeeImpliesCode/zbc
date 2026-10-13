@@ -83,6 +83,8 @@ pub const ValueInput = union(enum) {
     indexed: struct {
         array: LocalId,
         index: IndexTerm,
+        /// Projected inline array identity, matching indexed_read.field_array.
+        field_array: ?[]const u8 = null,
         modulo: ?ModuloIndex = null,
         /// Raw scaled byte coverage is not a value certificate.
         scaled: ?abstract_state.ScaledElement = null,
@@ -174,6 +176,7 @@ pub const StmtKind = union(enum) {
         result_is_computation: bool = false,
     },
     counter_step: struct { local: LocalId, step: i8 },
+    field_counter_step: struct { parent: LocalId, name: []const u8, step: i8 },
     compare_assume: Comparison,
     scaled_index: @import("bounded_prefix.zig").ScaledIndex,
     /// Existing exhaustive-fill proofs commit coverage explicitly.
@@ -204,7 +207,16 @@ pub const StmtKind = union(enum) {
     array_prefix: struct {
         array: LocalId,
         count: LocalId,
+        /// Diagnostic-only correlation from a body-proved count-preserving fill.
+        counter_term: ?IndexTerm = null,
+        field_array: ?[]const u8 = null,
+        extent: ?u64 = null,
+        entry_count: ?LocalId = null,
+        entry_array: ?LocalId = null,
+        diagnostic_only: bool = false,
+        preserves_prefix: bool = false,
         inputs: [8]?LocalId = .{null} ** 8,
+        selected_inputs: [8]?ValueInput = .{null} ** 8,
         scale: u64 = 1,
         /// A local seed-one append shape. Transfer checks the initial written
         /// slot and retains only diagnostic bytes plus its exact last selector.
@@ -288,6 +300,9 @@ pub const StmtKind = union(enum) {
         /// Replayed byte facts must not replace a resource/lifetime origin.
         /// An empty path denotes the whole value, or a pointer's pointee.
         diagnostic_only: bool = false,
+        /// A source-proved append preserves old byte masks only when its
+        /// saved entry count already describes initialized storage.
+        prefix_entry: ?struct { array: LocalId, count: LocalId, path: []const u8 = "" } = null,
         /// A possible source-proved poisoned store, never a write/repair credit.
         /// Unknown inputs have no effect; existing byte masks remain intact.
         may_write_only: bool = false,
@@ -324,6 +339,8 @@ pub const StmtKind = union(enum) {
     field_use: struct {
         parent: LocalId,
         name: []const u8,
+        /// The callee body reads only this initialized counted prefix.
+        counted_array: ?struct { array_path: []const u8, counter_path: []const u8 } = null,
         /// An inline aggregate prefix checks lifetime, not sibling payload.
         lifetime_only: bool = false,
         /// Whole aggregate transport reads no selected member. It still

@@ -223,6 +223,10 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             try replayIndexedAggregateBytes(ctx, state, w);
         },
         .counter_step => |s| try transferCounterStep(ctx, state, s),
+        .field_counter_step => |s| {
+            state.facts.forgetLocal(s.parent);
+            try state.stepFieldCounter(ctx.gpa, .{ .parent = s.parent, .name = s.name }, s.step);
+        },
         .compare_assume => |comparison| {
             const lhs_defined = indexIsDefined(ctx, state, comparison.lhs);
             const operands_defined = lhs_defined and indexIsDefined(ctx, state, comparison.rhs);
@@ -432,6 +436,46 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             }
         },
         .array_prefix => |prefix| {
+            if (prefix.diagnostic_only) {
+                const extent = prefix.extent orelse ctx.locals[@intFromEnum(prefix.array)].array_extent orelse return;
+                const array: state_mod.FieldKey = .{ .parent = prefix.array, .name = prefix.field_array orelse "" };
+                const count = prefix.counter_term orelse cfg.IndexTerm{ .local = .{ .local = prefix.count } };
+                if (storageInputsMayBeUndefined(ctx, state, &prefix.inputs) or
+                    valueInputsMayBeUndefined(ctx, state, &prefix.selected_inputs)) {
+                    state.forgetFieldInitialization(array);
+                    return;
+                }
+                if (prefix.preserves_prefix) {
+                    const entry: cfg.IndexTerm = if (prefix.entry_count) |local|
+                        .{ .local = .{ .local = local } }
+                    else
+                        count;
+                    const entry_array: state_mod.FieldKey = if (prefix.entry_array) |parent|
+                        .{ .parent = parent, .name = prefix.field_array orelse "" }
+                    else
+                        array;
+                    const offset = state.termSymbolicPrefixOffset(entry_array, entry);
+                    if (!(offset != null and offset.? >= 0) and
+                        !state.provesComparison(.{ .lhs = entry, .rhs = .{ .constant = 0 }, .op = .eq })) return;
+                }
+                try state.unknown_values.put(ctx.gpa, prefix.array, {});
+                if (prefix.preserves_prefix) state.forgetEntireUndefinedField(array);
+                if (prefix.preserves_prefix) {
+                    const entry = if (prefix.entry_count) |local| cfg.IndexTerm{ .local = .{ .local = local } } else count;
+                    if (indexIsDefined(ctx, state, entry)) {
+                        if (count == .field) {
+                            try state.bindFieldValue(ctx.gpa, .{ .parent = count.field.parent, .name = count.field.name }, true);
+                            try state.fields.putContext(ctx.gpa, .{ .parent = count.field.parent, .name = count.field.name }, .plain, .{});
+                        } else if (count == .local) {
+                            _ = state.unknown_values.swapRemove(count.local.local);
+                            try state.bindFieldValue(ctx.gpa, .{ .parent = count.local.local, .name = "" }, true);
+                        }
+                    }
+                }
+                if (count == .field) state.forgetFieldTermComparisons(.{ .parent = count.field.parent, .name = count.field.name });
+                try state.setTermSymbolicPrefix(ctx.gpa, array, count, 0, extent);
+                return;
+            }
             const extent = ctx.locals[@intFromEnum(prefix.array)].array_extent orelse return;
             if (prefix.seeded_append) {
                 // The builder proves the seed-one, capacity-guarded adjacent
@@ -774,6 +818,12 @@ fn seedLocalValueFacts(
     const info = ctx.locals[@intFromEnum(local)];
     if ((info.is_unsigned or tracksIntegerValue(state, local)) and kind == .copy_of) {
         try state.copyCounterValue(ctx.gpa, local, kind.copy_of);
+    } else if (info.is_unsigned and kind == .field_copy_of and
+        fixedArrayLength(ctx, kind.field_copy_of.parent, kind.field_copy_of.name) == null)
+    {
+        try state.copyTermCounterValue(ctx.gpa, local, .{ .field = .{
+            .parent = kind.field_copy_of.parent, .name = kind.field_copy_of.name, .is_unsigned = true,
+        } });
     } else {
         const length_value = if (kind == .field_copy_of)
             fixedArrayLength(ctx, kind.field_copy_of.parent, kind.field_copy_of.name)
@@ -1580,6 +1630,7 @@ fn copyCaptureDiagnosticBytes(ctx: Ctx, state: *AbstractState, value: @TypeOf(@a
     if (entire) {
         try state.entire_undefined_values.put(ctx.gpa, target.parent, {});
     } else try state.partial_undefined_values.put(ctx.gpa, target.parent, {});
+    try copyDiagnosticPrefixes(ctx, state, target, source);
 }
 
 /// Payload repairs do not write a union tag. Only a whole-root byte witness
@@ -1801,6 +1852,30 @@ fn copyArrayDiagnosticBytes(
         if (root_target) try state.entire_undefined_values.put(ctx.gpa, target.parent, {});
     } else if (!root_target) {
         _ = state.entire_undefined_values.swapRemove(target.parent);
+    }
+    try copyDiagnosticPrefixes(ctx, state, target, source);
+}
+
+fn copyDiagnosticPrefixes(ctx: Ctx, state: *AbstractState, target: ArrayBytePlace, source: ArrayBytePlace) !void {
+    const count = state.symbolic_prefixes.count();
+    for (0..count) |index| {
+        const key = state.symbolic_prefixes.keys()[index];
+        if (key.array != source.parent) continue;
+        const suffix = arrayByteSuffix(ctx, source, .{ .parent = key.array, .name = key.array_path }) orelse continue;
+        const target_array = try arrayByteKey(ctx, target, suffix);
+        const source_count: cfg.IndexTerm = if (key.counter_path.len == 0)
+            .{ .local = .{ .local = key.counter } }
+        else
+            .{ .field = .{ .parent = key.counter, .name = key.counter_path, .is_unsigned = true } };
+        var target_count = source_count;
+        if (key.counter == source.parent and key.counter_path.len != 0) {
+            if (arrayByteSuffix(ctx, source, .{ .parent = key.counter, .name = key.counter_path })) |count_suffix| {
+                const count_key = try arrayByteKey(ctx, target, count_suffix);
+                target_count = .{ .field = .{ .parent = count_key.parent, .name = count_key.name, .is_unsigned = true } };
+            }
+        }
+        try state.copyPrefixValue(ctx.gpa, target_array, target_count,
+            .{ .parent = key.array, .name = key.array_path }, source_count);
     }
 }
 
@@ -2110,6 +2185,15 @@ fn valueInputsAreEntirelyUndefined(ctx: Ctx, state: *const AbstractState, inputs
         .local => |local| if (localIsEntirelyUndefined(ctx, state, local)) return true,
         .field => |field| if (fieldIsEntirelyUndefined(ctx, state, field.parent, field.name)) return true,
         .indexed => |indexed| {
+            if (indexed.field_array) |path| {
+                if (state.hasInitializedFieldElement(indexed.array, path, indexed.index)) continue;
+                if (fieldIsEntirelyUndefined(ctx, state, indexed.array, path)) return true;
+                const known = resolveIndex(state, indexed.index) orelse continue;
+                var buffer: [256]u8 = undefined;
+                const selected = std.fmt.bufPrint(&buffer, "{s}[{d}]", .{ path, known }) catch continue;
+                if (fieldIsEntirelyUndefined(ctx, state, indexed.array, selected)) return true;
+                continue;
+            }
             if (localIsEntirelyUndefined(ctx, state, indexed.array)) return true;
             const index = resolveIndex(state, indexed.index) orelse continue;
             var buffer: [32]u8 = undefined;
@@ -2158,6 +2242,10 @@ fn valueInputsMayBeUndefined(ctx: Ctx, state: *const AbstractState, inputs: []co
         .field => |field| if (fixedArrayLength(ctx, field.parent, field.name) == null and
             fieldValueMayBeUndefined(ctx, state, field.parent, field.name)) return true,
         .indexed => |indexed| {
+            if (indexed.field_array) |path| {
+                if (fieldIndexedValueMayBeUndefined(ctx, state, indexed.array, path, indexed.index)) return true;
+                continue;
+            }
             if (indexed.scaled) |element| {
                 if (localIsArray(ctx, indexed.array) and
                     indexIsDefined(ctx, state, .{ .local = .{ .local = element.index } }) and
@@ -2168,6 +2256,19 @@ fn valueInputsMayBeUndefined(ctx: Ctx, state: *const AbstractState, inputs: []co
         },
     };
     return false;
+}
+
+fn fieldIndexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: LocalId, path: []const u8, index: cfg.IndexTerm) bool {
+    const correlated = state.hasInitializedFieldElement(array, path, index);
+    const written = state.fieldRangeBytesAreWritten(array, path, index) or correlated;
+    const selected_index = resolveIndex(state, index);
+    const selected_undefined = if (selected_index) |known| blk: {
+        var buffer: [256]u8 = undefined;
+        const selected = std.fmt.bufPrint(&buffer, "{s}[{d}]", .{ path, known }) catch
+            break :blk fieldValueMayBeUndefined(ctx, state, array, path);
+        break :blk fieldValueMayBeUndefined(ctx, state, array, selected);
+    } else fieldValueMayBeUndefined(ctx, state, array, path);
+    return ((selected_index != null and !correlated) or !written) and selected_undefined;
 }
 
 fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: LocalId, index: cfg.IndexTerm) bool {
@@ -2255,6 +2356,14 @@ fn transferFieldAssign(
     a: @TypeOf(@as(StmtKind, undefined).field_assign),
     pos: cfg.SrcPos,
 ) !void {
+    if (a.diagnostic_only and a.rhs_kind == .unknown) if (a.prefix_entry) |entry| {
+        const count: cfg.IndexTerm = .{ .local = .{ .local = entry.count } };
+        const offset = state.termSymbolicPrefixOffset(.{ .parent = entry.array, .name = entry.path }, count);
+        if ((offset != null and offset.? >= 0) or
+            state.provesComparison(.{ .lhs = count, .rhs = .{ .constant = 0 }, .op = .eq })) return;
+    };
+    if (!a.may_write_only)
+        state.forgetFieldInitialization(.{ .parent = a.parent, .name = a.name });
     if (a.may_write_only) {
         if (!fieldAssignmentReadsUndefined(ctx, state, a)) return;
         const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
@@ -2397,7 +2506,7 @@ fn transferFieldAssign(
                 copied_constant = premise.lhs.constant;
         }
     }
-    state.forgetFieldComparisons(a.parent);
+    state.forgetFieldTermComparisons(.{ .parent = a.parent, .name = a.name });
     const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
     const defined = !entirely_undefined and
         !(a.interior_view and origin == .stack and localIsArray(ctx, origin.stack)) and
@@ -2570,7 +2679,13 @@ fn transferFieldUse(
     end_pos: cfg.SrcPos,
 ) !void {
     // Whole aggregate transport preserves holes but only rejects an ALL proof.
-    const reads_undefined = !u.lifetime_only and if (u.optional_tag_path) |path|
+    const counted_defined = if (u.counted_array) |counted| blk: {
+        if (fieldValueMayBeUndefined(ctx, state, u.parent, counted.counter_path)) break :blk false;
+        const offset = state.termSymbolicPrefixOffset(.{ .parent = u.parent, .name = counted.array_path },
+            .{ .field = .{ .parent = u.parent, .name = counted.counter_path, .is_unsigned = true } }) orelse break :blk false;
+        break :blk offset >= 0;
+    } else false;
+    const reads_undefined = !u.lifetime_only and !counted_defined and if (u.optional_tag_path) |path|
         optionalTagBytesMayBeUndefined(ctx, state, u.parent, path)
     else if (u.aggregate_transport)
         fieldIsEntirelyUndefined(ctx, state, u.parent, u.name)
@@ -2839,7 +2954,6 @@ fn transferUse(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    if (u.from_method_call) state.forgetFieldComparisons(u.local);
     const origin = state.locals.get(u.local) orelse return;
     // Borrowing an undefined receiver does not read its payload. Only a
     // proven write may initialize it; a method name supplies no such proof.
@@ -2935,7 +3049,8 @@ fn transferIndexedRead(
     const info = ctx.locals[@intFromEnum(read.array)];
     if (read.field_array) |path| {
         // A projected index selects bytes, not every hole in the backing field.
-        const written = state.fieldRangeBytesAreWritten(read.array, path, read.index);
+        const correlated = state.hasInitializedFieldElement(read.array, path, read.index);
+        const written = state.fieldRangeBytesAreWritten(read.array, path, read.index) or correlated;
         const selected_index = resolveIndex(state, read.index);
         const selected_undefined = if (selected_index) |index| blk: {
             var buffer: [256]u8 = undefined;
@@ -2943,7 +3058,7 @@ fn transferIndexedRead(
                 break :blk fieldValueMayBeUndefined(ctx, state, read.array, path);
             break :blk fieldValueMayBeUndefined(ctx, state, read.array, selected);
         } else fieldValueMayBeUndefined(ctx, state, read.array, path);
-        if ((selected_index != null or !written) and selected_undefined)
+        if (((selected_index != null and !correlated) or !written) and selected_undefined)
             try checkOriginAlive(ctx, state, .undef, pos, end_pos, info.name);
         if (origin) |root| if (root != .undef)
             try checkOriginAlive(ctx, state, root, pos, end_pos, info.name);
@@ -3049,7 +3164,8 @@ fn transferIndexedWrite(
     }
     if (write.field_array) |path| {
         const rhs_defined = indexedRhsIsDefined(ctx, state, write, rhs_origin);
-        state.forgetFieldComparisons(write.array);
+        if (!rhs_defined) state.forgetFieldInitialization(.{ .parent = write.array, .name = path });
+        state.forgetFieldTermComparisons(.{ .parent = write.array, .name = path });
         if (write.name) |name| {
             const key: state_mod.FieldKey = .{ .parent = write.array, .name = name };
             try state.bindFieldValue(ctx.gpa, key, rhs_defined);
@@ -3079,7 +3195,7 @@ fn transferIndexedWrite(
             try state.unknown_field_values.putContext(ctx.gpa, .{ .parent = write.array, .name = path }, {}, .{});
         }
         if (!rhs_defined) try invalidateAliasedArrayPayload(ctx, state, write.array, write.name orelse path);
-        // Defined dynamic writes preserve existing coverage, but grant none.
+        if (rhs_defined) state.extendTermSymbolicPrefix(.{ .parent = write.array, .name = path }, write.index);
         return;
     }
     if (write.name) |name| {
@@ -3619,6 +3735,8 @@ fn valueInputsAreDefined(
                 if (!scalarFieldIsDefined(ctx, state, field.parent, field.name)) return false;
             },
             .indexed => |indexed| {
+                // Field-prefix byte facts do not supply a selected-value certificate.
+                if (indexed.field_array != null) return false;
                 // Written-but-unproved slots satisfy use-undefined, not certificates.
                 if (state.unknown_values.contains(indexed.array)) return false;
                 if (indexed.modulo) |modulo| {
@@ -3712,6 +3830,7 @@ fn extendSymbolicPrefix(
     if (next_offset < -1 or next_offset > 1) return;
     try state.setSymbolicPrefix(ctx.gpa, array, term.local, next_offset, extent);
 }
+
 
 fn reportUncoveredArrayUse(
     ctx: Ctx,

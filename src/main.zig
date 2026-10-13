@@ -73,6 +73,7 @@ fn run(init: std.process.Init) !u8 {
     var color_off = false;
     var jobs: ?usize = null;
     var zig_command: []const u8 = "zig";
+    var allow_partial = false;
     var exclusions: std.ArrayListUnmanaged([]const u8) = .empty;
     defer exclusions.deinit(gpa);
 
@@ -194,6 +195,10 @@ fn run(init: std.process.Init) !u8 {
             try exclusions.append(gpa, path);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--allow-partial")) {
+            allow_partial = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("zbc: unknown flag: {s}\n", .{arg});
             printUsage();
@@ -238,11 +243,12 @@ fn run(init: std.process.Init) !u8 {
             .unresolved_imports = 0,
         };
     }
-    defer for (tasks) |task| {
+    defer for (tasks) |*task| {
         lib.freeAnalysis(gpa, task.analysis);
         if (task.parse_failure) |failure| {
             if (failure.source_path) |path| gpa.free(path);
         }
+        if (task.budget) |*diagnostic| diagnostic.deinit(gpa);
     };
 
     // A toolchain failure is a property of the run, not of any file: it is
@@ -304,11 +310,7 @@ fn run(init: std.process.Init) !u8 {
                 if (info.function.slice().len != 0) {
                     std.debug.print(" in fn `{s}`", .{info.function.slice()});
                 }
-                if (info.line != 0) {
-                    std.debug.print(" at {s}:{d}:{d}\n", .{ task.path, info.line, info.column });
-                } else {
-                    std.debug.print(" at {s}+{d}\n", .{ task.path, info.byte });
-                }
+                printBudgetPosition(info);
             } else if (err == error.AnalysisBudgetExceeded) {
                 std.debug.print(
                     "zbc: cannot analyze {s}: analysis budget exhausted without a recorded limit — the walk that gave up did not report which cap it hit\n",
@@ -367,7 +369,9 @@ fn run(init: std.process.Init) !u8 {
         @import("builtin").zig_version_string,
         unresolved_imports,
     });
-    if (failed != 0 or partial != 0) return 2;
+    // A budget-partial file keeps its findings; only an opted-in caller may
+    // let partial coverage alone pass. Failed files always fail the run.
+    if (failed != 0 or (partial != 0 and !allow_partial)) return 2;
     return if (findings != 0) 1 else 0;
 }
 
@@ -714,6 +718,10 @@ fn printUsage() void {
         \\  --zig=<path>         Zig 0.16.0 executable whose `zig env` locates
         \\                        the std library.  Default: `zig` from PATH.
         \\  --no-color            Disable ANSI color in `rich` output.
+        \\  --allow-partial       Do not exit 2 only because a file was
+        \\                        partially analyzed (budget exhausted).
+        \\                        Findings still exit 1; failed files and
+        \\                        operational errors still exit 2.
         \\  --list-invariants     Print known invariant names and exit.
         \\  --list-rules          Print every rule id and one-line title
         \\                        and exit.
@@ -730,7 +738,7 @@ const Task = struct {
     analysis: lib.Analysis,
     err: ?anyerror,
     parse_failure: ?lib.ParseFailure,
-    budget: ?budget_mod.Diagnostic,
+    budget: ?budget_mod.OwnedDiagnostic,
     unresolved_imports: usize,
 };
 
@@ -840,7 +848,12 @@ fn runOne(t: *Task, gpa: std.mem.Allocator, session: *lib.Session) void {
                 };
             }
         } else if (err == error.AnalysisBudgetExceeded) {
-            t.budget = budget_mod.take();
+            if (budget_mod.take()) |diagnostic| {
+                t.budget = diagnostic.owned(gpa) catch {
+                    t.err = error.OutOfMemory;
+                    return;
+                };
+            }
         }
         return;
     };
@@ -861,10 +874,16 @@ fn printIncomplete(path: []const u8, part: lib.Incomplete) void {
         return;
     };
     std.debug.print(" — {s} limit {d} reached {d}", .{ info.limit.label(), info.limit_value, info.reached });
+    printBudgetPosition(info);
+}
+
+/// Unknown source identity must not turn foreign coordinates into input sites.
+fn printBudgetPosition(info: budget_mod.OwnedDiagnostic) void {
+    const document = if (info.document.len != 0) info.document else "<unknown>";
     if (info.line != 0) {
-        std.debug.print(" at {d}:{d}\n", .{ info.line, info.column });
+        std.debug.print(" at {s}:{d}:{d}\n", .{ document, info.line, info.column });
     } else {
-        std.debug.print(" at byte {d}\n", .{info.byte});
+        std.debug.print(" at {s}+{d}\n", .{ document, info.byte });
     }
 }
 

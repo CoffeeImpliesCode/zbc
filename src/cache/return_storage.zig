@@ -39,6 +39,9 @@ pub const Alternative = struct {
     storage: Storage,
     /// Field of an aggregate result carrying this borrow; "" is the result.
     result_path: []const u8 = "",
+    /// Non-null selects copied payloads within the sequence named by owner.path.
+    /// Null selects the existing value projection; "" selects each whole element.
+    element_path: ?[]const u8 = null,
 };
 
 pub const ReturnedStorage = struct {
@@ -307,7 +310,7 @@ fn returnedStorageResolved(query: *Query, cache: *FileCache, actual: FileCache.A
             const cell = try query.sourceCell(frame, mapped.node, null, 0);
             // An inline-storage pointer designates the actual's own cell at the
             // path, not a pointer value stored there; its content proves nothing.
-            if (alternative.projection != .cell_address and alternative.storage != .inline_storage and cell != null and cell.?.binding.origin != .param and mapped.path.len != 0) {
+            if (alternative.element_path == null and alternative.projection != .cell_address and alternative.storage != .inline_storage and cell != null and cell.?.binding.origin != .param and mapped.path.len != 0) {
                 try query.projectExpression(frame, mapped.node, mapped.path, .value, alternative.result_path, &source, 0);
                 for (source.allocations.items) |requirement| {
                     try query.charge();
@@ -473,13 +476,12 @@ pub const ExpressionLoanQuery = struct {
 /// These builtins compute values or metadata; none deposits into an operand.
 fn valueBuiltin(name: []const u8) bool {
     const names = [_][]const u8{
-        "@tagName", "@as", "@field", "@ptrCast", "@alignCast", "@constCast",
-        "@volatileCast", "@fieldParentPtr", "@intCast", "@truncate", "@bitCast",
-        "@intFromEnum", "@enumFromInt", "@intFromPtr", "@ptrFromInt",
-        "@sizeOf", "@bitSizeOf", "@alignOf", "@offsetOf", "@bitOffsetOf", "@typeInfo",
-        "@TypeOf", "@branchHint", "@setEvalBranchQuota", "@inComptime",
-        "@splat", "@ctz", "@clz", "@popCount",
-        "@addWithOverflow", "@subWithOverflow", "@mulWithOverflow", "@shlWithOverflow",
+        "@tagName",         "@as",              "@field",           "@ptrCast",  "@alignCast",  "@constCast",
+        "@volatileCast",    "@fieldParentPtr",  "@intCast",         "@truncate", "@bitCast",    "@intFromEnum",
+        "@enumFromInt",     "@intFromPtr",      "@ptrFromInt",      "@sizeOf",   "@bitSizeOf",  "@alignOf",
+        "@offsetOf",        "@bitOffsetOf",     "@typeInfo",        "@TypeOf",   "@branchHint", "@setEvalBranchQuota",
+        "@inComptime",      "@splat",           "@ctz",             "@clz",      "@popCount",   "@addWithOverflow",
+        "@subWithOverflow", "@mulWithOverflow", "@shlWithOverflow",
     };
     for (names) |known| if (std.mem.eql(u8, name, known)) return true;
     return false;
@@ -710,7 +712,9 @@ const ExpressionWalk = struct {
         while (prefix < path.len) {
             try self.charge();
             const ty = (try self.query.cellType(.{
-                .frame = self.frame, .binding = binding, .node = node,
+                .frame = self.frame,
+                .binding = binding,
+                .node = node,
                 .path = if (prefix == 0) "" else path[0 .. prefix - 1],
             }, depth + 1)) orelse {
                 self.complete = false;
@@ -1099,9 +1103,9 @@ const ExpressionWalk = struct {
         if (path.len == 0) try self.borrow(node, "", false, depth + 1);
     }
 
-    /// A std `Allocator` allocation call whose elements hold no address returns
-    /// provider memory: only the provider argument can lend it storage. Copied
-    /// elements (`dupe`) must also be narrow, since a copy keeps address bits.
+    /// An authenticated allocation gets backing storage from its provider.
+    /// Duplication also retains the copied elements' pointer or encoded payloads,
+    /// but never their source sequence's backing cell.
     fn allocationBorrow(self: *ExpressionWalk, canonical: FileCache.ActualCallSummary, node: Ast.Node.Index, depth: u8) Error!bool {
         const tree = self.cache.tree;
         const primitive = (try @import("fresh_storage.zig").allocatorPrimitive(self.cache, canonical, .{
@@ -1113,12 +1117,15 @@ const ExpressionWalk = struct {
         if (primitive.operation != .allocate) return false;
         const result = (try self.query.nodeType(self.frame, node)) orelse return false;
         const element = (try self.query.allocationPointee(result)) orelse return false;
-        if (primitive.copies_elements) {
-            if (!try self.query.addressNarrow(element, 0)) return false;
-        } else if (!try self.query.addressFree(element, 0)) return false;
+        if (!primitive.copies_elements and !try self.query.addressFree(element, 0)) return false;
         var buffer: [2]Ast.Node.Index = undefined;
         const provider = (try canonical.callArgumentFor(self.cache, &buffer, primitive.allocator_parameter)) orelse return false;
         try self.allocationProviderBorrow(provider, "", depth + 1);
+        if (primitive.copies_elements and !try self.query.addressNarrow(element, 0)) {
+            // Authenticated dupe/dupeZ copy formal 2's values, not its backing cell.
+            const source = (try canonical.callArgumentFor(self.cache, &buffer, 2)) orelse return false;
+            try self.elementBorrow(source, "", "", depth + 1);
+        }
         return true;
     }
 
@@ -1300,18 +1307,28 @@ const ExpressionWalk = struct {
             };
             cell.path = try self.join(cell.path, path);
             var effects: Output = .{};
+            const copies_start = self.query.copied_payloads.len;
             var buffer: [2]Ast.Node.Index = undefined;
             const call = TypeResolver.CallOperands.full(tree, &buffer, event.node);
             var permutation = false;
             if (call) |operands| {
                 const actual = try self.query.effectCall(at_effect, event.node, operands, depth + 1);
                 try self.query.callEffectsResolved(at_effect, event.node, operands, actual, cell, self.frame.domain, "", &effects, depth + 1, null);
-                if (actual) |canonical|
-                    try self.copiedCallEffects(at_effect, canonical, cell, depth + 1);
                 if (actual) |canonical| permutation = try self.swapsWithin(at_effect, operands, canonical, binding);
             } else {
                 at_effect.mutations = try self.query.scratch.allocator().dupe(Ast.Node.Index, &.{event.node});
                 try self.query.effectsFor(at_effect, cell, horizon, self.frame.domain, "", &effects, depth + 1);
+            }
+            if (!permutation) {
+                const copies = try self.query.copied_payloads.slice(self.query.scratch.allocator(), copies_start, self.query.copied_payloads.len);
+                // Nonmatching occurrences only performed pure comparisons.
+                // Filter shared subtrees once, but replay every matching
+                // occurrence in order with its original borrow/work charges.
+                const selected = try copies.filtered(self.query.scratch.allocator(), cell, Query.copiedPayloadMatches);
+                for (0..selected.len) |copied_index| {
+                    const copied = selected.at(copied_index);
+                    try self.borrowActualSource(copied.source, copied.path, copied.element, depth + 1);
+                }
             }
             // A scalar copy separates the source header from the destination,
             // but can still copy encoded addresses carried by its elements.
@@ -1362,27 +1379,6 @@ const ExpressionWalk = struct {
             }
         }
     }
-    /// Reuse actual copy sources discovered by the existing effect scan.
-    /// Do not traverse the callee a second time for each loaded field.
-    fn copiedCallEffects(self: *ExpressionWalk, caller: Frame, actual: FileCache.ActualCallSummary, cell: SourceCell, depth: u8) Error!void {
-        const count = self.query.copied_payloads.items.len;
-        var index: usize = 0;
-        while (index < count) : (index += 1) {
-            try self.charge();
-            const copied = self.query.copied_payloads.items[index];
-            if (!Query.sameCellRoot(copied.cell, cell) or !std.mem.eql(u8, copied.cell.path, cell.path)) continue;
-            var active = copied.frame.invocation;
-            var matches = false;
-            while (active) |invocation| : (active = invocation.caller.invocation) {
-                if (sameActual(invocation.actual, actual) and sameFrame(invocation.caller, caller)) {
-                    matches = true;
-                    break;
-                }
-            }
-            if (!matches) continue;
-            try self.borrowActualSource(copied.source, copied.path, copied.element, depth + 1);
-        }
-    }
 
     /// A proved store's RHS is evaluated in its actual invocation. Follow its
     /// formal-to-actual mapping, rather than treating every call argument as
@@ -1409,6 +1405,24 @@ const ExpressionWalk = struct {
         }
         const tree = source.frame.cache.tree;
         const node = source.node;
+        // Authenticate the copied value before remapping its storage source.
+        // Mapping `formal.*` first can replace a scalar load with `&actual`,
+        // which is the address used to read it, not bits stored in the result.
+        // The addressless proof still rejects explicit encoded addresses.
+        if (path.len == 0) {
+            if (try self.query.nodeType(source.frame, node)) |ty|
+                if (try self.query.addressless(source.frame, node, ty, 0)) return;
+        }
+        if (tree.nodeTag(node) == .deref) {
+            if (try self.query.sourceCell(source.frame, node, null, depth + 1)) |cell| {
+                const loaded = try self.query.nodeType(source.frame, node);
+                const stored = try self.query.cellType(cell, depth + 1);
+                if (loaded != null and stored != null and loaded.?.eql(stored.?))
+                    return self.borrowActualSource(.{ .frame = cell.frame, .node = cell.node }, try self.join(cell.path, path), element, depth + 1);
+            }
+            self.complete = false;
+            return;
+        }
         if (try self.query.sourceAt(source.frame, node, path, depth + 1)) |mapped| {
             if (mapped.frame.cache != source.frame.cache or mapped.frame.declaration != source.frame.declaration or
                 mapped.node != node or !sameInvocation(mapped.frame.invocation, source.frame.invocation))
@@ -1418,8 +1432,6 @@ const ExpressionWalk = struct {
             self.complete = false;
             return;
         }
-        if (try self.query.nodeType(source.frame, node)) |ty|
-            if (try self.query.addressless(source.frame, node, ty, 0)) return;
         switch (tree.nodeTag(node)) {
             .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal, .error_value => return,
             // The foreign cell belongs to the callee, not this function.
@@ -1440,9 +1452,9 @@ const ExpressionWalk = struct {
             // Only value casts forward operand bits; type operands and other
             // metadata computations never establish an address dependency.
             for ([_][]const u8{
-                "@as", "@ptrCast", "@alignCast", "@constCast", "@volatileCast",
-                "@intCast", "@truncate", "@bitCast", "@intFromEnum",
-                "@enumFromInt", "@intFromPtr", "@ptrFromInt",
+                "@as",         "@ptrCast",    "@alignCast", "@constCast",   "@volatileCast",
+                "@intCast",    "@truncate",   "@bitCast",   "@intFromEnum", "@enumFromInt",
+                "@intFromPtr", "@ptrFromInt",
             }) |cast| {
                 if (!std.mem.eql(u8, name, cast)) continue;
                 if (arguments.len == 0) break;
@@ -1727,12 +1739,68 @@ const ExpressionWalk = struct {
         }
     }
 
-    fn unresolvedBorrow(self: *ExpressionWalk, reference: ?Ast.Node.Index, depth: u8) Error!void {
+    /// Visible stores to an exact static cell are positive payload evidence.
+    /// Root identity alone is insufficient: a sibling field lends no storage.
+    fn globalStoredBorrow(self: *ExpressionWalk, declaration: ?Ast.Node.Index, path: []const u8, depth: u8) Error!void {
+        const tree = self.cache.tree;
+        const declared = declaration orelse return;
+        const variable = tree.fullVarDecl(declared) orelse return;
+        if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) return;
+        const selected: GlobalSelection = .{ .declaration = declared, .path = "" };
+        const selection = path;
+        var index = self.events.len;
+        while (index != 0) {
+            index -= 1;
+            try self.charge();
+            const event = self.events[index];
+            if (tree.nodeTag(event.node) != .assign or tree.lastToken(event.node) >= self.load_token) continue;
+            const pair = tree.nodeData(event.node).node_and_node;
+            const target = (try self.globalSelection(pair[0], depth + 1)) orelse continue;
+            if (target.declaration != selected.declaration) continue;
+            if (!Query.pathsNest(target.path, selection)) continue;
+            const tail = if (Query.pathContains(target.path, selection) and target.path.len < selection.len)
+                selection[target.path.len + @intFromBool(target.path.len != 0) ..]
+            else
+                "";
+            const saved_frame = self.frame;
+            const saved_load = self.load_token;
+            self.load_token = tree.firstToken(event.node);
+            self.frame.return_token = self.load_token;
+            defer {
+                self.frame = saved_frame;
+                self.load_token = saved_load;
+            }
+            try self.borrow(pair[1], tail, false, depth + 1);
+            // A direct whole-selection store replaces every earlier payload.
+            if (event.direct and Query.pathContains(target.path, selection)) return;
+        }
+    }
+
+    const GlobalSelection = struct { declaration: Ast.Node.Index, path: []const u8 };
+
+    fn globalSelection(self: *ExpressionWalk, node: Ast.Node.Index, depth: u8) Error!?GlobalSelection {
+        try self.charge();
+        if (depth >= depth_limit) return self.query.depthExhausted(depth);
+        const tree = self.cache.tree;
+        const declaration = (try self.query.globalDeclaration(self.frame, node, depth + 1)) orelse return null;
+        return switch (tree.nodeTag(node)) {
+            .identifier => .{ .declaration = declaration, .path = "" },
+            .grouped_expression, .unwrap_optional => self.globalSelection(tree.nodeData(node).node_and_token[0], depth + 1),
+            .field_access => blk: {
+                const access = tree.nodeData(node).node_and_token;
+                var selected = (try self.globalSelection(access[0], depth + 1)) orelse break :blk null;
+                selected.path = try self.join(selected.path, tree.tokenSlice(access[1]));
+                break :blk selected;
+            },
+            else => null,
+        };
+    }
+
+    fn unresolvedBorrow(self: *ExpressionWalk, selected: ?Ast.Node.Index, depth: u8) Error!void {
         self.complete = false;
         const saved = self.speculative;
         self.speculative = true;
         defer self.speculative = saved;
-        const selected = if (reference) |node| try self.query.globalDeclaration(self.frame, node, depth + 1) else null;
         try self.replayEvents(selected, depth);
     }
 
@@ -2019,7 +2087,9 @@ const ExpressionWalk = struct {
                 if (std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return;
                 const binding = (try self.bindingAt(name, token)) orelse {
                     if (location and try self.query.globalCellAddress(self.frame, node)) return;
-                    return self.unresolvedBorrow(node, depth + 1);
+                    const selected = try self.query.globalDeclaration(self.frame, node, depth + 1);
+                    if (!location) try self.globalStoredBorrow(selected, path, depth + 1);
+                    return self.unresolvedBorrow(selected, depth + 1);
                 };
                 const use_token = if (self.payload_load) self.load_token else token;
                 if (binding.origin == .param) {
@@ -2242,18 +2312,26 @@ const ExpressionWalk = struct {
                     try self.charge();
                     if (covered(self.excluded, alternative.result_path)) continue;
                     var selected_path = alternative.owner.path;
+                    var element_path = alternative.element_path;
                     if (path.len != 0 and alternative.result_path.len != 0) {
                         if (std.mem.eql(u8, path, alternative.result_path)) {
                             // The exact returned borrow is selected.
                         } else if (std.mem.startsWith(u8, path, alternative.result_path) and
                             path.len > alternative.result_path.len and path[alternative.result_path.len] == '.')
                         {
-                            selected_path = try self.join(selected_path, path[alternative.result_path.len + 1 ..]);
+                            const suffix = path[alternative.result_path.len + 1 ..];
+                            if (element_path) |selected_element|
+                                element_path = try self.join(selected_element, suffix)
+                            else
+                                selected_path = try self.join(selected_path, suffix);
                         } else if (!(std.mem.startsWith(u8, alternative.result_path, path) and
                             alternative.result_path.len > path.len and alternative.result_path[path.len] == '.'))
                             continue;
                     } else if (path.len != 0) {
-                        selected_path = try self.join(selected_path, path);
+                        if (element_path) |selected_element|
+                            element_path = try self.join(selected_element, path)
+                        else
+                            selected_path = try self.join(selected_path, path);
                     }
                     var argument_buffer: [2]Ast.Node.Index = undefined;
                     const mapped = (try mappedStorageAt(self.cache, canonical, alternative, &argument_buffer)) orelse {
@@ -2267,6 +2345,13 @@ const ExpressionWalk = struct {
                     const saved_unknown = self.element_unknown;
                     self.element_unknown = false;
                     defer self.element_unknown = self.element_unknown or saved_unknown;
+                    if (element_path) |selected_element| {
+                        const saved_load = self.load_token;
+                        self.load_token = tree.firstToken(node);
+                        defer self.load_token = saved_load;
+                        try self.elementBorrow(argument, selected_path, selected_element, depth + 1);
+                        continue;
+                    }
                     if (returned.direct_formal_load) |load| {
                         matched_load = true;
                         const saved_load = self.load_token;
@@ -2641,7 +2726,29 @@ const ExpressionWalk = struct {
             },
             .address_of, .deref, .@"try" => return self.elementBorrow(tree.nodeData(node).node, array_path, path, depth + 1),
             .grouped_expression, .unwrap_optional => return self.elementBorrow(tree.nodeData(node).node_and_token[0], array_path, path, depth + 1),
-            .slice_open, .slice, .slice_sentinel => return self.elementBorrow(tree.fullSlice(node).?.ast.sliced, array_path, path, depth + 1),
+            .slice_open, .slice, .slice_sentinel => {
+                const slice = tree.fullSlice(node).?;
+                const start = try self.query.resolver.analyser.resolveIntegerLiteral(u64, .{
+                    .node_handle = .of(slice.ast.start, self.frame.resolution.handle),
+                    .container_type = self.frame.resolution.container_type,
+                });
+                const end = if (slice.ast.end.unwrap()) |last|
+                    try self.query.resolver.analyser.resolveIntegerLiteral(u64, .{
+                        .node_handle = .of(last, self.frame.resolution.handle),
+                        .container_type = self.frame.resolution.container_type,
+                    })
+                else
+                    null;
+                if (start != null and end != null and start.? == end.?) return;
+                if (start == 0 and slice.ast.end.unwrap() == null)
+                    return self.elementBorrow(slice.ast.sliced, array_path, path, depth + 1);
+                // An unknown subset cannot prove that a particular base element was copied.
+                self.complete = false;
+                const saved_speculative = self.speculative;
+                self.speculative = true;
+                defer self.speculative = saved_speculative;
+                return self.elementBorrow(slice.ast.sliced, array_path, path, depth + 1);
+            },
             .@"if", .if_simple => {
                 const conditional = tree.fullIf(node).?;
                 const known = try self.frame.resolution.boolValueOfNode(conditional.ast.cond_expr);
@@ -2729,18 +2836,26 @@ const ExpressionWalk = struct {
                     try self.charge();
                     if (covered(self.excluded, alternative.result_path)) continue;
                     var owner_path = alternative.owner.path;
+                    var element_path = alternative.element_path;
                     if (selected.len != 0 and alternative.result_path.len != 0) {
                         if (std.mem.eql(u8, selected, alternative.result_path)) {
                             // This field carries the selected element payload.
                         } else if (std.mem.startsWith(u8, selected, alternative.result_path) and
                             selected.len > alternative.result_path.len and selected[alternative.result_path.len] == '.')
                         {
-                            owner_path = try self.join(owner_path, selected[alternative.result_path.len + 1 ..]);
+                            const suffix = selected[alternative.result_path.len + 1 ..];
+                            if (element_path) |selected_element|
+                                element_path = try self.join(selected_element, suffix)
+                            else
+                                owner_path = try self.join(owner_path, suffix);
                         } else if (!(std.mem.startsWith(u8, alternative.result_path, selected) and
                             alternative.result_path.len > selected.len and alternative.result_path[selected.len] == '.'))
                             continue;
                     } else if (selected.len != 0) {
-                        owner_path = try self.join(owner_path, selected);
+                        if (element_path) |selected_element|
+                            element_path = try self.join(selected_element, selected)
+                        else
+                            owner_path = try self.join(owner_path, selected);
                     }
                     var argument_buffer: [2]Ast.Node.Index = undefined;
                     const mapped = (try mappedStorageAt(self.cache, canonical, alternative, &argument_buffer)) orelse {
@@ -2751,6 +2866,10 @@ const ExpressionWalk = struct {
                     const saved = self.excluded;
                     self.excluded = &.{};
                     defer self.excluded = saved;
+                    if (element_path) |selected_element| {
+                        try self.elementBorrow(argument, owner_path, selected_element, depth + 1);
+                        continue;
+                    }
                     if (alternative.projection == .cell_address) {
                         if (alternative.storage == .inline_storage)
                             try self.cellBorrow(argument, owner_path, depth + 1)
@@ -2934,7 +3053,7 @@ const CallEffectCertificate = struct {
     complete: bool,
     items: []const Alternative,
     allocations: []const AllocationRequirement,
-    copies: []const CopiedPayload,
+    copies: CopiedPayloadLog,
 };
 
 const CopiedPayload = struct {
@@ -2944,6 +3063,127 @@ const CopiedPayload = struct {
     path: []const u8 = "",
     element: bool = true,
 };
+
+const CopiedPayloadLog = ReplayLog(*const CopiedPayload);
+const WrittenCellLog = ReplayLog(*const SourceCell);
+
+test "copied payload certificates share immutable snapshots across replay" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    var memo: Memo = .{};
+    var remaining: u32 = 100;
+    var query: Query = .{
+        .root = undefined,
+        .state = undefined,
+        .resolver = undefined,
+        .remaining = &remaining,
+        .scratch = &scratch,
+        .memo = &memo,
+        .entry_tree = undefined,
+        .entry_token = 0,
+    };
+    var value: CopiedPayload = .{
+        .frame = undefined,
+        .cell = undefined,
+        .source = .{ .frame = undefined, .node = @enumFromInt(1) },
+        .path = "first",
+    };
+    try query.appendCopiedPayload(value);
+    const first = query.copied_payloads.at(0);
+    const certificate = query.copied_payloads;
+    value.path = "second";
+    value.source.node = @enumFromInt(2);
+    try query.appendCopiedPayload(value);
+    const second = query.copied_payloads.at(1);
+    // Replays retain multiplicity and order without copying payload records.
+    for (0..100) |_| try query.copied_payloads.append(scratch.allocator(), certificate);
+    try std.testing.expectEqual(@as(usize, 102), query.copied_payloads.len);
+    try std.testing.expectEqualStrings("first", first.path);
+    try std.testing.expectEqual(@as(Ast.Node.Index, @enumFromInt(1)), first.source.node);
+    try std.testing.expect(first != second);
+    try std.testing.expectEqualStrings("second", second.path);
+    for (2..query.copied_payloads.len) |index| try std.testing.expect(query.copied_payloads.at(index) == first);
+    try std.testing.expect(certificate.at(0) == first);
+    try std.testing.expectEqual(@as(u32, 100), remaining);
+}
+
+test "copied payload replay shares repeated ranges without expanding occurrences" {
+    var buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scratch = std.heap.ArenaAllocator.init(fixed.allocator());
+    defer scratch.deinit();
+    var memo: Memo = .{};
+    var remaining: u32 = 100;
+    var query: Query = .{
+        .root = undefined,
+        .state = undefined,
+        .resolver = undefined,
+        .remaining = &remaining,
+        .scratch = &scratch,
+        .memo = &memo,
+        .entry_tree = undefined,
+        .entry_token = 0,
+    };
+    try query.appendCopiedPayload(.{
+        .frame = undefined,
+        .cell = undefined,
+        .source = .{ .frame = undefined, .node = @enumFromInt(1) },
+    });
+    const first = query.copied_payloads.at(0);
+    for (0..24) |_| {
+        const certificate = query.copied_payloads;
+        try query.copied_payloads.append(scratch.allocator(), certificate);
+    }
+    try std.testing.expectEqual(@as(usize, 1 << 24), query.copied_payloads.len);
+    try std.testing.expect(query.copied_payloads.at(0) == first);
+    try std.testing.expect(query.copied_payloads.at(query.copied_payloads.len - 1) == first);
+    try std.testing.expectEqual(@as(u32, 100), remaining);
+}
+
+test "copied payload replay preserves per-occurrence borrow budget charges" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "", .zig);
+    defer tree.deinit(gpa);
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    defer budget.clear();
+    var memo: Memo = .{};
+    var remaining: u32 = 3;
+    var query: Query = .{
+        .root = undefined,
+        .state = undefined,
+        .resolver = undefined,
+        .remaining = &remaining,
+        .scratch = &scratch,
+        .memo = &memo,
+        .entry_tree = &tree,
+        .entry_token = 0,
+    };
+    try query.appendCopiedPayload(.{
+        .frame = undefined,
+        .cell = undefined,
+        .source = .{ .frame = undefined, .node = @enumFromInt(0) },
+    });
+    const certificate = query.copied_payloads;
+    for (0..3) |_| try query.copied_payloads.append(scratch.allocator(), certificate);
+    var walk: ExpressionWalk = .{
+        .cache = undefined,
+        .bindings = undefined,
+        .query = &query,
+        .frame = undefined,
+        .events = &.{},
+    };
+    for (0..3) |index| {
+        const copied = query.copied_payloads.at(index);
+        try walk.borrowActualSource(copied.source, copied.path, copied.element, depth_limit);
+    }
+    try std.testing.expectEqual(@as(u32, 0), remaining);
+    const fourth = query.copied_payloads.at(3);
+    try std.testing.expectError(error.AnalysisBudgetExceeded,
+        walk.borrowActualSource(fourth.source, fourth.path, fourth.element, depth_limit));
+    try std.testing.expectEqual(budget.Limit.return_storage_work, budget.peek().?.limit);
+}
+
 const EffectCertificate = struct {
     frame: Frame,
     cell: SourceCell,
@@ -2955,8 +3195,8 @@ const EffectCertificate = struct {
     complete: bool,
     items: []const Alternative,
     allocations: []const AllocationRequirement,
-    writes: []const SourceCell,
-    copies: []const CopiedPayload,
+    writes: WrittenCellLog,
+    copies: CopiedPayloadLog,
 };
 
 const Query = struct {
@@ -2975,7 +3215,9 @@ const Query = struct {
     // before it repeats every path to the depth cap.
     active_sources: std.ArrayListUnmanaged(SourceDemand) = .empty,
     active_scalar_cells: std.ArrayListUnmanaged(ScalarDemand) = .empty,
-    copied_payloads: std.ArrayListUnmanaged(CopiedPayload) = .empty,
+    /// Immutable arena-owned payload snapshots and replay subtrees.
+    /// Logical occurrences remain ordered even when ranges share storage.
+    copied_payloads: CopiedPayloadLog = .{},
     /// ExpressionWalk demands being answered, outermost first.
     active_borrows: std.ArrayListUnmanaged(ExpressionWalk.BorrowDemand) = .empty,
     call_effect_certificates: std.AutoArrayHashMapUnmanaged(Ast.Node.Index, std.ArrayListUnmanaged(CallEffectCertificate)) = .empty,
@@ -2998,7 +3240,7 @@ const Query = struct {
     // A source cycle can be memoized only by an attempt enclosing its root.
     source_prune_floor: usize = no_prune,
     scalar_prune_floor: usize = no_prune,
-    written_cells: std.ArrayListUnmanaged(SourceCell) = .empty,
+    written_cells: WrittenCellLog = .{},
     source_events: ?*std.ArrayListUnmanaged(SourceEvent) = null,
     source_direct: bool = true,
     source_loop_start: Ast.TokenIndex = 0,
@@ -3019,6 +3261,22 @@ const Query = struct {
         path: []const u8,
         selected_formal: ?u32,
     };
+
+    fn appendCopiedPayload(self: *Query, value: CopiedPayload) Error!void {
+        const snapshot = try self.scratch.allocator().create(CopiedPayload);
+        snapshot.* = value;
+        try self.copied_payloads.appendValue(self.scratch.allocator(), snapshot);
+    }
+
+    fn copiedPayloadMatches(cell: SourceCell, copied: *const CopiedPayload) bool {
+        return sameCellRoot(copied.cell, cell) and std.mem.eql(u8, copied.cell.path, cell.path);
+    }
+
+    fn appendWrittenCell(self: *Query, value: SourceCell) Error!void {
+        const snapshot = try self.scratch.allocator().create(SourceCell);
+        snapshot.* = value;
+        try self.written_cells.appendValue(self.scratch.allocator(), snapshot);
+    }
 
     /// One computation that may be published to a memo. It qualifies only if
     /// it met no depth cut-off and abandoned no cycle through a frame older
@@ -3118,6 +3376,7 @@ const Query = struct {
             .limit_value = cap,
             .reached = reached,
             .byte = self.entry_tree.tokenStart(self.entry_token),
+            .document = budget.documentForTree(self.entry_tree),
             .line = pos.line,
             .column = pos.column,
             .function = name,
@@ -3309,6 +3568,7 @@ const Query = struct {
             dest.* = src;
             dest.owner.path = try arena.dupe(u8, src.owner.path);
             dest.result_path = try arena.dupe(u8, src.result_path);
+            dest.element_path = if (src.element_path) |path| try arena.dupe(u8, path) else null;
         }
         var answer: ReturnedStorage = .{ .complete = output.complete, .alternatives = owned };
         try self.directFormalSelection(frame, &answer);
@@ -3469,7 +3729,8 @@ const Query = struct {
                         const scalar_copy = std.mem.eql(u8, name, "@memcpy") and
                             try self.scalarParameterMemory(frame, arguments[1], 0);
                         if (!try self.addressFree(element, 0) or
-                            (!scalar_copy and try self.hasAddressBits(frame, arguments[1], 0))) {
+                            (!scalar_copy and try self.hasAddressBits(frame, arguments[1], 0)))
+                        {
                             output.complete = false;
                             try self.expression(frame, arguments[1], .value, "", output, depth + 1);
                         }
@@ -4579,6 +4840,9 @@ const Query = struct {
     fn add(self: *Query, output: *Output, alternative: Alternative) Error!void {
         for (output.items.items) |existing| {
             try self.charge();
+            if ((existing.element_path == null) != (alternative.element_path == null)) continue;
+            if (existing.element_path) |path|
+                if (!std.mem.eql(u8, path, alternative.element_path.?)) continue;
             if (existing.owner.param == alternative.owner.param and existing.projection == alternative.projection and
                 existing.storage == alternative.storage and std.mem.eql(u8, existing.owner.path, alternative.owner.path) and
                 std.mem.eql(u8, existing.result_path, alternative.result_path)) return;
@@ -4908,7 +5172,13 @@ const Query = struct {
         defer self.active_sources.items.len -= 1;
         const tree = frame.cache.tree;
         switch (tree.nodeTag(node)) {
-            .@"try", .deref => return self.sourceAt(frame, tree.nodeData(node).node, path, depth + 1),
+            .@"try" => return self.sourceAt(frame, tree.nodeData(node).node, path, depth + 1),
+            // A load is a value source, not the address used to read it.
+            // Keep it intact until a consumer requests its pointee payload.
+            .deref => {
+                if (path.len == 0) return .{ .frame = frame, .node = node };
+                return self.sourceAt(frame, tree.nodeData(node).node, path, depth + 1);
+            },
             .address_of => {
                 // An immutable address names the lexical destination even if
                 // its contents change. Only a pointee projection needs those
@@ -4960,6 +5230,12 @@ const Query = struct {
                         if (frame.invocation != null) return self.actualSource(frame, binding, path, depth + 1);
                         return if (path.len == 0) .{ .frame = frame, .node = node } else null;
                     }
+                    // A capture's RHS names the iterable or optional, not an
+                    // initializer copied wholesale into the binding. Preserve
+                    // the capture so the loan walk can select its value payload
+                    // (or its element cell for a pointer capture).
+                    if (binding.origin == .loop_capture)
+                        return if (path.len == 0) .{ .frame = frame, .node = node } else null;
                     if (try self.rebound(frame, binding, token, &.{})) {
                         return null;
                     }
@@ -4990,7 +5266,9 @@ const Query = struct {
                         }
                     }
                     self.written_reads += 1;
-                    for (self.written_cells.items) |written| {
+                    const writes = self.written_cells;
+                    for (0..writes.len) |index| {
+                        const written = writes.at(index).*;
                         try self.charge();
                         if (try self.cellsOverlap(selected, written)) {
                             return null;
@@ -5591,13 +5869,13 @@ const Query = struct {
                 if (!known.complete) output.complete = false;
                 for (known.items) |item| try self.add(output, item);
                 try output.allocations.appendSlice(self.scratch.allocator(), known.allocations);
-                try self.written_cells.appendSlice(self.scratch.allocator(), known.writes);
-                try self.copied_payloads.appendSlice(self.scratch.allocator(), known.copies);
+                try self.written_cells.append(self.scratch.allocator(), known.writes);
+                try self.copied_payloads.append(self.scratch.allocator(), known.copies);
                 return;
             }
         }
-        const writes = self.written_cells.items.len;
-        const copies = self.copied_payloads.items.len;
+        const writes = self.written_cells.len;
+        const copies = self.copied_payloads.len;
         const reads = self.written_reads;
         const prunes = self.prunes;
         const attempt = self.beginAttempt();
@@ -5613,6 +5891,9 @@ const Query = struct {
         if (!clean) return;
         const known = try self.effect_certificates.getOrPut(self.scratch.allocator(), frame.body);
         if (!known.found_existing) known.value_ptr.* = .empty;
+        // Both ranges borrow scratch; failed publication owns no separate buffer.
+        const written = try self.written_cells.slice(self.scratch.allocator(), writes, self.written_cells.len);
+        const copied = try self.copied_payloads.slice(self.scratch.allocator(), copies, self.copied_payloads.len);
         try known.value_ptr.append(self.scratch.allocator(), .{
             .frame = frame,
             .cell = cell,
@@ -5624,9 +5905,73 @@ const Query = struct {
             .complete = local.complete,
             .items = local.items.items,
             .allocations = local.allocations.items,
-            .writes = try self.scratch.allocator().dupe(SourceCell, self.written_cells.items[writes..]),
-            .copies = try self.scratch.allocator().dupe(CopiedPayload, self.copied_payloads.items[copies..]),
+            .writes = written,
+            .copies = copied,
         });
+    }
+
+    /// A returned cell address can prove a store without proving all destinations.
+    /// This adds positive copy witnesses only, never disjointness certificates.
+    fn copiedPointerReturnDestination(
+        self: *Query,
+        frame: Frame,
+        destination: Ast.Node.Index,
+        value: Ast.Node.Index,
+        demand: SourceCell,
+        depth: u32,
+    ) Error!void {
+        try self.charge();
+        if (depth >= depth_limit) {
+            self.cutoffs += 1;
+            return;
+        }
+        if (frame.invocation == null) return;
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(destination) == .grouped_expression)
+            return self.copiedPointerReturnDestination(frame, tree.nodeData(destination).node_and_token[0], value, demand, depth + 1);
+        if (tree.nodeTag(destination) != .deref) return;
+        const value_type = (try self.nodeType(frame, value)) orelse return;
+        if (try self.addressNarrow(value_type, 0)) return;
+        const pointer = tree.nodeData(destination).node;
+        const pointer_type = (try self.nodeType(frame, pointer)) orelse return;
+        if (try self.pointerSize(pointer_type) != .one) return;
+        const producer = (try self.sourceAt(frame, pointer, "", depth + 1)) orelse return;
+        const producer_tree = producer.frame.cache.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const operands = TypeResolver.CallOperands.full(producer_tree, &buffer, producer.node) orelse return;
+        const actual = (try producer.frame.cache.actualCallSummaryAt(
+            operands.queryToken(producer_tree, producer.node),
+            producer.frame.resolution,
+        )) orelse return;
+        const symbolic = result: {
+            const previous = self.selected_formal;
+            self.selected_formal = null;
+            defer self.selected_formal = previous;
+            break :result try self.body(producer.frame.cache, actual, depth + 1);
+        };
+        for (symbolic.storage.alternatives) |alternative| {
+            try self.charge();
+            if (alternative.result_path.len != 0 or alternative.projection != .cell_address or
+                alternative.storage == .payload_storage) continue;
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const mapped = (try mappedStorageAt(producer.frame.cache, actual, alternative, &argument_buffer)) orelse continue;
+            var target = (try self.sourceCell(producer.frame, mapped.node, null, depth + 1)) orelse continue;
+            target.path = try self.join(target.path, mapped.path);
+            if (!sameCellRoot(target, demand) or
+                !sameInvocation(target.frame.invocation, demand.frame.invocation) or
+                !pathsNest(target.path, demand.path)) continue;
+            const suffix = if (pathContains(target.path, demand.path) and target.path.len < demand.path.len)
+                demand.path[target.path.len + @intFromBool(target.path.len != 0) ..]
+            else
+                "";
+            try self.appendCopiedPayload(.{
+                .frame = frame,
+                .cell = demand,
+                .source = .{ .frame = frame, .node = value },
+                .path = suffix,
+                .element = false,
+            });
+        }
     }
 
     fn effectsForScan(self: *Query, frame: Frame, cell: SourceCell, horizon: Ast.TokenIndex, domain: Domain, result_path: []const u8, output: *Output, depth: u32) Error!void {
@@ -5676,10 +6021,11 @@ const Query = struct {
                 const target = (try self.sourceCell(at_effect, data[0], null, depth + 1)) orelse {
                     // An unresolved destination may alias the demanded cell.
                     output.complete = false;
+                    try self.copiedPointerReturnDestination(at_effect, data[0], data[1], cell, depth + 1);
                     continue;
                 };
                 if (try self.scalarAllocationPayloadStore(at_effect, data[0], data[1], target, depth + 1)) continue;
-                try self.written_cells.append(self.scratch.allocator(), target);
+                try self.appendWrittenCell(target);
                 if (!try self.cellsOverlap(target, cell)) continue;
                 if (!pathContains(target.path, cell.path) and !pathContains(cell.path, target.path))
                     output.complete = false;
@@ -5692,8 +6038,8 @@ const Query = struct {
                     cell.path[target.path.len + @intFromBool(target.path.len != 0) ..]
                 else
                     "";
-                if (frame.invocation != null and pathContains(target.path, cell.path)) {
-                    try self.copied_payloads.append(self.scratch.allocator(), .{
+                if (frame.invocation != null and pathsNest(target.path, cell.path)) {
+                    try self.appendCopiedPayload(.{
                         .frame = at_effect,
                         .cell = cell,
                         .source = .{ .frame = at_effect, .node = data[1] },
@@ -5738,6 +6084,16 @@ const Query = struct {
                         output.complete = false;
                         continue;
                     };
+                    if (target != null and std.mem.eql(u8, name, "@memcpy") and
+                        pathsNest(target.?.path, cell.path) and !try self.addressNarrow(element, 0))
+                    {
+                        try self.appendCopiedPayload(.{
+                            .frame = at_effect,
+                            .cell = cell,
+                            .source = .{ .frame = at_effect, .node = arguments[1] },
+                            .element = true,
+                        });
+                    }
                     // Address-free bytes stored into a new allocation reach
                     // no existing cell and carry no origin.
                     if (fresh and try self.addressFree(element, 0)) continue;
@@ -5751,10 +6107,11 @@ const Query = struct {
                     }
                     const scalar_safe = target != null and try self.scalarWritePreservesStorage(target.?, cell);
                     if (scalar_safe and std.mem.eql(u8, name, "@memcpy") and
-                        try self.memoryAddressBits(at_effect, arguments[1], depth + 1)) {
+                        try self.memoryAddressBits(at_effect, arguments[1], depth + 1))
+                    {
                         output.complete = false;
                         if (try self.sourceAt(at_effect, arguments[1], "", depth + 1)) |source|
-                            try self.copied_payloads.append(self.scratch.allocator(), .{ .frame = at_effect, .cell = cell, .source = source });
+                            try self.appendCopiedPayload(.{ .frame = at_effect, .cell = cell, .source = source });
                     }
                     if (!try self.addressFree(element, 0) or !scalar_safe) {
                         output.complete = false;
@@ -6018,14 +6375,14 @@ const Query = struct {
                     if (!known.complete) output.complete = false;
                     for (known.items) |item| try self.add(output, item);
                     for (known.allocations) |requirement| try output.allocations.append(self.scratch.allocator(), requirement);
-                    try self.copied_payloads.appendSlice(self.scratch.allocator(), known.copies);
+                    try self.copied_payloads.append(self.scratch.allocator(), known.copies);
                     return;
                 }
             }
         }
         const prunes = self.prunes;
         const attempt = self.beginAttempt();
-        const copies = self.copied_payloads.items.len;
+        const copies = self.copied_payloads.len;
         var local: Output = .{ .seeded = seeded };
         try self.callEffectsScan(frame, node, call_node, actual, cell, domain, result_path, &local, depth, null);
         const clean = self.endAttempt(attempt);
@@ -6047,7 +6404,7 @@ const Query = struct {
                 .complete = local.complete,
                 .items = local.items.items,
                 .allocations = local.allocations.items,
-                .copies = try self.scratch.allocator().dupe(CopiedPayload, self.copied_payloads.items[copies..]),
+                .copies = try self.copied_payloads.slice(self.scratch.allocator(), copies, self.copied_payloads.len),
             });
         }
     }
@@ -7220,6 +7577,42 @@ const Query = struct {
         }
     }
 
+    /// Copy summaries name an unchanged formal sequence, not individual pointer
+    /// values already extracted from a constructed array or unknown source.
+    fn formalElementOwner(self: *Query, frame: Frame, node: Ast.Node.Index, path: []const u8, depth: u32) Error!?fn_summary.ParamPath {
+        try self.charge();
+        if (depth >= depth_limit) {
+            self.cutoffs += 1;
+            return null;
+        }
+        if (frame.invocation != null or !frame.mutations_complete) return null;
+        const syntax = try self.syntaxPath(frame, node, depth + 1);
+        if (syntax == null or syntax.?.binding.origin != .param) {
+            const source = (try self.sourceAt(frame, node, path, depth + 1)) orelse return null;
+            if (!sameFrameBody(source.frame, frame) or source.node == node) return null;
+            return self.formalElementOwner(source.frame, source.node, "", depth + 1);
+        }
+        var selected = syntax.?;
+        selected.path = try self.join(selected.path, path);
+        if (try self.invalidatedPath(frame, selected)) return null;
+        var cell = (try self.sourceCell(frame, node, null, depth + 1)) orelse return null;
+        if (cell.binding.origin != .param or !sameFrameBody(cell.frame, frame)) return null;
+        cell.path = try self.join(cell.path, path);
+        const ty = (try self.cellType(cell, depth + 1)) orelse return null;
+        if (self.resolver.typeTag(ty) != .array) {
+            const size = try self.pointerSize(ty);
+            if (size != .slice and size != .many and size != .c) return null;
+        }
+        const writes_start = self.written_cells.len;
+        var effects: Output = .{};
+        try self.effectsFor(frame, cell, frame.return_token, frame.domain, "", &effects, depth + 1);
+        if (!effects.complete or effects.items.items.len != 0 or effects.allocations.items.len != 0) return null;
+        const writes = self.written_cells;
+        for (writes_start..writes.len) |index|
+            if (try self.cellsOverlap(cell, writes.at(index).*)) return null;
+        return .{ .param = (try self.formalIndex(frame, selected.binding)) orelse return null, .path = selected.path };
+    }
+
     fn call(self: *Query, frame: Frame, node: Ast.Node.Index, _: Mode, result_path: []const u8, output: *Output, depth: u32) Error!void {
         var buffer: [2]Ast.Node.Index = undefined;
         const ast_call = TypeResolver.CallOperands.full(frame.cache.tree, &buffer, node) orelse {
@@ -7242,7 +7635,11 @@ const Query = struct {
             if (primitive.operation == .allocate) {
                 if (try self.nodeType(frame, node)) |ty| {
                     if (try self.allocationPointee(ty)) |child| {
-                        if (try self.addressFree(child, 0)) {
+                        const independent = if (primitive.copies_elements)
+                            try self.addressNarrow(child, 0)
+                        else
+                            try self.addressFree(child, 0);
+                        if (independent) {
                             var allocator_buffer: [2]Ast.Node.Index = undefined;
                             const allocator = (try actual.callArgumentFor(frame.cache, &allocator_buffer, primitive.allocator_parameter)) orelse {
                                 output.complete = false;
@@ -7250,6 +7647,32 @@ const Query = struct {
                             };
                             try self.allocationOrigin(frame, allocator, output, depth + 1);
                             return;
+                        }
+                        if (primitive.copies_elements and self.selected_formal == null) {
+                            var source_buffer: [2]Ast.Node.Index = undefined;
+                            const source = (try actual.callArgumentFor(frame.cache, &source_buffer, 2)) orelse {
+                                output.complete = false;
+                                return;
+                            };
+                            var at_call = frame;
+                            at_call.return_token = frame.cache.tree.firstToken(node);
+                            if (try self.formalElementOwner(at_call, source, "", depth + 1)) |owner| {
+                                var allocator_buffer: [2]Ast.Node.Index = undefined;
+                                const allocator = (try actual.callArgumentFor(frame.cache, &allocator_buffer, primitive.allocator_parameter)) orelse {
+                                    output.complete = false;
+                                    return;
+                                };
+                                try self.allocationOrigin(frame, allocator, output, depth + 1);
+                                output.complete = false;
+                                try self.add(output, .{
+                                    .owner = owner,
+                                    .projection = .payload_value,
+                                    .storage = .payload_storage,
+                                    .result_path = result_path,
+                                    .element_path = "",
+                                });
+                                return;
+                            }
                         }
                     }
                 }
@@ -7344,6 +7767,18 @@ const Query = struct {
                 output.complete = false;
                 continue;
             };
+            if (alternative.element_path != null) {
+                var at_call = frame;
+                at_call.return_token = frame.cache.tree.firstToken(node);
+                output.complete = false;
+                if (try self.formalElementOwner(at_call, mapped.node, mapped.path, depth + 1)) |owner| {
+                    var translated = alternative;
+                    translated.owner = owner;
+                    translated.result_path = try self.join(result_path, alternative.result_path);
+                    try self.add(output, translated);
+                }
+                continue;
+            }
             // Project an actual private source cell before copying formal
             // coordinates. This binds allocator requirements at the caller.
             if (alternative.projection != .cell_address and mapped.path.len != 0) {
@@ -9822,7 +10257,7 @@ test "canonical expression loans distinguish finite wide enum results from opaqu
     }
 }
 
-test "borrow consumer accepts finite wide enum results but rejects opaque pointer aliases" {
+test "borrow consumer accepts finite enum copies and keeps opaque pointer results unproved" {
     const testing = @import("../testing.zig");
     const borrow = @import("../rules/borrow/borrowed_slice_into_stack_buffer_returned.zig");
     try testing.expectNoFireTyped(borrow.check,
@@ -9833,7 +10268,8 @@ test "borrow consumer accepts finite wide enum results but rejects opaque pointe
         \\    return join(&args);
         \\}
     );
-    try testing.expectFiresTyped(borrow.check, "borrowed-slice-into-stack-buffer-returned",
+    // Reporting contract: an opaque return is not a proved loan.
+    try testing.expectNoFireTyped(borrow.check,
         \\const Object = enum(u64) { integer = 1, floating = 2 };
         \\extern fn lookup(values: *const [2]Object) ?*const Object;
         \\fn unsafe() ?*const Object {
@@ -13167,4 +13603,197 @@ test "canonical expression loan proof upgrades do not depend on speculative walk
             proved = true;
         };
     try std.testing.expect(proved);
+}
+
+/// Immutable arena-owned replay sequences. Concatenation shares subtrees,
+/// including repeated ranges, without changing logical order or multiplicity.
+/// Copies and slices borrow the arena; no node can outlive its teardown.
+fn ReplayLog(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const Node = struct {
+            len: usize,
+            height: u16,
+            kind: union(enum) {
+                value: T,
+                pair: struct { left: *const Node, right: *const Node },
+            },
+        };
+
+        root: ?*const Node = null,
+        len: usize = 0,
+
+        pub fn appendValue(self: *Self, arena: std.mem.Allocator, value: T) !void {
+            const node = try arena.create(Node);
+            node.* = .{ .len = 1, .height = 1, .kind = .{ .value = value } };
+            try self.append(arena, .{ .root = node, .len = 1 });
+        }
+
+        /// Publish only after the new immutable root is complete.
+        pub fn append(self: *Self, arena: std.mem.Allocator, other: Self) !void {
+            const root = try join(arena, self.root, other.root);
+            self.* = .{ .root = root, .len = if (root) |node| node.len else 0 };
+        }
+
+        pub fn at(self: Self, index: usize) T {
+            std.debug.assert(index < self.len);
+            var node = self.root.?;
+            var offset = index;
+            while (true) switch (node.kind) {
+                .value => |value| return value,
+                .pair => |pair| {
+                    if (offset < pair.left.len) {
+                        node = pair.left;
+                    } else {
+                        offset -= pair.left.len;
+                        node = pair.right;
+                    }
+                },
+            };
+        }
+
+        pub fn slice(self: Self, arena: std.mem.Allocator, start: usize, end: usize) !Self {
+            std.debug.assert(start <= end and end <= self.len);
+            if (start == end) return .{};
+            const root = try sliceNode(arena, self.root.?, start, end);
+            return .{ .root = root, .len = end - start };
+        }
+
+        /// `keep` must be pure. Each shared subtree is filtered once, but every
+        /// retained occurrence remains in order, including repeated subtrees.
+        pub fn filtered(self: Self, arena: std.mem.Allocator, context: anytype, comptime keep: fn (@TypeOf(context), T) bool) !Self {
+            var memo: std.AutoHashMapUnmanaged(*const Node, ?*const Node) = .empty;
+            defer memo.deinit(arena);
+            const root = try filterNode(arena, self.root, context, keep, &memo);
+            return .{ .root = root, .len = if (root) |node| node.len else 0 };
+        }
+
+        fn filterNode(arena: std.mem.Allocator, root: ?*const Node, context: anytype, comptime keep: fn (@TypeOf(context), T) bool, memo: *std.AutoHashMapUnmanaged(*const Node, ?*const Node)) std.mem.Allocator.Error!?*const Node {
+            const node = root orelse return null;
+            if (memo.get(node)) |known| return known;
+            const result: ?*const Node = switch (node.kind) {
+                .value => |value| if (keep(context, value)) node else null,
+                .pair => |pair| result: {
+                    const left = try filterNode(arena, pair.left, context, keep, memo);
+                    const right = try filterNode(arena, pair.right, context, keep, memo);
+                    if (left == pair.left and right == pair.right) break :result node;
+                    break :result try join(arena, left, right);
+                },
+            };
+            try memo.put(arena, node, result);
+            return result;
+        }
+
+        fn sliceNode(arena: std.mem.Allocator, node: *const Node, start: usize, end: usize) std.mem.Allocator.Error!*const Node {
+            if (start == 0 and end == node.len) return node;
+            const pair = node.kind.pair;
+            if (end <= pair.left.len) return sliceNode(arena, pair.left, start, end);
+            if (start >= pair.left.len) return sliceNode(arena, pair.right, start - pair.left.len, end - pair.left.len);
+            const left = try sliceNode(arena, pair.left, start, pair.left.len);
+            const right = try sliceNode(arena, pair.right, 0, end - pair.left.len);
+            return (try join(arena, left, right)).?;
+        }
+
+        fn branch(arena: std.mem.Allocator, left: *const Node, right: *const Node) std.mem.Allocator.Error!*const Node {
+            const len = std.math.add(usize, left.len, right.len) catch return error.OutOfMemory;
+            const node = try arena.create(Node);
+            node.* = .{ .len = len, .height = @max(left.height, right.height) + 1, .kind = .{ .pair = .{ .left = left, .right = right } } };
+            return node;
+        }
+
+        fn balanced(arena: std.mem.Allocator, left: *const Node, right: *const Node) std.mem.Allocator.Error!*const Node {
+            if (left.height > right.height + 1) {
+                const pair = left.kind.pair;
+                if (pair.left.height >= pair.right.height)
+                    return branch(arena, pair.left, try branch(arena, pair.right, right));
+                const inner = pair.right.kind.pair;
+                return branch(arena, try branch(arena, pair.left, inner.left), try branch(arena, inner.right, right));
+            }
+            if (right.height > left.height + 1) {
+                const pair = right.kind.pair;
+                if (pair.right.height >= pair.left.height)
+                    return branch(arena, try branch(arena, left, pair.left), pair.right);
+                const inner = pair.left.kind.pair;
+                return branch(arena, try branch(arena, left, inner.left), try branch(arena, inner.right, pair.right));
+            }
+            return branch(arena, left, right);
+        }
+
+        // Persistent AVL concatenation bounds slice, indexing, and filter
+        // recursion by logical sequence height, not the number of appends.
+        fn join(arena: std.mem.Allocator, maybe_left: ?*const Node, maybe_right: ?*const Node) std.mem.Allocator.Error!?*const Node {
+            const left = maybe_left orelse return maybe_right;
+            const right = maybe_right orelse return left;
+            if (left.height > right.height + 1) {
+                const pair = left.kind.pair;
+                return try balanced(arena, pair.left, (try join(arena, pair.right, right)).?);
+            }
+            if (right.height > left.height + 1) {
+                const pair = right.kind.pair;
+                return try balanced(arena, (try join(arena, left, pair.left)).?, pair.right);
+            }
+            return try branch(arena, left, right);
+        }
+    };
+}
+
+fn replayLogOracle(gpa: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var log: ReplayLog(u32) = .{};
+    var expected: std.ArrayList(u32) = .empty;
+    defer expected.deinit(gpa);
+    for (0..128) |step| {
+        try log.appendValue(allocator, @intCast(step));
+        try expected.append(gpa, @intCast(step));
+        const start = step % expected.items.len;
+        const end = @min(start + 7, expected.items.len);
+        const snapshot = try log.slice(allocator, start, end);
+        const values = try gpa.dupe(u32, expected.items[start..end]);
+        defer gpa.free(values);
+        try log.append(allocator, snapshot);
+        try expected.appendSlice(gpa, values);
+        try std.testing.expectEqual(expected.items.len, log.len);
+        for (expected.items, 0..) |value, index| try std.testing.expectEqual(value, log.at(index));
+        for (values, 0..) |value, index| try std.testing.expectEqual(value, snapshot.at(index));
+    }
+    const Context = struct {
+        fn keep(_: void, value: u32) bool { return value % 3 == 0; }
+    };
+    const filtered = try log.filtered(allocator, @as(void, {}), Context.keep);
+    var index: usize = 0;
+    for (expected.items) |value| {
+        if (value % 3 != 0) continue;
+        try std.testing.expectEqual(value, filtered.at(index));
+        index += 1;
+    }
+    try std.testing.expectEqual(index, filtered.len);
+}
+
+test "replay log preserves ranges, order, multiplicity, and snapshots" {
+    try replayLogOracle(std.testing.allocator);
+}
+
+test "replay log allocation failures release arena storage" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, replayLogOracle, .{});
+}
+
+test "replay log filters shared repetitions without expanding them" {
+    var buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var arena = std.heap.ArenaAllocator.init(fixed.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var log: ReplayLog(u32) = .{};
+    try log.appendValue(allocator, 0);
+    try log.appendValue(allocator, 1);
+    for (0..24) |_| try log.append(allocator, log);
+    const Context = struct {
+        fn keep(_: void, value: u32) bool { return value == 1; }
+    };
+    const filtered = try log.filtered(allocator, @as(void, {}), Context.keep);
+    try std.testing.expectEqual(@as(usize, 1 << 24), filtered.len);
+    try std.testing.expectEqual(@as(u32, 1), filtered.at(0));
+    try std.testing.expectEqual(@as(u32, 1), filtered.at(filtered.len - 1));
 }

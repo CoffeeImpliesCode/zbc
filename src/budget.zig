@@ -166,6 +166,52 @@ pub const NameBuf = struct {
     }
 };
 
+/// Source lookup is scoped to one analysis. The document store owns URI/path
+/// bytes until Session.deinit; diagnostics in pending/memo records borrow them.
+/// Only exported Incomplete/Task records copy paths at their ownership boundary.
+pub const SourceScope = struct {
+    previous: ?*@import("type_engine").DocumentStore,
+
+    pub fn begin(store: *@import("type_engine").DocumentStore) SourceScope {
+        const previous = source_store;
+        source_store = store;
+        return .{ .previous = previous };
+    }
+
+    pub fn end(self: SourceScope) void {
+        source_store = self.previous;
+    }
+};
+
+threadlocal var source_store: ?*@import("type_engine").DocumentStore = null;
+
+/// Borrow the canonical path of exactly this tree, including foreign trees.
+/// AST structs may be copied; their source and node storage identify the same
+/// immutable document. A syntax-only tree with no source owner stays unknown.
+/// Lookup runs only when a bound fails, never during the successful walk.
+pub fn documentForTree(tree: *const std.zig.Ast) []const u8 {
+    const store = source_store orelse return "";
+    store.mutex.lockUncancelable(store.io);
+    defer store.mutex.unlock(store.io);
+    for (store.documents.values()) |document| {
+        if (document.tree.source.ptr != tree.source.ptr or
+            document.tree.nodes.items(.tag).ptr != tree.nodes.items(.tag).ptr) continue;
+        const uri = std.Uri.parse(document.uri.raw) catch unreachable;
+        if (!std.mem.eql(u8, uri.scheme, "file")) return "";
+        const encoded = uri.path.percent_encoded;
+        // This slice belongs to the stored URI, not a resolver's scratch arena.
+        if (std.mem.indexOfScalar(u8, encoded, '%') == null) return encoded;
+        var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        uri.path.formatRaw(&writer) catch return "";
+        const path = writer.buffered();
+        store.canonical_paths.mutex.lockUncancelable(store.io);
+        defer store.canonical_paths.mutex.unlock(store.io);
+        return store.canonical_paths.entries.get(path) orelse "";
+    }
+    return "";
+}
+
 /// What a bounded walk was doing when it gave up.
 pub const Diagnostic = struct {
     limit: Limit,
@@ -178,7 +224,42 @@ pub const Diagnostic = struct {
     /// 1-indexed; 0 when the producer had no line table.
     line: u32 = 0,
     column: u32 = 0,
+    /// Canonical source path of these coordinates; empty when unknown.
+    /// In-flight and memo records borrow Session-owned bytes.
+    document: []const u8 = "",
     function: NameBuf = .{},
+
+    /// Copy the document for the Session lifetime boundary. Empty paths allocate nothing.
+    /// The caller releases the result once with OwnedDiagnostic.deinit and the same gpa.
+    pub fn owned(self: Diagnostic, gpa: std.mem.Allocator) std.mem.Allocator.Error!OwnedDiagnostic {
+        return .{
+            .limit = self.limit,
+            .limit_value = self.limit_value,
+            .reached = self.reached,
+            .byte = self.byte,
+            .line = self.line,
+            .column = self.column,
+            .document = if (self.document.len == 0) "" else try gpa.dupe(u8, self.document),
+            .function = self.function,
+        };
+    }
+};
+
+/// A diagnostic exported beyond Session lifetime. Only this type releases paths.
+pub const OwnedDiagnostic = struct {
+    limit: Limit,
+    limit_value: u32,
+    reached: u32,
+    byte: u32,
+    line: u32,
+    column: u32,
+    document: []const u8,
+    function: NameBuf,
+
+    /// Release the copied path once, with the allocator passed to Diagnostic.owned.
+    pub fn deinit(self: *OwnedDiagnostic, gpa: std.mem.Allocator) void {
+        if (self.document.len != 0) gpa.free(self.document);
+    }
 };
 
 /// The first failure recorded on this thread since the last `take` or
@@ -236,12 +317,14 @@ pub fn lineCol(source: []const u8, byte: u32) struct { line: u32, column: u32 } 
 test "fail records the first limit and take clears it" {
     clear();
     try std.testing.expect(peek() == null);
+    var document = "/first.zig".*;
     // `fail` both records and returns, so the caller propagates the same
     // error its own callers already match on.
     try std.testing.expectEqual(error.AnalysisBudgetExceeded, fail(.{
         .limit = .block_visits,
         .limit_value = 10,
         .reached = 10,
+        .document = &document,
         .function = blk: {
             var name: NameBuf = .{};
             name.set("first");
@@ -254,6 +337,11 @@ test "fail records the first limit and take clears it" {
     try std.testing.expectEqual(@as(u32, 10), taken.limit_value);
     try std.testing.expectEqual(@as(u32, 10), taken.reached);
     try std.testing.expectEqualStrings("first", taken.function.slice());
+    try std.testing.expectEqualStrings("/first.zig", taken.document);
+    var owned = try taken.owned(std.testing.allocator);
+    defer owned.deinit(std.testing.allocator);
+    @memset(&document, 'x');
+    try std.testing.expectEqualStrings("/first.zig", owned.document);
     try std.testing.expect(peek() == null);
     try std.testing.expect(take() == null);
 }
@@ -284,4 +372,46 @@ test "lineCol reports 1-indexed line and column" {
     const past = lineCol(source, 10_000);
     try std.testing.expectEqual(@as(u32, 3), past.line);
     try std.testing.expectEqual(@as(u32, 1), past.column);
+}
+
+test "budget diagnostic ownership is encoded by distinct types" {
+    try std.testing.expect(!@hasDecl(Diagnostic, "deinit"));
+    const borrowed: Diagnostic = .{ .limit = .path_states, .limit_value = 4, .reached = 4 };
+    var exported = try borrowed.owned(std.testing.allocator);
+    defer exported.deinit(std.testing.allocator);
+    try std.testing.expect(@TypeOf(exported) != Diagnostic);
+    try std.testing.expectEqualStrings("", exported.document);
+    try std.testing.expectEqual(borrowed.limit, exported.limit);
+}
+
+test "budget owned diagnostic preserves metadata across allocation failure paths" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testOwnedDiagnostic, .{});
+}
+
+fn testOwnedDiagnostic(gpa: std.mem.Allocator) !void {
+    var name: NameBuf = .{};
+    name.set("foreign");
+    var document = "/foreign.zig".*;
+    const borrowed: Diagnostic = .{
+        .limit = .return_storage_work,
+        .limit_value = 50000,
+        .reached = 50000,
+        .byte = 27,
+        .line = 3,
+        .column = 4,
+        .document = &document,
+        .function = name,
+    };
+    var exported = try borrowed.owned(gpa);
+    defer exported.deinit(gpa);
+    try std.testing.expect(exported.document.ptr != borrowed.document.ptr);
+    @memset(&document, 'x');
+    try std.testing.expectEqualStrings("/foreign.zig", exported.document);
+    try std.testing.expectEqualStrings("foreign", exported.function.slice());
+    try std.testing.expectEqual(borrowed.limit, exported.limit);
+    try std.testing.expectEqual(borrowed.limit_value, exported.limit_value);
+    try std.testing.expectEqual(borrowed.reached, exported.reached);
+    try std.testing.expectEqual(borrowed.byte, exported.byte);
+    try std.testing.expectEqual(borrowed.line, exported.line);
+    try std.testing.expectEqual(borrowed.column, exported.column);
 }

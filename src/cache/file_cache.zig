@@ -604,6 +604,9 @@ pub const FileCache = struct {
     /// declaration identity and selected formal. Abstentions are not cached.
     method_scalar_reads: std.HashMapUnmanaged(CleanupKey, []const []const u8, CleanupKeyContext, 80) = .empty,
     method_scalar_reads_visiting: std.HashMapUnmanaged(CleanupKey, void, CleanupKeyContext, 80) = .empty,
+    /// Diagnostic-only unproved positive writes; null means unrestricted reach.
+    diagnostic_output_touches: std.HashMapUnmanaged(CleanupKey, ?[]const []const u8, CleanupKeyContext, 80) = .empty,
+    diagnostic_output_touches_visiting: std.HashMapUnmanaged(CleanupKey, void, CleanupKeyContext, 80) = .empty,
     store_value_visiting: std.HashMapUnmanaged(CleanupKey, void, CleanupKeyContext, 80) = .empty,
     cleanup_frame: ?TypeResolver.ResolutionFrame = null,
     /// Complete source-defined return values, under defined runtime formals.
@@ -2214,6 +2217,12 @@ pub const FileCache = struct {
         return proved;
     }
 
+    /// Raw possible-write mapping; no must-write or returned-value credit.
+    pub fn possibleAddressUseAt(self: *FileCache, token: Ast.TokenIndex) SummaryError!?AddressUse {
+        if (self.address_uses == null) self.address_uses = try self.buildAddressUses();
+        return self.address_uses.?.get(token);
+    }
+
     pub fn undefinedAddressUseAt(self: *FileCache, token: Ast.TokenIndex, success_bool: ?bool) anyerror!?AddressUse {
         if (self.address_uses == null) self.address_uses = try self.buildAddressUses();
         var use = self.address_uses.?.get(token) orelse return null;
@@ -2292,6 +2301,234 @@ pub const FileCache = struct {
         defer self.leaveNormalCleanup();
         try self.chargeNormalCleanup(call_node);
         return self.scalarReadsForUse(.{ .operand = argument, .address_node = argument, .call_node = call_node, .may_write = false }, call_node, canonical, true);
+    }
+
+    /// Overlay only writes whose positive byte effect is not source-proven.
+    /// Source-proven copies, negative writes and loop recipes retain their
+    /// existing masks; this query never grants an initialization certificate.
+    pub fn diagnosticOutputTouchesAt(self: *FileCache, call_token: Ast.TokenIndex, frame: ?TypeResolver.ResolutionFrame, argument: Ast.Node.Index) SummaryError!?MethodScalarReads {
+        const canonical = (try self.actualCallSummaryAt(call_token, frame)) orelse return null;
+        const tree = canonical.callee.tree;
+        const body = tokens.bodyOf(tree, canonical.callee.declaration) orelse return null;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, canonical.callee.declaration) orelse return null;
+        var parameters = proto.iterate(tree);
+        var parameter_index: u32 = 0;
+        var name: ?[]const u8 = null;
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        while (parameters.next()) |parameter| : (parameter_index += 1) {
+            const actual = (try canonical.callArgumentFor(self, &argument_buffer, parameter_index)) orelse continue;
+            if (actual != argument) continue;
+            name = tree.tokenSlice(parameter.name_token orelse return null);
+            break;
+        }
+        var key = resolvedCleanupKey(canonical.callee.reference, canonical.callee.declaration);
+        key.demand = .{ .one = parameter_index };
+        if (self.diagnostic_output_touches.get(key)) |cached| {
+            const paths = cached orelse return null;
+            var result: MethodScalarReads = .{ .receiver = argument, .field_count = paths.len };
+            @memcpy(result.fields[0..paths.len], paths);
+            return result;
+        }
+        if (self.diagnostic_output_touches_visiting.contains(key)) return null;
+        try self.diagnostic_output_touches_visiting.put(self.gpa, key, {});
+        defer _ = self.diagnostic_output_touches_visiting.remove(key);
+        const declaring = (try canonical.declaringCache(self)) orelse return null;
+        const resolver = declaring.zls orelse return null;
+        const formal_types = canonical.callee.reference.actual_type.data.function.parameters;
+        if (parameter_index >= formal_types.len) return null;
+        const formal_type = (try resolver.normalizedType(formal_types[parameter_index].type)) orelse return null;
+        if (resolver.pointerSize(formal_type) == null) return .{ .receiver = argument };
+        const read_only = switch (formal_type.data) {
+            .pointer => |pointer| pointer.is_const,
+            .ip_index => switch (resolver.ctx.ip.indexToKey(formal_type.ipIndex() orelse return null)) {
+                .pointer_type => |pointer| pointer.flags.is_const,
+                else => false,
+            },
+            else => false,
+        };
+        if (read_only) return .{ .receiver = argument };
+        // Build the callee's bindings now; the context names them by body and
+        // reacquires them at each use, because the nested touch queries below
+        // can grow `declaring.bindings` and move every borrowed entry.
+        _ = try declaring.localBindings(proto, body);
+        const context: DiagnosticTouchContext = .{
+            .declaring = declaring,
+            .frame = resolver.frameForFunction(canonical.callee.reference),
+            .body = body,
+        };
+        var result: MethodScalarReads = .{ .receiver = argument };
+        self.beginNormalCleanup();
+        defer self.endNormalCleanup();
+        if (!try self.collectDiagnosticOutputTouches(tree, body, name orelse return null, &result, context, 0)) {
+            try self.diagnostic_output_touches.put(self.gpa, key, null);
+            return null;
+        }
+        if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+        const paths = try self.summary_arena.?.allocator().dupe([]const u8, result.fields[0..result.field_count]);
+        try self.diagnostic_output_touches.put(self.gpa, key, paths);
+        return result;
+    }
+
+    fn diagnosticOutputPath(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, name: []const u8, depth: u32) SummaryError!?struct { path: []const u8, precise: bool = true } {
+        if (depth == 64) return null;
+        switch (tree.nodeTag(node)) {
+            .identifier => return if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name)) .{ .path = "" } else null,
+            .deref => {
+                const base = tree.nodeData(node).node;
+                if (tree.nodeTag(base) != .identifier) return null;
+                return self.diagnosticOutputPath(tree, base, name, depth + 1);
+            },
+            .address_of => return self.diagnosticOutputPath(tree, tree.nodeData(node).node, name, depth + 1),
+            .grouped_expression => return self.diagnosticOutputPath(tree, tree.nodeData(node).node_and_token[0], name, depth + 1),
+            .array_access => {
+                const base, const subscript = tree.nodeData(node).node_and_node;
+                const prefix = (try self.diagnosticOutputPath(tree, base, name, depth + 1)) orelse return null;
+                if (!prefix.precise) return prefix;
+                if (tree.nodeTag(subscript) != .number_literal) return .{ .path = prefix.path, .precise = false };
+                const index = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(subscript)), 0) catch return .{ .path = prefix.path, .precise = false };
+                if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+                return .{ .path = try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}[{d}]", .{ prefix.path, index }) };
+            },
+            .field_access => {
+                const base, const selector = tree.nodeData(node).node_and_token;
+                const prefix = (try self.diagnosticOutputPath(tree, base, name, depth + 1)) orelse return null;
+                if (!prefix.precise) return prefix;
+                if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+                return .{ .path = try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}{s}{s}", .{ prefix.path, if (prefix.path.len == 0) "" else ".", tree.tokenSlice(selector) }) };
+            },
+            else => return null,
+        }
+    }
+
+    const DiagnosticTouchContext = struct {
+        declaring: *FileCache,
+        frame: TypeResolver.ResolutionFrame,
+        /// Key of a `declaring.bindings` entry built before the walk. Entries
+        /// are only removed at cache teardown, but the table can rehash.
+        body: Ast.Node.Index,
+
+        fn bindings(context: DiagnosticTouchContext) *const local_bindings.LocalBindings {
+            return context.declaring.bindings.getPtr(@intFromEnum(context.body)).?;
+        }
+    };
+
+    fn appendDiagnosticTouch(result: *MethodScalarReads, path: []const u8) bool {
+        for (result.fields[0..result.field_count]) |old|
+            if (std.mem.eql(u8, old, path)) return true;
+        if (result.field_count == result.fields.len) return false;
+        result.fields[result.field_count] = path;
+        result.field_count += 1;
+        return true;
+    }
+
+    /// Local induction variables and scalar-counter dereferences already have
+    /// source-proven loop recipes. A record member or a free runtime parameter
+    /// does not identify the byte that a write will replace.
+    fn diagnosticUnprovedIndex(tree: *const Ast, node: Ast.Node.Index, context: DiagnosticTouchContext, depth: u32) bool {
+        if (depth == 64) return true;
+        switch (tree.nodeTag(node)) {
+            .field_access => return true,
+            .identifier => {
+                const token = tree.nodeMainToken(node);
+                const binding = context.bindings().findAt(tree.tokenSlice(token), token) orelse return false;
+                return binding.origin == .param;
+            },
+            .deref, .number_literal => return false,
+            else => {
+                var children = engine.AstIterator.init(tree, node);
+                while (children.next(tree)) |child|
+                    if (diagnosticUnprovedIndex(tree, child, context, depth + 1)) return true;
+                return false;
+            },
+        }
+    }
+
+    fn diagnosticOpaqueValue(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, context: DiagnosticTouchContext, depth: u32) SummaryError!bool {
+        if (depth == 64) return true;
+        var call_buffer: [2]Ast.Node.Index = undefined;
+        if (TypeResolver.CallOperands.full(tree, &call_buffer, node)) |call| {
+            const canonical = (try context.declaring.actualCallSummaryAt(call.queryToken(tree, node), context.frame)) orelse return true;
+            return tokens.bodyOf(canonical.callee.tree, canonical.callee.declaration) == null;
+        }
+        var children = engine.AstIterator.init(tree, node);
+        while (children.next(tree)) |child|
+            if (try self.diagnosticOpaqueValue(tree, child, context, depth + 1)) return true;
+        return false;
+    }
+
+    fn collectDiagnosticOutputTouches(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, name: []const u8, result: *MethodScalarReads, context: DiagnosticTouchContext, depth: u32) SummaryError!bool {
+        if (depth == 64) return false;
+        try self.chargeNormalCleanupAt(tree, node);
+        const tag = tree.nodeTag(node);
+        const assignment = switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
+            .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor,
+            .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap,
+            .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat,
+            => true,
+            else => false,
+        };
+        if (assignment) {
+            const target, const value = tree.nodeData(node).node_and_node;
+            if (tokens.rootIdentifier(tree, target)) |root| {
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(root)), name)) {
+                    const path = (try self.diagnosticOutputPath(tree, target, name, 0)) orelse return false;
+                    const literal_undefined = tree.nodeTag(value) == .identifier and
+                        std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "undefined");
+                    var unproved_index = false;
+                    var targets = engine.AstIterator.init(tree, target);
+                    if (tree.nodeTag(target) == .array_access) {
+                        unproved_index = diagnosticUnprovedIndex(tree, tree.nodeData(target).node_and_node[1], context, 0);
+                    }
+                    while (targets.next(tree)) |child| {
+                        if (tree.nodeTag(child) != .array_access) continue;
+                        unproved_index = unproved_index or diagnosticUnprovedIndex(tree, tree.nodeData(child).node_and_node[1], context, 0);
+                    }
+                    const opaque_value = try self.diagnosticOpaqueValue(tree, value, context, 0);
+                    const mutable_value = if (tree.nodeTag(value) == .identifier) mutable: {
+                        const token = tree.nodeMainToken(value);
+                        const binding = context.bindings().findAt(tree.tokenSlice(token), token) orelse break :mutable false;
+                        break :mutable binding.origin != .param and !binding.is_const;
+                    } else false;
+                    const selected_value = tree.nodeTag(value) == .array_access;
+                    if (tag == .assign and !literal_undefined and (unproved_index or opaque_value or (path.precise and (mutable_value or selected_value))))
+                        if (!appendDiagnosticTouch(result, path.path)) return false;
+                    return self.collectDiagnosticOutputTouches(tree, value, name, result, context, depth + 1);
+                }
+            }
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
+            var arguments = call.ast.params;
+            var receiver: [1]Ast.Node.Index = undefined;
+            if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+                receiver[0] = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+                if ((try self.diagnosticOutputPath(tree, receiver[0], name, 0)) != null)
+                    arguments = &receiver;
+            }
+            for (arguments) |argument| {
+                const path = (try self.diagnosticOutputPath(tree, argument, name, 0)) orelse continue;
+                const touches = try context.declaring.diagnosticOutputTouchesAt(call.queryToken(tree, node), context.frame, argument);
+                const whole = [1][]const u8{""};
+                const paths = if (touches) |*scope| scope.fields[0..scope.field_count] else &whole;
+                for (paths) |child| {
+                    if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+                    const selected = if (child.len == 0) path.path else if (path.path.len == 0) child else
+                        try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}.{s}", .{ path.path, child });
+                    if (!appendDiagnosticTouch(result, selected)) return false;
+                }
+            }
+            return true;
+        }
+        if (tag == .field_access or tag == .array_access or tag == .deref or tag == .address_of) {
+            if (tokens.rootIdentifier(tree, node)) |root|
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(root)), name)) return true;
+        }
+        var children = engine.AstIterator.init(tree, node);
+        while (children.next(tree)) |child|
+            if (!try self.collectDiagnosticOutputTouches(tree, child, name, result, context, depth + 1)) return false;
+        return true;
     }
 
     /// Reuse the raw method-address mapping even when it proves no write.
@@ -3315,7 +3552,9 @@ pub const FileCache = struct {
             if (actual.data != .container) return answer;
             const owner = frame.resolver.frameForContainer(actual.data.container);
             const owner_tree = &owner.handle.document.tree;
-            const container = owner_tree.fullContainerDecl(&buffer, actual.data.container.scope_handle.toNode()) orelse return answer;
+            // `literal.ast.fields` may borrow `buffer`; the container needs its own.
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            const container = owner_tree.fullContainerDecl(&container_buffer, actual.data.container.scope_handle.toNode()) orelse return answer;
             for (container.ast.members) |member| {
                 try self.chargeNormalCleanupAt(owner_tree, member);
                 const field = owner_tree.fullContainerField(member) orelse continue;
@@ -3494,17 +3733,13 @@ pub const FileCache = struct {
         if (can_memo_failure) {
             if (origin.return_replay_failures.get(failure_key)) |failed| {
                 if (failed.memo_entries == memo_entries and failed.exhausted_entries == exhausted_entries) {
-                    // Replay preserves the spent allowance and raw inner
-                    // site, but the current caller owns the reported error.
+                    // Preserve the first diagnostic and the raw inner site:
+                    // reusing a walk must not move its failure into another file.
                     try declaring.enterNormalCleanup(body);
                     defer declaring.leaveNormalCleanup();
                     cleanup_budget.remaining = failed.remaining;
-                    return self.cleanupBudgetFailureAt(
-                        failed.site.tree,
-                        failed.diagnostic.limit,
-                        failed.diagnostic.limit_value,
-                        failed.site.node,
-                    );
+                    if (replay_failure_site == null) replay_failure_site = failed.site;
+                    return budget_mod.fail(failed.diagnostic);
                 }
                 _ = origin.return_replay_failures.remove(failure_key);
             }
@@ -3603,7 +3838,7 @@ pub const FileCache = struct {
             stores.deinit(origin.gpa);
         }
         try worklist_mod.check(origin.gpa, &graph, .{
-            .path = declaring.file_path,
+            .path = budget_mod.documentForTree(callee.tree),
             .return_defined = &defined,
             .return_undefined = &undefined_value,
             .return_all_undefined = &all_undefined,
@@ -4610,6 +4845,22 @@ pub const FileCache = struct {
         try self.chargeNormalCleanupAt(call_tree, call_node);
         const resolver = self.zls orelse return false;
         const normalized = (try resolver.normalizedType(actual)) orelse return physical;
+        if (physical and resolver.typeTag(normalized) == .array) {
+            const count = definiteStoreArrayTypeCount(resolver, normalized) orelse return false;
+            if (count > fields.len - coverage.field_count) return false;
+            const child = resolver.childType(normalized) orelse return false;
+            if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+            for (0..@as(usize, @intCast(count))) |element| {
+                const path = try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}[{d}]", .{ prefix, element });
+                const index = coverage.field_count;
+                fields[index] = path;
+                coverage.field_names[index] = path;
+                defaults[index] = null;
+                coverage.field_count += 1;
+                if (!try self.storeCoverageFieldsAt(child, path, fields, defaults, coverage, call_tree, call_node, true)) return false;
+            }
+            return true;
+        }
         if (resolver.typeTag(normalized) != .@"struct") return true;
         if (normalized.data != .container) return false;
         const container = normalized.data.container.scope_handle;
@@ -4647,13 +4898,28 @@ pub const FileCache = struct {
 
     fn storeFieldIndex(proof: *const DefiniteStoreProof, name: []const u8, fields: []const []const u8, lhs: Ast.Node.Index) SummaryError!?usize {
         const tree = proof.tree;
-        if (tree.nodeTag(lhs) != .field_access) return null;
+        if (tree.nodeTag(lhs) != .field_access and tree.nodeTag(lhs) != .array_access) return null;
         const root = tokens.rootIdentifier(tree, lhs) orelse return null;
         if (!std.mem.eql(u8, proof.formalName(tree.tokenSlice(tree.nodeMainToken(root))), name)) return null;
         for (fields, 0..) |path, index| {
             var current = lhs;
             var end = path.len;
-            while (tree.nodeTag(current) == .field_access) {
+            while (tree.nodeTag(current) == .field_access or tree.nodeTag(current) == .array_access) {
+                if (tree.nodeTag(current) == .array_access) {
+                    const base, const subscript = tree.nodeData(current).node_and_node;
+                    const element = (try definiteStoreInteger(proof, subscript)) orelse break;
+                    if (end == 0 or path[end - 1] != ']') break;
+                    const start = std.mem.lastIndexOfScalar(u8, path[0..end], '[') orelse break;
+                    const expected = std.fmt.parseInt(u64, path[start + 1 .. end - 1], 10) catch break;
+                    if (element != expected) break;
+                    current = base;
+                    end = start;
+                    if (end == 0) {
+                        if (current == root) return index;
+                        break;
+                    }
+                    continue;
+                }
                 const base, const token = tree.nodeData(current).node_and_token;
                 const start = if (std.mem.lastIndexOfScalar(u8, path[0..end], '.')) |dot| dot + 1 else 0;
                 if (!std.mem.eql(u8, tree.tokenSlice(token), path[start..end])) break;
@@ -5784,7 +6050,9 @@ pub const FileCache = struct {
             if (!proof.setStorePointee(tree.nodeMainToken(base), .defined)) return null;
             return true;
         }
-        if (tree.nodeTag(lhs) == .field_access) {
+        if (tree.nodeTag(lhs) == .field_access or
+            (tree.nodeTag(lhs) == .array_access and proof.written_inputs != null))
+        {
             const field_root = tokens.rootIdentifier(tree, lhs) orelse return null;
             if (proof.computed_templates != null and
                 !std.mem.eql(u8, proof.formalName(tree.tokenSlice(tree.nodeMainToken(field_root))), context.name) and
@@ -8154,7 +8422,10 @@ pub const FileCache = struct {
         const actual_tag = proof.frame.resolver.typeTag(actual) orelse return null;
         const wrapper = switch (expected_tag) {
             .optional, .error_union => expected,
-            else => switch (actual_tag) { .optional, .error_union => actual, else => return null },
+            else => switch (actual_tag) {
+                .optional, .error_union => actual,
+                else => return null,
+            },
         };
         var value_type = actual;
         if (actual.eql(wrapper)) {
@@ -9354,6 +9625,7 @@ pub const FileCache = struct {
                 .limit = .address_use_nodes,
                 .limit_value = std.math.maxInt(u32),
                 .reached = std.math.maxInt(u32),
+                .document = budget_mod.documentForTree(self.tree),
             });
         var frames: [FileCache.max_address_use_frames]Frame = undefined;
         // A `.root` node's children live in its `extra_range`; the plain
@@ -9470,6 +9742,7 @@ pub const FileCache = struct {
             .limit_value = limit_value,
             .reached = reached,
             .byte = byte,
+            .document = budget_mod.documentForTree(self.tree),
             .line = line_col.line,
             .column = line_col.column,
             .function = name,
@@ -9577,6 +9850,8 @@ pub const FileCache = struct {
         self.array_source_visiting.deinit(self.gpa);
         self.method_scalar_reads.deinit(self.gpa);
         self.method_scalar_reads_visiting.deinit(self.gpa);
+        self.diagnostic_output_touches.deinit(self.gpa);
+        self.diagnostic_output_touches_visiting.deinit(self.gpa);
         self.store_value_visiting.deinit(self.gpa);
         self.retained_writes.deinit(self.gpa);
         var mit = self.method_lookup_cache.iterator();
@@ -11151,6 +11426,7 @@ pub const FileCache = struct {
             .limit_value = cap,
             .reached = cap,
             .byte = byte,
+            .document = budget_mod.documentForTree(tree),
             .line = lc.line,
             .column = lc.column,
             .function = name,
@@ -12393,6 +12669,7 @@ pub fn tokenBudgetFailure(
         .limit_value = cap,
         .reached = cap,
         .byte = byte,
+        .document = budget_mod.documentForTree(tree),
         .line = position.line,
         .column = position.column,
         .function = name,
@@ -14036,29 +14313,55 @@ test "FileCache: active storage clone preflight uses cleanup allowance" {
 
 test "FileCache: foreign storage clone preflight retains initiating node ownership" {
     const gpa = std.testing.allocator;
-    var tree = try Ast.parse(gpa, "fn caller() void {}", .zig);
-    defer tree.deinit(gpa);
-    var foreign = try Ast.parse(gpa,
-        "const padding = .{" ++ "0," ** 16 ++ "};\nfn foreign() void {}", .zig);
-    defer foreign.deinit(gpa);
-    var cache = FileCache.init(gpa, &tree);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "caller.zig",
+        .data = "const imported = @import(\"foreign file%.zig\");\nfn caller() void {}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "foreign file%.zig",
+        .data = "const padding = .{" ++ "0," ** 16 ++ "};\nfn foreign() void {}",
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const caller_path = try std.fs.path.join(gpa, &.{ root, "caller.zig" });
+    defer gpa.free(caller_path);
+    const foreign_path = try std.fs.path.join(gpa, &.{ root, "foreign file%.zig" });
+    defer gpa.free(foreign_path);
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{root} };
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, caller_path, null);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const imported = try context.sourceHandle(foreign_path, .unscoped);
+    const foreign = &imported.document.tree;
+    const source_scope = budget_mod.SourceScope.begin(&context.store);
+    defer source_scope.end();
+    var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
+    cache.setZls(&resolver);
     const node = foreign.rootDecls()[1];
     try std.testing.expect(@intFromEnum(node) >= tree.nodes.len);
     const outcomes = [_]fn_summary.StorageOutcome{.{ .operations = &.{} }};
     const summary = fn_summary.FnSummary{ .normal_success_storage_outcomes = &outcomes };
     cache.beginNormalCleanup();
     defer cache.endNormalCleanup();
-    try cache.enterNormalCleanupAt(&foreign, node);
+    try cache.enterNormalCleanupAt(foreign, node);
     defer cache.leaveNormalCleanup();
     _ = budget_mod.take();
     defer _ = budget_mod.take();
     cleanup_budget.remaining = 0;
-    try std.testing.expectError(error.AnalysisBudgetExceeded,
-        cache.chargeCleanupStorageClone(summary, cleanup_budget.initiating_tree.?, cleanup_budget.initiating_node.?));
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.chargeCleanupStorageClone(summary, cleanup_budget.initiating_tree.?, cleanup_budget.initiating_node.?));
     const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(budget_mod.Limit.normal_cleanup_nodes, failure.limit);
     try std.testing.expectEqualStrings("foreign", failure.function.slice());
+    try std.testing.expectEqualStrings(foreign_path, failure.document);
+    try std.testing.expect(!std.mem.eql(u8, caller_path, failure.document));
     try std.testing.expectEqual(foreign.tokenStart(foreign.nodeMainToken(node)), failure.byte);
 }
 
@@ -16546,7 +16849,7 @@ test "FileCache: completed source-free return cycles retain exact instantiation 
     try std.testing.expectEqual(@as(usize, 0), cache.return_source_visiting.count());
 }
 
-test "FileCache: return replay failures retain allowances contexts and current caller ownership" {
+test "FileCache: return replay failures retain allowances contexts and first diagnostic ownership" {
     const gpa = std.testing.allocator;
     const source: [:0]const u8 =
         \\fn hole(comptime poisoned: bool, value: u8) u8 {
@@ -16562,6 +16865,8 @@ test "FileCache: return replay failures retain allowances contexts and current c
     defer context.deinit();
     var resolver: engine.TypeResolver = undefined;
     try resolver.init(&context, gpa, "/tmp/zbc-return-replay-failure.zig", source);
+    const source_scope = budget_mod.SourceScope.begin(&context.store);
+    defer source_scope.end();
     defer resolver.deinit();
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
@@ -16589,18 +16894,20 @@ test "FileCache: return replay failures retain allowances contexts and current c
     try std.testing.expect(!calls[0].callee.reference.actual_type.eql(calls[2].callee.reference.actual_type));
     _ = budget_mod.take();
     defer _ = budget_mod.take();
-    const owners = [_][]const u8{ "first", "second", "safe" };
+    const owners = [_][]const u8{ "first", "first", "safe" };
     for (calls, 0..) |call, index| {
         cache.beginNormalCleanup();
-        // Source admission can leave the initiating caller set after its
-        // own stack unwinds. A memo must report this caller, not the first.
+        // Source admission leaves an initiating caller after its stack unwinds.
+        // A memo retains the first stopped walk, not the later caller's site.
         try cache.enterNormalCleanup(nodes[index]);
         cache.leaveNormalCleanup();
         cleanup_budget.remaining = 0;
         try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(query_tokens[index], null, true, &call));
         const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("/tmp/zbc-return-replay-failure.zig", failure.document);
         try std.testing.expectEqualStrings(owners[index], failure.function.slice());
-        try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(nodes[index])), failure.byte);
+        const diagnostic_node = nodes[if (index == 1) 0 else index];
+        try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(diagnostic_node)), failure.byte);
         try std.testing.expectEqual(@as(u32, 0), cleanup_budget.remaining);
         cache.endNormalCleanup();
         try std.testing.expectEqual(@as(usize, if (index == 2) 2 else 1), cache.return_replay_failures.count());
@@ -16630,7 +16937,11 @@ test "FileCache: return replay failures retain allowances contexts and current c
             .context = null,
         },
         .mode = .whole,
-    }, .{ .budget = 50_000, .limit = .normal_cleanup_nodes, .cap = 50_000, .reached = 50_000 });
+    }, .{ .budget = 50_000, .diagnostic = .{
+        .limit = .normal_cleanup_nodes,
+        .limit_value = 50_000,
+        .reached = 50_000,
+    } });
     cache.beginNormalCleanup();
     cleanup_budget.remaining = 0;
     try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(query_tokens[0], null, true, &calls[0]));
@@ -16798,14 +17109,13 @@ test "FileCache: memoized replay failures outlive nested caches and borrowed dem
     cache.leaveNormalCleanup();
     cleanup_budget.remaining = 0;
     const call = calls[1];
-    try std.testing.expectError(error.AnalysisBudgetExceeded,
-        cache.callResultValueAt(tree.nodeMainToken(nodes[1]), null, true, &call));
+    try std.testing.expectError(error.AnalysisBudgetExceeded, cache.callResultValueAt(tree.nodeMainToken(nodes[1]), null, true, &call));
     const failure = budget_mod.take() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("second", failure.function.slice());
+    try std.testing.expectEqualStrings("first", failure.function.slice());
     try std.testing.expectEqual(.normal_cleanup_nodes, failure.limit);
     try std.testing.expectEqual(@as(u32, 50_000), failure.limit_value);
     try std.testing.expectEqual(@as(u32, 50_000), failure.reached);
-    try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(nodes[1])), failure.byte);
+    try std.testing.expectEqual(tree.tokenStart(tree.nodeMainToken(nodes[0])), failure.byte);
     try std.testing.expectEqual(@as(u32, 0), cleanup_budget.remaining);
     try std.testing.expectEqual(&foreign, replay_failure_site.?.tree);
     try std.testing.expectEqual(foreign_node, replay_failure_site.?.node);

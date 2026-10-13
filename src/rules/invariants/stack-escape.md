@@ -11,6 +11,16 @@ token index, does not borrow the scratch buffer used to obtain it. Returning
 the complete view can still escape when its slices point into that buffer.
 Explicit integer encodings of local addresses remain tracked.
 
+Copying a pointer or slice element out of a local array copies the element's
+stored payload. It does not take the address of the array. A by-value loop
+capture follows that same rule, including when a helper stores it in a
+returned aggregate. Returning a slice of the local array, an element address,
+or an element whose payload points into a local buffer still escapes.
+
+A helper that copies scalar pointee values into a returned aggregate does
+not also copy the addresses used to read those values. The rule checks
+the copied value before following its formal-to-actual storage mapping.
+
 ## Example
 
 Incorrect:

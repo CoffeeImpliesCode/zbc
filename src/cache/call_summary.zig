@@ -253,9 +253,7 @@ const ExhaustedKeyContext = struct {
 const Exhausted = struct {
     /// The allowance the exhausted walk started with.
     budget: u32,
-    limit: budget_mod.Limit,
-    cap: u32,
-    reached: u32,
+    diagnostic: budget_mod.Diagnostic,
 };
 
 /// Scopes the thread's pending budget diagnostic to one walk.  `begin` sets
@@ -596,6 +594,7 @@ pub const State = struct {
             .limit_value = cap,
             .reached = reached,
             .byte = byte,
+            .document = budget_mod.documentForTree(tree),
             .line = position.line,
             .column = position.column,
             .function = name,
@@ -1200,7 +1199,7 @@ fn collectWitnesses(
         if (allowance <= known.budget) {
             // Exactly what the exhausted walk left behind: no allowance.
             state.counter().* = 0;
-            return state.report(known.limit, known.cap, known.reached);
+            return budget_mod.fail(known.diagnostic);
         }
     }
     const filed = state.sets.count() + state.scoped.count() + state.verdict_count;
@@ -1216,9 +1215,7 @@ fn collectWitnesses(
         {
             if (own) |first| state.exhausted.put(gpa, demand, .{
                 .budget = allowance,
-                .limit = first.limit,
-                .cap = first.limit_value,
-                .reached = first.reached,
+                .diagnostic = first,
             }) catch {};
         }
         return err;
@@ -3413,6 +3410,8 @@ test "an exhausted root demand fails again at once with the same diagnostic" {
     try std.testing.expectEqual(first.reached, second.reached);
     try std.testing.expectEqual(first.byte, second.byte);
     try std.testing.expectEqual(first.line, second.line);
+    try std.testing.expectEqual(first.column, second.column);
+    try std.testing.expectEqualStrings(first.document, second.document);
     try std.testing.expectEqualStrings(first.function.slice(), second.function.slice());
     try std.testing.expectEqual(@as(u32, 1), state.exhausted.count());
     state.end();
@@ -3470,14 +3469,16 @@ test "a recorded failure never replaces a completed answer and a completed walk 
     };
     const stale: Exhausted = .{
         .budget = actual_query_work_limit,
-        .limit = .readonly_call_nodes,
-        .cap = actual_query_work_limit,
-        .reached = actual_query_work_limit,
+        .diagnostic = .{
+            .limit = .readonly_call_nodes,
+            .limit_value = actual_query_work_limit,
+            .reached = actual_query_work_limit,
+        },
     };
 
     // A record whose allowance is smaller than this query's does not stop it;
     // the walk completes, files its answer and drops the record.
-    try state.exhausted.put(gpa, demand, .{ .budget = 1, .limit = stale.limit, .cap = stale.cap, .reached = stale.reached });
+    try state.exhausted.put(gpa, demand, .{ .budget = 1, .diagnostic = stale.diagnostic });
     const done = try witnessesFor(cache, light, 0, "", view, &state);
     try std.testing.expectEqual(Effect.read_only, mergeRooted(done, 0));
     try std.testing.expectEqual(@as(u32, 0), state.exhausted.count());

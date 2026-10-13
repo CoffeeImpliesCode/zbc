@@ -51,7 +51,12 @@ fn checkFn(
             },
             else => {},
         }
-        if (depth == frames.len) return budget_mod.fail(.{ .limit = .memset_walk_depth, .limit_value = frames.len, .reached = frames.len });
+        if (depth == frames.len) return budget_mod.fail(.{
+            .limit = .memset_walk_depth,
+            .limit_value = frames.len,
+            .reached = frames.len,
+            .document = budget_mod.documentForTree(tree),
+        });
         frames[depth] = Iterator.init(tree, node);
         depth += 1;
     }

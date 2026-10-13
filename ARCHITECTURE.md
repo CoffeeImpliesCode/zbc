@@ -1,7 +1,7 @@
 # zbc architecture
 
 zbc is a static analyzer for Zig, pinned to Zig 0.16.0.
-<!-- VERIFY: Update supported-invariant and documented-rule counts from the final CLI lists. -->
+It checks 112 supported invariants and documents 99 rules (`--list-invariants`, `--list-rules`, 2026-10-13).
 It uses two analysis families:
 
 1. **Flow analysis** uses a per-function control-flow graph and abstract interpretation.
@@ -17,6 +17,9 @@ Both families produce `Problem` values for the same reporter.
 Rules report proved problems, except for advisory numeric warnings.
 `stack-escape` requires a proved loan from function-local storage.
 Unresolved field chains and opaque call results stay silent. Direct proved loans still report.
+`borrowed-slice-into-stack-buffer-returned` also requires a proved expression loan.
+Conservative call-argument and event dependencies remain available to storage queries,
+but cannot serve as escape witnesses.
 Silence is not a safety certificate.
 
 `use-undefined` reports reads of proved-undefined bytes, not missing initialization certificates.
@@ -29,6 +32,9 @@ Unknown values alone remain silent and supply no positive initialization certifi
 Copies from container-level constants carry unknown holes, not undefined holes.
 A direct selected read on the constant still reports proved-undefined bytes.
 Strict initialization certificates are unchanged.
+Prefix joins first record common numeric predicates while each input still has its original bounds.
+They retain path-local predicates until empty-prefix entailment is checked, then remove predicates not proved by both inputs.
+Capacity-clipped push prefixes require a capacity guard at a selected read; copying a count does not remove that requirement.
 
 `index-type-narrowing-wraparound`, `intfromfloat-without-clamp`, and `f32-narrowing-int-to-float` retain advisory warnings.
 They warn when the required integer range, finite conversion range, or exact float representation is not proved.
@@ -189,6 +195,12 @@ Coverage reports `selected = analyzed + partial + failed` and counts unsuppresse
 Failed selection operands count as selected failures. Parse and analysis failures do not count as analyzed.
 A file with a non-empty `Analysis.incomplete` counts as `partial`, never as analyzed or failed.
 The CLI prints its findings in every format and one `zbc: incomplete` stderr line for each part that gave up.
+Budget positions name their own canonical source document, including imported files.
+The suffix is `at <document>:<line>:<column>`, or `at <document>+<byte>` without a line.
+In-flight and memo records use `budget.Diagnostic`, which borrows session-owned paths and has no destructor.
+`appendIncomplete` and `runOne` copy paths into `budget.OwnedDiagnostic` before their results can outlive the session.
+Only the owning type releases the copied path; empty paths need no allocation.
+Memoized failures retain the first diagnostic's document and position.
 Unresolved import lookups have a separate counter.
 That counter is not proof that external types resolved completely.
 
@@ -267,6 +279,12 @@ Its keys borrow canonical resolver identities. Cache teardown precedes resolver 
 `ExpressionLoanOptions.scratch` and the internal returned-storage `Query.scratch` borrow a `*std.heap.ArenaAllocator`.
 The caller owns this arena. Query snapshots and expression-loan slices remain valid only while the arena remains alive.
 Expression-loan requests retain explicit load horizons and do not cache result snapshots.
+Copied-payload and written-cell witnesses are immutable snapshots owned by query scratch.
+The internal `ReplayLog` in `src/cache/return_storage.zig` stores their ordered replay histories in immutable, balanced trees.
+Certificates share complete subtrees or selected ranges instead of expanding repeated occurrences.
+Logical length, order, and multiplicity remain unchanged, as do all per-occurrence query work charges.
+The copied-payload consumer filters shared subtrees only with its pure, uncharged cell/path predicate.
+It still visits every matching occurrence in order; written-cell scans retain their original charges and early exits.
 `returnedStorageAt` creates a temporary scratch arena and copies returned path storage into the root state before teardown.
 
 Ordinary calls and `@call` share `Analyser.resolveCallReturnType` in `src/type_engine/analysis.zig`.
@@ -277,6 +295,10 @@ Generic bindings use the actual caller's `ResolveOptions`. Resolver errors propa
 Returned-storage memo keys include canonical declaration identity and actual type context.
 Only complete, caller-independent symbolic returns enter that memo.
 Private-cell effect proofs keep constructor and call bindings query-local.
+Copied-element alternatives select payloads within a formal sequence, not its backing cells.
+Visible assignments and `@memcpy` retain exact copied-source witnesses, including addresses returned by helpers.
+These positive witnesses do not certify disjointness or complete storage coverage.
+Opaque calls and assembly still block non-retention certificates without proving an escape.
 
 `FileCache.callEffectAt` uses `EffectSelection.whole` from `src/cache/call_summary.zig` for whole-call mutation queries.
 It resolves the canonical callee or authenticates a supplied callee against the call and caller context.
@@ -688,12 +710,14 @@ The default build step runs zbc on `src/` and `build.zig`.
 The build script supplies named-module declarations for imports such as `@import("type_engine")`.
 With the default Debug mode, the audit uses a separate ReleaseSafe executable with safety checks enabled.
 An explicit non-Debug optimization mode reuses the CLI executable built with that mode.
-The audit command uses the normal CLI exit contract, including exit 2 for incomplete analysis.
+The audit passes `--allow-partial`: budget-partial files are listed on stderr but do not fail the build.
+Any finding (exit 1) or failed file (exit 2) fails the build.
 
 ## Performance notes
 
 - Use `zig build -Doptimize=ReleaseFast` for corpus sweeps.
-  <!-- VERIFY: Measure the Debug versus ReleaseSafe runtime comparison before stating a speed ratio. -->
+  A Debug CLI ran about 8 times slower than ReleaseSafe on 2026-10-13: 57.7 s versus 7.3 s for
+  `src/rules/misc/intfromfloat_without_clamp.zig build.zig` with `--jobs=1`.
 - `main.zig` uses `std.Thread.spawn` with one session per worker.
   `--jobs=<n>` selects a positive worker limit. The default uses the CPU count, or four if that lookup fails.
   The worker count never exceeds the selected task count.

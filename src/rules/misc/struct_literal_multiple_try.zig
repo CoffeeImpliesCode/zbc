@@ -289,6 +289,7 @@ fn ownershipBudgetFailure(tree: *const Ast, token: Ast.TokenIndex, limit: budget
         .limit_value = cap,
         .reached = cap,
         .byte = site.byte,
+        .document = budget_mod.documentForTree(tree),
         .line = site.line,
         .column = site.column,
         .function = name,

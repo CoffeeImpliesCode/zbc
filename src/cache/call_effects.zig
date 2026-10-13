@@ -165,6 +165,7 @@ pub const Scan = struct {
             .limit_value = cap,
             .reached = cap,
             .byte = byte,
+            .document = budget_mod.documentForTree(self.tree),
             .line = position.line,
             .column = position.column,
             .function = name,

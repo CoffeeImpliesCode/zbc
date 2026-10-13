@@ -111,6 +111,26 @@ first assignment:
   A decrement-before-store countdown gives only its initialized prefix, not the unused suffix.
   Each strict proof checks current input definedness before it adds coverage.
   A failed proof alone does not cause a diagnostic.
+- **Counted array fields retain their initialized prefix.**
+  A source-proved append stores at the old count before it increments the count.
+  Paths without an append must preserve both the array and its count.
+  A zero default count proves an empty prefix, not a complete array.
+  The count can be a local or a field path.
+  A guarded read below that count does not read the unused suffix.
+  Copies and optional returns retain the array/count relation within the copied value.
+  A saved countdown cursor retains its own relation to the unchanged array.
+  Selected stores, counter replacements, and mutable escapes revoke affected relations.
+  Joins retain only relations that each incoming path proves.
+  The join checks empty-count proofs before it removes path-specific bounds.
+  Resolved unsigned cursor types retain these facts even without a written type annotation.
+  By-value callees can read bounded prefix slices, including a minimum of two counts.
+  These facts do not establish complete-array or returned-value certificates.
+  An off-by-one read, a skipped store, or an undefined store still requires its own byte proof.
+  Pointer-parameter fills require disjoint, non-escaped caller storage and a proved entry prefix.
+  Each counter advance must follow its matching store, including in recursive callees.
+  Returned enumeration indices are below a snapshot of the actual slice length taken before the call.
+  Every successful return must select the same zero-based slice enumeration.
+  Counter mutation cannot extend that saved prefix or change the saved length.
 - **Runtime fills certify only their destination region.**
   `@memset(array[0..count], value)` can initialize `[0,count)` when the
   count and value are defined. A nonzero start does not initialize the

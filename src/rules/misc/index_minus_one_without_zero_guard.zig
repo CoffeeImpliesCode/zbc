@@ -95,6 +95,7 @@ fn peel(tree: *const Ast, node: Ast.Node.Index) (budget_mod.BudgetError || error
         .limit_value = peel_depth,
         .reached = peel_depth,
         .byte = site.byte,
+        .document = budget_mod.documentForTree(tree),
         .line = site.line,
         .column = site.column,
         .function = name,

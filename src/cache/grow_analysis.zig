@@ -372,6 +372,7 @@ pub const GrowState = struct {
             .limit_value = limit_value,
             .reached = reached,
             .byte = byte,
+            .document = budget_mod.documentForTree(at),
             .line = line_col.line,
             .column = line_col.column,
             .function = name,
@@ -381,10 +382,8 @@ pub const GrowState = struct {
     /// Where a grow fold failure is reported: the refused site itself when
     /// the fold was running in the file this analysis is ABOUT, and
     /// otherwise the call that opened the demand query, which is the point
-    /// in the analysed file where this walk left it.  The CLI prints a
-    /// recorded position under the path of the file it was asked about,
-    /// so a line taken from an imported document would name a line that
-    /// file does not have — worse than naming no line at all.
+    /// in the analysed file where this walk left it. The document identity
+    /// always belongs to the tree selected here.
     pub fn failureSite(
         self: *const GrowState,
         tree: *const Ast,

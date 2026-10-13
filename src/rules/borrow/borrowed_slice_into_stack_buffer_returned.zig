@@ -72,6 +72,8 @@ fn checkFn(
                 .horizon = tree.firstToken(value),
             });
             for (loans.loans) |loan| {
+                // Conservative argument/event dependencies are not escape witnesses.
+                if (!loan.proved) continue;
                 if (loan.origin != .frame_cell) continue;
                 if (!try bindingIsRuntimeLocal(cache, body, loan.binding_token)) continue;
                 if (loan.derivation == .direct_address and loan.scalar_cell) continue;
@@ -360,8 +362,9 @@ test "summary: borrowed value COPIED through an allocating call before return do
     );
 }
 
-test "unresolved copying call retains a possible stack borrow" {
-    try testing.expectFiresTyped(check, R,
+test "unresolved copying call retains no proved stack loan" {
+    // Reporting contract: an opaque return is not a proved loan.
+    try testing.expectNoFireTyped(check,
         \\fn detect(copy: *const fn ([]u8) []u8) []u8 {
         \\    var buf: [2]u8 = undefined;
         \\    return copy(&buf);
@@ -1236,8 +1239,9 @@ test "external pointer and slice payloads observe current invocation stores" {
     );
 }
 
-test "selected formal nonretention does not hide assembly outward stores" {
-    try testing.expectFiresTyped(check, R,
+test "opaque assembly outward stores are unproved and stay silent" {
+    // Reporting contract: opaque assembly effects are not proved loans.
+    try testing.expectNoFireTyped(check,
         \\var saved: [*]const u8 = undefined;
         \\fn capture(input: []const u8) void {
         \\    asm volatile ("movq %[src], %[dst]"
@@ -1564,6 +1568,167 @@ test "runtime array values are not their normalized type values" {
         \\    var bytes: [2]u8 = .{0, 0};
         \\    const alias = bytes[0..];
         \\    return alias;
+        \\}
+    );
+}
+
+test "borrowed budget URI return precedes a by-value formatting receiver" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn path(inputs: []const []const u8) []const u8 {
+        \\    for (inputs) |input| {
+        \\        const uri = std.Uri.parse(input) catch return "";
+        \\        const encoded = uri.path.percent_encoded;
+        \\        if (std.mem.indexOfScalar(u8, encoded, '%') == null) return encoded;
+        \\        var buffer: [256]u8 = undefined;
+        \\        var writer: std.Io.Writer = .fixed(&buffer);
+        \\        uri.path.formatRaw(&writer) catch return "";
+        \\        return "";
+        \\    }
+        \\    return "";
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn path(input: []const u8) []const u8 {
+        \\    const uri = std.Uri.parse(input) catch return "";
+        \\    var buffer: [256]u8 = undefined;
+        \\    var writer: std.Io.Writer = .fixed(&buffer);
+        \\    uri.path.formatRaw(&writer) catch return "";
+        \\    return uri.path.percent_encoded;
+        \\}
+    );
+}
+
+test "borrowed budget pointer receiver stores a genuine stack loan" {
+    try testing.expectFiresTyped(check, R,
+        \\const View = struct {
+        \\    bytes: []const u8,
+        \\    fn replace(self: *View, bytes: []const u8) void { self.bytes = bytes; }
+        \\};
+        \\pub fn path(input: []const u8) []const u8 {
+        \\    var view: View = .{ .bytes = input };
+        \\    var buffer: [8]u8 = undefined;
+        \\    view.replace(buffer[0..]);
+        \\    return view.bytes;
+        \\}
+    );
+}
+
+test "borrowed budget map value does not borrow its stack key" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn lookup(map: *std.StringHashMapUnmanaged([]const u8)) []const u8 {
+        \\    var buffer: [8]u8 = undefined;
+        \\    var writer: std.Io.Writer = .fixed(&buffer);
+        \\    writer.writeAll("key") catch return "";
+        \\    return map.get(writer.buffered()) orelse "";
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const Map = struct {
+        \\    value: []const u8,
+        \\    fn get(self: Map, key: []const u8) []const u8 { _ = key; return self.value; }
+        \\};
+        \\pub fn lookup(map: Map) []const u8 {
+        \\    var buffer: [8]u8 = undefined;
+        \\    return map.get(buffer[0..]);
+        \\}
+    );
+}
+
+test "borrowed budget helper and direct slices retain proved loans" {
+    try testing.expectFiresTyped(check, R,
+        \\fn slice(bytes: []const u8) []const u8 { return bytes[1..]; }
+        \\pub fn lookup() []const u8 {
+        \\    var buffer: [8]u8 = undefined;
+        \\    return slice(buffer[0..]);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\pub fn lookup(n: usize) []const u8 {
+        \\    var buffer: [8]u8 = undefined;
+        \\    return buffer[0..n];
+        \\}
+    );
+}
+
+test "borrowed global field selection excludes sibling stores" {
+    try testing.expectNoFireTyped(check,
+        \\const Holder = struct { pointer: *u8, sibling: *u8 };
+        \\var other: Holder = .{ .pointer = undefined, .sibling = undefined };
+        \\const saved: **u8 = &other.pointer;
+        \\fn detect() *u8 {
+        \\    var local: u8 = 1;
+        \\    other.sibling = &local;
+        \\    return saved.*;
+        \\}
+    );
+}
+
+test "borrowed copied payload proof excludes zero-length copies" {
+    try testing.expectNoFireTyped(check,
+        \\const Pending = struct { pointers: [1]*u8 };
+        \\pub fn detect(external: *u8) Pending {
+        \\    var local: u8 = 1;
+        \\    const pointers = [_]*u8{&local};
+        \\    var pending: Pending = .{ .pointers = .{external} };
+        \\    @memcpy(pending.pointers[0..0], pointers[0..0]);
+        \\    return pending;
+        \\}
+    );
+}
+
+test "borrowed copied array elements survive direct and forwarded duplication" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn detect(gpa: std.mem.Allocator) ![]*u8 {
+        \\    var local: u8 = 1;
+        \\    const pointers = [_]*u8{&local};
+        \\    return gpa.dupe(*u8, &pointers);
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn duplicate(gpa: std.mem.Allocator, pointers: []const *u8) ![]*u8 {
+        \\    return gpa.dupe(*u8, pointers);
+        \\}
+        \\fn forward(gpa: std.mem.Allocator, pointers: []const *u8) ![]*u8 {
+        \\    return duplicate(gpa, pointers);
+        \\}
+        \\pub fn detect(gpa: std.mem.Allocator) ![]*u8 {
+        \\    var local: u8 = 1;
+        \\    const pointers = [_]*u8{&local};
+        \\    return forward(gpa, &pointers);
+        \\}
+    );
+}
+
+test "borrowed returned destination helpers retain only copied value payloads" {
+    const definitions =
+        \\const Item = struct { pointer: *u8 };
+        \\const Store = struct {
+        \\    slots: [1]Item,
+        \\    fn vacant(self: *Store) *Item { return &self.slots[0]; }
+        \\    fn insert(self: *Store, item: Item) void {
+        \\        const target = self.vacant();
+        \\        target.* = item;
+        \\    }
+        \\};
+    ;
+    try testing.expectNoFireTyped(check, definitions ++
+        \\pub fn detect(external: *u8) Store {
+        \\    var store: Store = .{ .slots = .{.{ .pointer = external }} };
+        \\    store.insert(.{ .pointer = external });
+        \\    return store;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R, definitions ++
+        \\pub fn detect(external: *u8) Store {
+        \\    var local: u8 = 1;
+        \\    var store: Store = .{ .slots = .{.{ .pointer = external }} };
+        \\    store.insert(.{ .pointer = &local });
+        \\    return store;
         \\}
     );
 }

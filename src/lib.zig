@@ -132,6 +132,8 @@ pub const Session = struct {
 /// listed function, summary, or rule exhausted an analysis budget and
 /// contributed no findings; all other parts completed and their findings
 /// are in `problems`. Release with `freeAnalysis`.
+/// Incomplete records hold OwnedDiagnostic paths copied by appendIncomplete,
+/// not borrowed from Session. freeAnalysis releases those copies.
 pub const Analysis = struct {
     problems: []Problem,
     incomplete: []Incomplete,
@@ -151,6 +153,8 @@ pub const Analysis = struct {
 /// A failed load retains no source snapshot, so a later analysis can retry it.
 /// The caller reports returned errors; source loading emits no duplicate diagnostic.
 pub fn analyzeEscape(session: *Session, path: []const u8, config: *const Config) !Analysis {
+    const source_scope = budget_mod.SourceScope.begin(&session.type_context.store);
+    defer source_scope.end();
     const gpa = session.gpa;
     session.clearParseFailure();
     session.project.failure = null;
@@ -745,6 +749,10 @@ test "partial: an exhausted function keeps the findings of the others" {
     try std.testing.expectEqual(budget_mod.Limit.path_states, diagnostic.limit);
     try std.testing.expectEqual(@as(u32, 64), diagnostic.limit_value);
     try std.testing.expect(diagnostic.line != 0);
+    // analyzeSrc already destroyed its Session. The exported path must survive.
+    const expected_path = try tmp.dir.realPathFileAlloc(std.testing.io, "check.zig", gpa);
+    defer gpa.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, diagnostic.document);
 }
 
 test "partial: the same function alone, within budget, reports its finding" {

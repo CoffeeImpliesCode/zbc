@@ -1149,6 +1149,33 @@ test "cli json: partial, failed and complete files are counted apart" {
     try expectContains(run.stderr, "zbc: incomplete");
 }
 
+test "cli json: --allow-partial lets partial coverage pass but keeps findings and failures decisive" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.write("partial.zig", exhausted_function_src);
+    try fx.write("broken.zig", malformed_root);
+
+    // The finished function's finding still fails the run.
+    var finding = try zbc(fx.dir, &.{ "--format=json", "--allow-partial", "partial.zig" });
+    defer finding.deinit();
+    try std.testing.expectEqual(@as(u8, 1), finding.code);
+    try expectSummary(&finding, 1, 0, 1, 0, 1);
+    try expectContains(finding.stderr, "zbc: incomplete");
+
+    // Partial coverage alone passes; the summary still counts it.
+    var quiet = try zbc(fx.dir, &.{ "--format=json", "--allow-partial", "--disable=stack_escape", "partial.zig" });
+    defer quiet.deinit();
+    try std.testing.expectEqual(@as(u8, 0), quiet.code);
+    try expectSummary(&quiet, 1, 0, 1, 0, 0);
+    try expectContains(quiet.stderr, "zbc: incomplete");
+
+    // A failed file is never covered by the flag.
+    var failed = try zbc(fx.dir, &.{ "--format=json", "--allow-partial", "--disable=stack_escape", "partial.zig", "broken.zig" });
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(u8, 2), failed.code);
+    try expectSummary(&failed, 2, 0, 1, 1, 0);
+}
+
 // ── Flags ────────────────────────────────────────────────────
 
 test "cli: a rejected --jobs value answers once and accounts for nothing" {

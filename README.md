@@ -26,6 +26,9 @@ The examples below use the current local checkout, not an older release tag.
 The default `zig build` also runs zbc on its own `src/` and `build.zig`.
 A default Debug build uses a separate ReleaseSafe binary for this self-audit.
 An explicit non-Debug optimization mode uses the CLI binary built with that mode.
+The self-audit passes `--allow-partial`; a finding or a failed file fails the build.
+`zig build check` compiles the CLI without installing it or running the self-audit.
+ZLS build-on-save runs a top-level `check` step when one exists, so editor saves do not start the audit.
 
 ```sh
 zig fetch --save /path/to/zbc
@@ -93,7 +96,7 @@ It returns an `Analysis`. `problems` holds findings from completed units.
 A listed unit contributes no findings. Other units retain their findings.
 An empty `incomplete` means no unit exhausted an analysis budget.
 Each `Incomplete` holds its `kind` (`function`, `summary`, or `rule`), its `name`, and an optional `zbc.budget.Diagnostic`.
-The diagnostic identifies the limit, its value, the value reached, and the source position.
+The diagnostic identifies the limit, its value, the value reached, the canonical source document, and the source position.
 It is null when the walk recorded no limit.
 The result owns its text and can outlive the session.
 Release it with `freeAnalysis` and the session's allocator.
@@ -154,6 +157,8 @@ zbc keeps findings from completed units in a partial file.
 It prints one stderr line for each incomplete unit:
 `zbc: incomplete <file>: fn <name>` or `zbc: incomplete <file>: rule <id>`.
 The line identifies the limit and its value, the value reached, and the source position when available.
+The position suffix is `at <document>:<line>:<column>`, or `at <document>+<byte>` without a line.
+The document can be an imported file. An unknown document prints as `<unknown>`, not as the analyzed file.
 Without a recorded limit, the line states that the analysis budget was exhausted.
 Work-budget exhaustion marks the affected unit incomplete. That unit contributes no findings.
 Some internal proof-query depth cutoffs instead leave the proof unproved, without marking the unit incomplete.
@@ -168,12 +173,15 @@ The parser uses the pinned compiler. A malformed imported file makes its importe
 Exit 0 means complete analysis without findings.
 Exit 1 means complete analysis with findings.
 Exit 2 means incomplete analysis or an operational failure, even when other files produce findings.
-A partial file always gives exit 2.
+Without `--allow-partial`, a partial file always gives exit 2.
+With `--allow-partial`, a partial file alone does not give exit 2.
+Findings still give exit 1, and a failed file or an operational failure still gives exit 2.
+The coverage line and the `zbc: incomplete` lines are unchanged, and SARIF still marks the run unsuccessful.
 
 ## Rules
 
-<!-- VERIFY: Update supported-invariant and documented-rule counts from the final CLI lists. -->
-The analyzer uses two analysis families:
+The analyzer checks 112 supported invariants and documents 99 rules (2026-10-13 CLI lists).
+It uses two analysis families:
 
 **Flow analysis** uses a per-function CFG and abstract interpretation.
 It checks these invariants:
@@ -204,6 +212,8 @@ Silence is not a proof that the code is safe.
 `stack-escape` reports only proved escapes of function-local storage.
 Unresolved field chains and opaque call results stay silent.
 Known direct loans still report, including local addresses carried by returned aggregates.
+`borrowed-slice-into-stack-buffer-returned` uses the same proved-loan contract.
+Possible argument retention or mutation in an incomplete storage query is not a finding.
 
 `use-undefined` reports only reads of proved-undefined bytes.
 Return, copy, assignment, by-value arguments, and whole-value `@memcpy` silently transport partially undefined values.

@@ -60,6 +60,13 @@ pub fn build(b: *std.Build) void {
     exe_mod.link_libc = true; // project_cache.zig uses std.c.realpath on non-absolute paths
     b.installArtifact(exe);
 
+    // `zig build check` compiles the CLI without installing it or running the
+    // self-check. ZLS build-on-save runs a top-level "check" step when one
+    // exists and otherwise falls back to the default step, which reruns the
+    // full self-audit of src/ on every save.
+    const check_step = b.step("check", "Compile zbc without installing or self-checking");
+    check_step.dependOn(&exe.step);
+
     // ── CLI contract tests: runs the emitted exe against fixtures ─────
     const cli_contract_mod = b.createModule(.{
         .root_source_file = b.path("src/cli_contract_tests.zig"),
@@ -85,7 +92,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(engine_tests).step);
 
     // ── Dogfood: self-check on every `zig build` ────────────
-    // The self-check analyses all of src/, and a Debug zbc is roughly ten
+    // The self-check analyses all of src/, and a Debug zbc is roughly eight
     // times slower than ReleaseSafe on that tree, so a Debug build checks
     // itself with a ReleaseSafe copy.  Safety checks stay on.
     const self_check_exe = if (optimize == .Debug) blk: {
@@ -105,6 +112,9 @@ pub fn build(b: *std.Build) void {
         break :blk b.addExecutable(.{ .name = "zbc-self-check", .root_module = fast_mod });
     } else exe;
     const self_check = b.addRunArtifact(self_check_exe);
+    // Budget-partial files are expected on this tree and listed on stderr;
+    // findings and failed files still fail the build.
+    self_check.addArg("--allow-partial");
     self_check.addDirectoryArg(b.path("src/"));
     // build.zig is an input so its named modules (`@import("type_engine")`)
     // resolve; without it every call into the engine is opaque.

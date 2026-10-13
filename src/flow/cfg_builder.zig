@@ -147,6 +147,7 @@ pub fn lowerFunctionFullWithZls(
             .limit = .borrow_walk_nodes,
             .limit_value = std.math.maxInt(u32),
             .reached = std.math.maxInt(u32),
+            .document = budget_mod.documentForTree(tree),
             .function = fn_name,
         });
     // The scope/extent resolver the fill proofs ask.  It owns the ONE
@@ -1018,6 +1019,13 @@ const Builder = struct {
         block: BlockId,
         stable: bool = false,
     };
+    const PointerPrefixPlan = struct {
+        array: LocalId,
+        counter: cfg_types.IndexTerm,
+        entry_count: LocalId,
+        entry_array: LocalId,
+        inputs: [8]?LocalId,
+    };
 
     const AddressByteSource = struct {
         operand: Ast.Node.Index,
@@ -1083,6 +1091,9 @@ const Builder = struct {
     // locals, but are never selected by a new evaluation of that AST node.
     address_byte_evaluations: std.AutoHashMapUnmanaged(Ast.Node.Index, AddressByteEvaluation) = .empty,
     address_byte_sources: std.ArrayListUnmanaged(AddressByteSource) = .empty,
+    pointer_prefix_calls: std.AutoHashMapUnmanaged(Ast.Node.Index, struct { first: usize, end: usize }) = .empty,
+    pointer_prefix_plans: std.ArrayListUnmanaged(PointerPrefixPlan) = .empty,
+    returned_index_lengths: std.AutoHashMapUnmanaged(Ast.Node.Index, struct { local: LocalId, optional: bool, error_union: bool }) = .empty,
     expression_loan_query: ?return_storage.ExpressionLoanQuery = null,
     expression_loan_scratch: ?std.mem.Allocator = null,
     /// Nesting depth of the current `classifyExpr` recursion.
@@ -1305,6 +1316,7 @@ const Builder = struct {
             .limit_value = limit_value,
             .reached = reached,
             .byte = pos.byte,
+            .document = budget_mod.documentForTree(self.tree),
             .line = pos.line,
             .column = pos.column,
             .function = self.fn_name,
@@ -1564,6 +1576,9 @@ const Builder = struct {
         self.address_byte_evaluations.deinit(self.gpa);
         for (self.address_byte_sources.items) |plan| if (plan.prepared_use) |use| self.gpa.destroy(use);
         self.address_byte_sources.deinit(self.gpa);
+        self.pointer_prefix_calls.deinit(self.gpa);
+        self.pointer_prefix_plans.deinit(self.gpa);
+        self.returned_index_lengths.deinit(self.gpa);
         self.checked_differences.deinit(self.gpa);
         self.immutable_locals.deinit(self.gpa);
         self.guard_facts.deinit(self.gpa);
@@ -1617,6 +1632,10 @@ const Builder = struct {
                 },
                 .equal_equal, .bang_equal => |tag| {
                     const pair = self.tree.nodeData(node).node_and_node;
+                    if (self.integerResolutionFrame()) |frame| {
+                        if (self.queryOrUnknown(bool, frame.boolValueOfNode(node))) |value|
+                            return .{ .constant = value != inverted };
+                    }
                     var operand = pair[0];
                     var literal = pair[1];
                     if (self.booleanLiteral(literal) == null) {
@@ -1765,6 +1784,7 @@ const Builder = struct {
                 try self.addEdge(skipped, merge);
                 cur.* = merge;
             },
+            .@"try" => try self.lowerWrappedValue(node, cur, result_frame),
             else => {
                 try self.emitUsesInExpr(node, cur.*, null);
                 if (self.directValueCall(node)) |call| try self.prepareAddressByteSources(call, cur);
@@ -2760,6 +2780,18 @@ const Builder = struct {
     fn selectedDiagnosticValueInputs(self: *Builder, node: Ast.Node.Index, inputs: *[8]?cfg_types.ValueInput, depth: u32) void {
         if (depth == max_classify_depth) return;
         const tree = self.tree;
+        if (tree.nodeTag(node) == .array_access) {
+            if (self.indexedTarget(node)) |access| if (access.field_array) |path| {
+                for (inputs) |*entry| if (entry.* == null) {
+                    entry.* = .{ .indexed = .{
+                        .array = access.array, .field_array = path,
+                        .index = self.indexTerm(access.index_node),
+                    } };
+                    return;
+                };
+                return;
+            };
+        }
         if (self.arrayCallSourceFor(node, true)) |source| {
             const input: cfg_types.ValueInput = switch (source) {
                 .copy_of => |local| .{ .local = local },
@@ -2781,6 +2813,7 @@ const Builder = struct {
             const input: cfg_types.ValueInput = .{ .indexed = .{
                 .array = access.array,
                 .index = self.indexTerm(access.index_node),
+                .field_array = access.field_array,
                 .modulo = self.moduloIndexTokens(first, last),
                 .scaled = self.scaledOutputIndexTokens(first, last),
             } };
@@ -2889,6 +2922,14 @@ const Builder = struct {
             if (owner_default) return false;
             self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, node);
             return false;
+        }
+        if (!owner_default and tree == self.tree and tree.nodeTag(node) == .array_access) {
+            if (self.indexedTarget(node)) |access| if (access.field_array) |path| {
+                const index = self.indexTerm(access.index_node);
+                if (index == .unknown) return false;
+                inputs[0] = .{ .indexed = .{ .array = access.array, .field_array = path, .index = index } };
+                return true;
+            };
         }
         if (!scalar_value and !owner_default and tree == self.tree) {
             if (self.arrayCallSource(node)) |source| {
@@ -4461,6 +4502,17 @@ const Builder = struct {
             .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_shl_sat, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat => {
                 const pair = tree.nodeData(stmt_node).node_and_node;
                 try self.emitUsesInExpr(stmt_node, cur.*, null);
+                if ((tag == .assign_add or tag == .assign_sub) and self.integerValue(pair[1]) == 1) {
+                    if (self.fieldLhsFor(pair[0])) |field| {
+                        if (self.fieldIsUnsigned(field.parent, field.name)) {
+                            try self.appendStmt(cur.*, .{
+                                .kind = .{ .field_counter_step = .{ .parent = field.parent, .name = field.name, .step = if (tag == .assign_add) 1 else -1 } },
+                                .pos = self.posOf(stmt_node), .end_pos = self.endPosOf(stmt_node),
+                            });
+                            return;
+                        }
+                    }
+                }
                 if ((tag == .assign_add or tag == .assign_sub) and
                     tree.nodeTag(pair[0]) == .identifier and self.integerValue(pair[1]) == 1)
                 {
@@ -7533,6 +7585,112 @@ const Builder = struct {
     fn emitSuccessfulOutPrefix(self: *Builder, block: BlockId, count: LocalId, initializer: Ast.Node.Index) !void {
         if (try self.emitSuccessfulOutPrefixMode(block, count, initializer, false)) return;
         _ = try self.emitSuccessfulOutPrefixMode(block, count, initializer, true);
+    }
+
+    fn prepareReturnedIndexLength(self: *Builder, block: BlockId, node: Ast.Node.Index) !void {
+        _ = self.returned_index_lengths.remove(node);
+        const tree = self.tree;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node) orelse return;
+        const cache = self.cache orelse return;
+        const actual = self.queryOrUnknown(file_cache.FileCache.ActualCallSummary, cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(tree, call), self.integerResolutionFrame())) orelse return;
+        const source_tree = actual.callee.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(source_tree, &proto_buffer, actual.callee.declaration) orelse return;
+        const result_type = proto.ast.return_type.unwrap() orelse return;
+        if (!std.mem.eql(u8, source_tree.tokenSlice(source_tree.lastToken(result_type)), "usize")) return;
+        const parameter = @import("../cache/prefix_summary.zig").returnedIndexParameter(source_tree, actual.callee.declaration) orelse return;
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        const argument = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &argument_buffer, parameter)) orelse return;
+        const bound: cfg_types.IndexTerm = if (tree.fullSlice(argument)) |slice| blk: {
+            if (self.integerValue(slice.ast.start) != 0) return;
+            break :blk self.indexTerm(slice.ast.end.unwrap() orelse return);
+        } else if (tree.nodeTag(argument) == .identifier) blk: {
+            const local = self.indexLocalAt(tree.nodeMainToken(argument)) orelse return;
+            break :blk if (self.locals.items[@intFromEnum(local)].array_extent) |extent|
+                .{ .constant = extent }
+            else .{ .field = .{ .parent = local, .name = "len", .is_unsigned = true } };
+        } else return;
+        if (bound == .unknown) return;
+        const bound_local: ?LocalId = switch (bound) {
+            .local => |term| term.local,
+            .field => |term| term.parent,
+            else => null,
+        };
+        if (bound_local) |local| {
+            if (!self.prefixStorageHasNotEscaped(local, node)) return;
+            for (call.ast.params) |other| {
+                if (other != argument and self.exprMentionsLocal(other, local)) return;
+            }
+        }
+        var inputs: [8]?cfg_types.ValueInput = .{null} ** 8;
+        inputs[0] = switch (bound) {
+            .local => |term| .{ .local = term.local },
+            .field => |term| .{ .field = .{ .parent = term.parent, .name = term.name } },
+            else => null,
+        };
+        const source: ExprKind = switch (bound) {
+            .local => |term| .{ .copy_of = term.local },
+            .field => |term| .{ .field_copy_of = .{ .parent = term.parent, .name = term.name } },
+            else => .plain,
+        };
+        const length = try self.appendLocal(.{
+            .name = "$enumerated-length", .decl_pos = self.posOf(node),
+            .is_unsigned = true, .tracks_scalar_value = true, .is_control_local = true,
+        });
+        // Capture the actual slice length, not the callee's post-call view of
+        // its expression. Counter copies also preserve its existing prefix.
+        try self.appendStmt(block, .{
+            .kind = .{ .decl = .{
+                .local = length, .init_kind = source, .value_defined = true, .value_inputs = inputs,
+                .integer_value = if (bound == .constant) bound.constant else null,
+            } },
+            .pos = self.posOf(node), .end_pos = self.endPosOf(node),
+        });
+        var optional = false;
+        var error_union = false;
+        var token = source_tree.firstToken(result_type);
+        while (token <= source_tree.lastToken(result_type)) : (token += 1) {
+            optional = optional or source_tree.tokenTag(token) == .question_mark;
+            error_union = error_union or source_tree.tokenTag(token) == .bang;
+        }
+        try self.returned_index_lengths.put(self.gpa, node, .{ .local = length, .optional = optional, .error_union = error_union });
+    }
+
+    fn emitReturnedIndexBound(self: *Builder, block: BlockId, result: LocalId, initializer: Ast.Node.Index) !void {
+        const tree = self.tree;
+        var value = initializer;
+        var optional_unwrapped = false;
+        var error_unwrapped = false;
+        while (true) switch (tree.nodeTag(value)) {
+            .grouped_expression => value = tree.nodeData(value).node_and_token[0],
+            .@"try" => { value = tree.nodeData(value).node; error_unwrapped = true; },
+            .@"orelse" => {
+                const lhs, const fallback = tree.nodeData(value).node_and_node;
+                if (!fallbackYieldsNothing(self, fallback)) return;
+                value = lhs;
+                optional_unwrapped = true;
+            },
+            else => break,
+        };
+        const length = self.returned_index_lengths.get(value) orelse return;
+        if ((length.optional and !optional_unwrapped) or (length.error_union and !error_unwrapped)) return;
+        self.locals.items[@intFromEnum(result)].is_unsigned = true;
+        var inputs: [8]?cfg_types.ValueInput = .{null} ** 8;
+        inputs[0] = .{ .local = length.local };
+        // Only length bits supply this source-proved enumeration axis; an
+        // uninitialized slice payload cannot poison the integer index.
+        try self.appendStmt(block, .{
+            .kind = .{ .assign = .{ .target = result, .rhs_kind = .plain, .value_defined = true, .value_inputs = inputs } },
+            .pos = self.posOf(initializer), .end_pos = self.endPosOf(initializer),
+        });
+        try self.appendStmt(block, .{
+            .kind = .{ .compare_assume = .{
+                .lhs = .{ .local = .{ .local = result } },
+                .rhs = .{ .local = .{ .local = length.local } }, .op = .lt,
+            } },
+            .pos = self.posOf(initializer), .end_pos = self.endPosOf(initializer),
+        });
     }
 
     /// Calls may not mutate any storage. Unknown effects decline; no spelling
@@ -11308,6 +11466,9 @@ const Builder = struct {
             is_pointer,
         );
         self.integer_domains.items[@intFromEnum(local)] = value_type.domain;
+        self.locals.items[@intFromEnum(local)].is_unsigned =
+            self.locals.items[@intFromEnum(local)].is_unsigned or
+            value_type.domain.kind == .unsigned or value_type.domain.kind == .unsigned_unbounded;
         self.locals.items[@intFromEnum(local)].tracks_scalar_value = value_type.runtime_scalar;
         self.locals.items[@intFromEnum(local)].is_pointer =
             !value_type.slice_header and (is_pointer or value_type.pointer_header);
@@ -11587,6 +11748,7 @@ const Builder = struct {
         try self.updateDiagnosticAddressBacking(
             local, init_opt, cur.*, tree.tokenTag(var_decl.ast.mut_token) == .keyword_const,
         );
+        if (init_opt) |init| try self.emitReturnedIndexBound(cur.*, local, init);
     }
 
     /// Translate a canonical result dependency into existing local/field
@@ -12024,7 +12186,9 @@ const Builder = struct {
             const actual = self.immutableInitializerContainer(.{ .frame = frame, .node = node }) orelse return false;
             const owner_frame = frame.resolver.frameForContainer(actual);
             const owner_tree = &owner_frame.handle.document.tree;
-            const container = owner_tree.fullContainerDecl(&buffer, actual.scope_handle.toNode()) orelse return false;
+            // `literal.ast.fields` may borrow `buffer`; the container needs its own.
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            const container = owner_tree.fullContainerDecl(&container_buffer, actual.scope_handle.toNode()) orelse return false;
             if (owner_tree.tokenTag(container.ast.main_token) != .keyword_struct) return false;
             for (container.ast.members) |member| {
                 const field = owner_tree.fullContainerField(member) orelse continue;
@@ -12238,6 +12402,32 @@ const Builder = struct {
                 });
             }
         }
+        for (masks) |mask| for (mask.counted_prefixes.items) |fact| {
+            var extent = fact.extent;
+            const common = for (masks) |candidate| {
+                if (candidate.entire_value or candidate.mayBeUndefined(fact.counter_path)) break false;
+                const matching = for (candidate.counted_prefixes.items) |other| {
+                    if (std.mem.eql(u8, fact.array_path, other.array_path) and
+                        std.mem.eql(u8, fact.counter_path, other.counter_path)) {
+                        extent = @min(extent, other.extent);
+                        break true;
+                    }
+                } else false;
+                if (!matching and (candidate.mayBeUndefined(fact.array_path) or
+                    (candidate.whole and candidate.holes.items.len == 0))) break false;
+            } else true;
+            if (!common) continue;
+            const array_path = try self.allocDottedPath(target_field, fact.array_path);
+            const count_path = try self.allocDottedPath(target_field, fact.counter_path);
+            try self.appendStmt(block, .{
+                .kind = .{ .array_prefix = .{
+                    .array = local, .count = local, .field_array = array_path, .extent = extent,
+                    .counter_term = .{ .field = .{ .parent = local, .name = count_path, .is_unsigned = true } },
+                    .diagnostic_only = true,
+                } },
+                .pos = pos, .end_pos = end_pos,
+            });
+        };
     }
 
     /// A selected aggregate transports its sparse byte mask, not its owner.
@@ -12939,7 +13129,9 @@ const Builder = struct {
             const actual = self.immutableInitializerContainer(source) orelse return false;
             const owner_frame = source.frame.resolver.frameForContainer(actual);
             const owner_tree = &owner_frame.handle.document.tree;
-            const container = owner_tree.fullContainerDecl(&buffer, actual.scope_handle.toNode()) orelse return false;
+            // `literal.ast.fields` may borrow `buffer`; the container needs its own.
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            const container = owner_tree.fullContainerDecl(&container_buffer, actual.scope_handle.toNode()) orelse return false;
             if (owner_tree.tokenTag(container.ast.main_token) != .keyword_struct) return false;
             for (container.ast.members) |member| {
                 const field = owner_tree.fullContainerField(member) orelse continue;
@@ -13060,7 +13252,9 @@ const Builder = struct {
             const actual = self.immutableInitializerContainer(source) orelse return;
             const owner_frame = source.frame.resolver.frameForContainer(actual);
             const owner_tree = &owner_frame.handle.document.tree;
-            const container = owner_tree.fullContainerDecl(&buffer, actual.scope_handle.toNode()) orelse return;
+            // `literal.ast.fields` may borrow `buffer`; the container needs its own.
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            const container = owner_tree.fullContainerDecl(&container_buffer, actual.scope_handle.toNode()) orelse return;
             if (owner_tree.tokenTag(container.ast.main_token) != .keyword_struct) return;
             for (container.ast.members) |member| {
                 const field = owner_tree.fullContainerField(member) orelse continue;
@@ -14707,6 +14901,7 @@ const Builder = struct {
                 if (resolver.pointerSize(formal) != .one) return;
             }
         }
+        if (try self.receiverPrefixAt(call_node) != null) return;
         if (self.cache) |cache| {
             if (try self.callArgumentReadOnly(cache, call_node, receiver)) return;
         }
@@ -15855,7 +16050,11 @@ const Builder = struct {
         const shape = initShapeNode(self, node);
         if (self.tree.nodeTag(shape) == .field_access) {
             const value = self.classifySourceProjection(shape, 0) orelse return null;
-            const owner = switch (value) { .copy_of => |id| id, .field_copy_of => |field| field.parent, else => return null };
+            const owner = switch (value) {
+                .copy_of => |id| id,
+                .field_copy_of => |field| field.parent,
+                else => return null,
+            };
             if (!self.locals.items[@intFromEnum(owner)].is_pointer) return value;
             return null;
         }
@@ -16269,6 +16468,44 @@ const Builder = struct {
         _ = self.address_byte_evaluations.remove(call_node);
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = self.tree.fullCall(&call_buffer, call_node) orelse return;
+        if (try self.receiverPrefixAt(call_node)) |proof| {
+            const entry = try self.appendLocal(.{
+                .name = "", .decl_pos = self.posOf(call_node), .is_control_local = true,
+                .is_unsigned = true, .tracks_scalar_value = true,
+            });
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .decl = .{ .local = entry, .init_kind = .{ .field_copy_of = .{
+                    .parent = proof.parent, .name = proof.count_path,
+                } }, .value_defined = true } },
+                .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node),
+            });
+            var count_inputs: [8]?cfg_types.ValueInput = .{null} ** 8;
+            count_inputs[0] = .{ .local = entry };
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_assign = .{
+                    .parent = proof.parent, .name = proof.count_path,
+                    .rhs_kind = .unknown, .defined = true, .selected_inputs = count_inputs,
+                } },
+                .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node),
+            });
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_assign = .{
+                    .parent = proof.parent, .name = proof.array_path, .rhs_kind = .unknown, .diagnostic_only = true,
+                    .prefix_entry = .{ .array = proof.parent, .count = entry, .path = proof.array_path },
+                } },
+                .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node),
+            });
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .array_prefix = .{
+                    .array = proof.parent, .count = proof.parent,
+                    .counter_term = .{ .field = .{ .parent = proof.parent, .name = proof.count_path, .is_unsigned = true } },
+                    .field_array = proof.array_path, .extent = proof.extent, .selected_inputs = proof.inputs,
+                    .entry_count = entry,
+                    .diagnostic_only = true, .preserves_prefix = true,
+                } },
+                .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node),
+            });
+        }
         var candidates = self.addressOutputCandidates(call);
         var candidate = candidates.next() orelse return;
         const cache = self.cache orelse return;
@@ -16320,6 +16557,152 @@ const Builder = struct {
         }
         if (self.address_byte_sources.items.len != first)
             try self.address_byte_evaluations.put(self.gpa, call_node, .{ .first = first, .end = self.address_byte_sources.items.len });
+        try self.emitUnknownAddressEffects(call_node, cur.*);
+    }
+
+    /// Revoke possible writes only after recipes have frozen their input bytes.
+    /// A selected result can then replay a proved untouched original value.
+    fn emitUnknownAddressEffects(self: *Builder, call_node: Ast.Node.Index, block: BlockId) LoweringError!void {
+        const cache = self.cache orelse return;
+        const tree = self.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const full = tree.fullCall(&buffer, call_node) orelse return;
+        var candidates = self.addressOutputCandidates(full);
+        while (candidates.next()) |candidate| {
+            const address = (try self.queryAddressOutput(cache, candidate, call_node, block, null)) orelse
+                (try cache.possibleAddressUseAt(candidate.token)) orelse continue;
+            if (!address.may_write or address.call_node != call_node or address.address_node != candidate.address_node) continue;
+            if (try self.callArgumentReadOnly(cache, call_node, candidate.address_node)) continue;
+            if (address.definite_write and address.location_computed_complete and self.callReturnsWithoutError(call_node)) continue;
+            const root = tokens.rootIdentifier(tree, address.operand) orelse continue;
+            const id = self.indexLocalAt(tree.nodeMainToken(root)) orelse continue;
+            const output: ExprKind = self.classifySourceProjection(address.operand, 0) orelse .{ .copy_of = id };
+            const bytes = self.pointer_value_sources.get(id) orelse output;
+            const parent = if (bytes == .copy_of) bytes.copy_of else if (bytes == .field_copy_of) bytes.field_copy_of.parent else continue;
+            if (try self.receiverPrefixAt(call_node)) |proof| if (proof.parent == parent) continue;
+            if (self.locals.items[@intFromEnum(parent)].is_pointer) continue;
+            const empty_assignment: StmtKind = .{ .field_assign = .{ .parent = parent, .name = "", .rhs_kind = .unknown } };
+            var prefix_entry: @TypeOf(empty_assignment.field_assign.prefix_entry) = null;
+            if (bytes == .copy_of) if (self.pointer_prefix_calls.get(call_node)) |plans| {
+                for (self.pointer_prefix_plans.items[plans.first..plans.end]) |plan| {
+                    if (plan.array != parent) continue;
+                    prefix_entry = .{ .array = plan.entry_array, .count = plan.entry_count };
+                    break;
+                }
+            };
+            if (prefix_entry != null) {
+                try self.appendStmt(block, .{
+                    .kind = .{ .field_assign = .{
+                        .parent = parent, .name = "", .rhs_kind = .unknown,
+                        .diagnostic_only = true, .prefix_entry = prefix_entry,
+                    } },
+                    .pos = self.posOf(address.address_node), .end_pos = self.endPosOf(address.address_node),
+                });
+                continue;
+            }
+            var call_buffer: [2]Ast.Node.Index = undefined;
+            const call = zls_resolver_mod.TypeResolver.CallOperands.full(tree, &call_buffer, call_node) orelse continue;
+            const touches = try cache.diagnosticOutputTouchesAt(call.queryToken(tree, call_node), self.integerResolutionFrame(), address.address_node);
+            const prefix = if (bytes == .field_copy_of) bytes.field_copy_of.name else "";
+            const unknown_whole = [1][]const u8{""};
+            const paths = if (touches) |*scope| scope.fields[0..scope.field_count] else &unknown_whole;
+            for (paths) |path| {
+                if (address.location_computed_complete) {
+                    if (address.location_written) continue;
+                    var proved = false;
+                    for (address.fields[0..address.field_count]) |field|
+                        if (std.mem.eql(u8, field, path)) { proved = true; break; };
+                    for (address.location_fields[0..address.location_field_count]) |field|
+                        if (std.mem.eql(u8, field, path)) { proved = true; break; };
+                    if (proved) continue;
+                }
+                const selected = if (path.len == 0) prefix else if (prefix.len == 0) path else try self.allocDottedPath(prefix, path);
+                try self.appendStmt(block, .{
+                    .kind = .{ .field_assign = .{
+                        .parent = parent, .name = selected,
+                        .rhs_kind = .unknown, .diagnostic_only = true,
+                        .prefix_entry = prefix_entry,
+                    } },
+                    .pos = self.posOf(address.address_node), .end_pos = self.endPosOf(address.address_node),
+                });
+            }
+        }
+    }
+
+    const ReceiverPrefix = struct { parent: LocalId, array_path: []const u8, count_path: []const u8, extent: u64, inputs: [8]?cfg_types.ValueInput };
+
+    fn receiverPrefixAt(self: *Builder, node: Ast.Node.Index) LoweringError!?ReceiverPrefix {
+        const cache = self.cache orelse return null;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const full = self.tree.fullCall(&call_buffer, node) orelse return null;
+        const actual = self.queryOrUnknown(file_cache.FileCache.ActualCallSummary,
+            cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(self.tree, full), self.integerResolutionFrame())) orelse return null;
+        const source_tree = actual.callee.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(source_tree, &proto_buffer, actual.callee.declaration) orelse return null;
+        var params = proto.iterate(source_tree);
+        const first = params.next() orelse return null;
+        const receiver_name = source_tree.tokenSlice(first.name_token orelse return null);
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        const receiver = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &argument_buffer, 0)) orelse return null;
+        const place = self.actualLocalPath(receiver) orelse return null;
+        if (self.locals.items[@intFromEnum(place.local)].is_pointer) return null;
+        const declaring = self.queryOrUnknown(*file_cache.FileCache, actual.declaringCache(cache)) orelse return null;
+        const resolver = declaring.zls orelse return null;
+        const frame = resolver.frameForFunction(actual.callee.reference);
+        const body = source_tree.nodeData(actual.callee.declaration).node_and_node[1];
+        var iterator = type_engine.AstIterator.init(source_tree, body);
+        while (iterator.next(source_tree)) |statement| {
+            if (source_tree.nodeTag(statement) != .assign) continue;
+            const lhs, _ = source_tree.nodeData(statement).node_and_node;
+            if (source_tree.nodeTag(lhs) != .array_access) continue;
+            const array_node, const count_node = source_tree.nodeData(lhs).node_and_node;
+            if (source_tree.nodeTag(array_node) != .field_access or source_tree.nodeTag(count_node) != .field_access) continue;
+            const array_owner, const array_token = source_tree.nodeData(array_node).node_and_token;
+            const count_owner, const count_token = source_tree.nodeData(count_node).node_and_token;
+            if (source_tree.nodeTag(array_owner) != .identifier or source_tree.nodeTag(count_owner) != .identifier or
+                !std.mem.eql(u8, source_tree.tokenSlice(source_tree.nodeMainToken(array_owner)), receiver_name) or
+                !std.mem.eql(u8, source_tree.tokenSlice(source_tree.nodeMainToken(count_owner)), receiver_name)) continue;
+            const array_field = source_tree.tokenSlice(array_token);
+            const count_field = source_tree.tokenSlice(count_token);
+            if (!@import("../cache/prefix_summary.zig").proveBody(source_tree, actual.callee.declaration,
+                receiver_name, array_field, receiver_name, count_field)) continue;
+            const array_type = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.typeOfNode(array_node)) orelse continue;
+            const normalized = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, resolver.normalizedType(array_type)) orelse continue;
+            const extent: u64 = switch (normalized.data) {
+                .array => |info| info.elem_count orelse continue,
+                .ip_index => switch (resolver.ctx.ip.indexToKey(normalized.ipIndex() orelse continue)) {
+                    .array_type => |info| info.len,
+                    else => continue,
+                },
+                else => continue,
+            };
+            var inputs: [8]?cfg_types.ValueInput = .{null} ** 8;
+            var ordinal: u32 = 1;
+            var supported = true;
+            while (params.next() != null) : (ordinal += 1) {
+                const argument = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &argument_buffer, ordinal)) orelse {
+                    supported = false;
+                    break;
+                };
+                var dependencies: [8]?cfg_types.ValueInput = .{null} ** 8;
+                if (!self.selectedValueInputs(argument, &dependencies, false)) {
+                    self.selectedDiagnosticValueInputs(argument, &dependencies, 0);
+                    if (dependencies[0] == null) {
+                        supported = false;
+                        break;
+                    }
+                }
+                supported = mergeSelectedValueInputs(&inputs, dependencies) and supported;
+            }
+            if (!supported) continue;
+            // Each successful path allocation is already owned by the builder.
+            const array_path = try self.allocActualDottedPath(place, array_field);
+            const count_path = try self.allocActualDottedPath(place, count_field);
+            return .{ .parent = place.local, .array_path = array_path,
+                .count_path = count_path, .extent = extent, .inputs = inputs };
+        }
+        return null;
     }
 
     fn preparedAddressPlan(self: *const Builder, use: *const file_cache.FileCache.AddressUse) ?*const AddressByteSource {
@@ -16372,6 +16755,120 @@ const Builder = struct {
         try self.emitSuccessfulCountdownPrefix(block, call_node);
     }
 
+    fn preparePointerPrefixes(self: *Builder, call_node: Ast.Node.Index, block: BlockId) !void {
+        _ = self.pointer_prefix_calls.remove(call_node);
+        const cache = self.cache orelse return;
+        const tree = self.tree;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, call_node) orelse return;
+        // Prefix outputs require actual addressed local arrays. This also
+        // excludes borrowed/global storage and unsupported alias maps.
+        var addressed_array = false;
+        for (call.ast.params) |argument| {
+            if (tree.nodeTag(argument) != .address_of) continue;
+            const operand = tree.nodeData(argument).node;
+            if (tree.nodeTag(operand) != .identifier) continue;
+            const local = self.indexLocalAt(tree.nodeMainToken(operand)) orelse continue;
+            if (self.locals.items[@intFromEnum(local)].array_extent != null) addressed_array = true;
+        }
+        if (!addressed_array) return;
+        const actual = self.queryOrUnknown(file_cache.FileCache.ActualCallSummary, cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(tree, call), self.integerResolutionFrame())) orelse return;
+        var fills: [8]@import("../cache/prefix_summary.zig").Fill = undefined;
+        const count = @import("../cache/prefix_summary.zig").fills(cache, actual, &fills);
+        const first = self.pointer_prefix_plans.items.len;
+        for (fills[0..count]) |fill| {
+            if (fill.output.path.len != 0) continue;
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const output = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &argument_buffer, fill.output.parameter)) orelse continue;
+            const counter_argument = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &argument_buffer, fill.counter.parameter)) orelse continue;
+            if (tree.nodeTag(output) != .address_of or tree.nodeTag(counter_argument) != .address_of) continue;
+            const output_operand = tree.nodeData(output).node;
+            const counter_operand = tree.nodeData(counter_argument).node;
+            if (tree.nodeTag(output_operand) != .identifier or tree.nodeTag(counter_operand) != .identifier) continue;
+            const array = self.indexLocalAt(tree.nodeMainToken(output_operand)) orelse continue;
+            const counter_local = self.indexLocalAt(tree.nodeMainToken(counter_operand)) orelse continue;
+            if (array == counter_local or !self.localCanBeStored(array)) continue;
+            const extent = self.locals.items[@intFromEnum(array)].array_extent orelse continue;
+            if (self.locals.items[@intFromEnum(counter_local)].is_pointer or
+                !self.prefixStorageHasNotEscaped(array, call_node) or
+                !self.prefixStorageHasNotEscaped(counter_local, call_node)) continue;
+            // A second argument reaching the output/counter would invalidate
+            // the declaration-relative disjointness assumed by the proof.
+            var disjoint = true;
+            for (call.ast.params) |argument| {
+                if (argument == output or argument == counter_argument) continue;
+                if (self.exprMentionsLocal(argument, array) or self.exprMentionsLocal(argument, counter_local)) { disjoint = false; break; }
+            }
+            if (!disjoint) continue;
+            var inputs: [8]?LocalId = .{null} ** 8;
+            var supported = true;
+            for (call.ast.params) |argument| {
+                if (argument == output or argument == counter_argument) continue;
+                if (tree.nodeTag(argument) == .address_of) {
+                    var other_output = false;
+                    for (fills[0..count]) |other| {
+                        const other_argument = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &argument_buffer, other.output.parameter)) orelse continue;
+                        if (other_argument == argument) { other_output = true; break; }
+                    }
+                    if (other_output) continue;
+                    supported = self.valueInputs(tree.nodeData(argument).node, &inputs) and supported;
+                    continue;
+                }
+                supported = self.valueInputs(argument, &inputs) and supported;
+            }
+            if (!supported) continue;
+            const counter: cfg_types.IndexTerm = if (fill.counter.path.len == 0)
+                .{ .local = .{ .local = counter_local } }
+            else .{ .field = .{ .parent = counter_local, .name = fill.counter.path, .is_unsigned = true } };
+            const entry_count = try self.appendLocal(.{ .name = "$prefix-entry-count", .decl_pos = self.posOf(call_node), .is_unsigned = true });
+            const count_source: ExprKind = if (counter == .local)
+                .{ .copy_of = counter.local.local }
+            else .{ .field_copy_of = .{ .parent = counter.field.parent, .name = counter.field.name } };
+            try self.appendStmt(block, .{ .kind = .{ .decl = .{ .local = entry_count, .init_kind = count_source, .value_defined = true } }, .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node) });
+            try self.appendStmt(block, .{ .kind = .{ .compare_assume = .{ .lhs = .{ .local = .{ .local = entry_count } }, .rhs = counter, .op = .eq } }, .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node) });
+            const entry_array = try self.appendLocal(.{ .name = "$prefix-entry-array", .decl_pos = self.posOf(call_node), .is_array = true, .array_extent = extent });
+            try self.appendStmt(block, .{ .kind = .{ .decl = .{ .local = entry_array, .init_kind = .{ .copy_of = array } } }, .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node) });
+            try self.appendStmt(block, .{ .kind = .{ .array_value = .{ .target = entry_array, .source = .{ .copy_of = array }, .diagnostic_only = true } }, .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node) });
+            try self.pointer_prefix_plans.append(self.gpa, .{ .array = array, .counter = counter, .entry_count = entry_count, .entry_array = entry_array, .inputs = inputs });
+        }
+        if (self.pointer_prefix_plans.items.len != first)
+            try self.pointer_prefix_calls.put(self.gpa, call_node, .{ .first = first, .end = self.pointer_prefix_plans.items.len });
+    }
+
+    fn exprMentionsLocal(self: *Builder, node: Ast.Node.Index, local: LocalId) bool {
+        var token = self.tree.firstToken(node);
+        const last = self.tree.lastToken(node);
+        const name = self.locals.items[@intFromEnum(local)].name;
+        while (token <= last) : (token += 1)
+            if (self.tree.tokenTag(token) == .identifier and std.mem.eql(u8, self.tree.tokenSlice(token), name)) return true;
+        return false;
+    }
+
+    fn prefixStorageHasNotEscaped(self: *Builder, local: LocalId, call_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const decl_byte = self.locals.items[@intFromEnum(local)].decl_pos.byte;
+        const end = tree.firstToken(call_node);
+        for (0..tree.nodes.len) |raw| {
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            if (tree.nodeTag(node) != .address_of and tree.fullSlice(node) == null) continue;
+            const first = tree.firstToken(node);
+            if (first >= end or tree.tokenStart(first) < decl_byte) continue;
+            if (!self.exprMentionsLocal(node, local)) continue;
+            // Only previous proven prefix-preserving calls may have borrowed
+            // this local. Their bodies cannot keep an alias to its storage.
+            var allowed = false;
+            var calls = self.pointer_prefix_calls.iterator();
+            while (calls.next()) |entry| {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const prior = tree.fullCall(&buffer, entry.key_ptr.*) orelse continue;
+                for (prior.ast.params) |argument| if (argument == node) { allowed = true; break; };
+                if (allowed) break;
+            }
+            if (!allowed) return false;
+        }
+        return true;
+    }
+
     fn emitAddressOutputs(self: *Builder, block: BlockId, call_node: Ast.Node.Index, success_bool: ?bool) LoweringError!void {
         const cache = self.cache orelse return;
         const tree = self.tree;
@@ -16382,6 +16879,9 @@ const Builder = struct {
             var use = (try self.queryAddressOutput(cache, candidate, call_node, block, success_bool)) orelse
                 self.queryOrUnknown(file_cache.FileCache.AddressUse, cache.undefinedAddressUseAt(candidate.token, success_bool)) orelse continue;
             if (use.call_node != call_node or use.address_node != candidate.address_node) continue;
+            if (try self.receiverPrefixAt(call_node)) |proof| {
+                if (self.actualLocalPath(use.operand)) |place| if (place.local == proof.parent) continue;
+            }
             // Same-call source-proved literal negatives replay AFTER an
             // opaque diagnostic snapshot, so its overwrite cannot erase them.
             if (use.undefined_field_count == 0)
@@ -16396,6 +16896,23 @@ const Builder = struct {
                 success_bool,
             )) orelse continue;
             try self.emitAddressCredit(block, &use);
+        }
+        if (self.pointer_prefix_calls.get(call_node)) |plans| {
+            for (self.pointer_prefix_plans.items[plans.first..plans.end]) |plan| {
+                const counter_parent = switch (plan.counter) {
+                    .local => |term| term.local,
+                    .field => |term| term.parent,
+                    else => unreachable,
+                };
+                try self.appendStmt(block, .{
+                    .kind = .{ .array_prefix = .{
+                        .array = plan.array, .count = counter_parent, .counter_term = plan.counter,
+                        .entry_count = plan.entry_count, .entry_array = plan.entry_array,
+                        .inputs = plan.inputs, .diagnostic_only = true, .preserves_prefix = true,
+                    } },
+                    .pos = self.posOf(call_node), .end_pos = self.endPosOf(call_node),
+                });
+            }
         }
     }
 
@@ -20705,6 +21222,23 @@ const Builder = struct {
                     complete = false;
                     continue;
                 };
+                if (owner_tree.nodeTag(value) == .number_literal and
+                    unsignedType(owner_tree, field.ast.type_expr.unwrap() orelse return false)) {
+                    const integer = std.fmt.parseInt(u64, owner_tree.tokenSlice(owner_tree.nodeMainToken(value)), 0) catch return false;
+                    const path = try self.allocDottedPath(prefix, name);
+                    try self.appendStmt(cur, .{
+                        .kind = .{ .field_assign = .{ .parent = parent, .name = path, .rhs_kind = .plain, .defined = true } },
+                        .pos = pos, .end_pos = end_pos,
+                    });
+                    try self.appendStmt(cur, .{
+                        .kind = .{ .compare_assume = .{
+                            .lhs = .{ .field = .{ .parent = parent, .name = path, .is_unsigned = true } },
+                            .rhs = .{ .constant = integer }, .op = .eq,
+                        } },
+                        .pos = pos, .end_pos = end_pos,
+                    });
+                    continue;
+                }
                 var inputs: [8]?cfg_types.ValueInput = .{null} ** 8;
                 const defined = self.selectedValueInputsAtDepth(owner_tree, value, &inputs, false, 0, true);
                 complete = complete and defined;
@@ -20739,6 +21273,17 @@ const Builder = struct {
                     .pos = pos,
                     .end_pos = end_pos,
                 });
+                if (owner_tree.nodeTag(value) == .number_literal) {
+                    if (std.fmt.parseInt(u64, owner_tree.tokenSlice(owner_tree.nodeMainToken(value)), 0) catch null) |integer| {
+                        try self.appendStmt(cur, .{
+                            .kind = .{ .compare_assume = .{
+                                .lhs = .{ .field = .{ .parent = parent, .name = path, .is_unsigned = true } },
+                                .rhs = .{ .constant = integer }, .op = .eq,
+                            } },
+                            .pos = pos, .end_pos = end_pos,
+                        });
+                    }
+                }
                 if (nested) {
                     try self.emitDiagnosticDefaultFields(cur, parent, path, frame, value, pos, end_pos, 0);
                 } else if (shape == .aggregate) {
@@ -20772,17 +21317,35 @@ const Builder = struct {
             }
             return false;
         }
-        // No actual default node/context exists here. Fully explicit named
-        // fields retain their certificate; every omitted remainder abstains.
+        // Without a resolution frame, only an exact literal default supplies
+        // a numeric fact. Missing or computed defaults retain abstention.
+        var complete = true;
+        const owner_tree = owner.model.tree;
         for (owner.info.fields) |field| {
-            const raw = owner.model.tree.tokenSlice(field.name_token);
+            const raw = owner_tree.tokenSlice(field.name_token);
             const name = if (std.mem.startsWith(u8, raw, "@\""))
-                self.fieldLiteralNameInTree(owner.model.tree, field.name_token, false) orelse return false
+                self.fieldLiteralNameInTree(owner_tree, field.name_token, false) orelse return false
             else
                 raw;
-            if (!supplied.contains(name)) return false;
+            if (supplied.contains(name)) continue;
+            complete = false;
+            const equal = field.type_last + 1;
+            if (!field.has_default or equal + 2 >= owner_tree.tokens.len or owner_tree.tokenTag(equal) != .equal or
+                owner_tree.tokenTag(equal + 1) != .number_literal or
+                (owner_tree.tokenTag(equal + 2) != .comma and owner_tree.tokenTag(equal + 2) != .r_brace)) continue;
+            const integer = std.fmt.parseInt(u64, owner_tree.tokenSlice(equal + 1), 0) catch continue;
+            const path = try self.allocDottedPath(prefix, name);
+            try self.appendStmt(cur, .{
+                .kind = .{ .field_assign = .{ .parent = parent, .name = path, .rhs_kind = .plain, .defined = true } },
+                .pos = pos, .end_pos = end_pos,
+            });
+            try self.appendStmt(cur, .{
+                .kind = .{ .compare_assume = .{ .lhs = .{ .field = .{ .parent = parent, .name = path, .is_unsigned = true } },
+                    .rhs = .{ .constant = integer }, .op = .eq } },
+                .pos = pos, .end_pos = end_pos,
+            });
         }
-        return true;
+        return complete;
     }
 
     /// Unpack a struct-literal RHS into per-field `field_assign`
@@ -20809,8 +21372,21 @@ const Builder = struct {
     ) LoweringError!bool {
         const tree = self.tree;
         var buf: [2]Ast.Node.Index = undefined;
-        const init = tree.fullStructInit(&buf, rhs_node) orelse return true;
+        const init = tree.fullStructInit(&buf, rhs_node) orelse empty: {
+            const array = tree.fullArrayInit(&buf, rhs_node) orelse return true;
+            if (array.ast.elements.len != 0) return true;
+            // Zig parses `.{} ` as an empty array initializer. Its expected
+            // record type still applies the record's declared field defaults.
+            break :empty Ast.full.StructInit{ .ast = .{
+                .lbrace = array.ast.lbrace, .fields = &.{}, .type_expr = array.ast.type_expr,
+            } };
+        };
         var container = actual_container;
+        if (init.ast.fields.len == 0) if (self.integerResolutionFrame()) |frame| {
+            if (self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.expectedTypeOfNode(rhs_node))) |expected| {
+                if (expected.data == .container) container = expected.data.container;
+            }
+        };
         if (container == null) if (self.integerResolutionFrame()) |frame| {
             container = self.resolvedBindingValueType(frame, rhs_node, false).container;
             if (container == null) {
@@ -20901,6 +21477,13 @@ const Builder = struct {
                 .kind = .{ .field_assign = assignment },
                 .pos = pos,
                 .end_pos = end_pos,
+            });
+            if (self.integerValue(field_value)) |integer| try self.appendStmt(cur, .{
+                .kind = .{ .compare_assume = .{
+                    .lhs = .{ .field = .{ .parent = parent, .name = path, .is_unsigned = true } },
+                    .rhs = .{ .constant = integer }, .op = .eq,
+                } },
+                .pos = pos, .end_pos = end_pos,
             });
             try self.emitUndefinedByteMasks(cur, parent, field_value, self.callResultUndefinedBytes(field_value), path);
             _ = try self.emitSelectedCallUndefinedBytes(cur, parent, path, field_value);
@@ -21157,6 +21740,7 @@ const Builder = struct {
         var buffer: [2]Ast.Node.Index = undefined;
         const call = zls_resolver_mod.TypeResolver.CallOperands.full(self.tree, &buffer, node) orelse return;
         const reads = (try cache.valueScalarReadsAt(call.queryToken(self.tree, node), self.integerResolutionFrame(), argument)) orelse return;
+        const counted = try self.countedArgumentRead(node, argument, source);
         for (reads.fields[0..reads.field_count]) |field| {
             const prefix = if (source == .field_copy_of) source.field_copy_of.name else "";
             const path = if (prefix.len == 0) field else joined: {
@@ -21176,10 +21760,41 @@ const Builder = struct {
                     .pos = self.posOf(node), .end_pos = self.endPosOf(node),
                 });
             } else try self.appendStmt(block, .{
-                .kind = .{ .field_use = .{ .parent = parent, .name = path } },
+                .kind = .{ .field_use = .{ .parent = parent, .name = path, .counted_array = counted } },
                 .pos = self.posOf(node), .end_pos = self.endPosOf(node),
             });
         }
+    }
+
+    fn countedArgumentRead(self: *Builder, node: Ast.Node.Index, argument: Ast.Node.Index, source: ExprKind) LoweringError!@TypeOf(@as(@TypeOf(@as(StmtKind, undefined).field_use), undefined).counted_array) {
+        const cache = self.cache orelse return null;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = self.tree.fullCall(&call_buffer, node) orelse return null;
+        const actual = self.queryOrUnknown(file_cache.FileCache.ActualCallSummary,
+            cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(self.tree, call), self.integerResolutionFrame())) orelse return null;
+        const tree = actual.callee.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, actual.callee.declaration) orelse return null;
+        var parameters = proto.iterate(tree);
+        var ordinal: u32 = 0;
+        while (parameters.next()) |parameter| : (ordinal += 1) {
+            var arguments: [2]Ast.Node.Index = undefined;
+            const mapped = self.queryOrUnknown(Ast.Node.Index, actual.callArgumentFor(cache, &arguments, ordinal)) orelse continue;
+            if (mapped != argument) continue;
+            const ty = parameter.type_expr orelse return null;
+            if (tree.tokenTag(tree.firstToken(ty)) == .asterisk) return null;
+            const name = tree.tokenSlice(parameter.name_token orelse return null);
+            const proof = @import("../cache/prefix_reads.zig").selection(tree, actual.callee.declaration, name) orelse return null;
+            const prefix = if (source == .field_copy_of) source.field_copy_of.name else null;
+            // allocDottedPath registers ownership before returning either path.
+            const array_path = try self.allocDottedPath(prefix, proof.array_path);
+            const counter_path = try self.allocDottedPath(prefix, proof.counter_path);
+            return .{
+                .array_path = array_path,
+                .counter_path = counter_path,
+            };
+        }
+        return null;
     }
 
     fn emitTransportCallArguments(self: *Builder, node: Ast.Node.Index, block: BlockId) LoweringError!void {
@@ -21206,6 +21821,10 @@ const Builder = struct {
         skip_local: ?LocalId,
     ) !void {
         const tree = self.tree;
+        // Freeze caller-owned prefix/count storage before argument and call
+        // effects can revoke its numeric seed or its initialized bytes.
+        try self.preparePointerPrefixes(expr_node, cur);
+        try self.prepareReturnedIndexLength(cur, expr_node);
         try self.emitTransportValueUse(expr_node, cur);
         try self.emitTransportCallArguments(expr_node, cur);
         const first = tree.firstToken(expr_node);
@@ -21477,8 +22096,8 @@ const Builder = struct {
                         .initializes = false,
                         .payload_only = self.addressesElementOf(address.address_node),
                         .preserves_complete_array = preserving,
-                        .preserves_diagnostic_base = address.location_computed_complete and
-                            address.call_node != null and self.callReturnsWithoutError(address.call_node.?),
+                        // Freeze original bytes before replaying possible writes.
+                        .preserves_diagnostic_base = true,
                         .preserve_inputs = preserve_inputs,
                         .diagnostic_inputs = diagnostic_inputs,
                         .preserve_whole_payload = preserve_whole_payload,
@@ -23772,6 +24391,132 @@ fn expectReturnedStackEscapes(src: [:0]const u8, fn_name: []const u8, expected: 
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "stack-escape: copied slice elements retain payloads rather than their local array" {
+    const source =
+        \\const Path = struct {
+        \\    fields: [4][]const u8 = undefined,
+        \\    len: usize = 0,
+        \\    fn append(self: *Path, name: []const u8) bool {
+        \\        if (self.len == self.fields.len) return false;
+        \\        self.fields[self.len] = name;
+        \\        self.len += 1;
+        \\        return true;
+        \\    }
+        \\};
+        \\fn safe(base: Path, whole: Path, destination: Path) ?Path {
+        \\    var result = destination;
+        \\    for (whole.fields[base.len..whole.len]) |field| {
+        \\        if (!result.append(field)) return null;
+        \\    }
+        \\    return result;
+        \\}
+        \\fn outerSlice(whole: Path) []const []const u8 {
+        \\    return whole.fields[0..];
+        \\}
+        \\fn elementAddress(whole: Path) *const []const u8 {
+        \\    return &whole.fields[0];
+        \\}
+        \\fn localPayload(destination: Path) ?Path {
+        \\    var result = destination;
+        \\    var buf: [4]u8 = undefined;
+        \\    if (!result.append(buf[0..])) return null;
+        \\    return result;
+        \\}
+        \\fn localCapturedPayload(destination: Path) ?Path {
+        \\    var result = destination;
+        \\    var buf: [4]u8 = undefined;
+        \\    const fields = [_][]const u8{buf[0..]};
+        \\    for (fields) |field| {
+        \\        if (!result.append(field)) return null;
+        \\    }
+        \\    return result;
+        \\}
+        \\fn capturedCell(whole: Path) *const []const u8 {
+        \\    for (&whole.fields) |*field| return field;
+        \\    unreachable;
+        \\}
+    ;
+    try expectReturnedStackEscapes(source, "safe", 0, true);
+    try expectReturnedStackEscapes(source, "outerSlice", 1, true);
+    try expectReturnedStackEscapes(source, "elementAddress", 1, true);
+    try expectReturnedStackEscapes(source, "localPayload", 1, true);
+    try expectReturnedStackEscapes(source, "localCapturedPayload", 1, true);
+    try expectReturnedStackEscapes(source, "capturedCell", 1, true);
+}
+
+test "stack-escape: scalar match captures cannot retain helper input addresses" {
+    const source =
+        \\const Range = struct { start: u32, end: u32 };
+        \\const Match = struct {
+        \\    start: u32,
+        \\    end: u32,
+        \\    captures: [2]?u32 = @splat(null),
+        \\    ranges: [2]?Range = @splat(null),
+        \\};
+        \\const Atom = union(enum) { capture: u8, range: u8, opt: []const Atom };
+        \\fn matchSlice(atoms: []const Atom, t: *u32, captures: *[2]?u32, ranges: *[2]?Range) bool {
+        \\    for (atoms) |a| {
+        \\        switch (a) {
+        \\            .capture => |slot| captures[slot] = t.*,
+        \\            .range => |slot| ranges[slot] = .{ .start = t.*, .end = t.* },
+        \\            .opt => |sub| {
+        \\                const saved = captures.*;
+        \\                const saved_ranges = ranges.*;
+        \\                if (!matchSlice(sub, t, captures, ranges)) {
+        \\                    captures.* = saved;
+        \\                    ranges.* = saved_ranges;
+        \\                }
+        \\            },
+        \\        }
+        \\        t.* += 1;
+        \\    }
+        \\    return true;
+        \\}
+        \\fn safe(atoms: []const Atom, pos: u32, inherited: ?*const Match) ?Match {
+        \\    var m: Match = .{ .start = pos, .end = pos };
+        \\    if (inherited) |i| {
+        \\        m.captures = i.captures;
+        \\        m.ranges = i.ranges;
+        \\    }
+        \\    var t: u32 = pos;
+        \\    if (matchSlice(atoms, &t, &m.captures, &m.ranges)) {
+        \\        m.end = t - 1;
+        \\        return m;
+        \\    }
+        \\    return null;
+        \\}
+        \\const PointerMatch = struct { pointer: *u32 };
+        \\fn keep(t: *u32, out: *PointerMatch) void { out.pointer = t; }
+        \\fn unsafe(pos: u32) PointerMatch {
+        \\    var t = pos;
+        \\    var m: PointerMatch = undefined;
+        \\    keep(&t, &m);
+        \\    return m;
+        \\}
+        \\fn copyPointer(input: *const PointerMatch, out: *PointerMatch) void { out.* = input.*; }
+        \\fn unsafeCopied(pos: u32) PointerMatch {
+        \\    var t = pos;
+        \\    const input: PointerMatch = .{ .pointer = &t };
+        \\    var m: PointerMatch = undefined;
+        \\    copyPointer(&input, &m);
+        \\    return m;
+        \\}
+        \\const Encoded = struct { bits: usize };
+        \\fn copyEncoded(input: *const Encoded, out: *Encoded) void { out.* = input.*; }
+        \\fn unsafeEncoded(pos: u32) Encoded {
+        \\    var t = pos;
+        \\    const input: Encoded = .{ .bits = @intFromPtr(&t) };
+        \\    var m: Encoded = undefined;
+        \\    copyEncoded(&input, &m);
+        \\    return m;
+        \\}
+    ;
+    try expectReturnedStackEscapes(source, "safe", 0, true);
+    try expectReturnedStackEscapes(source, "unsafe", 1, true);
+    try expectReturnedStackEscapes(source, "unsafeCopied", 1, true);
+    try expectReturnedStackEscapes(source, "unsafeEncoded", 1, true);
 }
 
 test "S-LOAN: scalar outparam results are not frame addresses, direct addresses escape" {

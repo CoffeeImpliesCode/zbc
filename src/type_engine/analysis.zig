@@ -2874,6 +2874,24 @@ test "two integer constants decide a comparison; an unresolved side does not" {
     try std.testing.expect(undecided == comparisons.found[0]);
 }
 
+test "pointer size zero comparisons do not invent an ABI byte size" {
+    const gpa = std.testing.allocator;
+    for ([_]struct { source: [:0]const u8, decision: ?InternPool.Index }{
+        .{ .source = "fn f() bool { return @sizeOf(*u32) == 0; }", .decision = .bool_false },
+        .{ .source = "fn f() bool { return @sizeOf(*u32) != 0; }", .decision = .bool_true },
+        .{ .source = "fn f() bool { return 0 == @sizeOf(*u32); }", .decision = .bool_false },
+        .{ .source = "fn f() bool { return @sizeOf(*u32) == 1; }", .decision = null },
+        .{ .source = "fn f() bool { return @sizeOf(*u0) == 0; }", .decision = null },
+    }) |case| {
+        const fixture = try AnalyserFixture.create(gpa, "zbc-pointer-size-zero-test.zig", case.source);
+        defer fixture.destroy(gpa);
+        const comparison = try findComparison(fixture.tree());
+        const value = (try fixture.analyser.resolveTypeOfNode(.of(comparison, fixture.handle))).?;
+        try std.testing.expect(value.data == .ip_index);
+        try std.testing.expectEqual(case.decision, value.data.ip_index.index);
+    }
+}
+
 /// Returns whether the given `node` is the identifier `type`.
 pub fn isMetaType(tree: *const Ast, node: Ast.Node.Index) bool {
     if (tree.nodeTag(node) == .identifier) {
@@ -3267,6 +3285,31 @@ fn typeKnownByteSize(analyser: *Analyser, ty: Type, depth: u8, alignment_one: bo
         },
         else => return null,
     }
+}
+
+/// Prove only whether a size query is zero, without assuming a target ABI.
+fn sizeQueryIsZero(analyser: *Analyser, options: ResolveOptions) Error!?bool {
+    const tree = &options.node_handle.handle.document.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = tree.builtinCallParams(&buffer, options.node_handle.node) orelse return null;
+    if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(options.node_handle.node)), "@sizeOf")) return null;
+    const ty = (try analyser.resolveTypeOfNodeInternal(options.at(args[0]))) orelse return null;
+    if (try analyser.typeKnownByteSize(ty, 0, false)) |size| return size == 0;
+    // A pointer to runtime bytes cannot have a zero-bit representation.
+    // Its exact size, and pointers to zero-bit children, remain unknown.
+    if (!ty.is_type_val) return null;
+    const child = switch (ty.data) {
+        .pointer => |pointer| pointer.elem_ty.*,
+        .ip_index => blk: {
+            const key = analyser.ip.indexToKey(ty.ipIndex() orelse return null);
+            if (key != .pointer_type) return null;
+            break :blk Type.fromIP(analyser, .type_type, key.pointer_type.elem_type);
+        },
+        else => return null,
+    };
+    if (try analyser.typeKnownByteSize(child, 0, false)) |size|
+        if (size != 0) return false;
+    return null;
 }
 
 fn resolveReturnValueOfFuncNode(
@@ -6363,6 +6406,16 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                             }
                         }
                     }
+                }
+                const operands = [2]Ast.Node.Index{ lhs, rhs };
+                const types = [2]?Type{ lhs_ty, rhs_ty };
+                for (operands, 0..) |operand, index| {
+                    const other = types[1 - index] orelse continue;
+                    const value = internedIntValueOf(analyser, other) orelse continue;
+                    const integer = analyser.ip.toInt(value, i128) orelse continue;
+                    if (integer != 0) continue;
+                    const is_zero = (try analyser.sizeQueryIsZero(options.at(operand))) orelse continue;
+                    return Type.fromIP(analyser, .bool_type, if (is_zero == (tree.nodeTag(node) == .equal_equal)) .bool_true else .bool_false);
                 }
             }
 

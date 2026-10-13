@@ -1928,6 +1928,7 @@ fn reportGiveUp(o: *Oracle) budget_mod.BudgetError {
         // counter reads 0, and a depth or round cap reads its own bound.
         .reached = stop.cap,
         .byte = byte,
+        .document = budget_mod.documentForTree(o.tree),
         .line = site.line,
         .column = site.column,
         .function = name,

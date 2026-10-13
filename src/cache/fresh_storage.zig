@@ -1857,6 +1857,7 @@ fn locatedToken(tree: *const Ast, token: Ast.TokenIndex, limit: budget_mod.Limit
         .limit_value = limit_value,
         .reached = reached,
         .byte = byte,
+        .document = budget_mod.documentForTree(tree),
         .line = lc.line,
         .column = lc.column,
         .function = name,
@@ -3309,7 +3310,12 @@ fn numericValueIsZero(cache: *FileCache, value: Ast.Node.Index, walk: FreshWalk)
         .stopped = &stopped,
     };
     const value_range = evaluator.evaluate(value);
-    if (stopped) |stop| return budget_mod.fail(.{ .limit = stop.limit, .limit_value = stop.cap, .reached = stop.cap });
+    if (stopped) |stop| return budget_mod.fail(.{
+        .limit = stop.limit,
+        .limit_value = stop.cap,
+        .reached = stop.cap,
+        .document = budget_mod.documentForTree(cache.tree),
+    });
     return value_range == .integer and value_range.integer.min == 0 and value_range.integer.max == 0;
 }
 

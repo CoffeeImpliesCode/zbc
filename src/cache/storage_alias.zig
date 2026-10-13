@@ -135,9 +135,7 @@ pub const FileState = struct {
 const Exhausted = struct {
     /// The allowance the exhausted walk started with.
     budget: u32,
-    limit: budget_mod.Limit,
-    cap: u32,
-    reached: u32,
+    diagnostic: budget_mod.Diagnostic,
 };
 
 /// Everything a verdict depends on: the cache's own tree is implied, and the
@@ -413,7 +411,7 @@ pub fn mayShareStorageAt(
     const state = &cache.alias_state;
     if (standalone and !state.answers.contains(key)) {
         if (state.exhausted.get(key)) |known| {
-            if (work_limit <= known.budget) return query.report(known.limit, known.cap, known.reached);
+            if (work_limit <= known.budget) return budget_mod.fail(known.diagnostic);
         }
     }
     if (!standalone) return answerRoot(&query, key, left, right, domain);
@@ -433,9 +431,7 @@ pub fn mayShareStorageAt(
         {
             if (own) |first| state.recordExhausted(cache, key, .{
                 .budget = work_limit,
-                .limit = first.limit,
-                .cap = first.limit_value,
-                .reached = first.reached,
+                .diagnostic = first,
             });
         }
         return err;
@@ -747,6 +743,7 @@ const Query = struct {
             .limit_value = cap,
             .reached = reached,
             .byte = tree.tokens.items(.start)[token],
+            .document = budget_mod.documentForTree(tree),
         });
     }
 
@@ -2435,6 +2432,9 @@ test "an exhausted standalone question fails again at once with the same diagnos
     try std.testing.expectEqual(first.limit_value, second.limit_value);
     try std.testing.expectEqual(first.reached, second.reached);
     try std.testing.expectEqual(first.byte, second.byte);
+    try std.testing.expectEqual(first.line, second.line);
+    try std.testing.expectEqual(first.column, second.column);
+    try std.testing.expectEqualStrings(first.document, second.document);
     try std.testing.expectEqual(@as(u32, 1), cache.alias_state.exhausted.count());
 
     // Another selection path, and another domain, are other questions that
@@ -2477,16 +2477,18 @@ test "a recorded alias failure never replaces a completed answer and a completed
     const key = AnswerKey.of(&cache, site.call, left, right, .backing_storage, context);
     const stale: Exhausted = .{
         .budget = work_limit,
-        .limit = .storage_alias_work,
-        .cap = work_limit,
-        .reached = work_limit,
+        .diagnostic = .{
+            .limit = .storage_alias_work,
+            .limit_value = work_limit,
+            .reached = work_limit,
+        },
     };
     budget_mod.clear();
     defer budget_mod.clear();
 
     // A record with a smaller allowance than the question owns does not stop
     // it; the proof completes and the record is dropped.
-    cache.alias_state.recordExhausted(&cache, key, .{ .budget = 1, .limit = stale.limit, .cap = stale.cap, .reached = stale.reached });
+    cache.alias_state.recordExhausted(&cache, key, .{ .budget = 1, .diagnostic = stale.diagnostic });
     try std.testing.expectEqual(@as(u32, 1), cache.alias_state.exhausted.count());
     try std.testing.expect(!try mayShareStorageAt(&cache, site.call, left, right, .backing_storage, context));
     try std.testing.expectEqual(@as(u32, 0), cache.alias_state.exhausted.count());

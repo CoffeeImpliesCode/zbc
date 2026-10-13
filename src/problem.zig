@@ -119,14 +119,16 @@ pub const Incomplete = struct {
     /// Function name or rule id. Owned.
     name: []const u8,
     /// The limit that tripped. Null when the walk that gave up recorded none.
-    budget: ?budget_mod.Diagnostic,
+    /// A nonempty diagnostic document is owned, like name.
+    budget: ?budget_mod.OwnedDiagnostic,
 
     pub fn deinit(self: *Incomplete, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
+        if (self.budget) |*diagnostic| diagnostic.deinit(gpa);
     }
 };
 
-/// Copy `name` and append it as an incomplete part.
+/// Copy name and the diagnostic document before publishing an incomplete part.
 pub fn appendIncomplete(
     gpa: std.mem.Allocator,
     list: *std.ArrayListUnmanaged(Incomplete),
@@ -136,7 +138,9 @@ pub fn appendIncomplete(
 ) std.mem.Allocator.Error!void {
     const owned = try gpa.dupe(u8, name);
     errdefer gpa.free(owned);
-    try list.append(gpa, .{ .kind = kind, .name = owned, .budget = budget });
+    var owned_budget = if (budget) |diagnostic| try diagnostic.owned(gpa) else null;
+    errdefer if (owned_budget) |*diagnostic| diagnostic.deinit(gpa);
+    try list.append(gpa, .{ .kind = kind, .name = owned, .budget = owned_budget });
 }
 
 /// Free and drop every Problem at index `len` and above.
