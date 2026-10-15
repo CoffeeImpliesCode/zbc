@@ -462,7 +462,7 @@ pub const all = [_]Rule{
     },
     .{
         .id = "catch-error-panic",
-        .title = "`catch |err| @panic(...)` — catching an error and panicking turns a recoverable error into a process crash; use `try` to propagate or `catch unreachable` if impossible",
+        .title = "`catch ... @panic(...)` bypasses the declared input-error result on a source-proved capacity failure; use `try` to propagate the error",
         .body = @embedFile("rules/misc/catch-error-panic.md"),
     },
     .{

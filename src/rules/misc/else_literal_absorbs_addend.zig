@@ -23,14 +23,11 @@
 //! else 0 + conditions.len)` dropped `conditions.len` whenever `allow_addons`
 //! was true, causing `putAssumeCapacity` to assert past the reserved slots).
 //!
-//! Detection (Tier 1, token walk):
-//!   3-token pattern:
-//!     t+0: keyword_else
-//!     t+1: number_literal("0" or "1")
-//!     t+2: plus
-//!   Fire at t+0.
-//!   The naturally suppressed form `(if (cond) x else 0) + n` has `)` at t+2,
-//!   not `plus`, so it does not fire.
+//! Detection (Tier 1, AST structure):
+//!   An addition directly owns an unparenthesized `if` as its right operand.
+//!   The parsed else branch starts with `0 +` or `1 +`.
+//!   Explicitly grouped conditionals and branch sums are not candidates.
+//!   Standalone conditional branch arithmetic is also not a candidate.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -56,19 +53,24 @@ pub fn check(
     _ = cache;
 
     const tags = tree.tokens.items(.tag);
-    const last_tok = tree.lastToken(.root);
-
-    var t: Ast.TokenIndex = 0;
-    while (t + 2 <= last_tok) : (t += 1) {
-        // Pattern: else 0 + ... OR else 1 + ...
-        if (tags[t] != .keyword_else) continue;
-        if (tags[t + 1] != .number_literal) continue;
-        const lit = tree.tokenSlice(t + 1);
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .add) continue;
+        const addition: Ast.Node.Index = @enumFromInt(index);
+        const conditional = tree.nodeData(addition).node_and_node[1];
+        // Do not peel parentheses here. They explicitly make the conditional
+        // one addend rather than an ungrouped continuation of the outer sum.
+        const branch = tree.fullIf(conditional) orelse continue;
+        if (branch.error_token != null) continue;
+        const otherwise = branch.ast.else_expr.unwrap() orelse continue;
+        if (tree.nodeTag(otherwise) != .add) continue;
+        const first = tree.firstToken(otherwise);
+        if (first != branch.else_token + 1 or tags[first] != .number_literal) continue;
+        const lit = tree.tokenSlice(first);
         if (!std.mem.eql(u8, lit, "0") and !std.mem.eql(u8, lit, "1")) continue;
-        // The `+` must be the regular addition, not `+|` (saturating) or `+%` (wrapping).
-        if (tags[t + 2] != .plus) continue;
-
-        try report(gpa, problems, tree, t, lit);
+        // Check the start of this parsed branch, not any neighboring branch.
+        // Explicit branch grouping and wrapping/saturating addition stay quiet.
+        if (tags[first + 1] != .plus) continue;
+        try report(gpa, problems, tree, branch.else_token, lit);
     }
 }
 
@@ -147,5 +149,91 @@ test "else-literal-absorbs-addend: else 2 plus does not fire" {
         \\    return base + if (cond) 0 else 2 + extra;
         \\}
         \\
+    );
+}
+
+test "else-literal-absorbs-addend: grouped conditional suffix branch does not fire" {
+    try testing.expectNoFire(check,
+        \\fn length(root: []const u8, suffix: []const u8) usize {
+        \\    return root.len + (if (suffix.len == 0) 0 else 1 + suffix.len);
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: standalone nullable branch arithmetic does not fire" {
+    try testing.expectNoFire(check,
+        \\fn value(zero: bool, random: anytype) u32 {
+        \\    const result: u32 = if (zero) 0 else 1 + random.range(u32, 0, 8);
+        \\    return result;
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: standalone multi line branch arithmetic does not fire" {
+    try testing.expectNoFire(check,
+        \\fn count(nominal: bool, random: anytype) usize {
+        \\    return if (nominal)
+        \\        random.range(u8, 0, 9)
+        \\    else
+        \\        1 + random.range(u8, 0, 8);
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: explicitly grouped else sum does not fire" {
+    try testing.expectNoFire(check,
+        \\fn capacity(base: usize, cond: bool, extra: usize) usize {
+        \\    return base + if (cond) 1 else (0 + extra);
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: multiply grouped conditional does not fire" {
+    try testing.expectNoFire(check,
+        \\fn capacity(base: usize, cond: bool, extra: usize) usize {
+        \\    return base + ((if (cond) 1 else 0 + extra));
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: outer grouping does not hide trap" {
+    try testing.expectFires(check, R,
+        \\fn capacity(base: usize, cond: bool, extra: usize) usize {
+        \\    return (base + if (cond) 1 else 0 + extra);
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: nested true branch trap fires" {
+    try testing.expectFires(check, R,
+        \\fn capacity(base: usize, outer: bool, cond: bool, extra: usize) usize {
+        \\    return if (outer) base + if (cond) 1 else 0 + extra else 0;
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: nested intentional conditional branch does not fire" {
+    try testing.expectNoFire(check,
+        \\fn capacity(base: usize, outer: bool, cond: bool, extra: usize) usize {
+        \\    return base + (if (outer) 0 else if (cond) 1 else 0 + extra);
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: separate preceding addition does not fire" {
+    try testing.expectNoFire(check,
+        \\fn capacity(base: usize, cond: bool, extra: usize) usize {
+        \\    const sum = base + extra;
+        \\    return if (cond) sum else 0 + extra;
+        \\}
+    );
+}
+
+test "else-literal-absorbs-addend: wrapping and saturating branches do not fire" {
+    try testing.expectNoFire(check,
+        \\fn capacity(base: usize, cond: bool, extra: usize) usize {
+        \\    const wrapped = base + if (cond) 1 else 0 +% extra;
+        \\    return wrapped + if (cond) 1 else 0 +| extra;
+        \\}
     );
 }

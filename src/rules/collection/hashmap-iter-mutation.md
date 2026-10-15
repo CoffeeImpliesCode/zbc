@@ -1,10 +1,9 @@
 # hashmap-iter-mutation
 
-Modifying a `HashMap` while iterating over it (via `iterator()`,
-`keyIterator()`, or `valueIterator()`) invalidates the iterator's
-internal cursor.  Subsequent calls to `iter.next()` have undefined
-behaviour — on Zig's open-addressing hash table the cursor may
-revisit the same slot, skip slots entirely, or run off the end.
+Structural changes to a `HashMap` can invalidate an active `iterator()`,
+`keyIterator()`, or `valueIterator()`. New entries, removals, and backing
+storage changes can make its cursor stale. A value-only replacement of an
+existing key does not itself change occupancy or backing storage.
 
 ## Why this matters
 
@@ -57,15 +56,39 @@ Per-function token walk:
 
 1. Find `const/var <iter> = <recv>.<iter-method>()` where
    `iter-method ∈ {iterator, keyIterator, valueIterator}`.
-   Limited to single-identifier receivers.
+   The receiver can be a bare name or one field of a receiver.
 2. Scan forward for `while (<iter>.next()) [|...|]` loop headers.
 3. Inside the while body, scan for `<recv>.<mutate>(` at the same
    lexical depth (nested blocks are skipped).
-4. Fire at the mutation call site.
+4. Exclude a source-proven value-only replacement. Report the remaining mutation.
 
 Mutate methods: `put`, `putAssumeCapacity`, `putNoClobber`,
 `putNoClobberAssumeCapacity`, `remove`, `removeByPtr`, `fetchPut`,
-`fetchRemove`, `swapRemove`, `clearAndFree`, `clearRetainingCapacity`.
+`fetchRemove`, `swapRemove`, `clearAndFree`, `clearRetainingCapacity`,
+`ensureTotalCapacity`, `ensureUnusedCapacity`, and `rehash`.
 
-Deliberately omitted: `*AssumeCapacity` put variants — the key is
-already present by contract, so no rehash occurs.
+## Stable current-key replacement
+
+The rule can exclude `putAssumeCapacity` when all these facts hold:
+
+- The iterator, its `next` call, and the replacement resolve to the actual
+  SDK hash-map declarations.
+- The map has an integer key and the SDK `AutoContext` for that same key
+  type. Generic bindings use the factory parameter's token and declaring
+  document together. A custom hash or equality callback cannot use this proof.
+- The exact formal-to-actual mapping identifies the replacement key.
+  Managed and unmanaged Zig 0.16 maps both take `key` and `value` here;
+  the assumed-capacity call does not take an allocator.
+  The key is `entry.key_ptr.*` from this loop's current entry.
+- Both receiver expressions refer to the same lexical binding.
+- The complete relevant syntax contains no other call, store, rebind, or
+  opaque effect. This includes replacement arguments and the rest of the loop.
+
+The assumed-capacity contract prevents growth. The unchanged current key
+proves that the entry already exists. Together, these facts prove a value-only
+replacement. The method spelling alone proves neither fact.
+
+Ordinary `put` can grow before it searches for an existing key. It remains
+a candidate even when its argument is `entry.key_ptr.*`.
+No-clobber insertion, arbitrary keys, custom methods, unresolved types, and
+incomplete effect proofs also retain the warning.

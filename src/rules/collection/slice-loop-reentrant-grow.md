@@ -34,18 +34,49 @@ temporary list before processing:
 - The grown list is a **different object** than the one being iterated.
   Receiver field names alone do not prove that two lists share storage:
   `parent.allocations` and `output.allocations` can be independent lists.
-  The rule checks the whole receiver path and its root binding. A local
-  built from `.{}` can remain private when a callee fills it through an
-  address argument in a discarded call, including
-  `if (condition) try fill(&parent);`. The condition, callee, and arguments
-  must not name the other root. The enclosing `if` must itself be a
-  statement, not an initializer or another expression that keeps the
-  result. Header copies, stored addresses, pointer aliases, and unresolved
-  receiver chains remain possible aliases and are reported.
+  The rule resolves receiver binding origins, including immutable aliases
+  and copied list headers. Different parameter names do **not** prove
+  independence: two pointers can point to the same object. Independent
+  storage requires a fresh initializer proved from its declarations and
+  a private local before the growth call. Constructor names and `.empty`
+  spelling alone are not proof. Rebinding, header replacement, escaped
+  addresses, and unresolved receiver chains remain possible aliases.
+  A `*const` view does not change this: another mutable pointer or copied
+  header can still reallocate its backing buffer. A quiet consumer needs
+  an actual private fresh output, not only constness on an incoming tree.
+  A header store before the call also prevents a sibling-field exemption.
+  An address handover must resolve to a readable helper with scalar stores
+  and authenticated SDK list growth. Header stores and opaque calls cannot
+  certify that the local remains private.
 - The callee grows a **different** ArrayList than the one being iterated.
-  The rule uses callee growth paths to identify the affected parameters and
-  fields. A proved sibling-field growth or a call that cannot reach the
-  iterated receiver does not fire. Unknown growth effects stay conservative.
+  The rule uses canonical growth paths to identify affected parameters and
+  fields. A fresh output stays separate only when the caller's storage proof
+  and the callee's complete growth paths agree. The callee must also preserve
+  header identity: scalar stores and authenticated SDK list growth are allowed,
+  but header copies and opaque callees are not. Once those certificates are
+  complete, a generic write summary adds no storage-identity evidence:
+  ordinary SDK growth itself writes the destination header. Unknown
+  provenance and incomplete growth effects stay conservative.
+- An opaque callback can grow storage through its captured context. The
+  neutral closed-dispatch census supplies **all** registrations, leaf
+  arguments, source frames, and transport edges. The collection consumer
+  separately requires a private fresh iterated list at every dispatch,
+  with no earlier publication or transport of that local. The privacy
+  horizon is the invocation, not registration: a header copied into the
+  captured output after binding still prevents a storage certificate.
+  The census distinguishes an inline sibling component from the address
+  of its enclosing callback carrier. A component header store or a canonical
+  SDK list growth/lifecycle call does not by itself replace sibling callback
+  slots. Pointer fields, raw child addresses, and project methods that can
+  recover or publish their parent do not gain that exception.
+  Same-object arguments, copied headers, NULL contexts, escaped dispatchers,
+  and unsupported edges retain the finding. A complete census and an alignment
+  proof alone do not establish disjoint backing storage.
+- A collection access only **computes the iterable**. For example,
+  `for (successors[queue.items[head]])` borrows the successor slice, not
+  the queue's backing buffer. Growing a dynamically indexed queue does
+  not invalidate that distinct slice. Each nested `for (queue.items)`
+  still has its own borrow horizon.
 - The ArrayList is **pre-allocated** (via `ensureTotalCapacity`) before the
   loop and the callee only calls `appendAssumeCapacity`-family methods (which
   cannot reallocate).  Those methods are excluded from `may_grow_collections`

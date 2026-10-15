@@ -2450,6 +2450,71 @@ test "a quoted escaped enum tag binds decoded @tagName bytes, not unknown values
     })) == null);
 }
 
+test "canonical enum values refuse mutable pointer runtime cyclic and foreign enum sources" {
+    const gpa = std.testing.allocator;
+    const header =
+        \\const Mode = enum { bytes, disabled };
+        \\const Config = struct { mode: Mode };
+        \\
+    ;
+    inline for (.{
+        "var value: Mode = .bytes; fn f() void { _ = value; }",
+        "var config: Config = .{ .mode = .bytes }; const value = config.mode; fn f() void { _ = value; }",
+        "const config: Config = .{ .mode = .bytes }; const pointer = &config; const value = pointer.mode; fn f() void { _ = value; }",
+        "fn f(value: Mode) void { _ = value; }",
+        "const value: Mode = other; const other: Mode = value; fn f() void { _ = value; }",
+        "const Other = enum { bytes, disabled }; const value: Other = .bytes; fn f() void { _ = value; }",
+    }) |body| {
+        const fixture = try AnalyserFixture.create(gpa, "zbc-canonical-enum-refusal.zig", header ++ body);
+        defer fixture.destroy(gpa);
+        const analyser = &fixture.analyser;
+        const handle = fixture.handle;
+        const tree = fixture.tree();
+        const declared = (try analyser.resolveTypeOfNode(.of(try findIdentifier(tree, "Mode"), handle))) orelse
+            return error.EnumTypeUnresolved;
+        const node = try findIdentifier(tree, "value");
+        try std.testing.expect((try boundValueOfArgument(analyser, .of(node, handle), declared, node)) == null);
+    }
+}
+
+test "canonical enum switches refuse unknown duplicate and foreign enum cases" {
+    const gpa = std.testing.allocator;
+    const header =
+        \\const Mode = enum { bytes, disabled };
+        \\const Other = enum { bytes, disabled };
+        \\const choice: Mode = .bytes;
+        \\
+    ;
+    inline for (.{
+        "const Input = switch (choice) { .bytes => []const u8, .missing => void, else => []const u8 };",
+        "const Input = switch (choice) { .bytes => []const u8, .bytes => void, else => []const u8 };",
+        "const Input = switch (choice) { .bytes => []const u8, Other.disabled => void, else => []const u8 };",
+    }) |body| {
+        const fixture = try AnalyserFixture.create(gpa, "zbc-canonical-enum-cases.zig", header ++ body ++ "\nfn f(value: Input) void { _ = value; }");
+        defer fixture.destroy(gpa);
+        const tree = fixture.tree();
+        const result = (try fixture.analyser.resolveTypeOfNode(.of(try findIdentifier(tree, "Input"), fixture.handle))) orelse
+            return error.SwitchTypeUnresolved;
+        try std.testing.expect(result.data == .either);
+    }
+}
+
+test "canonical tag names read immutable aggregate fields with decoded enum spelling" {
+    const gpa = std.testing.allocator;
+    const fixture = try AnalyserFixture.create(gpa, "zbc-canonical-enum-tag-name.zig",
+        \\const Mode = enum { @"b\x79tes", disabled };
+        \\const Config = struct { mode: Mode };
+        \\const namespace = struct { const config: Config = .{ .mode = .bytes }; };
+        \\const value = namespace.config.mode;
+        \\fn f() void { _ = @tagName(value); }
+    );
+    defer fixture.destroy(gpa);
+    const node = try findBuiltinArg(fixture.tree(), "@tagName", 0, "value");
+    const name = (try fixture.analyser.resolveStringLiteral(.of(node, fixture.handle))) orelse
+        return error.TagNameUnresolved;
+    try std.testing.expectEqualStrings("bytes", name);
+}
+
 /// A `comptime` BOOLEAN formal: the two arguments are two instantiations,
 /// not one instantiation read twice.
 const bound_bool_source: [:0]const u8 =
@@ -3085,6 +3150,7 @@ const binding_keys = struct {
                     Type.Data.hashShallowType(tag.enum_ty, &entry, depth);
                 },
                 .string => |bytes| entry.update(bytes),
+                .optional_null => std.hash.autoHash(&entry, @intFromEnum(std.meta.activeTag(value))),
             }
             fold +%= entry.final();
         }
@@ -3189,29 +3255,170 @@ fn resolveGenericTypeInternal(
     return resolved;
 }
 
-fn findReturnStatementInternal(tree: *const Ast, body: Ast.Node.Index, already_found: *bool) ?Ast.Node.Index {
-    var result: ?Ast.Node.Index = null;
 
-    var buffer: [2]Ast.Node.Index = undefined;
-    const statements = tree.blockStatements(&buffer, body) orelse return null;
+const TypeFunctionReturn = union(enum) { fallthrough, unknown, value: Type };
 
-    for (statements) |child_idx| {
-        if (tree.nodeTag(child_idx) == .@"return") {
-            if (already_found.*) return null;
-            already_found.* = true;
-            result = child_idx;
-            continue;
+fn typeFactoryInitializerHasControl(tree: *const Ast, node: Ast.Node.Index) bool {
+    var token = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    while (true) : (token += 1) {
+        switch (tree.tokenTag(token)) {
+            .keyword_return, .keyword_break, .keyword_continue, .keyword_defer, .keyword_errdefer,
+            .keyword_asm, .keyword_try, .keyword_catch, .keyword_unreachable,
+            .keyword_if, .keyword_switch, .keyword_while, .keyword_for,
+            => return true,
+            else => {},
         }
-
-        result = findReturnStatementInternal(tree, child_idx, already_found);
+        if (token == last) break;
     }
-
-    return result;
+    return false;
 }
 
-fn findReturnStatement(tree: *const Ast, body: Ast.Node.Index) ?Ast.Node.Index {
-    var already_found = false;
-    return findReturnStatementInternal(tree, body, &already_found);
+const KnownNullSource = union(enum) { untyped, typed: Type };
+
+/// Null is read from syntax or this frame's actual binding, never from a
+/// declaration's optional type or an observed subset of its callers.
+/// Keep the declared type when forwarding a formal: null does not make
+/// two unrelated optional payload types interchangeable.
+fn knownNullSource(analyser: *Analyser, options: ResolveOptions, node: Ast.Node.Index, depth: u32) Error!?KnownNullSource {
+    if (depth >= analyser.resolve_depth_limit) {
+        analyser.resolve_truncated = true;
+        return null;
+    }
+    const handle = options.node_handle.handle;
+    const tree = &handle.document.tree;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return knownNullSource(analyser, options, tree.nodeData(node).node_and_token[0], depth + 1),
+        .identifier => {
+            const token = ast.identifierTokenFromIdentifierNode(tree, node) orelse return null;
+            if (std.mem.eql(u8, tree.tokenSlice(token), "null")) return .untyped;
+            const name = offsets.identifierTokenToNameSlice(tree, token);
+            const hit = (try analyser.lookupSymbolGlobalScoped(handle, name, tree.tokenStart(token))) orelse return null;
+            const framed = try withEnclosingContainer(options, hit);
+            const param = switch (framed.decl) {
+                .function_parameter => |parameter| parameter.get(&framed.handle.document.tree) orelse return null,
+                else => return null,
+            };
+            const modifier = param.comptime_noalias orelse return null;
+            if (framed.handle.document.tree.tokenTag(modifier) != .keyword_comptime) return null;
+            const key: TokenWithHandle = .{
+                .token = framed.decl.nameToken(&framed.handle.document.tree),
+                .handle = framed.handle,
+            };
+            var index: ?InternPool.Index = null;
+            var null_type: ?Type = null;
+            if (framed.container_type) |container| {
+                if (container.data == .container) {
+                    if (container.data.container.bound_params.get(key)) |actual| {
+                        if (!actual.is_type_val) {
+                            index = actual.ipIndex();
+                            if (container.data.container.bound_values.get(key)) |value| {
+                                if (value == .optional_null) {
+                                    const actual_type = try actual.typeOf(analyser);
+                                    if (knownTypeTag(analyser, actual_type) != .optional) return null;
+                                    null_type = actual_type;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (index == null) {
+                if (analyser.comptime_values) |values| index = values.get(key);
+            }
+            if (null_type == null and !analyser.ip.isNull(index orelse return null)) return null;
+            const type_node = param.type_expr orelse return null;
+            const declared = (try analyser.resolveTypeOfNodeInternal(framed.at(type_node))) orelse return null;
+            if (!declared.is_type_val or knownTypeTag(analyser, declared) != .optional) return null;
+            if (null_type) |actual_type| if (!actual_type.eqlImpl(declared, true)) return null;
+            return .{ .typed = declared };
+        },
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const arguments = tree.builtinCallParams(&buffer, node).?;
+            if (arguments.len != 2 or typeFactoryInitializerHasControl(tree, arguments[0])) return null;
+            const declared = (try analyser.resolveTypeOfNodeInternal(options.at(arguments[0]))) orelse return null;
+            if (!declared.is_type_val or knownTypeTag(analyser, declared) != .optional) return null;
+            const source = (try knownNullSource(analyser, options, arguments[1], depth + 1)) orelse return null;
+            if (source == .typed and !source.typed.eqlImpl(declared, true)) return null;
+            return .{ .typed = declared };
+        },
+        else => return null,
+    }
+}
+
+/// Re-evaluate type factories only along source-proved control flow under
+/// the call's actual comptime bindings. An unknown branch is not a return.
+fn resolveTypeFunctionReturn(analyser: *Analyser, options: ResolveOptions, node: Ast.Node.Index, depth: u32) Error!TypeFunctionReturn {
+    if (depth >= analyser.resolve_depth_limit) {
+        analyser.resolve_truncated = true;
+        return .unknown;
+    }
+    const tree = &options.node_handle.handle.document.tree;
+    switch (tree.nodeTag(node)) {
+        .@"return" => {
+            const value_node = tree.nodeData(node).opt_node.unwrap() orelse return .unknown;
+            const value = (try analyser.resolveTypeOfNodeInternal(options.at(value_node))) orelse return .unknown;
+            if (!value.is_type_val or value.data == .either or value.data == .compile_error or value.data == .type_parameter or value.data == .anytype_parameter)
+                return .unknown;
+            if (value.data == .ip_index and value.ipIndex() == null) return .unknown;
+            return .{ .value = value };
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (tree.blockStatements(&buffer, node).?) |statement| {
+                const result = try resolveTypeFunctionReturn(analyser, options, statement, depth + 1);
+                switch (result) {
+                    .fallthrough => {},
+                    .unknown, .value => return result,
+                }
+            }
+            return .fallthrough;
+        },
+        .@"comptime" => return resolveTypeFunctionReturn(analyser, options, tree.nodeData(node).node, depth + 1),
+        .@"if", .if_simple => {
+            const conditional = tree.fullIf(node).?;
+            if (conditional.payload_token != null) {
+                const source = (try knownNullSource(analyser, options, conditional.ast.cond_expr, depth + 1)) orelse return .unknown;
+                if (source != .typed) return .unknown;
+                if (conditional.ast.else_expr.unwrap()) |other|
+                    return resolveTypeFunctionReturn(analyser, options, other, depth + 1);
+                return .fallthrough;
+            }
+            const condition = (try analyser.resolveTypeOfNodeInternal(options.at(conditional.ast.cond_expr))) orelse return .unknown;
+            if (condition.is_type_val) return .unknown;
+            const known = condition.ipIndex() orelse return .unknown;
+            switch (known) {
+                .bool_true => return resolveTypeFunctionReturn(analyser, options, conditional.ast.then_expr, depth + 1),
+                .bool_false => {
+                    if (conditional.ast.else_expr.unwrap()) |other|
+                        return resolveTypeFunctionReturn(analyser, options, other, depth + 1);
+                    return .fallthrough;
+                },
+                else => return .unknown,
+            }
+        },
+        .simple_var_decl, .aligned_var_decl, .global_var_decl, .local_var_decl => {
+            const declaration = tree.fullVarDecl(node).?;
+            if (tree.tokenTag(declaration.ast.mut_token) != .keyword_const) return .unknown;
+            const initializer = declaration.ast.init_node.unwrap() orelse return .unknown;
+            // A declaration can hide an early exit in its initializer. Do not
+            // select a later return across control flow this evaluator omits.
+            if (typeFactoryInitializerHasControl(tree, initializer)) return .unknown;
+            const value = (try analyser.resolveTypeOfNodeInternal(options.at(initializer))) orelse return .unknown;
+            if (value.data == .compile_error or value.data == .either or value.data == .type_parameter or value.data == .anytype_parameter)
+                return .unknown;
+            if (value.data == .ip_index and value.ipIndex() == null) return .unknown;
+            if (!value.is_type_val) {
+                const index = value.ipIndex() orelse return .unknown;
+                if (index != .bool_true and index != .bool_false and internedIntValueOf(analyser, value) == null)
+                    return .unknown;
+            }
+            return .fallthrough;
+        },
+        else => return .unknown,
+    }
 }
 
 /// if `func_type_param` is callable, returns an instance of the return type.
@@ -3327,14 +3534,10 @@ fn resolveReturnValueOfFuncNode(
     if (isTypeFunction(tree, fn_proto)) {
         if (!has_body) return .unknown_type;
         const body = tree.nodeData(func_node).node_and_node[1];
-        // If this is a type function and it only contains a single return statement that returns
-        // a container declaration, we will return that declaration.
-        const return_node = findReturnStatement(tree, body) orelse return .unknown_type;
-        if (tree.nodeData(return_node).opt_node.unwrap()) |return_expr| {
-            return try analyser.resolveTypeOfNodeInternal(options.at(return_expr)) orelse .unknown_type;
-        }
-
-        return .unknown_type;
+        return switch (try resolveTypeFunctionReturn(analyser, options, body, 0)) {
+            .value => |value| value,
+            .unknown, .fallthrough => .unknown_type,
+        };
     }
 
     const return_type = fn_proto.ast.return_type.unwrap() orelse return null;
@@ -3600,6 +3803,7 @@ fn bracketAccessTypeFromIPIndex(analyser: *Analyser, ip_index: InternPool.Index)
                     .size = info.flags.size,
                     .sentinel = info.sentinel,
                     .is_const = info.flags.is_const,
+                    .is_allowzero = info.flags.is_allowzero,
                     .elem_ty = try analyser.allocType(try analyser.bracketAccessTypeFromIPIndex(info.elem_type)),
                 },
             },
@@ -3746,6 +3950,7 @@ pub fn resolvePropertyType(analyser: *Analyser, ty: Type, name: []const u8) erro
                                 .size = .many,
                                 .sentinel = info.sentinel,
                                 .is_const = info.is_const,
+                                .is_allowzero = info.is_allowzero,
                                 .elem_ty = info.elem_ty,
                             },
                         },
@@ -4196,7 +4401,7 @@ pub fn resolveStringLiteral(analyser: *Analyser, options: ResolveOptions) Error!
                 });
                 if (bound) |value| switch (value) {
                     .string => |bytes| return bytes,
-                    .enum_tag => {},
+                    .enum_tag, .optional_null => {},
                 };
             }
         }
@@ -4237,32 +4442,15 @@ pub fn resolveStringLiteral(analyser: *Analyser, options: ResolveOptions) Error!
         error.OutOfMemory => return error.OutOfMemory,
     };
 }
-/// The NAME of the enum tag `node` names, when the frame this read happens
-/// in actually bound that formal to one.
-///
-/// A tag that was never bound — a runtime value, or a formal read outside
-/// the call that supplied it — has no name this engine can know.  Naming
-/// one from the formal's spelling or from the enum's member list would be a
-/// fabrication, so that reads as unknown.
+/// Read a tag's actual value through the same query used to bind comptime
+/// arguments and select enum switch arms. Runtime enum types have no name.
 fn resolveBoundTagName(analyser: *Analyser, options: ResolveOptions, node: Ast.Node.Index) Error!?[]const u8 {
-    const container = options.container_type orelse return null;
-    const info = switch (container.data) {
-        .container => |info| info,
-        else => return null,
-    };
-    const handle = options.node_handle.handle;
-    const tree = &handle.document.tree;
-    if (tree.nodeTag(node) != .identifier) return null;
-    const name_token = ast.identifierTokenFromIdentifierNode(tree, node) orelse return null;
-    const name = offsets.identifierTokenToNameSlice(tree, name_token);
-    // Same declaration-key rule as the string reader: the store is keyed by
-    // the formal's declaration token, not by this use.
-    const decl = (try container.lookupSymbol(analyser, name)) orelse
-        (try analyser.lookupSymbolGlobal(handle, name, tree.tokenStart(name_token))) orelse return null;
-    const bound = info.bound_values.get(.{ .token = decl.nameToken(), .handle = decl.handle }) orelse return null;
+    const value = try analyser.resolveTypeOfNodeInternal(options.at(node));
+    const declared = if (value) |actual| try actual.typeOf(analyser) else Type.unknown_type;
+    const bound = (try boundValueOfArgument(analyser, options, declared, node)) orelse return null;
     return switch (bound) {
         .enum_tag => |tag| tag.name,
-        .string => null,
+        .string, .optional_null => null,
     };
 }
 
@@ -4683,6 +4871,32 @@ fn narrowSwitchToMatchingProng(
             return try analyser.resolveTypeOfNodeInternal(options.at(selected orelse fallback orelse return null));
         }
     }
+    const selector_type = try selector.typeOf(analyser);
+    if (selector_type.isEnumType()) {
+        const wanted_value = (try boundValueOfArgument(analyser, options, selector_type, switch_node.ast.condition)) orelse return null;
+        if (wanted_value != .enum_tag or !wanted_value.enum_tag.enum_ty.eql(selector_type)) return null;
+        var selected: ?Ast.Node.Index = null;
+        var fallback: ?Ast.Node.Index = null;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(analyser.gpa);
+        for (switch_node.ast.cases) |case_node| {
+            const case = tree.fullSwitchCase(case_node) orelse return null;
+            if (case.ast.values.len == 0) {
+                if (fallback != null) return null;
+                fallback = case.ast.target_expr;
+            }
+            for (case.ast.values) |case_value| {
+                const actual = (try boundValueOfArgument(analyser, options, selector_type, case_value)) orelse return null;
+                if (actual != .enum_tag or !actual.enum_tag.enum_ty.eql(selector_type)) return null;
+                const entry = try names.getOrPut(analyser.gpa, actual.enum_tag.name);
+                if (entry.found_existing) return null;
+                if (!std.mem.eql(u8, actual.enum_tag.name, wanted_value.enum_tag.name)) continue;
+                if (selected != null) return null;
+                selected = case.ast.target_expr;
+            }
+        }
+        return try analyser.resolveTypeOfNodeInternal(options.at(selected orelse fallback orelse return null));
+    }
     const selector_value = internedIntValueOf(analyser, selector) orelse return null;
     const wanted = analyser.ip.toInt(selector_value, i128) orelse return null;
 
@@ -4721,10 +4935,9 @@ fn narrowSwitchToMatchingProng(
 /// `comptime_int`, which has no runtime representation at all — that is
 /// how `std` writes `digest_bits: comptime_int` without the keyword.
 ///
-/// Only an INTEGER type qualifies.  `type` is not one, so a
-/// `comptime T: type` argument can never be mistaken for the
-/// parameter's own value, and a struct, pointer or slice parameter binds
-/// nothing either.
+/// Only integer and boolean types qualify here. A `type` argument is not
+/// the parameter's own value; structs, pointers and slices bind nothing.
+/// Optional null constants use a separate source-proved binding path.
 fn isComptimeReadableParameter(analyser: *Analyser, param: Type.Data.Parameter) bool {
     const declared = declaredTypeOf(param.type) orelse return false;
     switch (analyser.ip.zigTypeTag(declared) orelse return false) {
@@ -4739,9 +4952,8 @@ fn isComptimeReadableParameter(analyser: *Analyser, param: Type.Data.Parameter) 
 
 /// Is this parameter declared `comptime` at all?
 ///
-/// A WIDER question than `isComptimeReadableParameter`, which asks whether
-/// a value can be READ for this parameter — today only an integer, since an
-/// enum tag and a string literal have no value representation to read.
+/// A wider question than `isComptimeReadableParameter`, which reads integer
+/// and boolean constants. Other formals need their own exact value proof.
 /// This one asks only whether the parameter is a comptime formal, so that
 /// it REACHES the binding machinery instead of being skipped whole.
 ///
@@ -4755,21 +4967,104 @@ fn isComptimeFormal(param: Type.Data.Parameter) bool {
     return false;
 }
 
-/// The ACTUAL value of `arg` as a `BoundValue`, when `arg` is written as
-/// an enum tag or a string literal and `declared` says that is what the
-/// formal is declared to hold.
-///
-/// Both are read POSITIVELY.  An enum tag counts only when the formal is
-/// declared with an enum type; a string only when the argument really is a
-/// string literal.  Neither is inferred from the formal's name, and an
-/// argument this engine cannot read is no value at all rather than a
-/// guessed one.
+/// Decode enum literals and canonical member tokens with Zig's string parser.
+fn decodedEnumTagName(analyser: *Analyser, raw: []const u8) Error!?[]const u8 {
+    const quoted = raw.len >= 2 and raw[0] == '@' and raw[1] == '"';
+    if (!quoted) return raw;
+    return std.zig.string_literal.parseAlloc(analyser.arena.allocator(), raw[1..]) catch |err| switch (err) {
+        error.InvalidLiteral => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Actual argument values, also used by enum switches and @tagName. Existing
+/// formal bindings retain their identity; unbound enum reads must reach exact
+/// immutable initializer syntax. A runtime enum type alone proves no value.
 fn boundValueOfArgument(
     analyser: *Analyser,
     options: ResolveOptions,
     declared: Type,
     arg: Ast.Node.Index,
 ) Error!?BoundValue {
+    return boundValueOfArgumentAtDepth(analyser, options, declared, arg, 0);
+}
+
+/// Find literal value syntax only through canonical immutable declarations.
+/// Field selection reads the exact aggregate initializer, never a field default
+/// or a pointee whose value could have changed through another reference.
+fn immutableArgumentSource(analyser: *Analyser, options: ResolveOptions, depth: u32) Error!?ResolveOptions {
+    if (depth >= analyser.resolve_depth_limit) {
+        analyser.resolve_truncated = true;
+        return null;
+    }
+    const handle = options.node_handle.handle;
+    const tree = &handle.document.tree;
+    const node = options.node_handle.node;
+    if (tree.nodeTag(node) == .grouped_expression)
+        return immutableArgumentSource(analyser, options.at(tree.nodeData(node).node_and_token[0]), depth + 1);
+    var literal_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&literal_buffer, node) != null) return options;
+    switch (tree.nodeTag(node)) {
+        .enum_literal, .string_literal => return options,
+        else => {},
+    }
+    const declaration: ?DeclWithHandle = if (tree.nodeTag(node) == .identifier) blk: {
+        const token = ast.identifierTokenFromIdentifierNode(tree, node) orelse return null;
+        const name = offsets.identifierTokenToNameSlice(tree, token);
+        const hit = (try analyser.lookupSymbolGlobalScoped(handle, name, tree.tokenStart(token))) orelse return null;
+        const framed = try withEnclosingContainer(options, hit);
+        // Do not follow an alias past a mutable cell, even if its current
+        // initializer happens to name an immutable declaration.
+        if (framed.decl != .ast_node or !framed.isConst()) return null;
+        break :blk (try analyser.resolveVarDeclAlias(framed)) orelse framed;
+    } else if (tree.nodeTag(node) == .field_access)
+        try analyser.resolveVarDeclAlias(.{ .decl = .{ .ast_node = node }, .handle = handle, .container_type = options.container_type })
+    else
+        return null;
+    if (declaration) |found| {
+        if (found.decl != .ast_node or !found.isConst()) return null;
+        const source = &found.handle.document.tree;
+        const variable = source.fullVarDecl(found.decl.ast_node) orelse return null;
+        const initializer = variable.ast.init_node.unwrap() orelse return null;
+        return immutableArgumentSource(analyser, found.at(initializer), depth + 1);
+    }
+    if (tree.nodeTag(node) != .field_access) return null;
+    const base, const member = tree.nodeData(node).node_and_token;
+    const base_value = (try analyser.resolveTypeOfNodeInternal(options.at(base))) orelse return null;
+    if (base_value.is_type_val) return null;
+    const base_type = try base_value.typeOf(analyser);
+    if (knownTypeTag(analyser, base_type) != .@"struct" or base_type.data != .container) return null;
+    const name = offsets.identifierTokenToNameSlice(tree, member);
+    // Authenticate the field against the resolved owner before selecting its
+    // supplied value. A same-spelled field in another owner supplies no fact.
+    const field = (try lookupSymbolContainer(base_type, name, .field)) orelse return null;
+    if (field.decl != .ast_node or field.handle.document.tree.fullContainerField(field.decl.ast_node) == null) return null;
+    const source = (try immutableArgumentSource(analyser, options.at(base), depth + 1)) orelse return null;
+    const source_tree = &source.node_handle.handle.document.tree;
+    const literal = source_tree.fullStructInit(&literal_buffer, source.node_handle.node) orelse return null;
+    var selected: ?Ast.Node.Index = null;
+    for (literal.ast.fields) |value| {
+        const token = source_tree.firstToken(value);
+        if (token < 2 or source_tree.tokenTag(token - 1) != .equal) return null;
+        const supplied_name = offsets.identifierTokenToNameSlice(source_tree, token - 2);
+        if (!std.mem.eql(u8, supplied_name, name)) continue;
+        if (selected != null) return null;
+        selected = value;
+    }
+    return immutableArgumentSource(analyser, source.at(selected orelse return null), depth + 1);
+}
+
+fn boundValueOfArgumentAtDepth(
+    analyser: *Analyser,
+    options: ResolveOptions,
+    declared: Type,
+    arg: Ast.Node.Index,
+    depth: u32,
+) Error!?BoundValue {
+    if (depth >= analyser.resolve_depth_limit) {
+        analyser.resolve_truncated = true;
+        return null;
+    }
     const tree = &options.node_handle.handle.document.tree;
     switch (tree.nodeTag(arg)) {
         .enum_literal => {
@@ -4780,30 +5075,27 @@ fn boundValueOfArgument(
             // demanding one would skip exactly the bindings the acceptance
             // is about.  Nothing here is a runtime field guess.
             //
-            // The enum is copied into the analyser arena so the binding's
-            // owner is the arena rather than a parameter slot or a map
-            // bucket that a later frame may reuse.
+            // Carry enum identity by value. Its nested storage already
+            // borrows this analyser or the immutable source snapshot.
             const enum_ty: Type = if (declared.isEnumType()) declared else .unknown_type;
-            const raw = tree.tokenSlice(tree.nodeMainToken(arg));
-
-            // A plain `.value` is already its own name and borrows the
-            // source.  A quoted tag — `@"v\x61lue"` — is a string literal
-            // with an `@` in front, so it is decoded by the SAME canonical
-            // parser every other string here uses; stripping only the `@`
-            // and the quotes and taking the rest raw would leave the escape
-            // sequence in the name.
-            const quoted = raw.len >= 2 and raw[0] == '@' and raw[1] == '"';
-            const name = if (quoted)
-                (std.zig.string_literal.parseAlloc(analyser.arena.allocator(), raw[1..]) catch |err| switch (err) {
-                    error.InvalidLiteral => return null,
-                    error.OutOfMemory => return error.OutOfMemory,
-                })
-            else
-                raw;
+            const name = (try decodedEnumTagName(analyser, tree.tokenSlice(tree.nodeMainToken(arg)))) orelse return null;
+            if (declared.isEnumType()) {
+                const owner = enum_ty.data.container.scope_handle;
+                const owner_tree = &owner.handle.document.tree;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const container = owner_tree.fullContainerDecl(&buffer, owner.toNode()) orelse return null;
+                var present = false;
+                for (container.ast.members) |member| {
+                    const field = owner_tree.fullContainerField(member) orelse continue;
+                    const member_name = (try decodedEnumTagName(analyser, owner_tree.tokenSlice(field.ast.main_token))) orelse return null;
+                    if (std.mem.eql(u8, member_name, name)) present = true;
+                }
+                if (!present) return null;
+            }
 
             return .{ .enum_tag = .{
                 .name = name,
-                .enum_ty = (try analyser.allocType(enum_ty)).*,
+                .enum_ty = enum_ty,
             } };
         },
         .string_literal => {
@@ -4821,33 +5113,31 @@ fn boundValueOfArgument(
             const text = (try analyser.resolveStringLiteral(options.at(arg))) orelse return null;
             return .{ .string = text };
         },
-        .identifier => {
-            // FORWARDING.  `Self.items(field)` -> `self.slice().items(field)`
-            // -> `FieldType(field)`: the inner callee is handed the CALLER's
-            // formal by name, never a literal.  The value it should carry
-            // is the one THIS frame already bound, read through the
-            // declaration that name resolves to — a transferred copy of that
-            // value, not a guess from the spelling and not a read of the
-            // callee's own still-unbound parameter.
-            //
-            // The name resolves in the caller's frame: the declaration it
-            // names lives in the caller's body, so only the caller's own
-            // container carries the binding.  A container-free lookup finds
-            // the declaration but no frame, and answers nothing.
+        .grouped_expression => return boundValueOfArgumentAtDepth(analyser, options, declared, tree.nodeData(arg).node_and_token[0], depth + 1),
+        .identifier, .field_access => {
+            // Actual formal bindings take precedence over declaration syntax.
+            // Other values must reach a const initializer in their own frame.
             const handle = options.node_handle.handle;
-            const name_token = ast.identifierTokenFromIdentifierNode(tree, arg) orelse return null;
-            const name = offsets.identifierTokenToNameSlice(tree, name_token);
-            const scoped = (try analyser.lookupSymbolGlobalScoped(handle, name, tree.tokenStart(name_token))) orelse return null;
-            const framed = try withEnclosingContainer(options, scoped);
-            const source = framed.container_type orelse return null;
-            const info = switch (source.data) {
-                .container => |info| info,
-                else => return null,
-            };
-            return info.bound_values.get(.{
-                .token = framed.decl.nameToken(&framed.handle.document.tree),
-                .handle = framed.handle,
-            });
+            if (tree.nodeTag(arg) == .identifier) {
+                const name_token = ast.identifierTokenFromIdentifierNode(tree, arg) orelse return null;
+                const name = offsets.identifierTokenToNameSlice(tree, name_token);
+                const hit = (try analyser.lookupSymbolGlobalScoped(handle, name, tree.tokenStart(name_token))) orelse return null;
+                const framed = try withEnclosingContainer(options, hit);
+                if (framed.container_type) |container| {
+                    if (container.data == .container) {
+                        if (container.data.container.bound_values.get(.{
+                            .token = framed.nameToken(),
+                            .handle = framed.handle,
+                        })) |actual| return if (actual == .optional_null) null else actual;
+                    }
+                }
+            }
+            if (!declared.isEnumType()) return null;
+            const actual = (try analyser.resolveTypeOfNodeInternal(options.at(arg))) orelse return null;
+            const actual_type = try actual.typeOf(analyser);
+            if (!actual_type.eql(declared)) return null;
+            const source = (try immutableArgumentSource(analyser, options.at(arg), depth + 1)) orelse return null;
+            return boundValueOfArgumentAtDepth(analyser, source, actual_type, source.node_handle.node, depth + 1);
         },
         else => return null,
     }
@@ -4862,7 +5152,7 @@ fn withBoundParams(
     ty: Type,
     bindings: TokenToTypeMap,
     values: BoundValueMap,
-) Error!Type {
+) error{OutOfMemory}!Type {
     if (bindings.count() == 0 and values.count() == 0) return ty;
     const info = switch (ty.data) {
         .container => |info| info,
@@ -5004,9 +5294,9 @@ fn instantiatedReturnValue(
     return analyser.allocType(try withBoundParams(analyser, func_info.return_value.*, bindings, values));
 }
 
-/// Binds the ACTUAL value of `arg` to `param`, when the parameter is one
-/// the callee reads at comptime and the argument resolves to an integer
-/// constant that fits the parameter's declared type.
+/// Binds an actual integer, boolean, or optional null constant that the
+/// callee reads at comptime. Forwarded null bindings must have the same
+/// declared optional type; a null value alone does not prove coercibility.
 ///
 /// Nothing is bound otherwise, so an argument the engine cannot read
 /// leaves the parameter exactly as unknown as it was.
@@ -5018,12 +5308,32 @@ fn bindComptimeParameterValue(
     analyser: *Analyser,
     options: ResolveOptions,
     bindings: *TokenToTypeMap,
+    bound_values: *BoundValueMap,
     func_handle: DocumentStore.Handle,
     param: Type.Data.Parameter,
     arg: Ast.Node.Index,
 ) Error!void {
-    if (!isComptimeReadableParameter(analyser, param)) return;
     const param_name_token = param.name_token orelse return;
+    if (isComptimeFormal(param) and knownTypeTag(analyser, param.type) == .optional) {
+        const source = (try knownNullSource(analyser, options, arg, 0)) orelse return;
+        if (source == .typed and !source.typed.eqlImpl(param.type, true)) return;
+        // Keep the formal's type as well as its proved value. A raw null
+        // argument has null_type, not the declared optional type.
+        const key: TokenWithHandle = .{ .token = param_name_token, .handle = func_handle };
+        if (declaredTypeOf(param.type)) |declared| {
+            const coerced = (try coerceIP(analyser, declared, .null_value)) orelse return;
+            if (!analyser.ip.isNull(coerced)) return;
+            try bindings.put(analyser.gpa, key, Type.fromIP(analyser, declared, coerced));
+        } else {
+            // Nominal payloads need not have an IP type. Carry their
+            // optional type in bound_params and the null fact separately.
+            const actual = (try param.type.instanceTypeVal(analyser)) orelse return;
+            try bindings.put(analyser.gpa, key, actual);
+            try bound_values.put(analyser.gpa, key, .optional_null);
+        }
+        return;
+    }
+    if (!isComptimeReadableParameter(analyser, param)) return;
     const declared = declaredTypeOf(param.type) orelse return;
 
     const argument_type = (try analyser.resolveTypeOfNodeInternal(options.at(arg))) orelse return;
@@ -5117,15 +5427,13 @@ fn reretypeReturnValueUnder(
     if (isTypeFunction(tree, proto)) {
         if (tree.nodeTag(func_node) != .fn_decl) return null;
         const body = tree.nodeData(func_node).node_and_node[1];
-        const return_node = findReturnStatement(tree, body) orelse return null;
-        const return_expr = tree.nodeData(return_node).opt_node.unwrap() orelse return null;
-        const child = (try analyser.resolveTypeOfNodeInternal(.{
-            .node_handle = .of(return_expr, handle),
+        return switch (try resolveTypeFunctionReturn(analyser, .{
+            .node_handle = .of(body, handle),
             .container_type = container,
-        })) orelse return null;
-        if (!child.is_type_val) return null;
-        // A type function returns this type VALUE, not an instance of it.
-        return child;
+        }, body, 0)) {
+            .value => |value| value,
+            .unknown, .fallthrough => null,
+        };
     }
 
     const return_node = proto.ast.return_type.unwrap() orelse return null;
@@ -5218,7 +5526,7 @@ pub fn resolveFunctionTypeFromCall(
         bound_param.type = try analyser.resolveGenericType(param.type, added_params);
         bound_param.type = try analyser.resolveGenericType(bound_param.type, value_params);
         bound_param.type = try analyser.resolveGenericType(bound_param.type, declared_params);
-        try bindComptimeParameterValue(analyser, options, &value_params, base_info.handle, bound_param, arg);
+        try bindComptimeParameterValue(analyser, options, &value_params, &added_values, base_info.handle, bound_param, arg);
 
         const param_name_token = param.name_token orelse continue;
         const param_type = bound_param.type;
@@ -5256,12 +5564,10 @@ pub fn resolveFunctionTypeFromCall(
             else => {},
         }
 
-        // A `comptime` formal whose ACTUAL value has no `Type`
-        // representation: an enum tag, or a string literal.  Both are
-        // recorded under the formal's NAME — the one key the body reads them
-        // back by — and only when the argument is POSITIVELY that kind of
-        // literal and the formal says so.  A value this engine cannot read
-        // is no value at all, never one guessed from the formal's name.
+        // Values without an IP representation use the paired value map.
+        // Enum tags and strings are read here; optional nulls were bound above.
+        // Each is keyed by the formal's declaration token and requires
+        // a positive value proof; unknown inputs add no guessed value.
         if (isComptimeFormal(param) or param_type.data == .anytype_parameter) {
             if (try boundValueOfArgument(analyser, options, param_type, arg)) |actual| {
                 try added_values.put(analyser.gpa, .{
@@ -5377,7 +5683,7 @@ pub fn resolveFunctionTypeFromCall(
         // return type has already been memoised as unknown.  So it is read
         // AGAIN, now that the binding exists, under the container that
         // carries it.
-        if (bound_values.count() != 0) {
+        if (bound_values.count() != 0 or meta_params.count() != 0) {
             if (try analyser.reretypeReturnValueUnder(
                 func_info,
                 func_info.container_type.*,
@@ -5738,7 +6044,17 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
             // built from; anything that is neither is still unknown.
             const elem_ty = if (elem_resolved.is_type_val) elem_resolved else try elem_resolved.typeOf(analyser);
 
-            return try Type.createPointerType(analyser, size, sentinel, is_const, elem_ty);
+            return .{
+                .data = try Type.Data.createPointer(
+                    analyser,
+                    size,
+                    sentinel,
+                    is_const,
+                    ptr_info.allowzero_token != null,
+                    elem_ty,
+                ),
+                .is_type_val = true,
+            };
         },
         .array_type,
         .array_type_sentinel,
@@ -5865,7 +6181,8 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                 return try Type.createTupleType(analyser, elem_ty_slice);
             }
 
-            return try analyser.innermostContainer(handle, tree.tokenStart(tree.firstToken(node)));
+            const captured = if (options.container_type != null) &options.container_type.? else null;
+            return try analyser.innermostContainerInFrame(handle, tree.tokenStart(tree.firstToken(node)), captured);
         },
         .builtin_call,
         .builtin_call_comma,
@@ -5883,6 +6200,39 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                     // Opaque tuples cannot provide positional caller bindings.
                     const call = CallOperands.full(tree, &buffer, node) orelse return null;
                     return analyser.resolveCallReturnType(options, call);
+                },
+                .Int => {
+                    if (params.len != 2) return null;
+                    const expected = (try analyser.instanceStdBuiltinType("Signedness")) orelse return null;
+                    const declared = try expected.typeOf(analyser);
+                    const value = (try boundValueOfArgument(analyser, options, declared, params[0])) orelse return null;
+                    const name = switch (value) {
+                        .enum_tag => |tag| if (tag.enum_ty.eql(declared)) tag.name else return null,
+                        else => return null,
+                    };
+                    const signedness = std.meta.stringToEnum(std.builtin.Signedness, name) orelse return null;
+                    const bits = (try analyser.resolveIntegerLiteral(u16, options.at(params[1]))) orelse return null;
+                    const index = try analyser.ip.get(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
+                    return Type.fromIP(analyser, .type_type, index);
+                },
+                .clz => {
+                    if (params.len != 1) return null;
+                    const operand = (try analyser.resolveTypeOfNodeInternal(options.at(params[0]))) orelse return null;
+                    if (operand.is_type_val or operand.data != .ip_index) return null;
+                    const ty = operand.data.ip_index.type;
+                    if (analyser.ip.zigTypeTag(ty) != .int) return null;
+                    const info = analyser.ip.intInfo(ty, builtin.target);
+                    if (info.signedness != .unsigned) return null;
+                    const value_index = internedIntValueOf(analyser, operand) orelse return null;
+                    const integer = analyser.ip.toInt(value_index, u128) orelse return null;
+                    if (info.bits > 128) return null;
+                    const used: u16 = @intCast(128 - @clz(integer));
+                    if (used > info.bits) return null;
+                    const leading: u16 = if (integer == 0) info.bits else info.bits - used;
+                    const result_bits: u16 = if (info.bits == 0) 0 else @intCast(16 - @clz(info.bits));
+                    const result_type = try analyser.ip.get(.{ .int_type = .{ .signedness = .unsigned, .bits = result_bits } });
+                    const result = try analyser.ip.get(.{ .int_u64_value = .{ .ty = result_type, .int = leading } });
+                    return Type.fromIP(analyser, result_type, result);
                 },
                 .This => {
                     if (params.len != 0) return null;
@@ -5903,7 +6253,7 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                                 // but cannot change which container @This names.
                                 if (owner.scope == lexical_scope)
                                     return if (actual.is_type_val) actual else try actual.typeOf(analyser);
-                                const lexical = try analyser.innermostContainer(handle, source_index);
+                                const lexical = try analyser.innermostContainerInFrame(handle, source_index, &actual);
                                 return try analyser.resolveGenericType(lexical, actual.data.container.bound_params);
                             }
                         }
@@ -6377,36 +6727,46 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
         .less_or_equal,
         .greater_or_equal,
         => {
-            const lhs, _ = tree.nodeData(node).node_and_node;
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const tag = tree.nodeTag(node);
+            const equality = tag == .equal_equal or tag == .bang_equal;
+            const lhs_ty = try analyser.resolveTypeOfNodeInternal(options.at(lhs));
+            const rhs_ty = if (equality or (lhs_ty != null and internedIntValueOf(analyser, lhs_ty.?) != null))
+                try analyser.resolveTypeOfNodeInternal(options.at(rhs))
+            else
+                null;
 
-            const rhs = tree.nodeData(node).node_and_node[1];
-
-            // Two interned integer constants decide this comparison right
-            // here.  `@sizeOf(T) == 0` is exactly this shape, and it is
-            // the only way a comptime branch on a layout question gets an
-            // answer: anything else — a pointer, a float, an unknown
-            // layout — falls through to what the rest of this arm gives,
-            // which is a type and not a decision.
-            if (tree.nodeTag(node) == .equal_equal or tree.nodeTag(node) == .bang_equal) {
-                const lhs_ty = try analyser.resolveTypeOfNodeInternal(options.at(lhs));
-                const rhs_ty = try analyser.resolveTypeOfNodeInternal(options.at(rhs));
-                if (lhs_ty != null and rhs_ty != null) {
-                    if (internedIntValueOf(analyser, lhs_ty.?)) |lhs_value| {
-                        if (internedIntValueOf(analyser, rhs_ty.?)) |rhs_value| {
-                            if (analyser.ip.toInt(lhs_value, i128)) |lhs_int| {
-                                if (analyser.ip.toInt(rhs_value, i128)) |rhs_int| {
-                                    const equal = lhs_int == rhs_int;
-                                    const want_equal = tree.nodeTag(node) == .equal_equal;
-                                    return Type.fromIP(
-                                        analyser,
-                                        .bool_type,
-                                        if (equal == want_equal) .bool_true else .bool_false,
-                                    );
-                                }
+            if (lhs_ty != null and rhs_ty != null) {
+                if (equality and lhs_ty.?.is_type_val and rhs_ty.?.is_type_val) {
+                    if (lhs_ty.?.ipIndex()) |lhs_index| {
+                        if (rhs_ty.?.ipIndex()) |rhs_index| {
+                            if (analyser.ip.zigTypeTag(lhs_index) != null and analyser.ip.zigTypeTag(rhs_index) != null) {
+                                const equal = lhs_index == rhs_index;
+                                return Type.fromIP(analyser, .bool_type, if (equal == (tag == .equal_equal)) .bool_true else .bool_false);
                             }
                         }
                     }
                 }
+                if (internedIntValueOf(analyser, lhs_ty.?)) |lhs_value| {
+                    if (internedIntValueOf(analyser, rhs_ty.?)) |rhs_value| {
+                        if (analyser.ip.toInt(lhs_value, i128)) |lhs_int| {
+                            if (analyser.ip.toInt(rhs_value, i128)) |rhs_int| {
+                                const result = switch (tag) {
+                                    .equal_equal => lhs_int == rhs_int,
+                                    .bang_equal => lhs_int != rhs_int,
+                                    .less_than => lhs_int < rhs_int,
+                                    .greater_than => lhs_int > rhs_int,
+                                    .less_or_equal => lhs_int <= rhs_int,
+                                    .greater_or_equal => lhs_int >= rhs_int,
+                                    else => unreachable,
+                                };
+                                return Type.fromIP(analyser, .bool_type, if (result) .bool_true else .bool_false);
+                            }
+                        }
+                    }
+                }
+            }
+            if (equality) {
                 const operands = [2]Ast.Node.Index{ lhs, rhs };
                 const types = [2]?Type{ lhs_ty, rhs_ty };
                 for (operands, 0..) |operand, index| {
@@ -6415,11 +6775,11 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                     const integer = analyser.ip.toInt(value, i128) orelse continue;
                     if (integer != 0) continue;
                     const is_zero = (try analyser.sizeQueryIsZero(options.at(operand))) orelse continue;
-                    return Type.fromIP(analyser, .bool_type, if (is_zero == (tree.nodeTag(node) == .equal_equal)) .bool_true else .bool_false);
+                    return Type.fromIP(analyser, .bool_type, if (is_zero == (tag == .equal_equal)) .bool_true else .bool_false);
                 }
             }
 
-            const ty = try analyser.resolveTypeOfNodeInternal(options.at(lhs)) orelse
+            const ty = lhs_ty orelse
                 return Type.fromIP(analyser, .bool_type, null);
             const typeof = try ty.typeOf(analyser);
 
@@ -6439,10 +6799,26 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
             return Type.fromIP(analyser, .bool_type, null);
         },
 
-        .bool_and,
-        .bool_or,
-        .bool_not,
-        => return Type.fromIP(analyser, .bool_type, null),
+        .bool_not => return Type.fromIP(analyser, .bool_type, null),
+        .bool_and, .bool_or => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const left = (try analyser.resolveTypeOfNodeInternal(options.at(lhs))) orelse
+                return Type.fromIP(analyser, .bool_type, null);
+            if (left.is_type_val) return Type.fromIP(analyser, .bool_type, null);
+            const index = left.ipIndex() orelse return Type.fromIP(analyser, .bool_type, null);
+            if (index != .bool_true and index != .bool_false) return Type.fromIP(analyser, .bool_type, null);
+            if ((tree.nodeTag(node) == .bool_and and index == .bool_false) or
+                (tree.nodeTag(node) == .bool_or and index == .bool_true))
+                return Type.fromIP(analyser, .bool_type, index);
+            const right = (try analyser.resolveTypeOfNodeInternal(options.at(rhs))) orelse
+                return Type.fromIP(analyser, .bool_type, null);
+            if (!right.is_type_val) {
+                if (right.ipIndex()) |right_index| {
+                    if (right_index == .bool_true or right_index == .bool_false) return right;
+                }
+            }
+            return Type.fromIP(analyser, .bool_type, null);
+        },
 
         .bit_not,
         .negation_wrap,
@@ -7067,6 +7443,8 @@ pub const Type = struct {
             /// `.none` means no sentinel, `.unknown_unknown` means unknown sentinel
             sentinel: InternPool.Index,
             is_const: bool,
+            /// The root pointer's source qualifier, not its pointee's qualifier.
+            is_allowzero: bool = false,
             elem_ty: *Type,
         },
 
@@ -7185,6 +7563,7 @@ pub const Type = struct {
             size: std.builtin.Type.Pointer.Size,
             sentinel: InternPool.Index,
             is_const: bool,
+            is_allowzero: bool,
             elem_ty: Type,
         ) !Data {
             std.debug.assert(elem_ty.is_type_val);
@@ -7197,6 +7576,7 @@ pub const Type = struct {
                         .flags = .{
                             .size = size,
                             .is_const = is_const,
+                            .is_allowzero = is_allowzero,
                         },
                     },
                 });
@@ -7207,6 +7587,7 @@ pub const Type = struct {
                     .size = size,
                     .sentinel = sentinel,
                     .is_const = is_const,
+                    .is_allowzero = is_allowzero,
                     .elem_ty = try analyser.allocType(elem_ty),
                 },
             };
@@ -7306,6 +7687,7 @@ pub const Type = struct {
                     std.hash.autoHash(hasher, info.size);
                     std.hash.autoHash(hasher, info.sentinel);
                     std.hash.autoHash(hasher, info.is_const);
+                    std.hash.autoHash(hasher, info.is_allowzero);
                     info.elem_ty.hashWithHasher(hasher);
                 },
                 .array => |info| {
@@ -7415,6 +7797,7 @@ pub const Type = struct {
                     if (a_type.size != b_type.size) return false;
                     if (a_type.sentinel != b_type.sentinel) return false;
                     if (strict and a_type.is_const != b_type.is_const) return false;
+                    if (a_type.is_allowzero != b_type.is_allowzero) return false;
                     if (!a_type.elem_ty.eqlPtrImpl(b_type.elem_ty, strict)) return false;
                 },
                 .array => |a_type| {
@@ -7618,7 +8001,7 @@ pub const Type = struct {
                     }
                     for (info.bound_values.values()) |value| switch (value) {
                         .enum_tag => |tag| if (tag.enum_ty.data.mentionsBound(bound_params)) return true,
-                        .string => {},
+                        .string, .optional_null => {},
                     };
                     return false;
                 },
@@ -7715,6 +8098,7 @@ pub const Type = struct {
                     std.hash.autoHash(hasher, info.size);
                     std.hash.autoHash(hasher, info.sentinel);
                     std.hash.autoHash(hasher, info.is_const);
+                    std.hash.autoHash(hasher, info.is_allowzero);
                     if (depth > 0) hashShallowType(info.elem_ty.*, hasher, depth - 1);
                 },
                 .array => |info| {
@@ -7841,7 +8225,7 @@ pub const Type = struct {
                     const sentinel = info.sentinel;
                     const is_const = info.is_const;
                     const elem_ty = try analyser.resolveGenericTypeInternal(info.elem_ty.*, bound_params, state);
-                    return try createPointer(analyser, size, sentinel, is_const, elem_ty);
+                    return try createPointer(analyser, size, sentinel, is_const, info.is_allowzero, elem_ty);
                 },
                 .array => |info| {
                     const elem_count = info.elem_count;
@@ -7903,6 +8287,7 @@ pub const Type = struct {
                                         ),
                                     } },
                                     .string => |bytes| .{ .string = bytes },
+                                    .optional_null => .optional_null,
                                 });
                             }
                             break :blk new_values;
@@ -7967,7 +8352,7 @@ pub const Type = struct {
         elem_ty: Type,
     ) !Type {
         return .{
-            .data = try Data.createPointer(analyser, size, sentinel, is_const, elem_ty),
+            .data = try Data.createPointer(analyser, size, sentinel, is_const, false, elem_ty),
             .is_type_val = true,
         };
     }
@@ -8816,6 +9201,7 @@ pub const Type = struct {
                     },
                     .c => try writer.writeAll("[*c]"),
                 }
+                if (info.is_allowzero and info.size != .c) try writer.writeAll("allowzero ");
                 if (info.is_const) try writer.writeAll("const ");
                 try info.elem_ty.rawStringify(writer, analyser, options);
             },
@@ -9935,13 +10321,10 @@ pub fn getPositionContext(
 
 pub const TokenToTypeMap = std.array_hash_map.Custom(TokenWithHandle, Type, TokenWithHandle.Context, true);
 
-/// One ACTUAL comptime value a generic formal was given, in the only form
-/// this engine can carry it.
-///
-/// The intern pool keys `enum_type` but has NO key for a tag VALUE, and no
-/// key for a string value at all, so neither can live in a `Type`.  A
-/// container's `bound_values` is where they are kept instead: borrowed
-/// bytes and types owned by the arena that produced them.
+/// An actual comptime value without an intern-pool value representation.
+/// Enum names and string bytes borrow analyser-arena storage. Optional null
+/// facts are paired with a declared optional instance in `bound_params`
+/// under the same token key, so nullness never replaces that formal's type.
 pub const BoundValue = union(enum) {
     /// The NAME of an enum tag, together with the enum it belongs to, so
     /// the same spelling in two enums stays two different values.
@@ -9953,6 +10336,9 @@ pub const BoundValue = union(enum) {
     /// arena and never borrowed raw from the source, because a decoded
     /// escape is not a substring of the text it was written as.
     string: []const u8,
+    /// A proved null optional whose nominal payload has no IP type.
+    /// The matching `bound_params` entry retains its declared optional type.
+    optional_null,
 
     pub fn hashWithHasher(self: BoundValue, hasher: anytype) void {
         std.hash.autoHash(hasher, @intFromEnum(std.meta.activeTag(self)));
@@ -9962,6 +10348,7 @@ pub const BoundValue = union(enum) {
                 hasher.update(info.name);
             },
             .string => |bytes| hasher.update(bytes),
+            .optional_null => {},
         }
     }
 
@@ -9970,16 +10357,12 @@ pub const BoundValue = union(enum) {
     }
 
     fn eqlImpl(a: BoundValue, b: BoundValue, comptime strict: bool) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
-            .enum_tag => |a_info| switch (b) {
-                .enum_tag => |b_info| a_info.enum_ty.eqlImpl(b_info.enum_ty, strict) and
-                    std.mem.eql(u8, a_info.name, b_info.name),
-                .string => false,
-            },
-            .string => |a_bytes| switch (b) {
-                .string => |b_bytes| std.mem.eql(u8, a_bytes, b_bytes),
-                .enum_tag => false,
-            },
+            .enum_tag => |a_info| a_info.enum_ty.eqlImpl(b.enum_tag.enum_ty, strict) and
+                std.mem.eql(u8, a_info.name, b.enum_tag.name),
+            .string => |a_bytes| std.mem.eql(u8, a_bytes, b.string),
+            .optional_null => true,
         };
     }
 };
@@ -10296,6 +10679,15 @@ pub const DeclWithHandle = struct {
                             }
                             if (std.mem.eql(u8, name, "child"))
                                 return reflectedChild(analyser, reflection.subject.*);
+                            if (reflection.tag == .int and std.mem.eql(u8, name, "bits")) {
+                                const subject = reflection.subject.*;
+                                if (!subject.is_type_val) return null;
+                                const subject_index = subject.ipIndex() orelse return null;
+                                if (analyser.ip.zigTypeTag(subject_index) != .int) return null;
+                                const bits = analyser.ip.intInfo(subject_index, builtin.target).bits;
+                                const value = try analyser.ip.get(.{ .int_u64_value = .{ .ty = .u16_type, .int = bits } });
+                                return Type.fromIP(analyser, .u16_type, value);
+                            }
                             return null;
                         }
                     }
@@ -10696,28 +11088,58 @@ pub fn innermostScopeAtIndexWithTag(
     return scope_index;
 }
 
+/// The lexical container with unresolved type formals. Without an actual
+/// frame, scalar parameter values are not inferred from their declarations.
 pub fn innermostContainer(analyser: *Analyser, handle: DocumentStore.Handle, source_index: usize) error{OutOfMemory}!Type {
+    return analyser.innermostContainerInFrame(handle, source_index, null);
+}
+
+/// Close a literal or lexical subscope over this exact frame's visible
+/// formal bindings. Formals pending after the last container are method
+/// locals, not captures of the container named by @This().
+fn innermostContainerInFrame(
+    analyser: *Analyser,
+    handle: DocumentStore.Handle,
+    source_index: usize,
+    captured: ?*const Type,
+) error{OutOfMemory}!Type {
     const tree = &handle.document.tree;
     const document_scope = try handle.getDocumentScope();
     if (document_scope.scopes.len == 1) return .{
         .data = .{ .container = .root(handle) },
         .is_type_val = true,
     };
+    const captures: ?*const Type.Data.Container = if (captured) |actual|
+        if (actual.data == .container and actual.data.container.scope_handle.handle.eql(handle))
+            &actual.data.container
+        else
+            null
+    else
+        null;
 
     var pending_meta_params: TokenToTypeMap = .empty;
     defer pending_meta_params.deinit(analyser.gpa);
+    var pending_values: BoundValueMap = .empty;
+    defer pending_values.deinit(analyser.gpa);
+    var meta_params: TokenToTypeMap = .empty;
+    defer meta_params.deinit(analyser.gpa);
+    var values: BoundValueMap = .empty;
+    defer values.deinit(analyser.gpa);
 
     var current: DocumentScope.Scope.Index = .root;
-    var meta_params: TokenToTypeMap = .empty;
     var scope_iterator = iterateEnclosingScopes(document_scope, source_index);
     while (scope_iterator.next().unwrap()) |scope_index| {
         switch (document_scope.getScopeTag(scope_index)) {
             .container => {
                 current = scope_index;
                 for (pending_meta_params.keys(), pending_meta_params.values()) |token_handle, ty| {
-                    try meta_params.put(analyser.arena.allocator(), token_handle, ty);
+                    try meta_params.put(analyser.gpa, token_handle, ty);
+                }
+                for (pending_values.keys(), pending_values.values()) |token_handle, value| {
+                    try values.put(analyser.gpa, token_handle, value);
                 }
                 pending_meta_params.clearRetainingCapacity();
+                pending_values.clearRetainingCapacity();
             },
             .function => {
                 const function_node = document_scope.getScopeAstNode(scope_index).?;
@@ -10725,29 +11147,40 @@ pub fn innermostContainer(analyser: *Analyser, handle: DocumentStore.Handle, sou
                 const func = tree.fullFnProto(&buf, function_node).?;
                 var it: ast.FnParamIterator = .init(&func, tree);
                 while (it.next()) |param| {
-                    const param_type_expr = param.type_expr orelse continue;
-                    if (!Analyser.isMetaType(tree, param_type_expr)) continue;
                     const param_name_token = param.name_token orelse continue;
                     const token_handle: TokenWithHandle = .{ .token = param_name_token, .handle = handle };
-                    const ty: Type = .{ .data = .{ .type_parameter = token_handle }, .is_type_val = true };
-                    try pending_meta_params.put(analyser.gpa, token_handle, ty);
+                    if (param.type_expr) |param_type_expr| {
+                        if (Analyser.isMetaType(tree, param_type_expr)) {
+                            const ty: Type = .{ .data = .{ .type_parameter = token_handle }, .is_type_val = true };
+                            try pending_meta_params.put(analyser.gpa, token_handle, ty);
+                        }
+                    }
+                    if (captures) |actual| {
+                        if (actual.bound_params.get(token_handle)) |value|
+                            try pending_meta_params.put(analyser.gpa, token_handle, value);
+                        if (actual.bound_values.get(token_handle)) |value|
+                            try pending_values.put(analyser.gpa, token_handle, value);
+                        if (param.anytype_ellipsis3) |token| {
+                            if (tree.tokenTag(token) == .keyword_anytype) {
+                                const type_key: TokenWithHandle = .{ .token = token, .handle = handle };
+                                if (actual.bound_params.get(type_key)) |value|
+                                    try pending_meta_params.put(analyser.gpa, type_key, value);
+                            }
+                        }
+                    }
                 }
             },
             else => {},
         }
     }
-    return .{
-        .data = .{
-            .container = .{
-                .scope_handle = .{
-                    .handle = handle,
-                    .scope = current,
-                },
-                .bound_params = meta_params,
-            },
-        },
+    const lexical: Type = .{
+        .data = .{ .container = .{
+            .scope_handle = .{ .handle = handle, .scope = current },
+            .bound_params = .empty,
+        } },
         .is_type_val = true,
     };
+    return withBoundParams(analyser, lexical, meta_params, values);
 }
 
 pub fn lookupLabel(

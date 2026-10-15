@@ -205,8 +205,8 @@ An optional pointer to an optional value is valid Zig and is not itself a bug.
 
 ### Reporting contract
 
-zbc reports proved problems, except for the advisory numeric warnings below.
-An unresolved result does not prove a lifetime or initialization bug.
+Read each rule's reporting contract before treating a warning as a proved bug.
+Some lifetime-identity and numeric-range checks report missing proofs.
 Silence is not a proof that the code is safe.
 
 `stack-escape` reports only proved escapes of function-local storage.
@@ -233,6 +233,37 @@ These numeric rules warn when a required safety property is not proved:
 - `f32-narrowing-int-to-float`: the integer input must be exactly representable at the destination precision.
 
 These warnings are advisory. They do not claim that every reachable input fails or loses precision.
+
+### Current precision limits
+
+This checkpoint does not claim to remove every reviewed false positive.
+The retained review separates confirmed defects, conservative warnings, and incomplete analysis.
+
+The unit and executable CLI-contract suites pass, but the strict default self-audit is not green.
+`zig build` compiles the tools, then fails on retained conservative findings.
+`zig build check` compiles without that audit; it does not certify a clean analysis.
+The finding-regression sweep is also incomplete: `hashmap_getptr_rehash.zig` and
+`missing_errdefer_on_out_param.zig` reach query limits. Its baseline is unchanged.
+
+- Incoming iterator and output parameters can share storage.
+  Read-only effects alone do not prove that their backing buffers are disjoint.
+
+- Wrapper allocations can lack an exact allocator-provider identity.
+  Callback cleanup can lack a proved link to the created containing allocation.
+- Copied or unpublished owner fields can retain conservative lifetime warnings.
+  A warning at a genuinely unsafe read can include an additional unproved output-lifetime report.
+- Allocation-site identities do not distinguish every current and earlier loop iteration.
+  Transferred buffers can therefore retain conservative lifetime warnings.
+- Generic SDK type factories can remain unresolved.
+  An explicit nonempty argument vector does not always prove that the first iterator result is present.
+- Numeric queries retain their existing work and depth limits.
+  A query that reaches a limit marks its unit incomplete instead of proving the code safe.
+  Other findings from that file remain visible.
+- An absent target or unsupported call effect does not supply a range proof.
+  The analyzer does not assume the host target to remove a warning.
+
+Use the CLI coverage report when evaluating a run.
+No findings with partial coverage is not a complete clean result.
 
 ## False positives and missed bugs
 

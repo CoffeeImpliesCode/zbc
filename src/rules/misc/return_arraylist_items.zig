@@ -16,9 +16,8 @@
 //! Detection (Tier 1, flat token walk):
 //!   Pattern: `keyword_return identifier period identifier("items") semicolon`
 //!   — 5 tokens.  Fire at the `return` token.
-//!   Suppresses `self`/`this` receivers (those access a struct field, not a
-//!   local ArrayList).  `return list.toOwnedSlice()` does NOT match (ends
-//!   with `l_paren` not `semicolon`).
+//!   Names such as `self` and `this` do not establish ownership.
+//!   `return list.toOwnedSlice()` does not match (it ends with a call).
 //!
 //!   One more suppression is proved in that same walk: a full-capacity
 //! comparison written in the enclosing function — `assert(list.items.len
@@ -162,10 +161,7 @@ pub fn check(
         if (!std.mem.eql(u8, tree.tokenSlice(return_tok + 3), "items")) continue;
         if (tags[return_tok + 4] != .semicolon) continue;
 
-        // Suppress self/this — those access a struct field, not a local ArrayList.
         const recv = tree.tokenSlice(return_tok + 1);
-        if (std.mem.eql(u8, recv, "self") or std.mem.eql(u8, recv, "this")) continue;
-
         // Scope lookup uses the resolver's existing document index when present.
         const fn_decl = if (cache.zls) |resolver|
             try resolver.enclosingFunctionAt(return_tok)
@@ -178,7 +174,7 @@ pub fn check(
         if (capacityFullyUsed(tree, fn_decl, return_tok, recv)) continue;
 
         if (fn_decl) |decl| {
-            if (recvIsPointerParam(tree, decl, recv)) continue;
+            if (try returnsRetainedHeader(tree, cache, &index, decl, return_tok, recv)) continue;
         }
 
         // A capture cannot be a locally allocated header. Resolve its owner
@@ -1019,6 +1015,10 @@ const ArenaProof = struct {
                 }
                 return false;
             }
+            // A mutable allocator header can name a different provider by
+            // the time it reaches this actual. Its initializer is not a
+            // reaching-definition certificate.
+            if (!binding.is_const) return false;
             const decl = (try self.index.lookup(fn_decl, name, name_token)) orelse return false;
             const init_node = decl.init_node.unwrap() orelse return false;
             return try self.allocatorExprIsSafe(
@@ -1029,6 +1029,7 @@ const ArenaProof = struct {
             );
         }
         if (self.findGlobalDecl(name)) |decl| {
+            if (self.tree.tokenTag(decl.ast.mut_token) != .keyword_const) return false;
             const init_node = decl.ast.init_node.unwrap() orelse return false;
             return try self.allocatorExprIsSafe(
                 fn_decl,
@@ -1173,6 +1174,144 @@ const ArenaProof = struct {
         return baseTypeName(self.tree, self.tree.firstToken(type_node), self.tree.lastToken(type_node));
     }
 
+    /// A closed helper may use a local provider whose physical owner is
+    /// transferred by every normal result: the arena header, or the exact
+    /// heap allocation behind a fixed-buffer provider. Provider class alone
+    /// is not a lifetime proof.
+    fn localProviderReturnedWithOwner(
+        self: *const ArenaProof,
+        fn_decl: Ast.Node.Index,
+        local: IndexedDecl,
+    ) ProofError!bool {
+        const resolver = self.cache.zls orelse return false;
+        const initializer = local.init_node.unwrap() orelse return false;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = self.tree.fullCall(&call_buffer, initializer) orelse return false;
+        const actual = (try call_summary.actualCallSummaryAt(
+            self.cache,
+            fresh_storage.calleeQueryToken(self.tree, call),
+            null,
+        )) orelse return false;
+        const arena = try resolver.declaredInToolchainFile(actual.callee.handle, "/std/heap/ArenaAllocator.zig");
+        const fixed = try resolver.declaredInToolchainFile(actual.callee.handle, "/std/heap/FixedBufferAllocator.zig");
+        if (!arena and !fixed) return false;
+        if (!tokenIsNamed(actual.callee.tree, actual.callee.fn_token + 1, "init")) return false;
+        var retained = local;
+        var backing_argument: ?Ast.TokenIndex = null;
+        if (fixed) {
+            if (call.ast.params.len != 1) return false;
+            const backing = call.ast.params[0];
+            if (self.tree.nodeTag(backing) != .identifier) return false;
+            const token = self.tree.nodeMainToken(backing);
+            retained = (try self.index.lookup(fn_decl, self.tree.tokenSlice(token), token)) orelse return false;
+            if (self.tree.tokenTag(retained.name_token - 1) != .keyword_const) return false;
+            const allocation = unwrapTry(self.tree, retained.init_node.unwrap() orelse return false);
+            var allocation_buffer: [1]Ast.Node.Index = undefined;
+            const allocation_call = self.tree.fullCall(&allocation_buffer, allocation) orelse return false;
+            const allocated = (try call_summary.actualCallSummaryAt(
+                self.cache,
+                fresh_storage.calleeQueryToken(self.tree, allocation_call),
+                null,
+            )) orelse return false;
+            if (!try resolver.declaredInToolchainFile(allocated.callee.handle, "/std/mem/Allocator.zig") or
+                !tokenIsNamed(allocated.callee.tree, allocated.callee.fn_token + 1, "alloc")) return false;
+            var receiver_buffer: [2]Ast.Node.Index = undefined;
+            const allocator = (try allocated.callArgumentFor(self.cache, &receiver_buffer, 0)) orelse return false;
+            if (!try fresh_storage.allocatorOriginIsExternal(self.cache, allocator, .{
+                .claim = .{ .first = self.tree.firstToken(allocation), .last = self.tree.lastToken(allocation) },
+                .depth = 0,
+                .frame = allocated.callee.caller_frame,
+                .remaining = self.index.remaining,
+            }, 0)) return false;
+            backing_argument = token;
+        }
+
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return false;
+        const nodes = try self.index.nodesOf(fn_decl);
+        var allowed: std.ArrayListUnmanaged(Ast.TokenIndex) = .empty;
+        defer allowed.deinit(self.index.gpa);
+        try allowed.append(self.index.gpa, local.name_token);
+        const name = self.tree.tokenSlice(local.name_token);
+        const retained_name = self.tree.tokenSlice(retained.name_token);
+        if (backing_argument) |token| {
+            try allowed.append(self.index.gpa, token);
+            try allowed.append(self.index.gpa, retained.name_token);
+        }
+        var normal_returns: usize = 0;
+        for (nodes) |node| {
+            try self.index.spend(self.tree.nodeMainToken(node));
+            switch (self.tree.nodeTag(node)) {
+                .fn_decl, .@"asm", .asm_simple, .asm_input, .asm_output => return false,
+                .@"return" => {
+                    const value = self.tree.nodeData(node).opt_node.unwrap() orelse return false;
+                    if (self.tree.nodeTag(value) == .error_value) continue;
+                    var fields: [2]Ast.Node.Index = undefined;
+                    const aggregate = self.tree.fullStructInit(&fields, value) orelse return false;
+                    var owner_returned = false;
+                    for (aggregate.ast.fields) |field| {
+                        try self.index.spend(self.tree.nodeMainToken(field));
+                        if (self.tree.nodeTag(field) != .identifier or
+                            !tokenIsNamed(self.tree, self.tree.nodeMainToken(field), retained_name)) continue;
+                        try allowed.append(self.index.gpa, self.tree.nodeMainToken(field));
+                        owner_returned = true;
+                    }
+                    if (!owner_returned) return false;
+                    normal_returns += 1;
+                },
+                .call, .call_comma, .call_one, .call_one_comma => {
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    const operation = self.tree.fullCall(&buffer, node) orelse return false;
+                    const callee = fieldCallee(self.tree, operation.ast.fn_expr) orelse continue;
+                    if (self.tree.nodeTag(callee.receiver) != .identifier or
+                        !tokenIsNamed(self.tree, self.tree.nodeMainToken(callee.receiver), name)) continue;
+                    if (operation.ast.params.len != 0) return false;
+                    if (!tokenIsNamed(self.tree, callee.method, "allocator")) {
+                        if (!tokenIsNamed(self.tree, callee.method, "deinit")) return false;
+                        // Error cleanup is not executed when this owner is
+                        // returned. A normal defer still releases the borrow.
+                        var error_only = false;
+                        for (nodes) |parent| {
+                            try self.index.spend(self.tree.nodeMainToken(parent));
+                            if (self.tree.nodeTag(parent) != .@"errdefer") continue;
+                            if (self.tree.firstToken(parent) < self.tree.firstToken(node) and
+                                self.tree.lastToken(parent) >= self.tree.lastToken(node))
+                                error_only = true;
+                        }
+                        if (!error_only) return false;
+                    }
+                    try allowed.append(self.index.gpa, self.tree.nodeMainToken(callee.receiver));
+                },
+                else => {},
+            }
+        }
+        if (normal_returns == 0) return false;
+        var token = self.tree.firstToken(body);
+        while (token <= self.tree.lastToken(body)) : (token += 1) {
+            try self.index.spend(token);
+            if (!tokenIsNamed(self.tree, token, name) and !tokenIsNamed(self.tree, token, retained_name)) continue;
+            // A field label or selector with this spelling does not read
+            // the lexical provider/backing binding.
+            if (token > 0 and self.tree.tokenTag(token - 1) == .period) continue;
+            if (fixed and tokenIsNamed(self.tree, token, retained_name)) {
+                var error_only = false;
+                for (nodes) |parent| {
+                    try self.index.spend(self.tree.nodeMainToken(parent));
+                    if (self.tree.nodeTag(parent) == .@"errdefer" and
+                        self.tree.firstToken(parent) < token and self.tree.lastToken(parent) >= token)
+                        error_only = true;
+                }
+                if (error_only) continue;
+            }
+            var found = false;
+            for (allowed.items) |accepted| {
+                try self.index.spend(token);
+                if (token == accepted) found = true;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
     fn pathIsArenaObject(
         self: *const ArenaProof,
         fn_decl: Ast.Node.Index,
@@ -1186,8 +1325,8 @@ const ArenaProof = struct {
         if (path.len == 0) {
             // Resolve the actual local at this use, not another block's
             // declaration or a file-scope value with the same spelling.
-            // A body-local arena is not proved to outlive the returned view.
-            if (try self.index.lookup(fn_decl, path.root, use_token)) |_| return false;
+            if (try self.index.lookup(fn_decl, path.root, use_token)) |local|
+                return try self.localProviderReturnedWithOwner(fn_decl, local);
             if (self.pointerParameterIsArena(fn_decl, path.root)) |answer| return answer;
             const decl = self.findGlobalDecl(path.root) orelse return false;
             const type_node = decl.ast.type_node.unwrap() orelse return false;
@@ -2651,6 +2790,133 @@ fn aggregateAround(
     return null;
 }
 
+/// A copied header is a borrow only when the original is in caller storage
+/// and neither name can invalidate it. Pointer constness is not that proof.
+fn returnsRetainedHeader(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    index: *DeclIndex,
+    fn_decl: Ast.Node.Index,
+    return_tok: Ast.TokenIndex,
+    recv: []const u8,
+) ProofError!bool {
+    const body = tokens.bodyOf(tree, fn_decl) orelse return false;
+    var source = ProofPath{ .root = recv };
+    const start = tree.firstToken(body);
+    var copied_declaration: ?Ast.TokenIndex = null;
+    var copied = false;
+    if (!try scopedPointerParameter(tree, cache, index, fn_decl, recv, return_tok)) {
+        const declaration = (try index.lookup(fn_decl, recv, return_tok)) orelse {
+            // A resolved scalar `items` is not a slice allocation at all.
+            const resolver = cache.zls orelse return false;
+            const node = cache.nodeForExactSpan(return_tok + 1, return_tok + 3) orelse return false;
+            const actual = (try resolver.resolutionFrame().typeOfNode(node)) orelse return false;
+            return switch (resolver.typeTag(actual) orelse return false) {
+                .int, .float, .bool, .@"enum" => true,
+                else => false,
+            };
+        };
+        const initializer = declaration.init_node.unwrap() orelse return false;
+        const source_node = if (tree.nodeTag(initializer) == .deref)
+            tree.nodeData(initializer).node
+        else
+            initializer;
+        // This AST span ends at the value, not at a call argument's
+        // delimiter. Read the complete header path without borrowing the
+        // delimiter contract of pathForward.
+        const source_first = tree.firstToken(source_node);
+        const source_last = tree.lastToken(source_node);
+        source = pathEndingAt(tree, source_last) orelse return false;
+        if (@as(usize, source_last - source_first) != 2 * source.len) return false;
+        if (!tokenIsNamed(tree, source_first, source.root)) return false;
+        if (!try scopedPointerParameter(tree, cache, index, fn_decl, source.root, tree.firstToken(source_node)))
+            return false;
+        const resolver = cache.zls orelse return false;
+        if (!try actualStandardList(resolver, index, initializer)) return false;
+        // A value copy is not a pointer alias. Do not infer an untyped or
+        // reference-valued copy merely from its initializer's spelling.
+        const use = cache.nodeForExactSpan(return_tok + 1, return_tok + 1) orelse return false;
+        const ty = (try resolver.resolutionFrame().typeOfNode(use)) orelse return false;
+        if (resolver.typeTag(ty) != .@"struct") return false;
+        copied_declaration = declaration.name_token;
+        copied = true;
+    }
+
+    var scan = try index.scanNodes(fn_decl, start, return_tok - 1);
+    while (try scan.next()) |node| {
+        switch (tree.nodeTag(node)) {
+            .@"asm", .asm_simple, .asm_input, .asm_output, .fn_decl => return false,
+            .call, .call_comma, .call_one, .call_one_comma => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, node) orelse return false;
+                if (!copied) {
+                    if (fieldCallee(tree, call.ast.fn_expr)) |callee| {
+                        if (tree.nodeTag(callee.receiver) == .identifier and
+                            tokenIsNamed(tree, tree.nodeMainToken(callee.receiver), recv) and
+                            listGrowthMethod(tree.tokenSlice(callee.method)))
+                        {
+                            const resolver = cache.zls orelse return false;
+                            if (try actualStandardList(resolver, index, callee.receiver)) continue;
+                        }
+                    }
+                }
+                const token = fresh_storage.calleeQueryToken(tree, call);
+                const actual = (try call_summary.actualCallSummaryAt(cache, token, null)) orelse return false;
+                if ((try cache.callEffectAt(token, .{ .whole = actual.callee }, .{
+                    .remaining = index.remaining,
+                })) != .read_only) return false;
+            },
+            // Another incoming pointer can alias the retained owner. Without
+            // a disjointness proof, writes through that name are not harmless.
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div,
+            .assign_mod, .assign_shl, .assign_shr, .assign_bit_and,
+            .assign_bit_or, .assign_bit_xor, .assign_add_wrap,
+            .assign_sub_wrap, .assign_mul_wrap, .assign_shl_sat,
+            .assign_add_sat, .assign_sub_sat, .assign_mul_sat,
+            => return false,
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                // Builtin pointer writes and indirect @call are not covered
+                // by ordinary canonical-call effects.
+                return false;
+            },
+            .address_of => {
+                const first = tree.firstToken(tree.nodeData(node).node);
+                if (tokenIsNamed(tree, first, recv) or tokenIsNamed(tree, first, source.root)) return false;
+            },
+            .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+                const variable = tree.fullVarDecl(node) orelse continue;
+                if (copied_declaration == variable.ast.mut_token + 1) continue;
+                const initializer = variable.ast.init_node.unwrap() orelse continue;
+                var token = tree.firstToken(initializer);
+                while (token <= tree.lastToken(initializer)) : (token += 1) {
+                    try index.spend(token);
+                    if (tokenIsNamed(tree, token, recv) or tokenIsNamed(tree, token, source.root)) return false;
+                }
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn scopedPointerParameter(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    index: *DeclIndex,
+    fn_decl: Ast.Node.Index,
+    name: []const u8,
+    token: Ast.TokenIndex,
+) ProofError!bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, fn_decl) orelse return false;
+    const body = tokens.bodyOf(tree, fn_decl) orelse return false;
+    const bindings = try cache.localBindings(proto, body);
+    for (bindings.items) |_| try index.spend(token);
+    const binding = bindings.findAt(name, token) orelse return false;
+    if (binding.origin != .param) return false;
+    return recvIsPointerParam(tree, fn_decl, name);
+}
+
 /// True iff `recv` is a pointer-typed parameter of `fn_decl`.
 fn recvIsPointerParam(tree: *const Ast, fn_decl: Ast.Node.Index, recv: []const u8) bool {
     // Keep only the proto NODE — `fullFnProto` stores params in a local
@@ -2809,9 +3075,10 @@ test "return-arraylist-items: a full-capacity comparison across two lists proves
 }
 
 test "return-arraylist-items: pointer param (caller-owned) suppresses" {
-    try testing.expectNoFire(check,
-        \\fn collect(out: *std.ArrayList(u8)) []u8 {
-        \\    out.append(1) catch {};
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn collect(out: *std.ArrayList(u8), gpa: std.mem.Allocator) []u8 {
+        \\    out.append(gpa, 1) catch {};
         \\    return out.items;
         \\}
         \\
@@ -5048,4 +5315,676 @@ test "return-arraylist-items: fresh receiver arena initialization precedes the b
         \\    }
         \\};
     );
+}
+
+test "return-arraylist-items: allocator lookalikes and unsafe arena lifetimes still report" {
+    const source =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const List = std.ArrayList;
+        \\
+        \\// This name and comment do not prove the allocator is an arena.
+        \\fn arenaBacked(static: Allocator) []const u8 {
+        \\    var out: List(u8) = .empty;
+        \\    out.append(static, 1) catch {};
+        \\    return out.items;
+        \\}
+        \\fn nonArena() []const u8 {
+        \\    var out: List(u8) = .empty;
+        \\    out.append(std.heap.page_allocator, 1) catch {};
+        \\    return out.items;
+        \\}
+        \\fn localArena(gpa: Allocator) []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    defer arena.deinit();
+        \\    var out: List(u8) = .empty;
+        \\    out.append(arena.allocator(), 1) catch {};
+        \\    return out.items;
+        \\}
+        \\const Store = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    fn rebound(self: *Store) []const u8 {
+        \\        var out: List(u8) = .empty;
+        \\        out.append(self.arena.allocator(), 1) catch {};
+        \\        self.arena = .init(std.heap.page_allocator);
+        \\        return out.items;
+        \\    }
+        \\    fn released(self: *Store) []const u8 {
+        \\        var out: List(u8) = .empty;
+        \\        out.append(self.arena.allocator(), 1) catch {};
+        \\        self.arena.deinit();
+        \\        return out.items;
+        \\    }
+        \\    fn escaped(self: *Store) []const u8 {
+        \\        var out: List(u8) = .empty;
+        \\        out.append(self.arena.allocator(), 1) catch {};
+        \\        const owner = self;
+        \\        _ = owner.arena.reset(.free_all);
+        \\        return out.items;
+        \\    }
+        \\};
+    ;
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check, source);
+    defer testing.freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 6), problems.items.len);
+    for (problems.items) |problem| try std.testing.expectEqualStrings(R, problem.rule_id);
+}
+
+test "return-arraylist-items: authenticated module caller keeps arena identity" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var unique = std.testing.tmpDir(.{});
+    defer unique.cleanup();
+    const temporary_path = try std.fmt.allocPrint(gpa, "/tmp/zbc-arena-module-{s}", .{unique.sub_path});
+    defer gpa.free(temporary_path);
+    try std.Io.Dir.cwd().createDir(io, temporary_path, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, temporary_path) catch {};
+    var dir = try std.Io.Dir.cwd().openDir(io, temporary_path, .{});
+    defer dir.close(io);
+    const directory = try dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    try dir.createDirPath(io, "src");
+    try dir.writeFile(io, .{ .sub_path = "build.zig", .data =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addModule("app", .{ .root_source_file = b.path("src/main.zig") });
+        \\}
+    });
+    try dir.writeFile(io, .{ .sub_path = "src/main.zig", .data =
+        \\pub const repl = @import("repl.zig");
+    });
+    try dir.writeFile(io, .{ .sub_path = "src/repl.zig", .data =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\fn collect(memory: Allocator) []const u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    out.append(memory, 1) catch {};
+        \\    return out.items;
+        \\}
+        \\pub const Model = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    pub fn evaluate(self: *Model) []const u8 {
+        \\        return collect(self.arena.allocator());
+        \\    }
+        \\};
+    });
+    const root = try std.fs.path.join(gpa, &.{ directory, "src" });
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "repl.zig" });
+    defer gpa.free(path);
+    const build_path = try std.fs.path.join(gpa, &.{ directory, "build.zig" });
+    defer gpa.free(build_path);
+    var session: @import("../../lib.zig").Session = undefined;
+    try session.init(gpa, io, .{ .roots = &.{root}, .build_files = &.{build_path} });
+    defer session.deinit();
+    const source_scope = budget_mod.SourceScope.begin(&session.type_context.store);
+    defer source_scope.end();
+    const canonical = try session.project.sourcePath(path);
+    const model = (try session.project.modelForPath(canonical)) orelse return error.FileNotFound;
+    var resolver: resolver_mod.TypeResolver = undefined;
+    try resolver.init(&session.type_context, gpa, canonical, model.tree.source);
+    defer resolver.deinit();
+    var cache = file_cache_mod.FileCache.init(gpa, model.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.setProject(&session.project, canonical);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer testing.freeProblems(gpa, &problems);
+    try check(gpa, model.tree, &cache, &config_mod.Default, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "return-arraylist-items: shared source keeps each module allocator in both input orders" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var unique = std.testing.tmpDir(.{});
+    defer unique.cleanup();
+    const temporary_path = try std.fmt.allocPrint(gpa, "/tmp/zbc-arena-shared-{s}", .{unique.sub_path});
+    defer gpa.free(temporary_path);
+    try std.Io.Dir.cwd().createDir(io, temporary_path, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, temporary_path) catch {};
+    var dir = try std.Io.Dir.cwd().openDir(io, temporary_path, .{});
+    defer dir.close(io);
+    const directory = try dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    try dir.createDirPath(io, "src");
+    try dir.writeFile(io, .{ .sub_path = "build.zig", .data =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const arena = b.createModule(.{ .root_source_file = b.path("src/arena.zig") });
+        \\    const buffer = b.createModule(.{ .root_source_file = b.path("src/buffer.zig") });
+        \\    const left = b.addModule("left", .{ .root_source_file = b.path("src/left.zig") });
+        \\    left.addImport("backing", arena);
+        \\    const right = b.addModule("right", .{ .root_source_file = b.path("src/right.zig") });
+        \\    right.addImport("backing", buffer);
+        \\}
+    });
+    for ([_][]const u8{ "src/left.zig", "src/right.zig" }) |path| {
+        try dir.writeFile(io, .{ .sub_path = path, .data =
+            \\pub const shared = @import("shared.zig");
+        });
+    }
+    try dir.writeFile(io, .{ .sub_path = "src/arena.zig", .data =
+        \\pub const Storage = @import("std").heap.ArenaAllocator;
+    });
+    try dir.writeFile(io, .{ .sub_path = "src/buffer.zig", .data =
+        \\pub const Storage = @import("std").heap.FixedBufferAllocator;
+    });
+    try dir.writeFile(io, .{ .sub_path = "src/shared.zig", .data =
+        \\const std = @import("std");
+        \\const backing = @import("backing");
+        \\fn collect(memory: std.mem.Allocator) []const u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    out.append(memory, 1) catch {};
+        \\    return out.items;
+        \\}
+        \\pub const Model = struct {
+        \\    storage: backing.Storage,
+        \\    pub fn evaluate(self: *Model) []const u8 {
+        \\        return collect(self.storage.allocator());
+        \\    }
+        \\};
+    });
+    const root = try std.fs.path.join(gpa, &.{ directory, "src" });
+    defer gpa.free(root);
+    const build_path = try std.fs.path.join(gpa, &.{ directory, "build.zig" });
+    defer gpa.free(build_path);
+    const shared_path = try std.fs.path.join(gpa, &.{ root, "shared.zig" });
+    defer gpa.free(shared_path);
+    for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }) |order| {
+        var session: @import("../../lib.zig").Session = undefined;
+        try session.init(gpa, io, .{ .roots = &.{root}, .build_files = &.{build_path} });
+        defer session.deinit();
+        const source_scope = budget_mod.SourceScope.begin(&session.type_context.store);
+        defer source_scope.end();
+        var modules: [2]@import("type_engine").ModuleId = undefined;
+        for ([_][]const u8{ "left.zig", "right.zig" }, 0..) |name, position| {
+            const path = try std.fs.path.join(gpa, &.{ root, name });
+            defer gpa.free(path);
+            const uri = try @import("type_engine").Uri.fromPath(gpa, path);
+            defer uri.deinit(gpa);
+            modules[position] = try session.type_context.moduleForDocument(uri);
+            try std.testing.expect(modules[position] != .unscoped);
+        }
+        try std.testing.expect(modules[0] != modules[1]);
+        const handles: [2]@import("type_engine").DocumentStore.Handle = .{
+            try session.type_context.sourceHandle(shared_path, modules[0]),
+            try session.type_context.sourceHandle(shared_path, modules[1]),
+        };
+        try std.testing.expect(handles[0].document == handles[1].document);
+        for (order) |position| {
+            var resolver: resolver_mod.TypeResolver = undefined;
+            try resolver.initBorrowed(&session.type_context, gpa, handles[position]);
+            defer resolver.deinit();
+            const tree = &handles[position].document.tree;
+            var cache = file_cache_mod.FileCache.init(gpa, tree);
+            defer cache.deinit();
+            cache.setZls(&resolver);
+            cache.setProject(&session.project, shared_path);
+            try std.testing.expectEqual(modules[position], cache.module_id);
+            var problems: std.ArrayListUnmanaged(Problem) = .empty;
+            defer testing.freeProblems(gpa, &problems);
+            try check(gpa, tree, &cache, &config_mod.Default, &problems);
+            try std.testing.expectEqual(position, problems.items.len);
+            for (problems.items) |problem| try std.testing.expectEqualStrings(R, problem.rule_id);
+        }
+    }
+}
+
+test "return-arraylist-items: copied caller list retains its original header" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *const Store) []const u8 {
+        \\    const copy = store.buffer;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: copied list cannot outlive a rebound caller header" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *Store) []const u8 {
+        \\    const copy = store.buffer;
+        \\    store.buffer = .empty;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: copied list release and escape refuse the borrow" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *Store, gpa: std.mem.Allocator) []const u8 {
+        \\    const copy = store.buffer;
+        \\    store.buffer.deinit(gpa);
+        \\    return copy.items;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\extern fn escape(*Store) void;
+        \\pub fn view(store: *Store) []const u8 {
+        \\    const copy = store.buffer;
+        \\    escape(store);
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: copying a frame-local list does not retain ownership" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn view(gpa: std.mem.Allocator) ![]const u8 {
+        \\    var original: std.ArrayList(u8) = .empty;
+        \\    try original.append(gpa, 1);
+        \\    const copy = original;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: receiver names are not ownership evidence" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn view(gpa: std.mem.Allocator) ![]const u8 {
+        \\    var self: std.ArrayList(u8) = .empty;
+        \\    try self.append(gpa, 1);
+        \\    return self.items;
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn view(gpa: std.mem.Allocator) ![]const u8 {
+        \\    var this: std.ArrayList(u8) = .empty;
+        \\    try this.append(gpa, 1);
+        \\    return this.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: freed pointer parameters do not retain returned storage" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn view(list: *const std.ArrayList(u8), gpa: std.mem.Allocator) []const u8 {
+        \\    gpa.free(list.items);
+        \\    return list.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: scalar items fields are not list allocations" {
+    try testing.expectNoFireTyped(check,
+        \\const Window = struct { items: u64 };
+        \\pub fn amount(window: Window) u64 {
+        \\    return window.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: private outputs accompany the exact returned arena owner" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Result = struct { arena: std.heap.ArenaAllocator, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    return list.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Result {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    errdefer arena.deinit();
+        \\    const bytes = try collect(arena.allocator());
+        \\    return .{ .arena = arena, .bytes = bytes };
+        \\}
+    );
+}
+
+test "return-arraylist-items: every private caller must retain its allocation owner" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Result = struct { arena: std.heap.ArenaAllocator, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    return list.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Result {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    const bytes = try collect(arena.allocator());
+        \\    return .{ .arena = arena, .bytes = bytes };
+        \\}
+        \\pub fn dangling(gpa: std.mem.Allocator) ![]u8 {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    defer arena.deinit();
+        \\    return collect(arena.allocator());
+        \\}
+    );
+}
+
+test "return-arraylist-items: reset released and escaped returned owners refuse the proof" {
+    const prefix =
+        \\const std = @import("std");
+        \\const Result = struct { arena: std.heap.ArenaAllocator, bytes: []u8 };
+        \\extern fn escape(*std.heap.ArenaAllocator) void;
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    return list.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Result {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    const bytes = try collect(arena.allocator());
+        \\
+    ;
+    const suffix =
+        \\    return .{ .arena = arena, .bytes = bytes };
+        \\}
+    ;
+    inline for (.{
+        "    _ = arena.reset(.retain_capacity);\n",
+        "    arena.deinit();\n",
+        "    escape(&arena);\n",
+        "    arena = .init(gpa);\n",
+    }) |change| {
+        try testing.expectFiresTyped(check, R, prefix ++ change ++ suffix);
+    }
+}
+
+test "return-arraylist-items: source release before a header copy still invalidates it" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *Store, gpa: std.mem.Allocator) []const u8 {
+        \\    store.buffer.deinit(gpa);
+        \\    const copy = store.buffer;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: dereferenced caller list copies retain the original header" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn view(list: *const std.ArrayList(u8)) []const u8 {
+        \\    const copy = list.*;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: archived consumer outputs still require a real transfer" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn members(gpa: std.mem.Allocator, names: []const []const u8) ![][]const u8 {
+        \\    var out: std.ArrayList([]const u8) = .empty;
+        \\    for (names) |name| try out.append(gpa, try gpa.dupe(u8, name));
+        \\    return out.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: conditional page allocation is not an arena owner" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn patterns(names: []const []const u8) []const []const u8 {
+        \\    var kept: std.ArrayList([]const u8) = .empty;
+        \\    for (names) |name| kept.append(std.heap.page_allocator, name) catch return &.{};
+        \\    return kept.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: a pass-local arena still makes a dangling return" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn lower(gpa: std.mem.Allocator) ![]const u8 {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    defer arena.deinit();
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    try out.append(arena.allocator(), 1);
+        \\    return out.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: fixed-buffer outputs retain the exact returned allocation" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Parsed = struct { storage: []u8, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    try out.append(gpa, 1);
+        \\    return out.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Parsed {
+        \\    const storage = try gpa.alloc(u8, 4096);
+        \\    errdefer gpa.free(storage);
+        \\    var pool = std.heap.FixedBufferAllocator.init(storage);
+        \\    const bytes = try collect(pool.allocator());
+        \\    return .{ .storage = storage, .bytes = bytes };
+        \\}
+    );
+}
+
+test "return-arraylist-items: returned fixed-buffer backing cannot be freed or replaced" {
+    const prefix =
+        \\const std = @import("std");
+        \\const Parsed = struct { storage: []u8, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    try out.append(gpa, 1);
+        \\    return out.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Parsed {
+        \\    const storage = try gpa.alloc(u8, 4096);
+        \\    var pool = std.heap.FixedBufferAllocator.init(storage);
+        \\    const bytes = try collect(pool.allocator());
+        \\
+    ;
+    const suffix =
+        \\    return .{ .storage = storage, .bytes = bytes };
+        \\}
+    ;
+    inline for (.{
+        "    gpa.free(storage);\n",
+        "    pool.reset();\n",
+        "    pool = std.heap.FixedBufferAllocator.init(storage);\n",
+    }) |change| {
+        try testing.expectFiresTyped(check, R, prefix ++ change ++ suffix);
+    }
+}
+
+test "return-arraylist-items: returned stack-backed pool is not owned backing storage" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Parsed = struct { storage: []u8, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    try out.append(gpa, 1);
+        \\    return out.items;
+        \\}
+        \\pub fn parse() !Parsed {
+        \\    var storage: [4096]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&storage);
+        \\    const bytes = try collect(pool.allocator());
+        \\    return .{ .storage = &storage, .bytes = bytes };
+        \\}
+    );
+}
+
+test "return-arraylist-items: exact immutable allocator actual retains the returned owner" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Result = struct { arena: std.heap.ArenaAllocator, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    return list.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Result {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    const memory = arena.allocator();
+        \\    const bytes = try collect(memory);
+        \\    return .{ .arena = arena, .bytes = bytes };
+        \\}
+    );
+}
+
+test "return-arraylist-items: rebound allocator actual cannot borrow its initializer authority" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Result = struct { arena: std.heap.ArenaAllocator, bytes: []u8 };
+        \\fn collect(gpa: std.mem.Allocator) ![]u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    return list.items;
+        \\}
+        \\pub fn parse(gpa: std.mem.Allocator) !Result {
+        \\    var arena: std.heap.ArenaAllocator = .init(gpa);
+        \\    var memory = arena.allocator();
+        \\    memory = gpa;
+        \\    const bytes = try collect(memory);
+        \\    return .{ .arena = arena, .bytes = bytes };
+        \\}
+    );
+}
+
+test "return-arraylist-items: unchanged mutable caller header supports a value copy" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *Store) []const u8 {
+        \\    const copy = store.buffer;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: copied header keeps the complete nested source path" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Store = struct { nested: struct { buffer: std.ArrayList(u8) } };
+        \\pub fn view(store: *const Store) []const u8 {
+        \\    const copy = store.nested.buffer;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: copied header permits complete read-only calls" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\fn inspect(store: *const Store) void {
+        \\    if (store.buffer.items.len == 0) return;
+        \\}
+        \\pub fn view(store: *const Store) []const u8 {
+        \\    inspect(store);
+        \\    const copy = store.buffer;
+        \\    inspect(store);
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: copied pointer value is not a captured physical header" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: *const std.ArrayList(u8) };
+        \\pub fn view(store: *const Store) []const u8 {
+        \\    const copy = store.buffer;
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: dereferenced header writes invalidate either copy horizon" {
+    const prefix =
+        \\const std = @import("std");
+        \\pub fn view(list: *std.ArrayList(u8)) []const u8 {
+        \\
+    ;
+    const capture = "    const copy = list.*;\n";
+    const suffix =
+        \\    return copy.items;
+        \\}
+    ;
+    inline for (.{
+        "    list.deinit(std.heap.page_allocator);\n",
+        "    list.* = .empty;\n",
+        "    list.items.len = 0;\n",
+    }) |change| {
+        try testing.expectFiresTyped(check, R, prefix ++ change ++ capture ++ suffix);
+        try testing.expectFiresTyped(check, R, prefix ++ capture ++ change ++ suffix);
+    }
+}
+
+test "return-arraylist-items: caller aliases invalidate either copy horizon" {
+    const prefix =
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *Store) []const u8 {
+        \\
+    ;
+    const capture = "    const copy = store.buffer;\n";
+    const alias = "    const other = store;\n    if (other.buffer.items.len == 0) return &.{};\n";
+    const suffix =
+        \\    return copy.items;
+        \\}
+    ;
+    try testing.expectFiresTyped(check, R, prefix ++ alias ++ capture ++ suffix);
+    try testing.expectFiresTyped(check, R, prefix ++ capture ++ alias ++ suffix);
+}
+
+test "return-arraylist-items: growing a copied header does not update its caller owner" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *Store, gpa: std.mem.Allocator) ![]const u8 {
+        \\    var copy = store.buffer;
+        \\    try copy.append(gpa, 1);
+        \\    return copy.items;
+        \\}
+    );
+}
+
+test "return-arraylist-items: const caller escape invalidates either copy horizon" {
+    const prefix =
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\extern fn escape(*const Store) void;
+        \\pub fn view(store: *const Store) []const u8 {
+        \\
+    ;
+    const capture = "    const copy = store.buffer;\n";
+    const escape = "    escape(store);\n";
+    const suffix =
+        \\    return copy.items;
+        \\}
+    ;
+    try testing.expectFiresTyped(check, R, prefix ++ escape ++ capture ++ suffix);
+    try testing.expectFiresTyped(check, R, prefix ++ capture ++ escape ++ suffix);
+}
+
+test "return-arraylist-items: another incoming pointer can overwrite the captured header" {
+    const prefix =
+        \\const std = @import("std");
+        \\const Store = struct { buffer: std.ArrayList(u8) };
+        \\pub fn view(store: *const Store, other: *Store) []const u8 {
+        \\
+    ;
+    const capture = "    const copy = store.buffer;\n";
+    const write = "    other.buffer = .empty;\n";
+    const suffix =
+        \\    return copy.items;
+        \\}
+    ;
+    try testing.expectFiresTyped(check, R, prefix ++ write ++ capture ++ suffix);
+    try testing.expectFiresTyped(check, R, prefix ++ capture ++ write ++ suffix);
 }

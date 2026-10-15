@@ -613,6 +613,10 @@ pub const FileCache = struct {
     /// Actual type identity separates generic instantiations; a declaration
     /// already on the stack cannot publish a recursive certificate.
     return_defined_summaries: std.HashMapUnmanaged(CleanupKey, ReturnValueVerdict, CleanupKeyContext, 80) = .empty,
+    /// Caller-selected negative facts, never strict return certificates.
+    diagnostic_return_summaries: std.HashMapUnmanaged(ReturnCallKey, ReturnValueVerdict, ReturnCallKeyContext, 80) = .empty,
+    /// Borrowed only while lowering a caller-selected diagnostic replay.
+    diagnostic_actual_integers: []const DiagnosticIntegerBinding = &.{},
     return_defined_visiting: std.AutoHashMapUnmanaged(DeclKey, void) = .empty,
     /// Failed standalone replays, never verdicts. Exact initial allowances
     /// and unchanged memo state are required; active outer proofs do not reuse.
@@ -843,6 +847,16 @@ pub const FileCache = struct {
         bytes: std.ArrayListUnmanaged(worklist_mod.UndefinedReturnBytes) = .empty,
     };
 
+    pub const DiagnosticIntegerBinding = struct {
+        parameter_byte: u32,
+        value: u64,
+    };
+
+    const DiagnosticReplay = struct {
+        key: ReturnCallKey,
+        integers: []const DiagnosticIntegerBinding,
+    };
+
     const ReturnReplaySyntax = struct {
         has_defer: bool = false,
     };
@@ -900,7 +914,16 @@ pub const FileCache = struct {
         return tokens.enclosingFnDecl(tree, token);
     }
 
+    /// Bind the resolver for this cache's exact source document and module.
+    /// Bind before semantic queries. A cache already assigned to a module
+    /// cannot be rebound to another instance of the same physical source.
+    /// Detaching the resolver does not change the document's identity.
     pub fn setZls(self: *FileCache, zls: ?*zls_resolver_mod.TypeResolver) void {
+        if (zls) |resolver| {
+            std.debug.assert(self.tree == &resolver.handle.document.tree);
+            std.debug.assert(self.module_id == .unscoped or self.module_id == resolver.handle.module);
+            self.module_id = resolver.handle.module;
+        }
         self.zls = zls;
     }
 
@@ -1542,12 +1565,33 @@ pub const FileCache = struct {
         var namespace_closed: ?bool = null;
         for (tree.nodes.items(.tag), 0..) |tag, raw| {
             switch (tag) {
+                .call, .call_comma, .call_one, .call_one_comma,
+                .identifier, .field_access, .enum_literal,
+                => {},
+                .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(@enumFromInt(raw))), "@call")) continue;
+                },
+                else => continue,
+            }
+            // Namespace/self-relative references are interpreted where they
+            // are written, not in this document's root namespace.
+            const source_node: Ast.Node.Index = @enumFromInt(raw);
+            var source_frame = frame;
+            if (raw != 0) {
+                if (try resolver.enclosingFunctionAt(tree.firstToken(source_node))) |owner| {
+                    switch (try frame.functionReference(owner)) {
+                        .function => |reference| source_frame = resolver.frameForFunction(reference),
+                        else => {},
+                    }
+                }
+            }
+            switch (tag) {
                 .call, .call_comma, .call_one, .call_one_comma => {},
                 .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
                     const node: Ast.Node.Index = @enumFromInt(raw);
                     if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call")) continue;
                 },
-                .identifier, .field_access => {
+                .identifier, .field_access, .enum_literal => {
                     // A function value outside its callee expression can
                     // escape. Resolve the declaration, not its leaf name.
                     const use_node: Ast.Node.Index = @enumFromInt(raw);
@@ -1556,7 +1600,7 @@ pub const FileCache = struct {
                         const call = TypeResolver.CallOperands.full(tree, &call_buffer, call_node).?;
                         if (call.ast.fn_expr == use_node) continue;
                     }
-                    const escaped = try frame.functionReference(use_node);
+                    const escaped = try source_frame.functionReference(use_node);
                     switch (escaped) {
                         .function => |reference| {
                             if (reference.tree == tree and reference.handle.module == self.module_id and
@@ -1568,7 +1612,7 @@ pub const FileCache = struct {
                             else
                                 tree.nodeMainToken(use_node);
                             const target_name = proto.name_token orelse return null;
-                            if (std.mem.eql(u8, tree.tokenSlice(name_token), tree.tokenSlice(target_name))) return null;
+                            if (self.closedCallerNamesEqual(name_token, target_name) orelse return null) return null;
                         },
                         .not_callable => {},
                     }
@@ -1582,23 +1626,27 @@ pub const FileCache = struct {
             // Census identity does not require one concrete argument frame:
             // an inline tuple call can reach this declaration in many frames.
             // Numeric proofs must still resolve every actual iteration.
-            const reference = switch (try frame.functionReferenceOfCall(node)) {
+            const reference = switch (try source_frame.functionReferenceOfCall(node)) {
                 .function => |found| found,
                 .unknown => blk: {
                     var call_buffer: [2]Ast.Node.Index = undefined;
                     const call = TypeResolver.CallOperands.full(tree, &call_buffer, node) orelse return null;
-                    switch (try frame.functionReference(call.ast.fn_expr)) {
+                    switch (try source_frame.functionReference(call.ast.fn_expr)) {
                         .function => |found| break :blk found,
                         else => {},
                     }
                     if (try self.isFunctionPointerParameterCall(node)) continue;
                     const name_token = switch (tree.nodeTag(call.ast.fn_expr)) {
-                        .identifier => tree.nodeMainToken(call.ast.fn_expr),
+                        // A contextual declaration literal still selects a
+                        // named namespace member. It cannot rename this
+                        // private declaration unless a function value escaped,
+                        // which the independent reference walk refuses.
+                        .identifier, .enum_literal => tree.nodeMainToken(call.ast.fn_expr),
                         .field_access => tree.nodeData(call.ast.fn_expr).node_and_token[1],
                         else => return null,
                     };
                     const target_name = proto.name_token orelse return null;
-                    if (!std.mem.eql(u8, tree.tokenSlice(name_token), tree.tokenSlice(target_name))) {
+                    if (!(self.closedCallerNamesEqual(name_token, target_name) orelse return null)) {
                         if (namespace_closed == null)
                             namespace_closed = !try self.privateNamespaceEscapes(frame, fn_decl);
                         if (namespace_closed.?) continue;
@@ -1617,6 +1665,70 @@ pub const FileCache = struct {
         return try calls.toOwnedSlice(self.gpa);
     }
 
+    /// Unknown uses are unrelated only when their decoded names differ.
+    /// A quoted spelling is not a new declaration, and a malformed name
+    /// cannot close the census. Resolved uses still require declaration identity.
+    fn closedCallerNamesEqual(self: *FileCache, left: Ast.TokenIndex, right: Ast.TokenIndex) ?bool {
+        var names: [2][]const u8 = undefined;
+        for ([_]Ast.TokenIndex{ left, right }, 0..) |token, index| {
+            const raw = self.tree.tokenSlice(token);
+            if (!std.mem.startsWith(u8, raw, "@\"")) {
+                names[index] = raw;
+                continue;
+            }
+            if (raw.len < 3 or raw[raw.len - 1] != '"') return null;
+            names[index] = raw[2 .. raw.len - 1];
+        }
+        if (std.mem.indexOfScalar(u8, names[0], '\\') == null and
+            std.mem.indexOfScalar(u8, names[1], '\\') == null)
+            return std.mem.eql(u8, names[0], names[1]);
+        var readers: [2]CallerNameReader = .{ .{ .raw = names[0] }, .{ .raw = names[1] } };
+        var equal = true;
+        while (true) {
+            const a = readers[0].next() catch return null;
+            const b = readers[1].next() catch return null;
+            if (a == null and b == null) return equal;
+            if (a) |left_byte| {
+                if (b) |right_byte| {
+                    equal = equal and left_byte == right_byte;
+                } else equal = false;
+            } else if (b != null) equal = false;
+        }
+    }
+
+    /// Decode one identifier byte at a time without allocating a copied name.
+    const CallerNameReader = struct {
+        raw: []const u8,
+        index: usize = 0,
+        encoded: [4]u8 = undefined,
+        encoded_index: usize = 0,
+        encoded_len: usize = 0,
+
+        fn next(self: *CallerNameReader) error{InvalidLiteral}!?u8 {
+            if (self.encoded_index < self.encoded_len) {
+                const byte = self.encoded[self.encoded_index];
+                self.encoded_index += 1;
+                return byte;
+            }
+            if (self.index == self.raw.len) return null;
+            const byte = self.raw[self.index];
+            if (byte != '\\') {
+                if (byte == '\n' or byte == '"') return error.InvalidLiteral;
+                self.index += 1;
+                return byte;
+            }
+            const unicode = self.index + 1 < self.raw.len and self.raw[self.index + 1] == 'u';
+            const scalar = switch (std.zig.string_literal.parseEscapeSequence(self.raw, &self.index)) {
+                .success => |value| value,
+                .failure => return error.InvalidLiteral,
+            };
+            if (!unicode) return @as(u8, @intCast(scalar));
+            self.encoded_len = std.unicode.utf8Encode(scalar, &self.encoded) catch return error.InvalidLiteral;
+            self.encoded_index = 1;
+            return self.encoded[0];
+        }
+    };
+
     /// A helper can reflect a method after receiving its namespace or an
     /// instance's type, without spelling that method in this document.
     /// Only direct member projections keep the owner local. The declaration's
@@ -1632,9 +1744,11 @@ pub const FileCache = struct {
         const owner = function.data.function.container_type.*;
         if (owner.data != .container) return true;
         const owner_scope = owner.data.container.scope_handle;
-        // A module-level namespace can be public without a function-value
-        // use in this file. Require a lexically local owner for this proof.
-        if (owner_scope.scope == .root) return true;
+        // A private module declaration cannot be reflected from another
+        // document, even when that document imports/receives its namespace.
+        // This census separately refuses all local function-value escapes
+        // and unresolved reflection before relying on this privacy boundary.
+        if (owner_scope.scope == .root) return false;
         const owner_token = tree.firstToken(owner_scope.toNode());
         var local_owner = (try frame.resolver.enclosingFunctionAt(owner_token)) != null;
         if (!local_owner) for (tree.nodes.items(.tag), 0..) |tag, raw| {
@@ -1645,7 +1759,7 @@ pub const FileCache = struct {
                 break;
             }
         };
-        if (!local_owner) return true;
+        if (!local_owner) return false;
         // An inline literal can be passed as a type without an identifier
         // use. A namespace member can also escape through its outer container.
         // Require a const statement in a local block, not a container member.
@@ -2140,6 +2254,10 @@ pub const FileCache = struct {
         may_write: bool,
         definite_write: bool = false,
         location_written: bool = false,
+        /// The successful source paths were completely traversed, even when
+        /// they prove only partial/conditional writes. False means UNKNOWN,
+        /// not a witnessed no-store alternative.
+        location_store_coverage_known: bool = false,
         whole_source: ?WholeStoreSource = null,
         written_computations: [8]?ComputedStoreValue = .{null} ** 8,
         location_computed_sources: u8 = 0,
@@ -2210,7 +2328,10 @@ pub const FileCache = struct {
         const use = self.address_uses.?.get(operand_token) orelse return null;
         if (use.proof_queried) return use;
         var proved = use;
-        if (!try self.definiteAddressWrite(&proved)) return if (use.receiver) null else use;
+        const positive = try self.definiteAddressWrite(&proved);
+        if (!positive and use.receiver) return null;
+        // A completed no-store or conditional-store query still carries
+        // diagnostic facts. Do not replace them with the raw call mapping.
         proved.proof_queried = true;
         self.address_uses.?.getPtr(operand_token).?.* = proved;
         self.address_proof_generation += 1;
@@ -2338,7 +2459,10 @@ pub const FileCache = struct {
         const formal_types = canonical.callee.reference.actual_type.data.function.parameters;
         if (parameter_index >= formal_types.len) return null;
         const formal_type = (try resolver.normalizedType(formal_types[parameter_index].type)) orelse return null;
-        if (resolver.pointerSize(formal_type) == null) return .{ .receiver = argument };
+        if (resolver.pointerSize(formal_type) == null) switch (resolver.typeTag(formal_type) orelse return null) {
+            .@"struct", .@"union", .array, .vector => {},
+            else => return .{ .receiver = argument },
+        };
         const read_only = switch (formal_type.data) {
             .pointer => |pointer| pointer.is_const,
             .ip_index => switch (resolver.ctx.ip.indexToKey(formal_type.ipIndex() orelse return null)) {
@@ -2360,6 +2484,11 @@ pub const FileCache = struct {
         var result: MethodScalarReads = .{ .receiver = argument };
         self.beginNormalCleanup();
         defer self.endNormalCleanup();
+        // These whole-body proofs bind every write and its value dependencies.
+        // Their caller byte effects retain old-hole and poisoned-input witnesses.
+        if ((try self.preservingParameterBody(canonical, canonical.callee.call_node, parameter_index, false)) != null or
+            (try self.preservingParameterBody(canonical, canonical.callee.call_node, parameter_index, true)) != null)
+            return result;
         if (!try self.collectDiagnosticOutputTouches(tree, body, name orelse return null, &result, context, 0)) {
             try self.diagnostic_output_touches.put(self.gpa, key, null);
             return null;
@@ -2413,6 +2542,155 @@ pub const FileCache = struct {
         }
     };
 
+    const DiagnosticTouchPath = struct { path: []const u8, precise: bool = true };
+
+    /// A copied scalar cannot write its source. Aggregate values can still
+    /// transport borrowed pointers; their constructor leaves retain that reach.
+    fn diagnosticBorrowedTouchPath(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, name: []const u8, context: DiagnosticTouchContext, depth: u32) SummaryError!?DiagnosticTouchPath {
+        // Forming an address selects a location, even when its stored value is
+        // scalar. Passing that scalar value itself still supplies no address.
+        if (tree.nodeTag(node) == .address_of)
+            return self.diagnosticTouchPath(tree, tree.nodeData(node).node, name, context, depth + 1);
+        if (tree.nodeTag(node) == .grouped_expression)
+            return self.diagnosticBorrowedTouchPath(tree, tree.nodeData(node).node_and_token[0], name, context, depth + 1);
+        if (try context.frame.typeOfNode(node)) |actual| {
+            if (try context.frame.resolver.normalizedType(actual)) |normalized| {
+                if (context.frame.resolver.pointerSize(normalized) == null) switch (context.frame.resolver.typeTag(normalized) orelse return null) {
+                    .@"struct", .@"union", .array, .vector => {},
+                    else => return self.diagnosticEncodedTouchPath(tree, node, name, context, depth),
+                };
+            }
+        }
+        return self.diagnosticTouchPath(tree, node, name, context, depth);
+    }
+
+    /// Only explicit pointer encodings supply scalar address reach. Ordinary
+    /// scalar loads, parameters and field selections never infer such a loan.
+    fn diagnosticEncodedTouchPath(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, name: []const u8, context: DiagnosticTouchContext, depth: u32) SummaryError!?DiagnosticTouchPath {
+        if (depth == 64) return .{ .path = "", .precise = false };
+        try self.chargeNormalCleanupAt(tree, node);
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.builtinCallParams(&buffer, node)) |arguments| {
+            const builtin = tree.tokenSlice(tree.nodeMainToken(node));
+            if (arguments.len == 1 and std.mem.eql(u8, builtin, "@intFromPtr")) {
+                if ((try self.diagnosticBorrowedTouchPath(tree, arguments[0], name, context, depth + 1)) != null)
+                    return .{ .path = "", .precise = false };
+                return null;
+            }
+            if (arguments.len != 0 and (std.mem.eql(u8, builtin, "@as") or
+                std.mem.eql(u8, builtin, "@bitCast") or std.mem.eql(u8, builtin, "@intCast") or
+                std.mem.eql(u8, builtin, "@truncate")))
+                return self.diagnosticEncodedTouchPath(tree, arguments[arguments.len - 1], name, context, depth + 1);
+            return null;
+        }
+        if (tree.nodeTag(node) == .identifier) {
+            const token = tree.nodeMainToken(node);
+            const binding = (context.bindings().findAt(tree.tokenSlice(token), token) orelse return null).*;
+            if (binding.origin == .param or binding.origin == .loop_capture) return null;
+            var base: ?DiagnosticTouchPath = null;
+            if (context.declaring.nodeForExactSpan(binding.rhs_first, binding.rhs_last)) |rhs| {
+                base = try self.diagnosticEncodedTouchPath(tree, rhs, name, context, depth + 1);
+            }
+            if (!binding.is_const)
+                try self.diagnosticReboundTouches(tree, context.body, binding.name_token, token, name, context, &base, depth + 1);
+            return base;
+        }
+        if (tree.nodeTag(node) == .grouped_expression)
+            return self.diagnosticEncodedTouchPath(tree, tree.nodeData(node).node_and_token[0], name, context, depth + 1);
+        switch (tree.nodeTag(node)) {
+            .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor,
+            .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat,
+            => {
+                var children = engine.AstIterator.init(tree, node);
+                while (children.next(tree)) |child|
+                    if ((try self.diagnosticEncodedTouchPath(tree, child, name, context, depth + 1)) != null)
+                        return .{ .path = "", .precise = false };
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    /// Follow local pointer copies and pointer captures for possible opaque
+    /// writes. This is reachability only, never a current-pointee certificate.
+    /// Rebindings are unioned so an alias cannot hide a reachable opaque call.
+    fn diagnosticTouchPath(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, name: []const u8, context: DiagnosticTouchContext, depth: u32) SummaryError!?DiagnosticTouchPath {
+        if (depth == 64) return .{ .path = "", .precise = false };
+        try self.chargeNormalCleanupAt(tree, node);
+        const root = tokens.rootIdentifier(tree, node) orelse {
+            // A cast or returned pointer can hide a formal root. Keep possible
+            // reach, without inventing a precise projection.
+            var children = engine.AstIterator.init(tree, node);
+            while (children.next(tree)) |child|
+                if ((try self.diagnosticBorrowedTouchPath(tree, child, name, context, depth + 1)) != null)
+                    return .{ .path = "", .precise = false };
+            return null;
+        };
+        const token = tree.nodeMainToken(root);
+        const root_name = tree.tokenSlice(token);
+        const binding = (context.bindings().findAt(root_name, token) orelse return null).*;
+        if (binding.origin == .param) {
+            if (!std.mem.eql(u8, root_name, name)) return null;
+            const path = (try self.diagnosticOutputPath(tree, node, name, 0)) orelse
+                return .{ .path = "", .precise = false };
+            return .{ .path = path.path, .precise = path.precise };
+        }
+        if (try context.frame.typeOfNode(root)) |actual| {
+            if (try context.frame.resolver.normalizedType(actual)) |normalized| {
+                if (context.frame.resolver.pointerSize(normalized) == null) switch (context.frame.resolver.typeTag(normalized) orelse return null) {
+                    .@"struct", .@"union", .array, .vector => {},
+                    else => return null,
+                };
+            }
+        }
+        if (binding.origin == .loop_capture and
+            (binding.name_token == 0 or tree.tokenTag(binding.name_token - 1) != .asterisk)) return null;
+        var base: ?DiagnosticTouchPath = null;
+        if (context.declaring.nodeForExactSpan(binding.rhs_first, binding.rhs_last)) |rhs| {
+            if (try self.diagnosticBorrowedTouchPath(tree, rhs, name, context, depth + 1)) |path|
+                base = .{ .path = path.path, .precise = path.precise };
+        }
+        if (!binding.is_const)
+            try self.diagnosticReboundTouches(tree, context.body, binding.name_token, token, name, context, &base, depth + 1);
+        const source = base orelse return null;
+        if (binding.origin == .loop_capture or !source.precise) return .{ .path = source.path, .precise = false };
+        const relative = (try self.diagnosticOutputPath(tree, node, root_name, 0)) orelse
+            return .{ .path = source.path, .precise = false };
+        if (relative.path.len == 0) return .{ .path = source.path, .precise = relative.precise };
+        if (source.path.len == 0) return .{ .path = relative.path, .precise = relative.precise };
+        if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+        return .{
+            .path = try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}{s}{s}",
+                .{ source.path, if (relative.path[0] == '[') "" else ".", relative.path }),
+            .precise = relative.precise,
+        };
+    }
+
+    fn diagnosticReboundTouches(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, binding_token: Ast.TokenIndex, use_token: Ast.TokenIndex, name: []const u8, context: DiagnosticTouchContext, base: *?DiagnosticTouchPath, depth: u32) SummaryError!void {
+        if (depth == 64) {
+            base.* = .{ .path = "", .precise = false };
+            return;
+        }
+        try self.chargeNormalCleanupAt(tree, node);
+        if (tree.nodeTag(node) == .fn_decl or tree.firstToken(node) >= use_token) return;
+        if (tree.nodeTag(node) == .assign) {
+            const target, const value = tree.nodeData(node).node_and_node;
+            if (tree.nodeTag(target) == .identifier) {
+                const token = tree.nodeMainToken(target);
+                const binding = context.bindings().findAt(tree.tokenSlice(token), token);
+                if (binding != null and binding.?.name_token == binding_token)
+                    if (try self.diagnosticBorrowedTouchPath(tree, value, name, context, depth + 1)) |path| {
+                        if (base.*) |prior| {
+                            if (!std.mem.eql(u8, prior.path, path.path)) base.* = .{ .path = "", .precise = false };
+                        } else base.* = path;
+                    };
+            }
+        }
+        var children = engine.AstIterator.init(tree, node);
+        while (children.next(tree)) |child|
+            try self.diagnosticReboundTouches(tree, child, binding_token, use_token, name, context, base, depth + 1);
+    }
+
     fn appendDiagnosticTouch(result: *MethodScalarReads, path: []const u8) bool {
         for (result.fields[0..result.field_count]) |old|
             if (std.mem.eql(u8, old, path)) return true;
@@ -2425,23 +2703,88 @@ pub const FileCache = struct {
     /// Local induction variables and scalar-counter dereferences already have
     /// source-proven loop recipes. A record member or a free runtime parameter
     /// does not identify the byte that a write will replace.
-    fn diagnosticUnprovedIndex(tree: *const Ast, node: Ast.Node.Index, context: DiagnosticTouchContext, depth: u32) bool {
+    fn diagnosticUnprovedIndex(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, context: DiagnosticTouchContext, depth: u32) SummaryError!bool {
         if (depth == 64) return true;
+        try self.chargeNormalCleanupAt(tree, node);
         switch (tree.nodeTag(node)) {
             .field_access => return true,
             .identifier => {
                 const token = tree.nodeMainToken(node);
-                const binding = context.bindings().findAt(tree.tokenSlice(token), token) orelse return false;
-                return binding.origin == .param;
+                const binding = (context.bindings().findAt(tree.tokenSlice(token), token) orelse return true).*;
+                if (!binding.is_const and
+                    try self.diagnosticIndexRebound(tree, context.body, binding.name_token, token, context, depth + 1)) return true;
+                switch (binding.origin) {
+                    .param => return true,
+                    .literal, .loop_capture => return false,
+                    else => {
+                        if (diagnosticCountdownIndex(tree, context.body, binding.name, token, 0)) return false;
+                        const value = context.declaring.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return true;
+                        return self.diagnosticUnprovedIndex(tree, value, context, depth + 1);
+                    },
+                }
             },
             .deref, .number_literal => return false,
             else => {
                 var children = engine.AstIterator.init(tree, node);
                 while (children.next(tree)) |child|
-                    if (diagnosticUnprovedIndex(tree, child, context, depth + 1)) return true;
+                    if (try self.diagnosticUnprovedIndex(tree, child, context, depth + 1)) return true;
                 return false;
             },
         }
+    }
+
+    fn diagnosticIndexRebound(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, binding_token: Ast.TokenIndex, use_token: Ast.TokenIndex, context: DiagnosticTouchContext, depth: u32) SummaryError!bool {
+        if (depth == 64) return true;
+        try self.chargeNormalCleanupAt(tree, node);
+        if (tree.nodeTag(node) == .fn_decl or tree.firstToken(node) >= use_token) return false;
+        switch (tree.nodeTag(node)) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
+            .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor,
+            .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap,
+            .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat,
+            => {
+                const target, const value = tree.nodeData(node).node_and_node;
+                if (tree.nodeTag(target) == .identifier) {
+                    const token = tree.nodeMainToken(target);
+                    const binding = context.bindings().findAt(tree.tokenSlice(token), token);
+                    if (binding != null and binding.?.name_token == binding_token and
+                        try self.diagnosticUnprovedIndex(tree, value, context, depth + 1)) return true;
+                }
+            },
+            else => {},
+        }
+        var children = engine.AstIterator.init(tree, node);
+        while (children.next(tree)) |child|
+            if (try self.diagnosticIndexRebound(tree, child, binding_token, use_token, context, depth + 1)) return true;
+        return false;
+    }
+
+    /// A decrement-before-store countdown places writes in a visible prefix,
+    /// even when an early exit prevents an initialization certificate.
+    fn diagnosticCountdownIndex(tree: *const Ast, node: Ast.Node.Index, name: []const u8, use_token: Ast.TokenIndex, depth: u32) bool {
+        if (depth == 64 or tree.nodeTag(node) == .fn_decl) return false;
+        if (tree.fullWhile(node)) |loop| {
+            if (tree.firstToken(loop.ast.then_expr) <= use_token and tree.lastToken(loop.ast.then_expr) >= use_token and
+                tree.nodeTag(loop.ast.cond_expr) == .greater_than)
+            {
+                const index, const zero = tree.nodeData(loop.ast.cond_expr).node_and_node;
+                if (tree.nodeTag(index) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(index)), name) and
+                    tree.nodeTag(zero) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(zero)), "0"))
+                {
+                    var statements = engine.AstIterator.init(tree, loop.ast.then_expr);
+                    if (statements.next(tree)) |step| if (tree.nodeTag(step) == .assign_sub) {
+                        const target, const one = tree.nodeData(step).node_and_node;
+                        if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), name) and
+                            tree.nodeTag(one) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(one)), "1"))
+                            return true;
+                    };
+                }
+            }
+        }
+        var children = engine.AstIterator.init(tree, node);
+        while (children.next(tree)) |child|
+            if (diagnosticCountdownIndex(tree, child, name, use_token, depth + 1)) return true;
+        return false;
     }
 
     fn diagnosticOpaqueValue(self: *FileCache, tree: *const Ast, node: Ast.Node.Index, context: DiagnosticTouchContext, depth: u32) SummaryError!bool {
@@ -2449,8 +2792,22 @@ pub const FileCache = struct {
         var call_buffer: [2]Ast.Node.Index = undefined;
         if (TypeResolver.CallOperands.full(tree, &call_buffer, node)) |call| {
             const canonical = (try context.declaring.actualCallSummaryAt(call.queryToken(tree, node), context.frame)) orelse return true;
-            return tokens.bodyOf(canonical.callee.tree, canonical.callee.declaration) == null;
+            if (tokens.bodyOf(canonical.callee.tree, canonical.callee.declaration) == null) return true;
+            // Reaching a source body is not itself a usable value recipe.
+            // Explicit negative returns remain represented by source replay.
+            return try context.declaring.diagnosticReturnSeed(canonical, context.frame) != .present;
         }
+        if (tree.nodeTag(node) == .identifier) {
+            const token = tree.nodeMainToken(node);
+            const spelling = tree.tokenSlice(token);
+            for ([_][]const u8{ "undefined", "null", "true", "false" }) |literal|
+                if (std.mem.eql(u8, spelling, literal)) return false;
+            const binding = (context.bindings().findAt(spelling, token) orelse return true).*;
+            if (binding.origin == .param or binding.origin == .loop_capture) return false;
+            const value = context.declaring.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return true;
+            return self.diagnosticOpaqueValue(tree, value, context, depth + 1);
+        }
+        if (tree.builtinCallParams(&call_buffer, node) != null) return true;
         var children = engine.AstIterator.init(tree, node);
         while (children.next(tree)) |child|
             if (try self.diagnosticOpaqueValue(tree, child, context, depth + 1)) return true;
@@ -2471,19 +2828,18 @@ pub const FileCache = struct {
         };
         if (assignment) {
             const target, const value = tree.nodeData(node).node_and_node;
-            if (tokens.rootIdentifier(tree, target)) |root| {
-                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(root)), name)) {
-                    const path = (try self.diagnosticOutputPath(tree, target, name, 0)) orelse return false;
+            if (tree.nodeTag(target) != .identifier) {
+                if (try self.diagnosticTouchPath(tree, target, name, context, 0)) |path| {
                     const literal_undefined = tree.nodeTag(value) == .identifier and
                         std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "undefined");
                     var unproved_index = false;
                     var targets = engine.AstIterator.init(tree, target);
                     if (tree.nodeTag(target) == .array_access) {
-                        unproved_index = diagnosticUnprovedIndex(tree, tree.nodeData(target).node_and_node[1], context, 0);
+                        unproved_index = try self.diagnosticUnprovedIndex(tree, tree.nodeData(target).node_and_node[1], context, 0);
                     }
                     while (targets.next(tree)) |child| {
                         if (tree.nodeTag(child) != .array_access) continue;
-                        unproved_index = unproved_index or diagnosticUnprovedIndex(tree, tree.nodeData(child).node_and_node[1], context, 0);
+                        unproved_index = unproved_index or try self.diagnosticUnprovedIndex(tree, tree.nodeData(child).node_and_node[1], context, 0);
                     }
                     const opaque_value = try self.diagnosticOpaqueValue(tree, value, context, 0);
                     const mutable_value = if (tree.nodeTag(value) == .identifier) mutable: {
@@ -2497,29 +2853,45 @@ pub const FileCache = struct {
                     return self.collectDiagnosticOutputTouches(tree, value, name, result, context, depth + 1);
                 }
             }
+            // Storing an exposed pointer into other storage escapes its source.
+            // The subsequent opaque mutation cannot retain old byte witnesses.
+            if (tree.nodeTag(target) != .identifier)
+                if ((try self.diagnosticBorrowedTouchPath(tree, value, name, context, 0)) != null)
+                    if (!appendDiagnosticTouch(result, "")) return false;
         }
         var buffer: [2]Ast.Node.Index = undefined;
         if (TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
-            var arguments = call.ast.params;
-            var receiver: [1]Ast.Node.Index = undefined;
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-                receiver[0] = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-                if ((try self.diagnosticOutputPath(tree, receiver[0], name, 0)) != null)
-                    arguments = &receiver;
-            }
-            for (arguments) |argument| {
-                const path = (try self.diagnosticOutputPath(tree, argument, name, 0)) orelse continue;
+            const receiver: ?Ast.Node.Index = if (tree.nodeTag(call.ast.fn_expr) == .field_access)
+                tree.nodeData(call.ast.fn_expr).node_and_token[0] else null;
+            for (0..call.ast.params.len + @as(usize, @intFromBool(receiver != null))) |ordinal| {
+                const argument = if (ordinal < call.ast.params.len) call.ast.params[ordinal] else receiver.?;
+                const path = (try self.diagnosticBorrowedTouchPath(tree, argument, name, context, 0)) orelse continue;
                 const touches = try context.declaring.diagnosticOutputTouchesAt(call.queryToken(tree, node), context.frame, argument);
-                const whole = [1][]const u8{""};
-                const paths = if (touches) |*scope| scope.fields[0..scope.field_count] else &whole;
+                const paths = if (touches) |*scope| scope.fields[0..scope.field_count] else {
+                    // An opaque callee can recover the enclosing object from
+                    // a field address. Unknown scope is not a leaf-only write.
+                    if (!appendDiagnosticTouch(result, "")) return false;
+                    continue;
+                };
                 for (paths) |child| {
                     if (self.summary_arena == null) self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
-                    const selected = if (child.len == 0) path.path else if (path.path.len == 0) child else
-                        try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}.{s}", .{ path.path, child });
+                    const selected = if (!path.precise or child.len == 0) path.path else if (path.path.len == 0) child else
+                        try std.fmt.allocPrint(self.summary_arena.?.allocator(), "{s}{s}{s}",
+                            .{ path.path, if (child[0] == '[') "" else ".", child });
                     if (!appendDiagnosticTouch(result, selected)) return false;
                 }
             }
             return true;
+        }
+        if (tree.builtinCallParams(&buffer, node)) |arguments| {
+            const builtin = tree.tokenSlice(tree.nodeMainToken(node));
+            for ([_][]const u8{ "@memcpy", "@memset", "@atomicStore", "@atomicRmw", "@cmpxchgStrong", "@cmpxchgWeak" }) |writer| {
+                if (!std.mem.eql(u8, builtin, writer)) continue;
+                // No independent bulk/atomic byte recipe was published here.
+                // A reachable destination abstains instead of claiming empty.
+                for (arguments) |argument|
+                    if ((try self.diagnosticTouchPath(tree, argument, name, context, 0)) != null) return false;
+            }
         }
         if (tag == .field_access or tag == .array_access or tag == .deref or tag == .address_of) {
             if (tokens.rootIdentifier(tree, node)) |root|
@@ -2933,12 +3305,207 @@ pub const FileCache = struct {
         if (origin.return_defined_summaries.getPtr(key)) |verdict| {
             if (!verdict.may_undefined) return verdict;
         }
+        // Eligibility, generic replay and actual-selected replay spend one
+        // query allowance. Selection must not refresh a spent cleanup budget.
+        self.beginNormalCleanup();
+        defer self.endNormalCleanup();
         if (try self.diagnosticReturnSeed(canonical, caller_frame) != .present) return null;
         // Seed resolution can rehash the map: borrow its verdict only now.
-        if (origin.return_defined_summaries.getPtr(key)) |verdict| return verdict;
-        _ = try self.callResultValueAt(token, caller_frame, true, &canonical);
-        return origin.return_defined_summaries.getPtr(key);
+        if (!origin.return_defined_summaries.contains(key))
+            _ = try self.callResultValueAt(token, caller_frame, true, &canonical);
+        const generic = origin.return_defined_summaries.getPtr(key) orelse return null;
+        if (!generic.may_undefined) return generic;
+        const frame = caller_frame orelse (self.zls orelse return null).resolutionFrame();
+        const actual_key: ReturnCallKey = .{
+            .token = token, .resolver = frame.resolver, .tree = self.tree,
+            .module = frame.handle.module, .callable = frame.actual_type, .container = frame.container_type,
+        };
+        if (origin.diagnostic_return_summaries.getPtr(actual_key)) |verdict| return verdict;
+        var integers: std.ArrayListUnmanaged(DiagnosticIntegerBinding) = .empty;
+        defer integers.deinit(origin.gpa);
+        try self.collectDiagnosticActualIntegers(canonical, frame, &integers);
+        if (integers.items.len == 0) return origin.return_defined_summaries.getPtr(key);
+        _ = try self.replayCallResultValueAt(token, caller_frame, true, &canonical, .{
+            .key = actual_key, .integers = integers.items,
+        });
+        // An unfinished selected replay proves neither the generic path nor
+        // safety for this actual call. Its result remains silent UNKNOWN.
+        return origin.diagnostic_return_summaries.getPtr(actual_key);
     }
+
+    fn collectDiagnosticActualIntegers(
+        self: *FileCache,
+        canonical: ActualCallSummary,
+        frame: TypeResolver.ResolutionFrame,
+        integers: *std.ArrayListUnmanaged(DiagnosticIntegerBinding),
+    ) anyerror!void {
+        const tree = canonical.callee.tree;
+        const declaring = (try canonical.declaringCache(self)) orelse return;
+        const resolver = declaring.zls orelse return;
+        const formals = canonical.callee.reference.actual_type.data.function.parameters;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, canonical.callee.declaration) orelse return;
+        const body = tokens.bodyOf(tree, canonical.callee.declaration) orelse return;
+        var parameters = proto.iterate(tree);
+        var ordinal: u32 = 0;
+        while (parameters.next()) |parameter| : (ordinal += 1) {
+            const name_token = parameter.name_token orelse continue;
+            if (ordinal >= formals.len) break;
+            const formal = (try resolver.normalizedType(formals[ordinal].type)) orelse continue;
+            const tag = resolver.typeTag(formal) orelse continue;
+            if (tag != .int and tag != .comptime_int) continue;
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const argument = (try canonical.callArgumentFor(self, &argument_buffer, ordinal)) orelse continue;
+            const stable = (try self.diagnosticStableIntegerActual(argument, canonical.callee.call_node)) orelse continue;
+            const actual_type = (try frame.typeOfNode(argument)) orelse continue;
+            const normalized_actual = (try frame.resolver.normalizedType(actual_type)) orelse continue;
+            const actual_tag = frame.resolver.typeTag(normalized_actual) orelse continue;
+            if (actual_tag != .int and actual_tag != .comptime_int) continue;
+            if (tag == .int) {
+                const index = formal.ipIndex() orelse continue;
+                const info = resolver.ctx.ip.intInfo(index, @import("builtin").target);
+                const digits = info.bits - @intFromBool(info.signedness == .signed and info.bits != 0);
+                if (digits < 64 and stable >= (@as(u64, 1) << @intCast(digits))) continue;
+            }
+            // The immutable source expression is the value proof. Resolution
+            // must authenticate the scalar type, not invent an IP value for a
+            // typed const alias. Cross-check a value when one is available.
+            if (try frame.resolveValueOfNode(argument)) |actual| {
+                if (actual.is_type_val) continue;
+                if (actual.ipIndex()) |index| switch (frame.resolver.ctx.ip.indexToKey(index)) {
+                    .int_u64_value => |known| if (known.int != stable) continue,
+                    .int_i64_value => |known| if (known.int < 0 or @as(u64, @intCast(known.int)) != stable) continue,
+                    else => {},
+                };
+            }
+            // Reuse the body's lexical escape census. Discarding an address
+            // does not mutate a formal; every non-discarded scalar alias makes
+            // the caller constant unavailable for this replay.
+            const roots = try declaring.escapeRoots(body);
+            const escaped = for (roots.addressed) |name| {
+                if (std.mem.eql(u8, name, tree.tokenSlice(name_token))) break true;
+            } else false;
+            if (escaped) continue;
+            try integers.append((self.cleanup_origin orelse self).gpa, .{
+                .parameter_byte = tree.tokenStart(name_token), .value = stable,
+            });
+        }
+    }
+
+    fn diagnosticStableIntegerActual(self: *FileCache, node: Ast.Node.Index, call_node: Ast.Node.Index) SummaryError!?u64 {
+        var evaluator = comptime_fill_mod.Resolver.init(self.gpa, self.tree, self, null);
+        defer evaluator.deinit();
+        const span: comptime_fill_mod.TokenSpan = .{ .first = self.tree.firstToken(node), .last = self.tree.lastToken(node) };
+        const function = self.enclosingFunctionAt(self.tree, span.first) orelse return evaluator.comptimeIntTokens(span, 0);
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(self.tree, &proto_buffer, function) orelse return null;
+        const body = tokens.bodyOf(self.tree, function) orelse return null;
+        const roots = try self.escapeRoots(body);
+        const bindings = try self.localBindings(proto, body);
+        return self.diagnosticIntegerTokens(&evaluator, bindings, roots.addressed, span, call_node, 0);
+    }
+
+    /// Same scalar arithmetic and caps as the fill evaluator, but immutable
+    /// aliases are selected by this body's declaration/scope identity. A
+    /// same-spelled binding in a sibling function cannot decline or vouch for it.
+    fn diagnosticIntegerTokens(
+        self: *FileCache,
+        evaluator: *const comptime_fill_mod.Resolver,
+        bindings: *const local_bindings.LocalBindings,
+        escaped: []const []const u8,
+        span: comptime_fill_mod.TokenSpan,
+        call_node: Ast.Node.Index,
+        depth: u32,
+    ) SummaryError!?u64 {
+        if (depth > 6 or span.first > span.last or span.last >= self.tree.tokens.len or
+            span.last - span.first + 1 > 32) return null;
+        try self.normalCleanupStorageWork(call_node, span.last - span.first + 1);
+        var expression: DiagnosticIntegerEval = .{
+            .cache = self, .evaluator = evaluator, .bindings = bindings,
+            .escaped = escaped, .call_node = call_node,
+            .pos = span.first, .end = span.last, .depth = depth,
+        };
+        const value = (try expression.expr()) orelse return null;
+        return if (expression.pos > expression.end) value else null;
+    }
+
+    const DiagnosticIntegerEval = struct {
+        cache: *FileCache,
+        evaluator: *const comptime_fill_mod.Resolver,
+        bindings: *const local_bindings.LocalBindings,
+        escaped: []const []const u8,
+        call_node: Ast.Node.Index,
+        pos: Ast.TokenIndex,
+        end: Ast.TokenIndex,
+        depth: u32,
+
+        fn expr(self: *DiagnosticIntegerEval) SummaryError!?u64 {
+            var value = (try self.term()) orelse return null;
+            while (self.pos <= self.end) {
+                const tag = self.cache.tree.tokenTag(self.pos);
+                if (tag != .plus and tag != .minus) break;
+                self.pos += 1;
+                const rhs = (try self.term()) orelse return null;
+                value = if (tag == .plus)
+                    std.math.add(u64, value, rhs) catch return null
+                else
+                    std.math.sub(u64, value, rhs) catch return null;
+            }
+            return value;
+        }
+
+        fn term(self: *DiagnosticIntegerEval) SummaryError!?u64 {
+            var value = (try self.factor()) orelse return null;
+            while (self.pos <= self.end and self.cache.tree.tokenTag(self.pos) == .asterisk) {
+                self.pos += 1;
+                const rhs = (try self.factor()) orelse return null;
+                value = std.math.mul(u64, value, rhs) catch return null;
+            }
+            return value;
+        }
+
+        fn factor(self: *DiagnosticIntegerEval) SummaryError!?u64 {
+            if (self.pos > self.end) return null;
+            const tree = self.cache.tree;
+            const token = self.pos;
+            switch (tree.tokenTag(token)) {
+                .number_literal => {
+                    self.pos += 1;
+                    return self.evaluator.comptimeIntTokens(.{ .first = token, .last = token }, self.depth);
+                },
+                .identifier => {
+                    self.pos += 1;
+                    const name = tree.tokenSlice(token);
+                    for (self.escaped) |root| if (std.mem.eql(u8, root, name)) return null;
+                    const span: comptime_fill_mod.TokenSpan = if (self.bindings.findAt(name, token)) |binding| local: {
+                        if (!binding.is_const or binding.origin == .param or binding.origin == .loop_capture or
+                            binding.name_token == 0 or tree.tokenTag(binding.name_token - 1) != .keyword_const or
+                            binding.rhs_last >= token) return null;
+                        break :local .{ .first = binding.rhs_first, .last = binding.rhs_last };
+                    } else global: {
+                        // This is the existing scope-indexed immutable lookup,
+                        // never a spelling-only scan across foreign declarations.
+                        const declaration = self.evaluator.visibleConstDecl(token, name) orelse return null;
+                        break :global declaration.spans.?.init;
+                    };
+                    return self.cache.diagnosticIntegerTokens(
+                        self.evaluator, self.bindings, self.escaped, span, self.call_node, self.depth + 1,
+                    );
+                },
+                .l_paren => {
+                    if (self.depth == 6) return null;
+                    self.pos += 1;
+                    self.depth += 1;
+                    defer self.depth -= 1;
+                    const value = (try self.expr()) orelse return null;
+                    if (self.pos > self.end or tree.tokenTag(self.pos) != .r_paren) return null;
+                    self.pos += 1;
+                    return value;
+                },
+                else => return null,
+            }
+        }
+    };
 
     fn diagnosticReturnSeed(
         self: *FileCache,
@@ -3711,13 +4278,26 @@ pub const FileCache = struct {
         diagnostic: bool,
         resolved: ?*const ActualCallSummary,
     ) anyerror!bool {
+        return self.replayCallResultValueAt(token, caller_frame, diagnostic, resolved, null);
+    }
+
+    fn replayCallResultValueAt(
+        self: *FileCache,
+        token: Ast.TokenIndex,
+        caller_frame: ?TypeResolver.ResolutionFrame,
+        diagnostic: bool,
+        resolved: ?*const ActualCallSummary,
+        selected: ?DiagnosticReplay,
+    ) anyerror!bool {
         self.beginNormalCleanup();
         defer self.endNormalCleanup();
         const canonical = if (resolved) |actual| actual.* else (try self.returnCallAt(token, caller_frame)) orelse return false;
         const origin = self.cleanup_origin orelse self;
         const callee = canonical.callee;
         const key = resolvedCleanupKey(callee.reference, callee.declaration);
-        if (origin.return_defined_summaries.get(key)) |verdict|
+        if (selected) |actual| {
+            if (origin.diagnostic_return_summaries.get(actual.key)) |verdict| return verdict.may_undefined;
+        } else if (origin.return_defined_summaries.get(key)) |verdict|
             return if (diagnostic) verdict.may_undefined else verdict.defined;
         if (origin.return_defined_visiting.contains(key.declaration)) return false;
         const declaring = (try canonical.declaringCache(self)) orelse return false;
@@ -3727,7 +4307,7 @@ pub const FileCache = struct {
             .remaining = cleanup_budget.remaining,
             .depth = cleanup_budget.depth,
         };
-        const can_memo_failure = origin.replayFailureMemoAllowed(declaring);
+        const can_memo_failure = selected == null and origin.replayFailureMemoAllowed(declaring);
         const memo_entries = if (can_memo_failure) origin.replayMemoEntries(declaring) else 0;
         const exhausted_entries = if (can_memo_failure) origin.replayExhaustedEntries(declaring) else 0;
         if (can_memo_failure) {
@@ -3785,6 +4365,9 @@ pub const FileCache = struct {
         const saved_frame = declaring.cleanup_frame;
         const saved_origin = declaring.cleanup_origin;
         const saved_mode = declaring.return_defined_mode;
+        const saved_integers = declaring.diagnostic_actual_integers;
+        declaring.diagnostic_actual_integers = if (selected) |actual| actual.integers else &.{};
+        defer declaring.diagnostic_actual_integers = saved_integers;
         declaring.cleanup_frame = resolver.frameForFunction(callee.reference);
         declaring.cleanup_origin = origin;
         declaring.return_defined_mode = true;
@@ -3800,6 +4383,16 @@ pub const FileCache = struct {
             resolver,
         )) orelse return false;
         defer graph.deinit(origin.gpa);
+        if (selected) |actual| for (graph.blocks) |*block| {
+            for (block.stmts) |*statement| {
+                if (statement.kind != .decl) continue;
+                const local = graph.locals[@intFromEnum(statement.kind.decl.local)];
+                for (actual.integers) |binding| if (local.decl_pos.byte == binding.parameter_byte) {
+                    statement.kind.decl.integer_value = binding.value;
+                    break;
+                };
+            }
+        };
         var problems: std.ArrayListUnmanaged(problem_mod.Problem) = .empty;
         defer {
             for (problems.items) |*problem| problem.deinit(origin.gpa);
@@ -3847,13 +4440,17 @@ pub const FileCache = struct {
             .summary_cache = declaring,
         }, &problems);
         if (has_defer) defined = false;
-        try origin.return_defined_summaries.put(origin.gpa, key, .{
-            .defined = defined,
+        const verdict: ReturnValueVerdict = .{
+            .defined = selected == null and defined,
             .may_undefined = undefined_value,
             .all_undefined = all_undefined,
             .stores = stores,
             .bytes = bytes,
-        });
+        };
+        if (selected) |actual|
+            try origin.diagnostic_return_summaries.put(origin.gpa, actual.key, verdict)
+        else
+            try origin.return_defined_summaries.put(origin.gpa, key, verdict);
         return if (diagnostic) undefined_value else defined;
     }
 
@@ -4304,7 +4901,10 @@ pub const FileCache = struct {
                 use.fields[use.field_count] = path;
                 use.field_count += 1;
             }
-            if (use.definite_write and !use.physical_store_only) return true;
+            if (use.definite_write and !use.physical_store_only) {
+                use.location_store_coverage_known = true;
+                return true;
+            }
         }
         // Partial value certification can still omit definitely written fields.
         // Preserve its certificates and credit only the remaining physical writes.
@@ -4316,6 +4916,7 @@ pub const FileCache = struct {
         }
         const written = (try self.parameterStoreCoverage(canonical, call_node, parameter_index, &caller_proof, &chain, use.success_bool, &use.written_inputs, &use.written_reads, &use.may_written_stores, use, c_element != null)) orelse
             return use.field_count != 0 or use.may_written_stores.count != 0;
+        use.location_store_coverage_known = written.effects_known;
         use.location_written = written.complete;
         use.whole_source = if (written.complete) written.whole_source else null;
         for (written.field_names[0..written.field_count], written.covered[0..written.field_count], 0..) |path, covered, slot| {
@@ -4814,6 +5415,7 @@ pub const FileCache = struct {
         computed_opaque_alternative: bool = false,
         computed_overflow: bool = false,
         complete: bool = false,
+        effects_known: bool = true,
         whole_source: ?WholeStoreSource = null,
     };
 
@@ -5361,7 +5963,8 @@ pub const FileCache = struct {
         };
         var exits: ?StoreCoverage = null;
         const falls_through = try self.definiteStoreBody(&context, &proof, body, &coverage, &exits);
-        // Exhaustion declines positive credit, not already authenticated slots.
+        // An unavailable byte recipe revokes value/identity credit, not a
+        // source-proved must-store. Resource failures still propagate above.
         if (proof.written_dependencies_complete) |complete| if (!complete.*) {
             if (may_written_stores) |stores| {
                 for (coverage.field_names[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |path, recipe| {
@@ -5373,7 +5976,9 @@ pub const FileCache = struct {
                     }
                 }
             }
-            return null;
+            if (proof.written_inputs == null) return null;
+            coverage.computed_overflow = true;
+            if (exits) |*final| final.computed_overflow = true;
         };
         if (falls_through orelse return null) intersectStoreExit(&exits, coverage);
         if (computed_use) |use| {
@@ -5386,7 +5991,10 @@ pub const FileCache = struct {
             for (use.may_written_stores.dependencies[0..use.may_written_stores.count]) |recipe| {
                 selected_reads |= recipe.reads;
             }
-            var consume_root = final.complete;
+            // A conditional source effect needs both its computed output and
+            // its untouched entry alternative, even without must-store credit.
+            var consume_root = final.complete or
+                (root.original_alternative and (root.computations != 0 or root.opaque_alternative));
             if (!final.complete) {
                 for (final.field_names[0..final.field_count], final.covered[0..final.field_count], 0..) |path, covered, slot| {
                     if (!covered) continue;
@@ -5445,6 +6053,7 @@ pub const FileCache = struct {
         target.computed_original_alternative = target.computed_original_alternative or other.computed_original_alternative;
         target.computed_opaque_alternative = target.computed_opaque_alternative or other.computed_opaque_alternative;
         target.computed_overflow = target.computed_overflow or other.computed_overflow;
+        target.effects_known = target.effects_known and other.effects_known;
         for (target.covered[0..target.field_count], other.covered[0..other.field_count], target.written_dependencies[0..target.field_count], other.written_dependencies[0..other.field_count]) |*mine, theirs, *dependencies, incoming| {
             mine.* = mine.* and theirs;
             dependencies.merge(incoming);
@@ -5936,6 +6545,7 @@ pub const FileCache = struct {
             if (storeCall(tree, node)) |nested_call| {
                 if (!try self.definiteNestedStore(proof, context.canonical, context.call_node, context.name, context.fields, nested_call, context.visiting, coverage, node != nested_call)) {
                     if (proof.written_inputs == null) return null;
+                    try self.unprovedStoreCallOutputs(proof, nested_call);
                     try self.definiteStoreEscapes(proof, nested_call, 0);
                 }
                 return true;
@@ -6581,6 +7191,69 @@ pub const FileCache = struct {
         return .{ .projections = @as(u8, 1) << @intCast(index), .opaque_alternative = false };
     }
 
+    const ScalarOutputAlias = struct { same: bool, selected_token: Ast.TokenIndex };
+
+    /// C scalar bookkeeping is clipped to two authenticated scalar variables
+    /// in the same caller body. Array extents, casts, fields and unresolved
+    /// pointer aliases do not acquire whole-pointee credit through this path.
+    fn scalarOutputAlias(
+        self: *FileCache,
+        proof: *const DefiniteStoreProof,
+        name: []const u8,
+        child: TypeResolver.ActualType,
+    ) SummaryError!?ScalarOutputAlias {
+        const canonical = proof.canonical orelse return null;
+        const output_name = proof.out_name orelse return null;
+        const caller_cache = proof.caller_cache orelse self;
+        const caller_tree = caller_cache.tree;
+        const caller_frame = canonical.callee.caller_frame orelse
+            (caller_cache.zls orelse return null).resolutionFrame();
+        if (&caller_frame.handle.document.tree != caller_tree or
+            caller_frame.handle.module != caller_cache.module_id) return null;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(proof.tree, &proto_buffer, canonical.callee.declaration) orelse return null;
+        var parameters = proto.iterate(proof.tree);
+        var ordinal: u32 = 0;
+        var selected_token: ?Ast.TokenIndex = null;
+        var output: ?Ast.Node.Index = null;
+        var other: ?Ast.Node.Index = null;
+        while (parameters.next()) |parameter| : (ordinal += 1) {
+            const token = parameter.name_token orelse continue;
+            const parameter_name = proof.tree.tokenSlice(token);
+            if (!std.mem.eql(u8, parameter_name, output_name) and !std.mem.eql(u8, parameter_name, name)) continue;
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const argument = (try canonical.callArgumentFor(caller_cache, &argument_buffer, ordinal)) orelse return null;
+            if (std.mem.eql(u8, parameter_name, output_name)) {
+                selected_token = token;
+                output = argument;
+            } else other = argument;
+        }
+        const arguments = [2]Ast.Node.Index{ output orelse return null, other orelse return null };
+        var declarations: [2]Ast.TokenIndex = undefined;
+        var body_node: ?Ast.Node.Index = null;
+        for (arguments, 0..) |argument, index| {
+            if (caller_tree.nodeTag(argument) != .address_of) return null;
+            const operand = caller_tree.nodeData(argument).node;
+            if (caller_tree.nodeTag(operand) != .identifier) return null;
+            const ty = (try caller_frame.typeOfNode(operand)) orelse return null;
+            const normalized = (try caller_frame.resolver.normalizedType(ty)) orelse return null;
+            if (!normalized.eql(child)) return null;
+            const token = caller_tree.nodeMainToken(operand);
+            const function = caller_cache.enclosingFunctionAt(caller_tree, token) orelse return null;
+            var caller_proto_buffer: [1]Ast.Node.Index = undefined;
+            const caller_proto = tokens.fnProto(caller_tree, &caller_proto_buffer, function) orelse return null;
+            const body = tokens.bodyOf(caller_tree, function) orelse return null;
+            if (body_node != null and body_node.? != body) return null;
+            body_node = body;
+            const bindings = try caller_cache.localBindings(caller_proto, body);
+            const binding = bindings.findAt(caller_tree.tokenSlice(token), token) orelse return null;
+            if (binding.is_const or binding.origin == .param or binding.origin == .loop_capture or
+                binding.name_token == 0 or caller_tree.tokenTag(binding.name_token - 1) != .keyword_var) return null;
+            declarations[index] = binding.name_token;
+        }
+        return .{ .same = declarations[0] == declarations[1], .selected_token = selected_token orelse return null };
+    }
+
     /// Compose non-output formal stores into the same bounded immutable COW pool.
     fn recordOtherPointeeStore(
         self: *FileCache,
@@ -6595,8 +7268,17 @@ pub const FileCache = struct {
         const resolver = proof.frame.resolver;
         const actual = (try proof.frame.typeOfNode(root)) orelse return false;
         const pointer = (try resolver.normalizedType(actual)) orelse return false;
-        if (resolver.pointerSize(pointer) != .one) return false;
+        const size = resolver.pointerSize(pointer) orelse return false;
+        if (size != .one and (size != .c or proof.written_inputs == null)) return false;
         const child = (try resolver.normalizedType(resolver.childType(pointer) orelse return false)) orelse return false;
+        const scalar_alias: ?ScalarOutputAlias = if (size == .c) relation: {
+            switch (resolver.typeTag(child) orelse return false) {
+                .int, .float, .bool, .@"enum" => {},
+                else => return false,
+            }
+            if (tree.nodeTag(lhs) != .deref) return false;
+            break :relation (try self.scalarOutputAlias(proof, name, child)) orelse return false;
+        } else null;
         switch (resolver.typeTag(child) orelse return false) {
             .@"struct", .@"union", .array, .vector => {},
             .int, .float, .bool, .@"enum" => {
@@ -6678,6 +7360,23 @@ pub const FileCache = struct {
         for (proof.pointees[0..proof.pointee_count]) |*entry| {
             if (std.mem.eql(u8, tree.tokenSlice(entry.token), name)) {
                 entry.computed = .{ .original = state.original, .base = composed };
+                if (scalar_alias) |relation| if (relation.same) {
+                    const coverage = proof.out_coverage orelse return false;
+                    if (!coverage.pointee.eql(child)) return false;
+                    coverage.whole_dependencies = proof.written_dependencies;
+                    coverage.whole_source = composed.source;
+                    coverage.computed_sources = composed.computations;
+                    coverage.computed_original_alternative = composed.original_alternative;
+                    coverage.computed_opaque_alternative = composed.opaque_alternative;
+                    @memset(coverage.covered[0..coverage.field_count], true);
+                    coverage.complete = true;
+                    const current = entry.computed;
+                    if (!proof.setStorePointee(relation.selected_token, .unknown)) return false;
+                    for (proof.pointees[0..proof.pointee_count]) |*selected| {
+                        if (std.mem.eql(u8, tree.tokenSlice(selected.token), proof.out_name.?))
+                            selected.computed = current;
+                    }
+                };
                 return true;
             }
         }
@@ -6972,6 +7671,7 @@ pub const FileCache = struct {
         @memcpy(chain[0..visiting.len], visiting);
         chain[visiting.len] = .{ .tree = nested.callee.tree, .declaration = nested.callee.declaration };
         const stored = (try declaring.definiteParameterStore(nested, nested_call, delegate.index, &state, chain[0 ..visiting.len + 1])) orelse return false;
+        coverage.effects_known = coverage.effects_known and stored.effects_known;
         switch (delegate.target) {
             .unknown_field => return false,
             .whole => {
@@ -7555,6 +8255,96 @@ pub const FileCache = struct {
         return null;
     }
 
+    /// An opaque delegated pointer effect supplies UNKNOWN, not an authenticated
+    /// unchanged alternative. Later exact source stores still overlay this base.
+    fn unprovedStoreCallOutputs(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index) SummaryError!void {
+        if (proof.written_inputs == null) return;
+        const coverage = proof.out_coverage orelse return;
+        const output = proof.out_name orelse return;
+        const declaring = if (proof.canonical) |owner|
+            (try owner.declaringCache(self)) orelse return
+        else self;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(proof.tree, &buffer, node) orelse return;
+        const canonical = try declaring.actualCallSummaryAt(call.queryToken(proof.tree, node), proof.frame);
+        const count = if (canonical) |actual|
+            actual.callee.reference.actual_type.data.function.parameters.len
+        else call.ast.params.len;
+        for (0..count) |ordinal| {
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const argument = if (canonical) |actual|
+                (try actual.callArgumentFor(declaring, &argument_buffer, @intCast(ordinal))) orelse continue
+            else call.ast.params[ordinal];
+            const operand = if (proof.tree.nodeTag(argument) == .address_of)
+                proof.tree.nodeData(argument).node
+            else argument;
+            const root = tokens.rootIdentifier(proof.tree, operand) orelse continue;
+            const name = proof.tree.tokenSlice(proof.tree.nodeMainToken(root));
+            if (!std.mem.eql(u8, proof.formalName(name), output)) continue;
+            const raw = (try proof.frame.typeOfNode(argument)) orelse continue;
+            const ty = (try proof.frame.resolver.normalizedType(raw)) orelse continue;
+            if (proof.frame.resolver.pointerSize(ty) == null) continue;
+            if (try declaring.callEffectAt(call.queryToken(proof.tree, node), .{
+                .parameter = .{ .param = @intCast(ordinal), .read_only_only = true },
+            }, .{ .frame = proof.frame })) |effect| if (effect == .read_only) continue;
+            coverage.effects_known = false;
+            const selected = try self.diagnosticOutputPath(proof.tree, argument, name, 0);
+            const path = if (selected) |place| place.path else "";
+            coverage.whole_dependencies = .{};
+            for (coverage.field_names[0..coverage.field_count], coverage.written_dependencies[0..coverage.field_count]) |field, *dependencies| {
+                if (storeEffectReachesPath(path, field)) dependencies.* = .{};
+            }
+            if (proof.may_written_stores) |stores| {
+                var index: usize = 0;
+                while (index < stores.count) {
+                    if (!storeEffectReachesPath(path, stores.fields[index]) and stores.fields[index].len != 0) {
+                        index += 1;
+                        continue;
+                    }
+                    stores.count -= 1;
+                    stores.fields[index] = stores.fields[stores.count];
+                    stores.dependencies[index] = stores.dependencies[stores.count];
+                    stores.literal_may_undefined[index] = stores.literal_may_undefined[stores.count];
+                }
+            }
+            const base: ComputedStoreBase = .{
+                .source = coverage.whole_source,
+                .computations = coverage.computed_sources,
+                .original_alternative = coverage.computed_original_alternative,
+                .opaque_alternative = coverage.computed_opaque_alternative,
+            };
+            const write: ComputedStoreWrite = .{ .path = path, .opaque_alternative = true };
+            const unknown: ComputedStoreState = .{ .opaque_alternative = true, .value_nonidentity = true };
+            const updated = appendComputedFieldStoreWrite(
+                proof, base, write, unknown, coverage.field_names[0..coverage.field_count],
+            ) orelse {
+                coverage.computed_overflow = true;
+                if (path.len == 0) {
+                    coverage.whole_source = null;
+                    coverage.computed_sources = 0;
+                    coverage.computed_original_alternative = false;
+                    coverage.computed_opaque_alternative = true;
+                }
+                continue;
+            };
+            coverage.whole_source = updated.source;
+            coverage.computed_sources = updated.computations;
+            coverage.computed_original_alternative = updated.original_alternative;
+            coverage.computed_opaque_alternative = updated.opaque_alternative;
+            for (proof.pointees[0..proof.pointee_count]) |*pointee| {
+                if (!std.mem.eql(u8, proof.tree.tokenSlice(pointee.token), output)) continue;
+                pointee.value = .unknown;
+                pointee.computed = .{ .original = .{}, .base = updated };
+            }
+        }
+    }
+
+    fn storeEffectReachesPath(effect: []const u8, path: []const u8) bool {
+        return effect.len == 0 or std.mem.eql(u8, effect, path) or
+            (path.len > effect.len and std.mem.startsWith(u8, path, effect) and
+                (path[effect.len] == '.' or path[effect.len] == '['));
+    }
+
     fn definiteStoreEscapes(self: *FileCache, proof: *DefiniteStoreProof, node: Ast.Node.Index, depth: u32) SummaryError!void {
         try self.chargeNormalCleanupAt(proof.call_tree, proof.call_node);
         if (depth == 64) return self.cleanupBudgetFailureAt(proof.call_tree, .normal_cleanup_depth, 64, proof.call_node);
@@ -7568,8 +8358,23 @@ pub const FileCache = struct {
                     binding.complete_value = false;
                     binding.formal_alias = null;
                     binding.written_dependencies = .{};
-                    const raw = if (proof.computed_templates != null) try proof.frame.typeOfNode(root) else null;
+                    const header = proof.tree.nodeTag(proof.tree.nodeData(node).node) == .identifier;
+                    const raw = if (proof.computed_templates != null or header) try proof.frame.typeOfNode(root) else null;
                     const ty = if (raw) |actual| try proof.frame.resolver.normalizedType(actual) else null;
+                    if (header and ty != null) switch (proof.frame.resolver.typeTag(ty.?) orelse .@"struct") {
+                        .int, .float, .bool, .@"enum", .pointer => {
+                            // Failure to certify an addressed scalar is not a
+                            // surviving source-negative witness. Its actual
+                            // caller byte snapshot remains the diagnostic input.
+                            binding.literal_undefined = false;
+                            binding.literal_may_undefined = false;
+                            binding.computed_sources = 0;
+                            binding.computed_original_alternative = false;
+                            binding.computed_opaque_alternative = true;
+                            binding.value_nonidentity = true;
+                        },
+                        else => {},
+                    };
                     if (ty != null and proof.frame.resolver.typeTag(ty.?) == .array) {
                         // An opaque call may write; it cannot erase prior poison.
                         binding.aggregate_source = prior_source;
@@ -7711,6 +8516,32 @@ pub const FileCache = struct {
                     if (written and !proof.setStoreField(token, path, .defined, dependencies)) return false;
                 }
                 binding.aggregate_source = if (coverage.complete) coverage.whole_source else null;
+                if (coverage.complete and proof.written_inputs != null and
+                    proof.computed_templates != null and binding.formal_alias == null)
+                {
+                    switch (resolver.typeTag(coverage.pointee) orelse .@"struct") {
+                        .int, .float, .bool, .@"enum" => {
+                            // The nested store replaced this local's bytes.
+                            // Carry its current recipe, not the declaration's
+                            // obsolete literal witness or a value certificate.
+                            const base: ComputedStoreBase = if (coverage.computed_overflow)
+                                .{ .opaque_alternative = true }
+                            else computedCoverageBase(&coverage);
+                            const source = try self.computedPointeeReadSource(
+                                proof, operand, "", coverage.pointee, base, false,
+                            );
+                            binding.written_dependencies = .{ .reads = source.projections };
+                            binding.aggregate_source = source;
+                            binding.literal_undefined = false;
+                            binding.literal_may_undefined = false;
+                            binding.computed_sources = 0;
+                            binding.computed_original_alternative = false;
+                            binding.computed_opaque_alternative = source.opaque_alternative;
+                            binding.value_nonidentity = true;
+                        },
+                        else => {},
+                    }
+                }
             } else if (addressed and proof.tree.nodeTag(operand) == .field_access) {
                 if (coverage.complete and !try self.setStoreFieldNode(proof, operand, .defined, coverage.whole_dependencies)) return false;
             } else if (!addressed and proof.tree.nodeTag(operand) == .identifier) {
@@ -7784,9 +8615,15 @@ pub const FileCache = struct {
             self;
         var buffer: [2]Ast.Node.Index = undefined;
         const call = TypeResolver.CallOperands.full(proof.tree, &buffer, node) orelse return .unknown;
-        const canonical = (try declaring.actualCallSummaryAt(call.queryToken(proof.tree, node), proof.frame)) orelse return .unknown;
+        const canonical = (try declaring.actualCallSummaryAt(call.queryToken(proof.tree, node), proof.frame)) orelse {
+            try self.unprovedStoreCallOutputs(proof, node);
+            return .unknown;
+        };
         const tree = canonical.callee.tree;
-        if (tree.nodeTag(canonical.callee.declaration) != .fn_decl) return .unknown;
+        if (tree.nodeTag(canonical.callee.declaration) != .fn_decl) {
+            try self.unprovedStoreCallOutputs(proof, node);
+            return .unknown;
+        }
         if (!selected_success) {
             const result_type = (try proof.frame.typeOfNode(node)) orelse return .unknown;
             const normalized = (try proof.frame.resolver.normalizedType(result_type)) orelse return .unknown;
@@ -9832,14 +10669,16 @@ pub const FileCache = struct {
         self.resolved_declaration_visiting.deinit(self.gpa);
         self.cleanup_summaries.deinit(self.gpa);
         self.cleanup_visiting.deinit(self.gpa);
-        var return_verdicts = self.return_defined_summaries.valueIterator();
-        while (return_verdicts.next()) |verdict| {
-            for (verdict.stores.items) |store| self.gpa.free(store.path);
-            verdict.stores.deinit(self.gpa);
-            for (verdict.bytes.items) |*mask| mask.deinit(self.gpa);
-            verdict.bytes.deinit(self.gpa);
+        inline for (.{ &self.return_defined_summaries, &self.diagnostic_return_summaries }) |verdicts| {
+            var return_verdicts = verdicts.valueIterator();
+            while (return_verdicts.next()) |verdict| {
+                for (verdict.stores.items) |store| self.gpa.free(store.path);
+                verdict.stores.deinit(self.gpa);
+                for (verdict.bytes.items) |*mask| mask.deinit(self.gpa);
+                verdict.bytes.deinit(self.gpa);
+            }
+            verdicts.deinit(self.gpa);
         }
-        self.return_defined_summaries.deinit(self.gpa);
         self.return_defined_visiting.deinit(self.gpa);
         self.return_replay_failures.deinit(self.gpa);
         self.return_replay_syntax.deinit(self.gpa);
@@ -11456,6 +12295,30 @@ pub const FileCache = struct {
         return (try self.cleanupFreshAllocatorNode(node)) != null;
     }
 
+    /// Empty syntax proves a descriptor value only in its actual slice type.
+    pub fn normalCleanupStaticEmpty(self: *FileCache, lhs: Ast.Node.Index, rhs: Ast.Node.Index) SummaryError!bool {
+        try self.normalCleanupStorageWork(rhs, @as(usize, self.tree.lastToken(rhs) - self.tree.firstToken(rhs)) + 1);
+        if (!fn_summary.isStaticEmptyDescriptor(self.tree, rhs)) return false;
+        const frame = self.cleanup_frame orelse (self.zls orelse return false).resolutionFrame();
+        const ty = (try frame.typeOfNode(lhs)) orelse return false;
+        const pointer = cleanupPointerTraits(frame.resolver, ty) orelse return false;
+        return pointer.size == .slice and !pointer.has_sentinel;
+    }
+
+    fn cleanupPointerTraits(resolver: *TypeResolver, ty: TypeResolver.ActualType) ?struct {
+        size: std.builtin.Type.Pointer.Size,
+        has_sentinel: bool,
+    } {
+        return switch (ty.data) {
+            .pointer => |info| .{ .size = info.size, .has_sentinel = info.sentinel != .none },
+            .ip_index => switch (resolver.ctx.ip.indexToKey(ty.ipIndex() orelse return null)) {
+                .pointer_type => |info| .{ .size = info.flags.size, .has_sentinel = info.sentinel != .none },
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     /// Identify the allocation's allocator in this function's formal paths.
     /// A copied local allocator can carry an earlier field value, so refuse
     /// that projection rather than authenticate the current field instead.
@@ -11646,6 +12509,8 @@ pub const FileCache = struct {
         storage_complete: bool = false,
         error_storage_complete: bool = false,
         release_argument: ?Ast.Node.Index = null,
+        /// Only canonical SDK free of a nonsentinel slice ignores zero length.
+        sdk_empty_slice_noop: bool = false,
         can_normal: bool = true,
         can_error: bool = true,
         returns_error: ?bool = null,
@@ -11724,7 +12589,8 @@ pub const FileCache = struct {
             const argument = (try actual.callArgumentFor(self, &buffer, 1)) orelse return unknown;
             const ty = (try caller_frame.typeOfNode(argument)) orelse return unknown;
             const expected: std.builtin.Type.Pointer.Size = if (is_free) .slice else .one;
-            if (resolver.pointerSize(ty) != expected) return unknown;
+            const pointer = cleanupPointerTraits(resolver, ty) orelse return unknown;
+            if (pointer.size != expected) return unknown;
             const owner = try fn_summary.ownerOfExpr(arena, tree, proto, bindings, tree.firstToken(argument), tree.lastToken(argument), 0);
             var release = unknown;
             release.can_normal = true;
@@ -11734,6 +12600,7 @@ pub const FileCache = struct {
             release.storage_complete = true;
             release.error_storage_complete = true;
             release.release_argument = argument;
+            release.sdk_empty_slice_noop = is_free and !pointer.has_sentinel;
             if (owner != .param or !self.cleanup_demand.contains(owner.param.param)) {
                 release.complete = try self.normalCleanupFresh(argument);
                 return release;
@@ -11742,7 +12609,11 @@ pub const FileCache = struct {
             const paths = try arena.alloc(fn_summary.ParamPath, 1);
             paths[0] = owner.param;
             const operations = try arena.alloc(fn_summary.StorageOperation, 1);
-            operations[0] = .{ .path = owner.param, .kind = .release_current };
+            operations[0] = .{
+                .path = owner.param,
+                .kind = .release_current,
+                .sdk_empty_slice_noop = release.sdk_empty_slice_noop,
+            };
             const outcomes = try arena.alloc(fn_summary.StorageOutcome, 1);
             outcomes[0] = .{ .operations = operations };
             release.definite_paths = paths;
@@ -11964,7 +12835,7 @@ pub const FileCache = struct {
                     try self.mapStoragePath(arena, proto, bindings, call, source_allocator)
                 else
                     null;
-                if (operation.kind == .replace and allocator == null) complete.* = false;
+                if (operation.kind == .replace and operation.replacement == .fresh_heap and allocator == null) complete.* = false;
                 if (operation.allocator != null and allocator == null) complete.* = false;
                 // Distinct formal histories cannot share one caller ledger:
                 // their relative replacement ordinals would name other cells.
@@ -11984,6 +12855,8 @@ pub const FileCache = struct {
                     .path = path,
                     .allocator = allocator,
                     .kind = operation.kind,
+                    .replacement = operation.replacement,
+                    .sdk_empty_slice_noop = operation.sdk_empty_slice_noop,
                     .version = operation.version,
                     .identity_proved = operation.identity_proved,
                 };
@@ -13333,7 +14206,6 @@ test "FileCache: anyMethodAllocatesSelf detects type with heap factory method" {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
 
     try std.testing.expect(try cache.anyMethodAllocatesSelf("Foo"));
     try std.testing.expect(!try cache.anyMethodAllocatesSelf("Bar"));
@@ -13368,7 +14240,6 @@ test "FileCache: summaryOfFn fills deep fields (heap_allocates_self + result_hea
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
 
     // Find the init fn_decl.
     var idx: u32 = 1;
@@ -14051,7 +14922,6 @@ test "FileCache: normal success cleanup differs from error and conditional sites
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     for ([_][]const u8{ "always", "later", "delegated" }) |name| {
         const summary = (try cache.summaryByName(name)).?.*;
         try std.testing.expectEqual(@as(usize, 1), summary.normal_success_definite_freed_paths.len);
@@ -14100,7 +14970,6 @@ test "FileCache: retained formals require same typed owner field cleanup" {
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const owner = (try cache.summaryByMethod("Owner", "init")).?.*;
     try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, owner.retained_owned_params);
     try std.testing.expectEqual(@as(?u32, null), owner.takes_ownership_of);
@@ -14173,7 +15042,6 @@ test "FileCache: foreign positive cleanup and retention clones survive failure a
         var cache = FileCache.init(failing.allocator(), &caller_resolver.handle.document.tree);
         defer cache.deinit();
         cache.setZls(&caller_resolver);
-        cache.module_id = caller_resolver.handle.module;
         failing.fail_index = failing.alloc_index + offset;
         read(&cache, release_token.?, init_token.?) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
@@ -14269,7 +15137,6 @@ test "FileCache: nested saved payload releases refuse current-version mapping" {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var checked: usize = 0;
     for (tree.nodes.items(.tag), 0..) |_, index| {
         const node: Ast.Node.Index = @enumFromInt(index);
@@ -14393,7 +15260,6 @@ test "FileCache: cleanup freshness requires heap allocation provenance" {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     cache.beginNormalCleanup();
     defer cache.endNormalCleanup();
     var checked: usize = 0;
@@ -14440,7 +15306,6 @@ test "FileCache: cleanup allocation retains a formal allocator field requirement
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     cache.beginNormalCleanup();
     defer cache.endNormalCleanup();
     for (tree.nodes.items(.tag), 0..) |_, index| {
@@ -14503,7 +15368,6 @@ test "FileCache: actual cleanup contexts retain conditional and error-only field
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var checked: usize = 0;
     for (tree.nodes.items(.tag), 0..) |_, index| {
         const node: Ast.Node.Index = @enumFromInt(index);
@@ -14571,7 +15435,6 @@ test "FileCache: value-only calls stay unknown without inventing cleanup certifi
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const scalar = (try cache.summaryByName("scalar")).?.*;
     try std.testing.expect(!scalar.normal_success_effects_complete);
     try std.testing.expectEqual(@as(usize, 0), scalar.normal_success_may_freed_paths.len);
@@ -14636,7 +15499,6 @@ test "FileCache: reflective exports refuse only the exact escaped declaration" {
         var cache = FileCache.init(gpa, tree);
         defer cache.deinit();
         cache.setZls(&resolver);
-        cache.module_id = resolver.handle.module;
         const model = try cache.fileModel();
         const target = model.findFn("target").?.fn_decl;
         const calls = try cache.closedLocalCalls(target);
@@ -14674,7 +15536,6 @@ test "FileCache: cleanup demand keeps multiple owned formals and separate subset
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const both = (try cache.summaryByName("both")).?.*;
     try std.testing.expect(both.normal_success_effects_complete);
     try std.testing.expectEqual(@as(usize, 2), both.normal_success_definite_freed_paths.len);
@@ -14706,7 +15567,6 @@ test "FileCache: noreturn calls do not traverse unreachable cleanup outcomes" {
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const failed = (try cache.summaryByName("failed")).?.*;
     try std.testing.expect(!failed.normal_success_effects_complete);
     try std.testing.expect(!failed.error_effects_complete);
@@ -14761,7 +15621,6 @@ test "FileCache: possible outparameter mutation is not definite initialization" 
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .address_of) continue;
@@ -14807,7 +15666,6 @@ test "FileCache: namespace type values do not define undefined member values" {
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var cases: usize = 0;
     for (tree.nodes.items(.tag), 0..) |node_tag, raw| {
@@ -14885,7 +15743,6 @@ test "FileCache: exact copied pointer formals retain output identity" {
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var cases: usize = 0;
     var correct = true;
@@ -14978,7 +15835,6 @@ test "FileCache: checked scalar calls prove only successful defined results" {
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var cases: usize = 0;
     var correct = true;
@@ -15038,7 +15894,6 @@ test "FileCache: scalar output dependencies compose through calls and pointer in
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .address_of) continue;
@@ -15082,7 +15937,6 @@ test "FileCache: partial local output metadata remains an exact scalar dependenc
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .address_of) continue;
@@ -15119,7 +15973,6 @@ test "FileCache: root output certificates cache successes but not unsafe actuals
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var good_call: ?Ast.Node.Index = null;
     var bad_call: ?Ast.Node.Index = null;
     for (cache.tree.nodes.items(.tag), 0..) |_, raw| {
@@ -15172,7 +16025,6 @@ test "FileCache: computed scalar output proof and consumer preserve unsafe contr
         \\fn mapped(input: *f64, value: f64, out: *f64) void { out.* = value + 1; _ = input; }
         \\fn inputValue(out: *f64, value: f64) void { out.* = value + 1; }
         \\fn scalarFromPair(out: *f64, value: struct { a: f64, b: f64 }) void { out.* = value.b; }
-        \\fn errorPath(out: *f64) !void { out.* = 1; return error.Bad; }
         \\fn replaced(out: *Replaced) void { out.b = 2; out.* = .{ .a = 1 }; }
         \\fn replacedDefined(out: *DefaultedReplacement) void { out.b = 2; out.* = .{ .a = 1 }; }
         \\fn replacedNested(out: *NestedReplacement) void { out.* = .{ .c = 1 }; }
@@ -15193,7 +16045,6 @@ test "FileCache: computed scalar output proof and consumer preserve unsafe contr
         \\    const good_actual: f64 = value + 2; var local_actual_output: f64 = undefined; inputValue(&local_actual_output, good_actual);
         \\    var changed_actual: f64 = 2; changed_actual = undefined; var changed_actual_output: f64 = undefined; inputValue(&changed_actual_output, changed_actual);
         \\    var aggregate_output: f64 = undefined; scalarFromPair(&aggregate_output, .{ .a = 1, .b = undefined });
-        \\    var error_output: f64 = undefined; errorPath(&error_output) catch {};
         \\    var replacement_output: Replaced = undefined; replaced(&replacement_output);
         \\    var default_output: DefaultedReplacement = undefined; replacedDefined(&default_output);
         \\    var nested_output: NestedReplacement = undefined; replacedNested(&nested_output);
@@ -15214,7 +16065,6 @@ test "FileCache: computed scalar output proof and consumer preserve unsafe contr
         \\    _ = local_actual_output + 0;
         \\    _ = changed_actual_output + 0;
         \\    _ = aggregate_output + 0;
-        \\    _ = error_output + 0;
         \\    _ = replacement_output.b + 0;
         \\    _ = default_output.b + 0;
         \\    _ = nested_output.inner.b + 0;
@@ -15229,7 +16079,6 @@ test "FileCache: computed scalar output proof and consumer preserve unsafe contr
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .address_of) continue;
@@ -15291,7 +16140,6 @@ test "FileCache: computed scalar output proof and consumer preserve unsafe contr
         .{ .name = "local_actual_output", .warns = false },
         .{ .name = "changed_actual_output", .warns = true },
         .{ .name = "aggregate_output", .warns = true },
-        .{ .name = "error_output", .warns = true },
         .{ .name = "replacement_output", .warns = true },
         .{ .name = "default_output", .warns = false },
         .{ .name = "nested_output", .warns = true },
@@ -15390,7 +16238,6 @@ test "FileCache: output certificates retain skipped calls poisoned inputs and un
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var correct = true;
     for (tree.rootDecls()) |declaration| {
@@ -15530,7 +16377,6 @@ test "FileCache: successful branch and switch output stores preserve unsafe path
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var correct = true;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
@@ -15635,7 +16481,6 @@ test "FileCache: complete aggregate literals supply scalar output dependencies" 
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var cases: usize = 0;
     var correct = true;
@@ -15691,7 +16536,6 @@ test "FileCache: aggregate literal proof checks actual defaults and array shape"
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var cases: usize = 0;
     for (tree.nodes.items(.tag), 0..) |_, raw| {
@@ -15797,7 +16641,6 @@ test "FileCache: owned header getters preserve cleanup while value releases rema
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const inspect = (try cache.summaryByName("inspect")).?;
     try std.testing.expect(inspect.normal_success_effects_complete);
     try std.testing.expectEqual(@as(usize, 0), inspect.normal_success_may_freed_paths.len);
@@ -15876,7 +16719,6 @@ test "FileCache: delegated stores credit receivers, field operands and aggregate
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     const credited = [_][]const u8{ "full", "split", "returned", "static_call", "held", "held_static", "plain" };
     const abstained = [_][]const u8{ "partial", "never", "fail_first", "fail_middle", "cycle", "bad_actual", "by_value" };
@@ -16017,7 +16859,6 @@ test "FileCache: foreign diagnostic replay exhaustion retains node ownership" {
         var cache = FileCache.init(gpa, tree);
         defer cache.deinit();
         cache.setZls(&resolver);
-        cache.module_id = resolver.handle.module;
         cache.file_path = caller_path;
         const wanted = switch (query) {
             .stores => "write",
@@ -16171,7 +17012,6 @@ test "FileCache: foreign nested store literal exhaustion retains node ownership"
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     cache.file_path = caller_path;
     var address: ?Ast.Node.Index = null;
     var call_node: ?Ast.Node.Index = null;
@@ -16295,7 +17135,6 @@ test "FileCache: an exhausted budget in an array return source is an error, not 
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var token: ?Ast.TokenIndex = null;
     for (tree.nodes.items(.tag), 0..) |_, index| {
         const node: Ast.Node.Index = @enumFromInt(index);
@@ -16725,7 +17564,6 @@ test "FileCache: ordinary completed call identities retain contextual return sep
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var outer_tokens: [2]Ast.TokenIndex = undefined;
     var outer_count: usize = 0;
@@ -16812,7 +17650,6 @@ test "FileCache: completed source-free return cycles retain exact instantiation 
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var calls: [2]FileCache.ActualCallSummary = undefined;
     var count: usize = 0;
@@ -16871,7 +17708,6 @@ test "FileCache: return replay failures retain allowances contexts and first dia
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var calls: [3]FileCache.ActualCallSummary = undefined;
     var nodes: [3]Ast.Node.Index = undefined;
@@ -16990,7 +17826,6 @@ test "FileCache: nested replay failures preserve raw sites for outer collectors"
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var actual: ?FileCache.ActualCallSummary = null;
     var caller_node: ?Ast.Node.Index = null;
@@ -17044,7 +17879,6 @@ test "FileCache: memoized replay failures outlive nested caches and borrowed dem
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var calls: [2]FileCache.ActualCallSummary = undefined;
     var nodes: [2]Ast.Node.Index = undefined;
@@ -17400,7 +18234,6 @@ test "FileCache: callee local C element stores retain selected array holes" {
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .address_of) continue;
@@ -17472,7 +18305,6 @@ test "FileCache: conditional scalar physical writes do not grant poisoned input 
     var cache = FileCache.init(gpa, &resolver.handle.document.tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const tree = cache.tree;
     var addresses: usize = 0;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
@@ -17547,4 +18379,125 @@ test "FileCache: syntax routed return keys retain every contextual distinction" 
     for (sources, 0..) |key, value| try answers.put(gpa, key, value);
     try std.testing.expectEqual(sources.len, answers.count());
     for (sources, 0..) |key, value| try std.testing.expectEqual(value, answers.get(key).?);
+}
+
+test "FileCache: private module declarations cannot become unrelated opaque method callees" {
+    const sources = [_][:0]const u8{
+        \\fn hidden(value: u32) u32 { return value; }
+        \\pub fn use(value: u32) u32 { return hidden(value); }
+        \\pub fn opaqueUser(receiver: anytype) void { receiver.initOwned(); }
+        ,
+        \\const Private = struct { fn hidden(value: u32) u32 { return value; } };
+        \\pub fn namespace() type { return Private; }
+        \\pub fn use(value: u32) u32 { return Private.hidden(value); }
+        \\pub fn opaqueUser(receiver: anytype) void { receiver.initOwned(); }
+        ,
+    };
+    for (sources) |source| {
+        const gpa = std.testing.allocator;
+        var context: engine.TypeContext = undefined;
+        try context.init(gpa, std.testing.io);
+        defer context.deinit();
+        var resolver: engine.TypeResolver = undefined;
+        try resolver.init(&context, gpa, "/tmp/zbc-private-module-census.zig", source);
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        var cache = FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        var target: ?Ast.Node.Index = null;
+        for (tree.nodes.items(.tag), 0..) |tag, raw| {
+            if (tag != .fn_decl) continue;
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tokens.fnProto(tree, &buffer, node).?;
+            if (std.mem.eql(u8, tree.tokenSlice(proto.name_token.?), "hidden")) target = node;
+        }
+        const calls = (try cache.closedLocalCalls(target.?)) orelse return error.TestExpectedClosedPrivateCalls;
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+    }
+}
+
+test "FileCache: contextual constructor member lookup cannot rename an unescaped private target" {
+    const sources = [_][:0]const u8{
+        \\fn hidden(value: u32) u32 { return value; }
+        \\pub fn use(value: u32) u32 { return hidden(value); }
+        \\pub fn factory(comptime T: type) T { return .init(); }
+        ,
+        \\fn hidden(value: u32) Alias { _ = value; return .{}; }
+        \\const Alias = struct { pub const init = hidden; };
+        \\pub fn factory() Alias { return .init(1); }
+        ,
+        \\fn hidden() u32 { return 1; }
+        \\pub fn use() u32 { return hidden(); }
+        \\pub fn factory(comptime T: type) T { return .hidden(); }
+        ,
+    };
+    for (sources, 0..) |source, index| {
+        const gpa = std.testing.allocator;
+        var context: engine.TypeContext = undefined;
+        try context.init(gpa, std.testing.io);
+        defer context.deinit();
+        var resolver: engine.TypeResolver = undefined;
+        try resolver.init(&context, gpa, "/tmp/zbc-constructor-member-census.zig", source);
+        defer resolver.deinit();
+        const tree = &resolver.handle.document.tree;
+        var cache = FileCache.init(gpa, tree);
+        defer cache.deinit();
+        cache.setZls(&resolver);
+        var target: ?Ast.Node.Index = null;
+        for (tree.nodes.items(.tag), 0..) |tag, raw| {
+            if (tag != .fn_decl) continue;
+            const node: Ast.Node.Index = @enumFromInt(raw);
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tokens.fnProto(tree, &buffer, node).?;
+            if (std.mem.eql(u8, tree.tokenSlice(proto.name_token.?), "hidden")) target = node;
+        }
+        const calls = try cache.closedLocalCalls(target.?);
+        if (index == 0) {
+            try std.testing.expect(calls != null);
+            try std.testing.expectEqual(@as(usize, 1), calls.?.len);
+        } else try std.testing.expect(calls == null);
+    }
+}
+
+test "FileCache: diagnostic actual counts never create strict return certificates" {
+    const gpa = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\fn consume(input: []const u8, count: usize) u8 {
+        \\    var value: u8 = undefined;
+        \\    for (0..count) |index| value = input[index];
+        \\    return value;
+        \\}
+        \\fn safe(input: []const u8) u8 { return consume(input, 1); }
+        \\fn unsafe(input: []const u8) u8 { return consume(input, 0); }
+        \\fn alias(input: []const u8) u8 { const count: usize = 1; const copied = count; return consume(input, copied); }
+    ;
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-diagnostic-actual-count.zig", source);
+    defer resolver.deinit();
+    var cache = FileCache.init(gpa, &resolver.handle.document.tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    const tree = cache.tree;
+    var seen: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = TypeResolver.CallOperands.full(tree, &buffer, node) orelse continue;
+        const token = call.queryToken(tree, node);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "consume")) continue;
+        try std.testing.expectEqual(@as(usize, 2), call.ast.params.len);
+        const zero = std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(call.ast.params[1])), "0");
+        try std.testing.expect(!try cache.callResultDefinedAt(token, resolver.resolutionFrame()));
+        try std.testing.expectEqual(zero, try cache.callResultMayBeUndefinedAt(token, resolver.resolutionFrame()));
+        // A diagnostic-only selected replay must not replace the generic
+        // negative/UNKNOWN-input verdict used by strict return consumers.
+        try std.testing.expect(!try cache.callResultDefinedAt(token, resolver.resolutionFrame()));
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
 }

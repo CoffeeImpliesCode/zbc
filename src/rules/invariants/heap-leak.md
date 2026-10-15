@@ -42,15 +42,24 @@ Fix — destructor must release the heap descriptor too:
 
 ## When this might be a false positive
 
-- The destructor passes ownership of `self` to another fn that
-  zbc can't see (FFI boundary, GC handoff, callback registration).
-  Rename the method out of `finalize` / `deinit` / `destroy` to
-  signal that, or add a wrapper that explicitly handles `self`'s
-  lifecycle.
-- The type is heap-allocated only in tests or rare paths; the
-  canonical instance is value-typed and stored by-value.  In that
-  case, rename the heap-allocating method out of `create` /
-  `init` / `new` so it doesn't look like the canonical constructor.
+- An erased callback can recover its owner with a typed
+  `@ptrCast(@alignCast(context))` and destroy that allocation.
+  A callback for an embedded member can recover its containing
+  allocation with `@fieldParentPtr`. Match the exact declaration,
+  canonical owner type, allocation, and released storage. The callback
+  parameter's spelling and the nearest named outer container are not
+  ownership identities.
+  For a same-address incoming-owner obligation, a source-bound callback
+  certificate must release parameter zero through the SDK allocator.
+  Its canonical released container must equal the callback's canonical
+  lexical owner. An erased parameter type alone is not proof.
+  A parent-container projection is a different relation: discharge
+  requires the created canonical owner and its exact declared embedding
+  field, not just an equal child type or a nearby constructor.
+- Releasing a child, an adjacent object, or only one conditional
+  outcome does not prove that the owner is released. Unknown callback
+  effects do not prove cleanup. Actual allocation-leak controls must
+  remain active.
 
 ## Related
 

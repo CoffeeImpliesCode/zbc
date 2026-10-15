@@ -58,25 +58,52 @@ pub fn reset(self: *SegmentedArray, node_pool: *NodePool) void {
 }
 ```
 
-## Why the detector is precise
+## Detection boundary
 
-- Limited to structs that have BOTH `deinit` and `reset` defined
-  as sibling methods — the asymmetry is what makes the bug.
-- Cleanup-method allowlist: `release`, `free`, `destroy`,
-  `close`, `deinit`, `unref`, `deref` — common Zig std + custom
-  pool / refcount idioms.
-- Comparison is on `<recv>.<method>` pairs: a cleanup is
-  considered "present in reset" only if the SAME receiver
-  identifier AND SAME method name appears.  This catches the
-  common shape `<pool>.release(...)` vs missing `<pool>.release(...)`.
-- Receiver-aware: `allocator.free(self.nodes)` in deinit and
-  `allocator.free(other_thing)` in reset both count as
-  `allocator.free` — the rule cares that the cleanup TYPE
-  appears, not the exact argument.
+The rule compares sibling `deinit` and `reset` methods.
+It collects cleanup candidates and compares their receiver identifiers.
+For minimal resets, a non-lifecycle method must also acquire through that receiver.
+An existing cleanup in `reset` keeps the current partial-clear policy.
+These policies do not prove that every reported receiver owns a pool slot.
 
-Limitations (deliberate):
-- Only compares the FIRST `deinit` and FIRST `reset` per struct.
-  Overloaded variants are out of scope.
-- Doesn't try to reason about what cleanups SHOULD be in reset
-  (e.g., a reset that intentionally KEEPS its allocator-managed
-  state isn't easily distinguished).
+### Backing storage is not a pool resource
+
+A standard list of address-free observations owns its backing allocation.
+Appending observations does not acquire external pool slots.
+A logical reset can preserve this history or its capacity.
+The host event log in `Mmio.Port` has this lifetime.
+
+The quiet case requires all of these facts:
+
+- The field type resolves through the actual standard import to `ArrayList`
+  or `ArrayListUnmanaged`.
+- The instantiated element type contains no addresses.
+  Inline enums and imported enum declarations retain their actual type identity.
+- The cleanup call resolves to its actual declaration through the call's canonical
+  AST key: the method-access dot, not the method-name token.
+- The actual receiver maps to formal zero of that call.
+- The exact SDK destructor body contains only a standard allocator `free` of
+  that receiver's canonical slice projection, followed by clearing that header.
+- The projection's complete source body returns exactly
+  `self.items.ptr[0..self.capacity]`. Both calls use their actual source frames.
+- The receiver root resolves to the containing struct's parameter.
+
+This is a certificate about the selected list storage, not about global effects
+of opaque allocator callbacks. It does not convert an incomplete whole-call
+summary into a successful one. Every destructor and projection statement must
+match the backing-only proof; an additional call, release, rebind, or observer
+refuses it. An unreadable owner, unknown element, or unresolved call also refuses it.
+Analysis errors propagate instead of becoming a quiet result.
+The shared query limits do not change.
+
+A user type called `ArrayList` does not satisfy the standard-type proof.
+A list of address-carrying elements does not satisfy the element proof.
+An external pool release remains a resource candidate.
+No field name, pool type name, or cleanup name alone proves a nonpool lifetime.
+
+## Limits
+
+- The rule compares the first `deinit` and first `reset` in each struct.
+- The existing receiver-name and partial-clear policies remain candidate filters.
+- The backing-only proof does not establish a lifetime for opaque external handles.
+- This rule does not prove that every omitted cleanup is a defect.

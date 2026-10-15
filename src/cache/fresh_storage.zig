@@ -1777,7 +1777,6 @@ test "aggregate allocation correlation uses actual SDK receiver identity" {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     for (tree.nodes.items(.tag), 0..) |_, raw_node| {
         const node: Ast.Node.Index = @enumFromInt(raw_node);
         if (raw_node == 0) continue;
@@ -1970,7 +1969,6 @@ test "SDK map defaults prove new backing but project lookalikes and cached heade
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var seen: usize = 0;
     for (tree.nodes.items(.tag), 0..) |_, raw_node| {
         if (raw_node == 0) continue;
@@ -2852,7 +2850,7 @@ fn actualTypeAddressFreeResolved(
             const index = actual.ipIndex() orelse return false;
             const tag = frame.resolver.ctx.ip.zigTypeTag(index) orelse return false;
             return switch (tag) {
-                .int, .float, .bool, .@"enum", .void, .comptime_int, .comptime_float, .null => true,
+                .int, .float, .bool, .@"enum", .void, .comptime_int, .comptime_float, .null, .error_set => true,
                 .array, .vector, .optional => blk: {
                     const child = frame.resolver.childType(actual) orelse return false;
                     break :blk try actualTypeAddressFreeInner(frame, child, depth + 1, remaining, depth_stopped, location_tree, location_token);
@@ -2983,6 +2981,37 @@ test "fresh storage address-free memo separates actual generic fields and never 
         const count = memo.answers.count();
         try std.testing.expectEqual(index == 0, try memo.proves(gpa, frame, actual, node, &remaining));
         try std.testing.expectEqual(count + @as(u32, if (index == 2) 0 else 1), memo.answers.count());
+    }
+}
+
+test "fresh storage error-set fields are address-free without admitting error-union pointer payloads" {
+    const source: [:0]const u8 =
+        \\const named_error = error{Busy};
+        \\const erased_error = anyerror;
+        \\const optional_error = ?anyerror;
+        \\const status = struct { operation_error: ?anyerror };
+        \\const error_pointer = *anyerror;
+        \\const borrowed_result = anyerror![]const u8;
+    ;
+    const gpa = std.testing.allocator;
+    var context: type_engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(cwd);
+    const path = try std.fs.path.join(gpa, &.{ cwd, "zbc-error-set-address-free-test.zig" });
+    defer gpa.free(path);
+    var resolver: type_engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const frame = resolver.resolutionFrame();
+    const expected = [_]bool{ true, true, true, true, false, false };
+    for (tree.rootDecls(), expected) |declaration, address_free| {
+        const initializer = tree.fullVarDecl(declaration).?.ast.init_node.unwrap().?;
+        const actual = (try frame.typeOfNode(initializer)).?;
+        var remaining: u32 = 32;
+        try std.testing.expectEqual(address_free, try actualTypeAddressFree(frame, actual, 0, &remaining));
     }
 }
 

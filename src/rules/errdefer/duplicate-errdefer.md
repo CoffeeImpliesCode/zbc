@@ -33,14 +33,25 @@ Fix — drop the duplicate `IO.init` + `errdefer`:
 
     // …other init steps…
 
-## When this might be a false positive
+## Identity and limits
 
-- The two errdefers genuinely target different lifetimes — e.g.
-  `errdefer X.deinit()` for an early-success state, then a later
-  `errdefer X.deinit()` after a refactor where `X` was rebound to
-  a fresh resource.  Rename the second resource (`var X2 =
-  rebuild()`) to remove the ambiguity, or wrap the inner section
-  in a labeled block that releases the first errdefer.
+Calls are compared in the same lexical cleanup domain. Receiver and argument
+identifiers must resolve to the same declarations; equal spellings in separate
+branches do not establish identity. Value copies remain distinct bindings.
+
+Deferred expressions read mutable receivers when the scope exits, not when
+the `errdefer` is registered. Reassigning `X` between two `errdefer X.deinit()`
+registrations does not make those cleanups independent: both read the final
+`X`. Keep separate snapshot locals when the resources have separate lifetimes.
+
+Equal numeric arguments do not identify a resource. For example, two successful
+budget reservations of the same byte count need two matching releases.
+When type resolution proves that all explicit arguments are numeric values,
+this rule does not infer a double cleanup from equal call text alone.
+Pointer/slice arguments and argument-free receiver cleanups retain the
+duplicate check. Unknown argument types do not obtain the numeric exclusion.
+
+Block-form errdefers are not compared by this rule.
 
 ## Related
 

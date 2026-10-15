@@ -7,6 +7,7 @@ const Range = numbers.Range;
 const budget_mod = @import("../budget.zig");
 const local_bindings = @import("../model/local_bindings.zig");
 const tokens = @import("../ast/tokens.zig");
+const TypeResolver = @import("../type_resolver.zig").TypeResolver;
 
 /// A named value together with the range it was proved to hold: the shape
 /// every range fact in this module takes.  It carries no claim of its own
@@ -82,6 +83,12 @@ pub const Evaluator = struct {
         context: *anyopaque,
         bounds: *const fn (*anyopaque, Ast.Node.Index) ?FloatFormats,
     } = null,
+    /// Canonical source-certified scalar getters share the owning walk's
+    /// facts and budget. Null does not provide an alternate name resolver.
+    call_value: ?struct {
+        context: *anyopaque,
+        bound: *const fn (*anyopaque, []const Fact, Ast.Node.Index) Range,
+    } = null,
     /// File-scope `const` bindings, when the caller could resolve which of
     /// them this walk may name.  Null leaves an identifier to its declared
     /// type, which is the weaker but never wrong reading.
@@ -125,6 +132,9 @@ pub const Evaluator = struct {
     /// Metadata/source failures are not missing numeric proofs. The owning
     /// throwing query returns the first error before publishing its answer.
     query_error: ?*?@import("../cache/file_cache.zig").SummaryError = null,
+    /// Set only for a pure RHS whose store is consumed on its normal successor.
+    /// A query inside the operation must not assume that it already completed.
+    completed_integer_operations: bool = false,
 
     /// Record the bound that stopped this evaluator.  First stop wins: a walk
     /// that gives up keeps unwinding and may trip a second bound, but the
@@ -176,7 +186,13 @@ pub const Evaluator = struct {
             .@"switch", .switch_comma => self.switchExpression(node),
             .@"if", .if_simple => self.conditionalExpression(node),
             .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => self.builtinCall(node),
-            .call, .call_comma, .call_one, .call_one_comma => self.standardCall(node),
+            .call, .call_comma, .call_one, .call_one_comma => blk: {
+                if (self.call_value) |projection| {
+                    const value = projection.bound(projection.context, self.facts, node);
+                    if (value != .unknown) break :blk value;
+                }
+                break :blk self.standardCall(node);
+            },
             else => self.typeRange(node),
         };
     }
@@ -204,6 +220,23 @@ pub const Evaluator = struct {
                     return .unknown;
                 };
                 if (length) |known| return Range.constant(known);
+            }
+        }
+        // A generic array extent need not resolve to one integer yet. Its
+        // count expression still has canonical unsigned bounds. Array type
+        // formation has completed, so checked arithmetic cannot wrap.
+        if (self.cache != null) {
+            var type_node = node;
+            if (self.tree.fullPtrType(type_node)) |pointer| {
+                if (pointer.size == .one)
+                    type_node = ungroup(self.tree, pointer.ast.child_type);
+            }
+            if (self.tree.fullArrayType(type_node)) |array| {
+                const previous = self.completed_integer_operations;
+                self.completed_integer_operations = true;
+                defer self.completed_integer_operations = previous;
+                const count = self.evaluate(array.ast.elem_count);
+                if (count == .integer and count.integer.min >= 0) return count;
             }
         }
         var projected: Range = self.allocatedLengthBound(node) orelse .unknown;
@@ -324,12 +357,8 @@ pub const Evaluator = struct {
     }
 
     pub fn typeRange(self: *Evaluator, node: Ast.Node.Index) Range {
+        if (self.integerInfo(node)) |integer| return Range.integerType(integer.bits, integer.signed);
         if (self.resolution_frame) |frame| {
-            const info = frame.intInfo(node) catch |err| {
-                _ = self.failedQuery(err);
-                return .unknown;
-            };
-            if (info) |integer| return Range.integerType(integer.bits, integer.signed);
             const bits = frame.floatBits(node) catch |err| {
                 _ = self.failedQuery(err);
                 return .unknown;
@@ -337,9 +366,78 @@ pub const Evaluator = struct {
             return if (bits != null) .{ .floating = .{} } else .unknown;
         }
         const cache = self.cache orelse return .unknown;
-        if (cache.intInfoOf(node)) |info| return Range.integerType(info.bits, info.signed);
         if (cache.isFloatType(node) == true) return .{ .floating = .{} };
         return .unknown;
+    }
+
+    /// Preserve exact integer operator types when the backend has no result
+    /// record. Shifts keep their left type; peer arithmetic requires equal
+    /// resolved integer types or one genuine comptime-integer operand.
+    pub fn integerInfo(self: *Evaluator, node: Ast.Node.Index) ?TypeResolver.IntInfo {
+        return self.integerInfoDepth(node, 0);
+    }
+
+    fn integerInfoDepth(self: *Evaluator, original: Ast.Node.Index, depth: u8) ?TypeResolver.IntInfo {
+        if (@as(u16, self.depth) + depth >= self.depth_limit) {
+            self.noteStop(.numeric_oracle_depth, self.depth_limit);
+            return null;
+        }
+        if (self.budget.* == 0) {
+            self.noteStop(.numeric_oracle_steps, self.budget_cap);
+            return null;
+        }
+        self.budget.* -= 1;
+        if (self.resolution_frame) |frame| {
+            if (frame.intInfo(original) catch |err| {
+                _ = self.failedQuery(err);
+                return null;
+            }) |info| return info;
+        } else if (self.cache) |cache| {
+            if (cache.intInfoOf(original)) |info| return info;
+        }
+        if (self.floatBits(original) != null) return null;
+        const node = ungroup(self.tree, original);
+        switch (self.tree.nodeTag(node)) {
+            .shl, .shr => return self.integerInfoDepth(self.tree.nodeData(node).node_and_node[0], depth + 1),
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
+                const operands = self.tree.nodeData(node).node_and_node;
+                return self.integerPeerInfo(operands[0], operands[1], depth + 1);
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const arguments = self.tree.builtinCallParams(&buffer, node) orelse return null;
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+                if (arguments.len == 2 and (std.mem.eql(u8, name, "@divTrunc") or
+                    std.mem.eql(u8, name, "@divFloor") or std.mem.eql(u8, name, "@divExact")))
+                    return self.integerPeerInfo(arguments[0], arguments[1], depth + 1);
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn integerPeerInfo(self: *Evaluator, left: Ast.Node.Index, right: Ast.Node.Index, depth: u8) ?TypeResolver.IntInfo {
+        const a = self.integerInfoDepth(left, depth);
+        const b = self.integerInfoDepth(right, depth);
+        if (a != null and b != null) return if (std.meta.eql(a.?, b.?)) a else null;
+        if (a != null and self.comptimeInteger(right)) return a;
+        if (b != null and self.comptimeInteger(left)) return b;
+        return null;
+    }
+
+    fn comptimeInteger(self: *Evaluator, original: Ast.Node.Index) bool {
+        const node = ungroup(self.tree, original);
+        if (self.tree.nodeTag(node) == .number_literal) return switch (std.zig.parseNumberLiteral(self.tree.tokenSlice(self.tree.nodeMainToken(node)))) {
+            .int, .big_int => true,
+            else => false,
+        };
+        const resolver = (self.cache orelse return false).zls orelse return false;
+        const frame = self.resolution_frame orelse resolver.resolutionFrame();
+        const actual = (frame.typeOfNode(node) catch |err| {
+            _ = self.failedQuery(err);
+            return false;
+        }) orelse return false;
+        return resolver.typeTag(actual) == .comptime_int;
     }
 
     pub fn floatBits(self: *Evaluator, node: Ast.Node.Index) ?u16 {
@@ -527,7 +625,7 @@ pub const Evaluator = struct {
     /// could not bound, proves nothing and answers nothing: the length stays
     /// what the declared `usize` says, which is the whole domain and never a
     /// claim that this allocation was small.
-    fn allocatedLengthBound(self: *Evaluator, node: Ast.Node.Index) ?Range {
+    pub fn allocatedLengthBound(self: *Evaluator, node: Ast.Node.Index) ?Range {
         const name = path(self.tree, node) orelse return null;
         if (self.length_bounds) |bounds| {
             if (bounds.bound(bounds.context, name)) |value|
@@ -575,6 +673,7 @@ pub const Evaluator = struct {
     }
 
     fn arithmetic(self: *Evaluator, node: Ast.Node.Index) Range {
+        if (self.tree.nodeTag(node) == .div) if (self.wideSumQuotient(node)) |value| return value;
         const parts = self.tree.nodeData(node).node_and_node;
         var left = self.evaluate(parts[0]);
         var right = self.evaluate(parts[1]);
@@ -604,10 +703,60 @@ pub const Evaluator = struct {
         // keeps a length bounded by its own guard, `arena.len`, apart from a
         // difference against a snapshot that has no bound of its own.
         const declared = self.typeRange(node);
+        if (self.completed_integer_operations and declared == .integer and value == .integer)
+            return value.intersect(declared);
         if (declared == .integer and value == .integer) {
             return overflowInterval(value.integer, declared.integer);
         }
         return value;
+    }
+
+    /// A bounded u128 sum can exceed the interval carrier before division,
+    /// although its quotient fits that carrier. Keep the intermediate exact;
+    /// do not clamp an overflowing sum into a successful quotient.
+    fn wideSumQuotient(self: *Evaluator, node: Ast.Node.Index) ?Range {
+        const division = self.tree.nodeData(node).node_and_node;
+        const sum = ungroup(self.tree, division[0]);
+        if (self.tree.nodeTag(sum) != .add) return null;
+        const info = self.integerInfo(sum) orelse return null;
+        if (info.signed or info.bits != 128) return null;
+        const divisor = self.evaluate(division[1]);
+        if (divisor != .integer or divisor.integer.min <= 0 or
+            divisor.integer.min != divisor.integer.max) return null;
+        const addends = self.tree.nodeData(sum).node_and_node;
+        const left = self.evaluate(addends[0]);
+        const right = self.evaluate(addends[1]);
+        if (!Range.additionFitsInteger(left, right, info.bits, info.signed) or
+            left != .integer or right != .integer or left.integer.min < 0 or right.integer.min < 0) return null;
+        var low = std.math.add(u128, @intCast(left.integer.min), @intCast(right.integer.min)) catch return null;
+        const high = std.math.add(u128, @intCast(left.integer.max), @intCast(right.integer.max)) catch return null;
+        // For positive integers x and n, x + n/x >= 2: at x==1 the
+        // quotient is positive; at x>=2 the first addend already suffices.
+        if (self.positiveReciprocalSum(addends[0], addends[1], left) or
+            self.positiveReciprocalSum(addends[1], addends[0], right))
+            low = @max(low, 2);
+        const count: u128 = @intCast(divisor.integer.min);
+        const maximum = high / count;
+        if (maximum > std.math.maxInt(i128)) return null;
+        return .{ .integer = .{ .min = @intCast(low / count), .max = @intCast(maximum) } };
+    }
+
+    fn positiveReciprocalSum(self: *Evaluator, scalar: Ast.Node.Index, quotient: Ast.Node.Index, value: Range) bool {
+        if (value != .integer or value.integer.min <= 0) return false;
+        const node = ungroup(self.tree, quotient);
+        const operands: [2]Ast.Node.Index = blk: {
+            if (self.tree.nodeTag(node) == .div) break :blk self.tree.nodeData(node).node_and_node;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const arguments = self.tree.builtinCallParams(&buffer, node) orelse return false;
+            if (arguments.len != 2 or
+                !std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(node)), "@divTrunc")) return false;
+            break :blk .{ arguments[0], arguments[1] };
+        };
+        const name = path(self.tree, ungroup(self.tree, scalar)) orelse return false;
+        const denominator = path(self.tree, ungroup(self.tree, operands[1])) orelse return false;
+        if (!std.mem.eql(u8, name, denominator)) return false;
+        const numerator = self.evaluate(operands[0]);
+        return numerator == .integer and numerator.integer.min > 0;
     }
 
     /// The values `a op b` can be relied on to take, computed inside
@@ -734,8 +883,11 @@ pub const Evaluator = struct {
             const destination = self.typeRange(node);
             if (destination == .integer) {
                 if (low < destination.integer.min or high > destination.integer.max) return destination;
-            } else if (self.tree.nodeTag(parts[0]) != .number_literal or self.tree.nodeTag(parts[1]) != .number_literal)
-                return .unknown;
+            } else if (self.tree.nodeTag(parts[0]) != .number_literal or self.tree.nodeTag(parts[1]) != .number_literal) {
+                const info = self.integerInfo(node) orelse return .unknown;
+                const computed: Range = .{ .integer = .{ .min = low, .max = high } };
+                if (!computed.fitsInteger(info.bits, info.signed)) return .unknown;
+            }
         }
         return .{ .integer = .{ .min = low, .max = high } };
     }
@@ -873,17 +1025,133 @@ pub const Evaluator = struct {
     fn integerLogarithmCall(self: *Evaluator, node: Ast.Node.Index, type_node: Ast.Node.Index) ?Range {
         const cache = self.cache orelse return null;
         const resolver = cache.zls orelse return null;
-        const info = cache.intInfoOf(type_node) orelse return null;
+        const info = self.integerInfo(type_node) orelse return null;
         if (info.signed or info.bits == 0) return null;
-        const reference = switch (resolver.functionReferenceOfCall(node) catch |err| return self.failedQuery(err)) {
+        const frame = self.resolution_frame orelse resolver.resolutionFrame();
+        const argument = (frame.resolveValueOfNode(type_node) catch |err| return self.failedQuery(err)) orelse return null;
+        if (!argument.is_type_val) return null;
+        const reference = switch (frame.functionReferenceOfCall(node) catch |err| return self.failedQuery(err)) {
             .function => |resolved| resolved,
             else => return null,
         };
         const function = reference.actual_type.data.function;
-        if (!std.mem.eql(u8, function.name orelse return null, "log2_int_ceil")) return null;
-        if (!(resolver.declaredInToolchainFile(reference.handle, "/std/math.zig") catch |err| return self.failedQuery(err)))
-            return null;
-        return .{ .integer = .{ .min = 0, .max = info.bits } };
+        if (function.name) |name| {
+            if (std.mem.eql(u8, name, "log2_int_ceil") and
+                (resolver.declaredInToolchainFile(reference.handle, "/std/math.zig") catch |err| return self.failedQuery(err)))
+                return .{ .integer = .{ .min = 0, .max = info.bits } };
+        }
+        if (!self.widthMinusClzBody(reference)) return null;
+        // @clz on a fixed-width unsigned input lies in [0,bits], even at zero.
+        // Keep -1 in the image; no assertion's success is assumed here.
+        return .{ .integer = .{ .min = -1, .max = @as(i128, info.bits) - 1 } };
+    }
+
+    /// Verify every statement of the reached body. This proof is about the
+    /// integer-width/clz expression, not a helper name or a source pathname.
+    fn widthMinusClzBody(self: *Evaluator, reference: TypeResolver.FunctionReference) bool {
+        const tree = reference.tree;
+        const declaration = tokens.enclosingFnDecl(tree, reference.fn_token) orelse return false;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return false;
+        var parameters = proto.iterate(tree);
+        const type_parameter = parameters.next() orelse return false;
+        const modifier = type_parameter.comptime_noalias orelse return false;
+        if (tree.tokenTag(modifier) != .keyword_comptime) return false;
+        if (!identifierIs(tree, type_parameter.type_expr orelse return false, "type")) return false;
+        const type_name = tree.tokenSlice(type_parameter.name_token orelse return false);
+        const value_parameter = parameters.next() orelse return false;
+        if (parameters.next() != null or
+            !identifierIs(tree, value_parameter.type_expr orelse return false, type_name)) return false;
+        const value_name = tree.tokenSlice(value_parameter.name_token orelse return false);
+        const body = tokens.bodyOf(tree, declaration) orelse return false;
+        var body_buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&body_buffer, body) orelse return false;
+        if (statements.len != 3) return false;
+        const guard = tree.fullIf(statements[0]) orelse return false;
+        if (guard.ast.else_expr != .none or tree.nodeTag(guard.ast.cond_expr) != .bool_or) return false;
+        const clauses = tree.nodeData(guard.ast.cond_expr).node_and_node;
+        if (tree.nodeTag(clauses[0]) != .bang_equal or tree.nodeTag(clauses[1]) != .bang_equal) return false;
+        const kind = tree.nodeData(clauses[0]).node_and_node;
+        const sign = tree.nodeData(clauses[1]).node_and_node;
+        if (!typeInfoOf(tree, kind[0], type_name) or !enumIs(tree, kind[1], "int") or
+            !typeInfoIntField(tree, sign[0], type_name, "signedness") or !enumIs(tree, sign[1], "unsigned")) return false;
+        var builtin_buffer: [2]Ast.Node.Index = undefined;
+        const rejected = tree.builtinCallParams(&builtin_buffer, guard.ast.then_expr) orelse return false;
+        if (rejected.len != 1 or
+            !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(guard.ast.then_expr)), "@compileError")) return false;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const assertion = tree.fullCall(&call_buffer, statements[1]) orelse return false;
+        if (assertion.ast.params.len != 1 or tree.nodeTag(assertion.ast.fn_expr) != .identifier) return false;
+        const assertion_condition = assertion.ast.params[0];
+        if (tree.nodeTag(assertion_condition) != .bang_equal) return false;
+        const compared = tree.nodeData(assertion_condition).node_and_node;
+        if (!identifierIs(tree, compared[0], value_name) or !integerLiteralIs(tree, compared[1], 0)) return false;
+        if (tree.nodeTag(statements[2]) != .@"return") return false;
+        const returned = tree.nodeData(statements[2]).opt_node.unwrap() orelse return false;
+        const cast = tree.builtinCallParams(&builtin_buffer, returned) orelse return false;
+        if (cast.len != 2 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(returned)), "@as")) return false;
+        if (!self.sameSourceExpression(tree, cast[0], proto.ast.return_type.unwrap() orelse return false)) return false;
+        var inner_buffer: [2]Ast.Node.Index = undefined;
+        const inner = tree.builtinCallParams(&inner_buffer, cast[1]) orelse return false;
+        if (inner.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(cast[1])), "@intCast")) return false;
+        const difference = ungroup(tree, inner[0]);
+        if (tree.nodeTag(difference) != .sub) return false;
+        const parts = tree.nodeData(difference).node_and_node;
+        if (tree.nodeTag(parts[0]) != .sub) return false;
+        const width = tree.nodeData(parts[0]).node_and_node;
+        if (!typeInfoIntField(tree, width[0], type_name, "bits") or !integerLiteralIs(tree, width[1], 1)) return false;
+        const counted = tree.builtinCallParams(&builtin_buffer, parts[1]) orelse return false;
+        return counted.len == 1 and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parts[1])), "@clz") and
+            identifierIs(tree, counted[0], value_name);
+    }
+
+    fn sameSourceExpression(self: *Evaluator, tree: *const Ast, left: Ast.Node.Index, right: Ast.Node.Index) bool {
+        var a = tree.firstToken(left);
+        var b = tree.firstToken(right);
+        const end_a = tree.lastToken(left);
+        const end_b = tree.lastToken(right);
+        while (a <= end_a and b <= end_b) : ({ a += 1; b += 1; }) {
+            if (self.budget.* == 0) {
+                self.noteStop(.numeric_oracle_steps, self.budget_cap);
+                return false;
+            }
+            self.budget.* -= 1;
+            if (tree.tokenTag(a) != tree.tokenTag(b) or
+                !std.mem.eql(u8, tree.tokenSlice(a), tree.tokenSlice(b))) return false;
+        }
+        return a > end_a and b > end_b;
+    }
+
+    fn identifierIs(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+        return tree.nodeTag(node) == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name);
+    }
+
+    fn enumIs(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+        return tree.nodeTag(node) == .enum_literal and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name);
+    }
+
+    fn integerLiteralIs(tree: *const Ast, node: Ast.Node.Index, value: i128) bool {
+        if (tree.nodeTag(node) != .number_literal) return false;
+        return (std.fmt.parseInt(i128, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false) == value;
+    }
+
+    fn typeInfoOf(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const arguments = tree.builtinCallParams(&buffer, node) orelse return false;
+        return arguments.len == 1 and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@typeInfo") and
+            identifierIs(tree, arguments[0], name);
+    }
+
+    fn typeInfoIntField(tree: *const Ast, node: Ast.Node.Index, name: []const u8, field: []const u8) bool {
+        if (tree.nodeTag(node) != .field_access) return false;
+        const owner, const token = tree.nodeData(node).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(token), field) or tree.nodeTag(owner) != .field_access) return false;
+        const type_info, const kind = tree.nodeData(owner).node_and_token;
+        return std.mem.eql(u8, tree.tokenSlice(kind), "int") and typeInfoOf(tree, type_info, name);
     }
 
     fn failedQuery(self: *Evaluator, err: anyerror) ?Range {

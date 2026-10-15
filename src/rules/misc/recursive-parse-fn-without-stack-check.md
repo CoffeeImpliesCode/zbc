@@ -49,13 +49,32 @@ const Parser = struct {
 Alternatively, thread a `depth: u32` parameter and return an error when
 it exceeds a known-safe maximum.
 
-## Suppression
+## Guard evidence and limits
 
-- Functions with a parameter named `depth`, `max_depth`, `nesting_depth`,
-  or `level` are suppressed — they already carry an explicit depth counter.
-- Functions whose body calls `is_safe_to_recurse`, `isSafeToRecurse`,
-  `isStackOverflow`, `safeRecurse`, `checkStack`, `checkRecursion`, or
-  `stackOverflow` are suppressed.
+The rule recognizes a straight-line entry counter increment, a deferred
+decrement of that exact counter, and a comparison that returns an error
+before the recursive call. The comparison can follow the increment or
+reside in a fallible entry helper. For the helper case, the canonical call
+must resolve its source declaration. The rule maps the receiver formal to
+the actual caller receiver and compares the exact counter field path.
+The helper must increment that counter and then reject excessive depth.
+No later helper work may reset the checked counter before successful return.
+A method named `enter` alone is not a guard.
+
+A `recursion_depth` meter label or observation is not a limit. In
+particular, resetting state for each distinct subprogram call does not
+bound the host stack across a deep acyclic chain. A byte-size limit on an
+input frame also does not establish a safe container-nesting limit.
+
+An AST walk can be bounded by its producer, but that requires a complete
+caller and actual-value provenance proof. An AST type tag alone does not
+prove that all incoming trees came from the capped parser. Nor does that
+proof cover a walker that can enter another subprogram body.
+
+The rule retains older compatibility heuristics for depth-named
+parameters, explicit stack-check calls, visited-set checks, and explicit
+recursion-entry calls. These are not general termination or stack-space
+proofs. A visited set rejects cycles, not arbitrarily long acyclic paths.
 
 ## Real-world instances
 

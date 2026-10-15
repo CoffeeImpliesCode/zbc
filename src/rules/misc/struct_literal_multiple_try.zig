@@ -51,6 +51,7 @@ const tokens = @import("../../ast/tokens.zig");
 const fresh_storage = @import("../../cache/fresh_storage.zig");
 const grow_analysis = @import("../../cache/grow_analysis.zig");
 const call_summary = @import("../../cache/call_summary.zig");
+const call_effects = @import("../../cache/call_effects.zig");
 const budget_mod = @import("../../budget.zig");
 
 const ProofError = file_cache_mod.SummaryError;
@@ -88,6 +89,7 @@ pub fn check(
     }
 
     var t: Ast.TokenIndex = 0;
+    var last_reported: ?Ast.TokenIndex = null;
     while (t + 7 <= last_tok) : (t += 1) {
         // First field: . identifier = try
         if (tags[t] != .period) continue;
@@ -95,21 +97,7 @@ pub fn check(
         if (tags[t + 2] != .equal) continue;
         if (tags[t + 3] != .keyword_try) continue;
 
-        // Skip to ',' at depth 0 (end of this field's initializer)
-        var i = t + 4;
-        var depth: u32 = 0;
-        while (i <= last_tok) : (i += 1) {
-            switch (tags[i]) {
-                .l_paren, .l_brace, .l_bracket => depth += 1,
-                .r_paren, .r_brace, .r_bracket => {
-                    if (depth == 0) break; // closing delimiter of the struct literal
-                    depth -= 1;
-                },
-                .comma => if (depth == 0) break,
-                else => {},
-            }
-        }
-        if (i > last_tok) continue;
+        const i = initializerEnd(tree, t + 4, last_tok) orelse continue;
         if (tags[i] != .comma) continue; // hit a closing delimiter — skip
 
         // The first try-expression (t+4 .. comma) must allocate an owned
@@ -123,26 +111,98 @@ pub fn check(
         if (!firstTryUsesAllocator(cache, &ident_nodes, tags, t + 4, i) and
             !tryExprAllocates(tree, tags, t + 4, i)) continue;
         if (try firstTryReturnsValue(tree, cache, t + 4, i)) continue;
+        if (try zeroLengthSdkAllocation(cache, t + 4, i)) continue;
+        var ownership: ArenaOwnershipWalk = .{};
+        defer ownership.effects.deinit(gpa);
+        if (cache.zls) |resolver| {
+            if (cache.nodeForExactSpan(t + 4, i - 1)) |expression| {
+                if (try zeroStorageResult(cache, resolver.resolutionFrame(), expression, 0, &ownership, 0)) continue;
+            }
+        }
         if (firstTryUsesScopedArena(tree, cache, t + 4, i)) continue;
 
-        if (try firstTryUsesProvedArena(tree, cache, t + 4, i)) continue;
+        if (try firstTryUsesProvedArena(tree, cache, t + 4, i, &ownership)) continue;
 
-        // Check the next field starts with . identifier = try
-        const next = i + 1;
-        if (next + 3 > last_tok) continue;
-        if (tags[next] != .period) continue;
-        if (tags[next + 1] != .identifier) continue;
-        if (tags[next + 2] != .equal) continue;
-        if (tags[next + 3] != .keyword_try) continue;
-
-        const field1 = tree.tokenSlice(t + 1);
-        const field2 = tree.tokenSlice(next + 1);
-
-        try report(gpa, problems, tree, next, field1, field2);
+        // A zero-byte SDK allocation cannot fail. Keep the earlier owning
+        // field live across it: a later fallible field can still leak it.
+        var next = i + 1;
+        while (next + 3 <= last_tok) {
+            if (tags[next] != .period or tags[next + 1] != .identifier or
+                tags[next + 2] != .equal or tags[next + 3] != .keyword_try) break;
+            const next_end = initializerEnd(tree, next + 4, last_tok) orelse break;
+            if (try zeroLengthSdkAllocation(cache, next + 4, next_end)) {
+                if (tags[next_end] != .comma) break;
+                next = next_end + 1;
+                continue;
+            }
+            if (last_reported != next) {
+                try report(gpa, problems, tree, next, tree.tokenSlice(t + 1), tree.tokenSlice(next + 1));
+                last_reported = next;
+            }
+            break;
+        }
     }
     // The lexical type-name adapter has a nullable API. A budget failure
     // recorded there is still incomplete, not evidence for a leak.
     if (budget_mod.peek() != null) return error.AnalysisBudgetExceeded;
+}
+
+fn initializerEnd(tree: *const Ast, start: Ast.TokenIndex, last: Ast.TokenIndex) ?Ast.TokenIndex {
+    var depth: u32 = 0;
+    var token = start;
+    while (token <= last) : (token += 1) {
+        switch (tree.tokenTag(token)) {
+            .l_paren, .l_brace, .l_bracket => depth += 1,
+            .r_paren, .r_brace, .r_bracket => {
+                if (depth == 0) return token;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) return token,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Only the authenticated SDK alloc(T, 0) fast path has this certificate.
+/// A project allocator can charge or fail even for zero elements. Nested
+/// `try` operands can fail before the SDK call and invalidate the certificate.
+fn zeroLengthSdkAllocation(cache: *file_cache_mod.FileCache, first: Ast.TokenIndex, end: Ast.TokenIndex) ProofError!bool {
+    const resolver = cache.zls orelse return false;
+    if (first >= end) return false;
+    const tree = cache.tree;
+    for (tree.tokens.items(.tag)[first..end]) |tag| {
+        if (tag == .keyword_try) return false;
+    }
+    const node = cache.nodeForExactSpan(first, end - 1) orelse return false;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, node) orelse return false;
+    const callee = (try grow_analysis.actualCalleeOf(cache, fresh_storage.calleeQueryToken(tree, call), null)) orelse return false;
+    if (!std.mem.eql(u8, callee.tree.tokenSlice(callee.fn_token + 1), "alloc") or
+        !try resolver.declaredInToolchainFile(callee.handle, "/std/mem/Allocator.zig")) return false;
+    const canonical: file_cache_mod.FileCache.ActualCallSummary = .{
+        .callee = callee,
+        .summary = null,
+        .argument_offset = null,
+        .read_only = null,
+    };
+    var argument_buffer: [2]Ast.Node.Index = undefined;
+    const count = (try canonical.callArgumentFor(cache, &argument_buffer, 2)) orelse return false;
+    return zeroCount(cache, count, 0);
+}
+
+fn zeroCount(cache: *file_cache_mod.FileCache, node: Ast.Node.Index, depth: u8) ProofError!bool {
+    const tree = cache.tree;
+    if (depth >= 16) return ownershipBudgetFailure(tree, tree.firstToken(node), .arena_proof_depth, 16);
+    switch (tree.nodeTag(node)) {
+        .number_literal => return (std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false) == 0,
+        .grouped_expression => return zeroCount(cache, tree.nodeData(node).node_and_token[0], depth + 1),
+        .identifier => {
+            const init = std_types.aliasInitializer(cache, tree, tree.nodeMainToken(node)) orelse return false;
+            return zeroCount(cache, cache.nodeForExactSpan(init.first, init.last) orelse return false, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 fn firstTryReturnsValue(tree: *const Ast, cache: *file_cache_mod.FileCache, start: Ast.TokenIndex, end: Ast.TokenIndex) ProofError!bool {
@@ -246,7 +306,7 @@ fn isValueOnlyType(
 /// Prove every newly owned call result in this expression, including nested
 /// operands. An arena-backed outer header cannot reclaim a general-allocator
 /// payload constructed while evaluating its arguments.
-fn firstTryUsesProvedArena(tree: *const Ast, cache: *file_cache_mod.FileCache, start: Ast.TokenIndex, end: Ast.TokenIndex) ProofError!bool {
+fn firstTryUsesProvedArena(tree: *const Ast, cache: *file_cache_mod.FileCache, start: Ast.TokenIndex, end: Ast.TokenIndex, walk: *ArenaOwnershipWalk) ProofError!bool {
     if (start >= end) return false;
     const node = cache.nodeForExactSpan(start, end - 1) orelse return false;
     if (cache.zls == null) {
@@ -255,13 +315,11 @@ fn firstTryUsesProvedArena(tree: *const Ast, cache: *file_cache_mod.FileCache, s
         if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
         return allocatorExprComesFromArena(tree, cache, tree.nodeData(call.ast.fn_expr).node_and_token[0], 0);
     }
-    var walk: ArenaOwnershipWalk = .{};
-    defer walk.effects.deinit(cache.gpa);
-    return callsUseArena(cache, null, start, end - 1, null, &walk);
+    return callsUseArena(cache, null, start, end - 1, null, walk);
 }
 
 const ArenaOwnershipWalk = struct {
-    active: [16]resolver_mod.TypeResolver.ActualType = undefined,
+    active: [16]BoundArenaCall = undefined,
     len: usize = 0,
     completed: [16]resolver_mod.TypeResolver.ActualType = undefined,
     completed_len: usize = 0,
@@ -273,6 +331,15 @@ const ArenaOwnershipWalk = struct {
             return ownershipBudgetFailure(tree, token, .arena_proof_steps, call_summary.actual_query_work_limit);
         self.remaining -= 1;
     }
+};
+
+/// Runtime allocator values are operands, not part of the callable's type.
+/// Retain the caller frame until every use of the formal has been proved.
+const BoundArenaCall = struct {
+    actual_type: resolver_mod.TypeResolver.ActualType,
+    caller_cache: *file_cache_mod.FileCache,
+    caller_frame: resolver_mod.TypeResolver.ResolutionFrame,
+    call_node: Ast.Node.Index,
 };
 
 fn ownershipBudgetFailure(tree: *const Ast, token: Ast.TokenIndex, limit: budget_mod.Limit, cap: u32) ProofError {
@@ -337,7 +404,7 @@ fn callsUseArena(
         }
         const scalar = try resolvedValueOnlyType(frame.resolver, result, 0);
         if (frame.resolver.typeTag(result) == .noreturn) continue;
-        if (try allocatorInFrame(cache, frame, node, 0)) continue;
+        if (try allocatorInFrame(cache, frame, node, 0, walk, walk.len)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse return false;
         // Ownership needs declaration identity, not the broad normal-cleanup
@@ -355,22 +422,26 @@ fn callsUseArena(
             .{ .whole = canonical.callee },
             .{ .frame = supplied, .effects_state = &walk.effects, .remaining = &walk.remaining },
         )) == .read_only) continue;
-        if (try sdkCallUsesArena(cache, frame, canonical)) |arena| {
+        if (try sdkCallUsesArena(cache, frame, canonical, walk)) |arena| {
             if (arena) continue;
             // This SDK result is tied to its allocator formal. Inspecting the
             // allocator's callback implementation cannot improve that fact.
             return false;
         }
         const body = tokens.bodyOf(callee.tree, callee.declaration) orelse return false;
+        const operands_proved = try allocatorFormalsUseArena(cache, frame, node, canonical, walk);
         var recursive = false;
-        for (walk.completed[0..walk.completed_len]) |completed| {
-            if (completed.eql(callee.reference.actual_type)) {
-                recursive = true;
-                break;
+        if (operands_proved) {
+            for (walk.completed[0..walk.completed_len]) |completed| {
+                if (completed.eql(callee.reference.actual_type)) {
+                    recursive = true;
+                    break;
+                }
             }
         }
         for (walk.active[0..walk.len]) |active| {
-            if (active.eql(callee.reference.actual_type)) {
+            if (active.actual_type.eql(callee.reference.actual_type)) {
+                if (!operands_proved) return false;
                 recursive = true;
                 break;
             }
@@ -379,7 +450,12 @@ fn callsUseArena(
         if (walk.len == walk.active.len)
             return ownershipBudgetFailure(tree, start, .arena_proof_depth, walk.active.len);
         const declaring = (try canonical.declaringCache(cache)) orelse return false;
-        walk.active[walk.len] = callee.reference.actual_type;
+        walk.active[walk.len] = .{
+            .actual_type = callee.reference.actual_type,
+            .caller_cache = cache,
+            .caller_frame = frame,
+            .call_node = node,
+        };
         walk.len += 1;
         const proved = try callsUseArena(
             declaring,
@@ -391,7 +467,7 @@ fn callsUseArena(
         );
         walk.len -= 1;
         if (!proved) return false;
-        if (walk.completed_len < walk.completed.len) {
+        if (operands_proved and walk.completed_len < walk.completed.len) {
             walk.completed[walk.completed_len] = callee.reference.actual_type;
             walk.completed_len += 1;
         }
@@ -445,6 +521,7 @@ fn sdkCallUsesArena(
     cache: *file_cache_mod.FileCache,
     frame: resolver_mod.TypeResolver.ResolutionFrame,
     canonical: file_cache_mod.FileCache.ActualCallSummary,
+    walk: *ArenaOwnershipWalk,
 ) ProofError!?bool {
     const callee = canonical.callee;
     const resolver = frame.resolver;
@@ -467,7 +544,28 @@ fn sdkCallUsesArena(
     }
     var argument_buffer: [2]Ast.Node.Index = undefined;
     const argument = (try canonical.callArgumentFor(cache, &argument_buffer, if (list or map) 1 else 0)) orelse return false;
-    return try allocatorInFrame(cache, frame, argument, 0);
+    return try allocatorInFrame(cache, frame, argument, 0, walk, walk.len);
+}
+
+/// Memo and recursive-edge reuse require every SDK allocator formal to have
+/// proved operands. A callable type alone cannot distinguish an arena from a
+/// general allocator passed to the same runtime parameter.
+fn allocatorFormalsUseArena(
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    node: Ast.Node.Index,
+    canonical: file_cache_mod.FileCache.ActualCallSummary,
+    walk: *ArenaOwnershipWalk,
+) ProofError!bool {
+    for (canonical.callee.reference.actual_type.data.function.parameters, 0..) |parameter, index| {
+        const actual = (try frame.resolver.normalizedType(parameter.type)) orelse return false;
+        if (actual.data != .container) continue;
+        if (!try frame.resolver.declaredInToolchainFile(actual.data.container.scope_handle.handle, "/std/mem/Allocator.zig")) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const argument = (try frame.callArgumentIn(&buffer, node, index)) orelse return false;
+        if (!try allocatorInFrame(cache, frame, argument, 0, walk, walk.len)) return false;
+    }
+    return true;
 }
 
 fn allocatorInFrame(
@@ -475,19 +573,27 @@ fn allocatorInFrame(
     frame: resolver_mod.TypeResolver.ResolutionFrame,
     node: Ast.Node.Index,
     depth: u8,
+    walk: *ArenaOwnershipWalk,
+    bindings_len: usize,
 ) ProofError!bool {
     if (depth >= 16) return ownershipBudgetFailure(cache.tree, cache.tree.firstToken(node), .arena_proof_depth, 16);
     const tree = cache.tree;
     // Ordinary caller queries retain the existing closed-call/accessor
     // proofs. Foreign callable frames must never use the root document.
-    if (frame.actual_type == null and cache.zls == frame.resolver)
-        return allocatorExprComesFromArena(tree, cache, node, depth);
+    if (frame.actual_type == null and cache.zls == frame.resolver) {
+        return try allocatorExprComesFromArena(tree, cache, node, depth) or
+            try localAllocatorFieldUsesArena(cache, frame, node, depth, walk);
+    }
     switch (tree.nodeTag(node)) {
-        .grouped_expression => return allocatorInFrame(cache, frame, tree.nodeData(node).node_and_token[0], depth + 1),
+        .grouped_expression => return allocatorInFrame(cache, frame, tree.nodeData(node).node_and_token[0], depth + 1, walk, bindings_len),
         .identifier => {
-            const init = std_types.aliasInitializer(cache, tree, tree.nodeMainToken(node)) orelse return false;
-            const initializer = cache.nodeForExactSpan(init.first, init.last) orelse return false;
-            return allocatorInFrame(cache, frame, initializer, depth + 1);
+            const use = tree.nodeMainToken(node);
+            if (std_types.aliasInitializer(cache, tree, use)) |init| {
+                const initializer = cache.nodeForExactSpan(init.first, init.last) orelse return false;
+                return allocatorInFrame(cache, frame, initializer, depth + 1, walk, bindings_len);
+            }
+            const argument = (try boundFormalArgument(cache, frame, node, walk, bindings_len)) orelse return false;
+            return allocatorInFrame(argument.cache, argument.frame, argument.node, depth + 1, walk, argument.bindings_len);
         },
         else => {},
     }
@@ -497,7 +603,368 @@ fn allocatorInFrame(
     const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
     if (!std.mem.eql(u8, tree.tokenSlice(method), "allocator")) return false;
     const actual = (try frame.containerOfNode(receiver)) orelse return false;
-    return frame.resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig");
+    return try frame.resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig") or
+        try frame.resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/FixedBufferAllocator.zig");
+}
+
+const BoundArgument = struct {
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    node: Ast.Node.Index,
+    bindings_len: usize,
+};
+
+/// Runtime values use the same canonical formal/actual binding for both proofs.
+fn boundFormalArgument(
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    node: Ast.Node.Index,
+    walk: *ArenaOwnershipWalk,
+    bindings_len: usize,
+) ProofError!?BoundArgument {
+    const tree = cache.tree;
+    if (tree.nodeTag(node) != .identifier) return null;
+    const actual = frame.actual_type orelse return null;
+    const use = tree.nodeMainToken(node);
+    var bound_index = bindings_len;
+    while (bound_index != 0) {
+        try walk.charge(tree, use);
+        bound_index -= 1;
+        const bound = walk.active[bound_index];
+        if (!bound.actual_type.eql(actual)) continue;
+        const declaration = tokens.enclosingFnDecl(tree, use) orelse return null;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return null;
+        const body = tokens.bodyOf(tree, declaration) orelse return null;
+        const bindings = try cache.localBindings(proto, body);
+        const binding = bindings.findAt(tree.tokenSlice(use), use) orelse return null;
+        if (binding.origin != .param) return null;
+        var params = proto.iterate(tree);
+        var index: usize = 0;
+        while (params.next()) |param| : (index += 1) {
+            try walk.charge(tree, param.name_token orelse use);
+            if (param.name_token != binding.name_token) continue;
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const argument = (try bound.caller_frame.callArgumentIn(&argument_buffer, bound.call_node, index)) orelse return null;
+            return .{
+                .cache = bound.caller_cache,
+                .frame = bound.caller_frame,
+                .node = argument,
+                .bindings_len = bound_index,
+            };
+        }
+        return null;
+    }
+    return null;
+}
+
+/// This certifies returned storage, not infallibility. A helper can reject a
+/// zero count before reaching the SDK, so this proof never skips a later try.
+fn zeroStorageResult(
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    node: Ast.Node.Index,
+    depth: u8,
+    walk: *ArenaOwnershipWalk,
+    bindings_len: usize,
+) ProofError!bool {
+    const tree = cache.tree;
+    try walk.charge(tree, tree.firstToken(node));
+    if (depth >= 16) return ownershipBudgetFailure(tree, tree.firstToken(node), .arena_proof_depth, 16);
+    switch (tree.nodeTag(node)) {
+        .error_value, .unreachable_literal => return true,
+        .@"try" => return zeroStorageResult(cache, frame, tree.nodeData(node).node, depth + 1, walk, bindings_len),
+        .grouped_expression => return zeroStorageResult(cache, frame, tree.nodeData(node).node_and_token[0], depth + 1, walk, bindings_len),
+        .@"return" => return zeroStorageResult(cache, frame, tree.nodeData(node).opt_node.unwrap() orelse return false, depth + 1, walk, bindings_len),
+        .@"catch" => {
+            const pair = tree.nodeData(node).node_and_node;
+            return try zeroStorageResult(cache, frame, pair[0], depth + 1, walk, bindings_len) and
+                try zeroStorageResult(cache, frame, pair[1], depth + 1, walk, bindings_len);
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            // A labelled break can supply a value before the final return.
+            for (tree.tokens.items(.tag)[tree.firstToken(node)..tree.lastToken(node)]) |tag| {
+                try walk.charge(tree, tree.firstToken(node));
+                if (tag == .keyword_break) return false;
+            }
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buffer, node) orelse return false;
+            if (statements.len == 0 or tree.nodeTag(statements[statements.len - 1]) != .@"return") return false;
+            return zeroStorageResult(cache, frame, statements[statements.len - 1], depth + 1, walk, bindings_len);
+        },
+        .identifier => {
+            const use = tree.nodeMainToken(node);
+            if (std_types.aliasInitializer(cache, tree, use)) |init| {
+                if (!try localHeaderStable(cache, node, false, .{}, walk)) return false;
+                const initializer = cache.nodeForExactSpan(init.first, init.last) orelse return false;
+                return zeroStorageResult(cache, frame, initializer, depth + 1, walk, bindings_len);
+            }
+            return false;
+        },
+        else => {},
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    // The outer result cannot account for owning nested try operands.
+    for (tree.tokens.items(.tag)[tree.firstToken(node)..tree.lastToken(node)]) |tag| {
+        try walk.charge(tree, tree.firstToken(node));
+        if (tag == .keyword_try) return false;
+    }
+    const callee = (try grow_analysis.actualCalleeOf(cache, fresh_storage.calleeQueryToken(tree, call), frame)) orelse return false;
+    if (try frame.resolver.declaredInToolchainFile(callee.handle, "/std/mem/Allocator.zig")) {
+        if (!std.mem.eql(u8, callee.tree.tokenSlice(callee.fn_token + 1), "alloc")) return false;
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        const count = (try frame.callArgumentIn(&argument_buffer, node, 2)) orelse return false;
+        return zeroCountInFrame(cache, frame, count, depth + 1, walk, bindings_len);
+    }
+    for (walk.active[0..walk.len]) |active| {
+        if (active.actual_type.eql(callee.reference.actual_type)) return false;
+    }
+    if (walk.len == walk.active.len)
+        return ownershipBudgetFailure(tree, tree.firstToken(node), .arena_proof_depth, walk.active.len);
+    const canonical: file_cache_mod.FileCache.ActualCallSummary = .{
+        .callee = callee, .summary = null, .argument_offset = null, .read_only = null,
+    };
+    const declaring = (try canonical.declaringCache(cache)) orelse return false;
+    const body = tokens.bodyOf(callee.tree, callee.declaration) orelse return false;
+    walk.active[walk.len] = .{
+        .actual_type = callee.reference.actual_type,
+        .caller_cache = cache,
+        .caller_frame = frame,
+        .call_node = node,
+    };
+    walk.len += 1;
+    defer walk.len -= 1;
+    const declaring_frame = frame.resolver.frameForFunction(callee.reference);
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(callee.tree, &proto_buffer, callee.declaration) orelse return false;
+    // Nested result queries can grow the cache's binding map. Keep a shallow
+    // read-only view; its arena-backed items remain owned by the cache.
+    const bindings = (try declaring.localBindings(proto, body)).*;
+    var scan = call_effects.Scan.init(callee.tree, callee.declaration, &bindings);
+    var returns: usize = 0;
+    while (try scan.next()) |event| {
+        if (event != .node) continue;
+        const returned = event.node;
+        try walk.charge(callee.tree, callee.tree.firstToken(returned));
+        if (callee.tree.nodeTag(returned) != .@"return") continue;
+        returns += 1;
+        if (!try zeroStorageResult(declaring, declaring_frame, returned, depth + 1, walk, walk.len)) return false;
+    }
+    return returns != 0;
+}
+
+fn zeroCountInFrame(
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    node: Ast.Node.Index,
+    depth: u8,
+    walk: *ArenaOwnershipWalk,
+    bindings_len: usize,
+) ProofError!bool {
+    const tree = cache.tree;
+    try walk.charge(tree, tree.firstToken(node));
+    if (depth >= 16) return ownershipBudgetFailure(tree, tree.firstToken(node), .arena_proof_depth, 16);
+    switch (tree.nodeTag(node)) {
+        .number_literal => return (std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false) == 0,
+        .grouped_expression => return zeroCountInFrame(cache, frame, tree.nodeData(node).node_and_token[0], depth + 1, walk, bindings_len),
+        .identifier => {
+            if (std_types.aliasInitializer(cache, tree, tree.nodeMainToken(node))) |init| {
+                if (!try localHeaderStable(cache, node, false, .{}, walk)) return false;
+                return zeroCountInFrame(cache, frame, cache.nodeForExactSpan(init.first, init.last) orelse return false, depth + 1, walk, bindings_len);
+            }
+            const argument = (try boundFormalArgument(cache, frame, node, walk, bindings_len)) orelse return false;
+            return zeroCountInFrame(argument.cache, argument.frame, argument.node, depth + 1, walk, argument.bindings_len);
+        },
+        else => return false,
+    }
+}
+
+/// A local literal can preserve an allocator header without making all values
+/// of its public type arena-backed. Pointer parameters and constructor results
+/// require the shared contextual source proof and do not enter this certificate.
+fn localAllocatorFieldUsesArena(
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    node: Ast.Node.Index,
+    depth: u8,
+    walk: *ArenaOwnershipWalk,
+) ProofError!bool {
+    const tree = cache.tree;
+    if (tree.nodeTag(node) != .field_access) return false;
+    const receiver, const field = tree.nodeData(node).node_and_token;
+    if (tree.nodeTag(receiver) != .identifier) return false;
+    const receiver_type = (try frame.typeOfNode(receiver)) orelse return false;
+    if (frame.resolver.typeTag(receiver_type) != .@"struct") return false;
+    if (!try localHeaderStable(cache, receiver, true, .{}, walk)) return false;
+    const use = tree.nodeMainToken(receiver);
+    const declaration = tokens.enclosingFnDecl(tree, use) orelse return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return false;
+    const bindings = try cache.localBindings(proto, tokens.bodyOf(tree, declaration) orelse return false);
+    const binding = bindings.findAt(tree.tokenSlice(use), use) orelse return false;
+    if (binding.origin != .literal) return false;
+    const initializer = cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return false;
+    var literal_buffer: [2]Ast.Node.Index = undefined;
+    const literal = tree.fullStructInit(&literal_buffer, initializer) orelse return false;
+    for (literal.ast.fields) |value| {
+        try walk.charge(tree, tree.firstToken(value));
+        const first = tree.firstToken(value);
+        if (first < 2 or !std.mem.eql(u8, tree.tokenSlice(first - 2), tree.tokenSlice(field))) continue;
+        return localFixedBufferHeaderLive(cache, frame, value, use, depth + 1, walk);
+    }
+    return false;
+}
+
+/// The allocator header keeps a live context pointer. Authenticate both SDK
+/// operations and keep that actual local receiver stable through allocation.
+fn localFixedBufferHeaderLive(
+    cache: *file_cache_mod.FileCache,
+    frame: resolver_mod.TypeResolver.ResolutionFrame,
+    accessor: Ast.Node.Index,
+    through: Ast.TokenIndex,
+    depth: u8,
+    walk: *ArenaOwnershipWalk,
+) ProofError!bool {
+    const tree = cache.tree;
+    try walk.charge(tree, tree.firstToken(accessor));
+    if (depth >= 16) return ownershipBudgetFailure(tree, tree.firstToken(accessor), .arena_proof_depth, 16);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, accessor) orelse return false;
+    if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+    if (tree.nodeTag(receiver) != .identifier or !std.mem.eql(u8, tree.tokenSlice(method), "allocator")) return false;
+    const callee = (try grow_analysis.actualCalleeOf(cache, fresh_storage.calleeQueryToken(tree, call), frame)) orelse return false;
+    if (!try frame.resolver.declaredInToolchainFile(callee.handle, "/std/heap/FixedBufferAllocator.zig")) return false;
+    const use = tree.nodeMainToken(receiver);
+    const declaration = tokens.enclosingFnDecl(tree, use) orelse return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return false;
+    const bindings = try cache.localBindings(proto, tokens.bodyOf(tree, declaration) orelse return false);
+    const binding = bindings.findAt(tree.tokenSlice(use), use) orelse return false;
+    if (binding.origin == .param or binding.origin == .loop_capture) return false;
+    const initializer = cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return false;
+    const constructor = tree.fullCall(&buffer, initializer) orelse return false;
+    const initialized = (try grow_analysis.actualCalleeOf(cache, fresh_storage.calleeQueryToken(tree, constructor), frame)) orelse return false;
+    if (!std.mem.eql(u8, initialized.tree.tokenSlice(initialized.fn_token + 1), "init") or
+        !try frame.resolver.declaredInToolchainFile(initialized.handle, "/std/heap/FixedBufferAllocator.zig")) return false;
+    return localHeaderStable(cache, receiver, true, .{ .through = through, .accessor = accessor }, walk);
+}
+
+fn rangeMentionsBinding(
+    cache: *file_cache_mod.FileCache,
+    bindings: *const @import("../../model/local_bindings.zig").LocalBindings,
+    node: Ast.Node.Index,
+    binding_token: Ast.TokenIndex,
+    walk: *ArenaOwnershipWalk,
+) ProofError!bool {
+    const tree = cache.tree;
+    var token = tree.firstToken(node);
+    while (token <= tree.lastToken(node)) : (token += 1) {
+        try walk.charge(tree, token);
+        if (tree.tokenTag(token) != .identifier) continue;
+        const binding = bindings.findAt(tree.tokenSlice(token), token) orelse continue;
+        if (binding.name_token == binding_token) return true;
+    }
+    return false;
+}
+
+const LocalHeaderWindow = struct {
+    through: ?Ast.TokenIndex = null,
+    accessor: ?Ast.Node.Index = null,
+};
+
+/// Use the existing complete body scanner and lexical bindings. No field value
+/// is inferred from a type name, a nearby allocator, or a subset of callers.
+/// Enclosing loops extend the horizon through their later iterations.
+fn localHeaderStable(
+    cache: *file_cache_mod.FileCache,
+    identifier: Ast.Node.Index,
+    projection_only: bool,
+    window: LocalHeaderWindow,
+    walk: *ArenaOwnershipWalk,
+) ProofError!bool {
+    const tree = cache.tree;
+    if (tree.nodeTag(identifier) != .identifier) return false;
+    const use = tree.nodeMainToken(identifier);
+    const declaration = tokens.enclosingFnDecl(tree, use) orelse return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return false;
+    const body = tokens.bodyOf(tree, declaration) orelse return false;
+    // Callee resolution below can populate another body's cached bindings.
+    // The immutable items outlive map growth; the borrowed map entry does not.
+    const bindings = (try cache.localBindings(proto, body)).*;
+    const selected = bindings.findAt(tree.tokenSlice(use), use) orelse return false;
+    if (selected.origin == .param or selected.origin == .loop_capture or
+        selected.name_token < tree.firstToken(body)) return false;
+    const anchor = window.through orelse use;
+    var horizon = anchor;
+    var scan = call_effects.Scan.init(tree, declaration, &bindings);
+    while (try scan.next()) |event| {
+        const node = switch (event) {
+            .node, .call, .write_or_unknown => |value| value,
+            .write => |value| value.node,
+        };
+        try walk.charge(tree, tree.firstToken(node));
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        if (event == .node and first <= anchor and last >= anchor and
+            (tree.fullFor(node) != null or tree.fullWhile(node) != null))
+            horizon = @max(horizon, last);
+        if (last <= selected.rhs_last or first > horizon) {
+            if (event == .node) scan.pending_children = .{ .array = @splat(.none) };
+            continue;
+        }
+        switch (event) {
+            .node => switch (tree.nodeTag(node)) {
+                .identifier => {
+                    const token = tree.nodeMainToken(node);
+                    const binding = bindings.findAt(tree.tokenSlice(token), token) orelse continue;
+                    if (binding.name_token != selected.name_token) continue;
+                    if (projection_only) {
+                        // A copied Allocator exposes its mutable context pointer.
+                        // Only the one authenticated provider accessor and SDK
+                        // member-call receiver positions can keep this proof.
+                        if (window.accessor != null and token == use) continue;
+                        if (token + 5 >= tree.tokens.len or
+                            tree.tokenTag(token + 1) != .period or
+                            tree.tokenTag(token + 3) != .period or
+                            tree.tokenTag(token + 5) != .l_paren) return false;
+                    }
+                },
+                .address_of => {
+                    if (try rangeMentionsBinding(cache, &bindings, node, selected.name_token, walk)) return false;
+                },
+                .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub,
+                .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor,
+                .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap,
+                .assign_mul_sat, .assign_add_sat, .assign_sub_sat,
+                => if (try rangeMentionsBinding(cache, &bindings, tree.nodeData(node).node_and_node[0], selected.name_token, walk)) return false,
+                else => {},
+            },
+            .call => {
+                if (window.accessor == node) continue;
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, node) orelse return false;
+                if (projection_only) {
+                    if (!try rangeMentionsBinding(cache, &bindings, node, selected.name_token, walk)) continue;
+                    const resolver = cache.zls orelse return false;
+                    const callee = (try grow_analysis.actualCalleeOf(cache, fresh_storage.calleeQueryToken(tree, call), null)) orelse return false;
+                    if (!try resolver.declaredInToolchainFile(callee.handle, "/std/mem/Allocator.zig")) return false;
+                    continue;
+                }
+                if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+                const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+                if (tree.nodeTag(receiver) != .identifier) continue;
+                const token = tree.nodeMainToken(receiver);
+                const binding = bindings.findAt(tree.tokenSlice(token), token) orelse continue;
+                if (binding.name_token == selected.name_token) return false;
+            },
+            .write_or_unknown => return false,
+            .write => {},
+        }
+    }
+    return true;
 }
 
 fn nodeIsAllocator(cache: *file_cache_mod.FileCache, node: Ast.Node.Index) ProofError!bool {
@@ -549,7 +1016,8 @@ fn allocatorExprComesFromArena(tree: *const Ast, cache: *file_cache_mod.FileCach
         return resolvedCallReturnsArena(cache, node);
     if (cache.zls) |resolver| {
         if (try resolver.containerOfNode(receiver)) |actual| {
-            if (try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig"))
+            if (try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig") or
+                try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/FixedBufferAllocator.zig"))
                 return true;
         }
         return resolvedCallReturnsArena(cache, node);
@@ -611,7 +1079,8 @@ fn resolvedCallReturnsArena(cache: *file_cache_mod.FileCache, node: Ast.Node.Ind
         const receiver, const method = declaring_tree.nodeData(allocator_call.ast.fn_expr).node_and_token;
         if (!std.mem.eql(u8, declaring_tree.tokenSlice(method), "allocator")) return false;
         const actual = (try frame.containerOfNode(receiver)) orelse return false;
-        if (!try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig")) return false;
+        if (!try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig") and
+            !try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/FixedBufferAllocator.zig")) return false;
         returns += 1;
     }
     return returns != 0;
@@ -2000,11 +2469,366 @@ test "struct-literal-multiple-try: atomic lock operations preserve arena ownersh
     try testing.expectFiresTyped(check, R, unsafe_source);
 }
 
-test "struct-literal-multiple-try: intrinsic ownership excludes callbacks and memory growth" {
-    for ([_][]const u8{ "@atomicLoad", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong", "@memcpy", "@memset", "@memmove", "@field", "@intFromPtr" }) |name| {
-        try std.testing.expect(builtinDoesNotAllocate(name));
-    }
-    for ([_][]const u8{ "@call", "@extern", "@wasmMemoryGrow", "@frame", "@Frame", "@unknownIntrinsic" }) |name| {
-        try std.testing.expect(!builtinDoesNotAllocate(name));
-    }
+
+test "struct-literal-multiple-try: zero-length SDK allocations own no field storage" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\pub fn duplicate(gpa: std.mem.Allocator) !Pair {
+        \\    return .{ .a = try gpa.alloc(u8, 0), .b = try gpa.alloc(u8, 16) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: zero-length SDK second field cannot propagate error" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\pub fn duplicate(gpa: std.mem.Allocator) !Pair {
+        \\    return .{ .a = try gpa.alloc(u8, 16), .b = try gpa.alloc(u8, 0) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: zero-length intervening field retains later error leak" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Triple = struct { a: []u8, b: []u8, c: []u8 };
+        \\pub fn duplicate(gpa: std.mem.Allocator) !Triple {
+        \\    return .{ .a = try gpa.alloc(u8, 16), .b = try gpa.alloc(u8, 0), .c = try gpa.alloc(u8, 16) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: nested fallible operand defeats zero-length error proof" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn memory(gpa: std.mem.Allocator, fail: bool) !std.mem.Allocator {
+        \\    if (fail) return error.Bad;
+        \\    return gpa;
+        \\}
+        \\pub fn duplicate(gpa: std.mem.Allocator, fail: bool) !Pair {
+        \\    return .{ .a = try gpa.alloc(u8, 16), .b = try (try memory(gpa, fail)).alloc(u8, 0) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: project zero-count allocator can fail" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Memory = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    fn alloc(self: *Memory, comptime T: type, n: usize) ![]T {
+        \\        if (n == 0) return error.Bad;
+        \\        return self.gpa.alloc(T, n);
+        \\    }
+        \\};
+        \\pub fn duplicate(memory: *Memory) !Pair {
+        \\    return .{ .a = try memory.alloc(u8, 16), .b = try memory.alloc(u8, 0) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: fixed-buffer allocator retains partial initializer storage" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\pub fn duplicate(storage: *std.heap.FixedBufferAllocator) !Pair {
+        \\    const memory = storage.allocator();
+        \\    return .{ .a = try memory.dupe(u8, "one"), .b = try memory.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: helper binds its arena allocator operand" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn cloneBytes(memory: std.mem.Allocator) ![]u8 {
+        \\    return memory.dupe(u8, "value");
+        \\}
+        \\pub fn duplicate(storage: *std.heap.ArenaAllocator) !Pair {
+        \\    return .{ .a = try cloneBytes(storage.allocator()), .b = try cloneBytes(storage.allocator()) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: helper binds the owning allocator not alternate arena" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn cloneBytes(memory: std.mem.Allocator, alternate: std.mem.Allocator) ![]u8 {
+        \\    _ = alternate;
+        \\    return memory.dupe(u8, "value");
+        \\}
+        \\pub fn duplicate(gpa: std.mem.Allocator, storage: *std.heap.ArenaAllocator) !Pair {
+        \\    return .{ .a = try cloneBytes(gpa, storage.allocator()), .b = try cloneBytes(gpa, storage.allocator()) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: escaped allocator helper remains caller-dependent" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn clonePair(memory: std.mem.Allocator) !Pair {
+        \\    return .{ .a = try memory.dupe(u8, "one"), .b = try memory.dupe(u8, "two") };
+        \\}
+        \\pub const callback = clonePair;
+        \\pub fn duplicate(storage: *std.heap.ArenaAllocator) !Pair {
+        \\    return clonePair(storage.allocator());
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: fallible zero-storage helper has no first field to leak" {
+    try expectImportedRuleCount(
+        \\const std = @import("std");
+        \\pub const Memory = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    cancelled: bool,
+        \\    pub fn alloc(self: *Memory, comptime T: type, count: usize) ![]T {
+        \\        if (self.cancelled) return error.Cancelled;
+        \\        const items = self.allocator.alloc(T, count) catch return error.OutOfMemory;
+        \\        return items;
+        \\    }
+        \\};
+    ,
+        \\const std = @import("std");
+        \\const Memory = @import("ranges.zig").Memory;
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\pub fn duplicate(memory: *Memory) !Pair {
+        \\    return .{ .a = try memory.alloc(u8, 0), .b = try memory.alloc(u8, 16) };
+        \\}
+    , 0);
+
+    // Seven nested bodies grow the binding map while the outer scanner is
+    // suspended. Its later assignment must still read the original bindings.
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn zero6(memory: std.mem.Allocator) ![]u8 { return memory.alloc(u8, 0); }
+        \\fn zero5(memory: std.mem.Allocator) ![]u8 { return zero6(memory); }
+        \\fn zero4(memory: std.mem.Allocator) ![]u8 { return zero5(memory); }
+        \\fn zero3(memory: std.mem.Allocator) ![]u8 { return zero4(memory); }
+        \\fn zero2(memory: std.mem.Allocator) ![]u8 { return zero3(memory); }
+        \\fn zero1(memory: std.mem.Allocator) ![]u8 { return zero2(memory); }
+        \\fn zero0(memory: std.mem.Allocator, choose: bool) ![]u8 {
+        \\    if (choose) return zero1(memory);
+        \\    var scratch: usize = 0;
+        \\    scratch = 1;
+        \\    _ = scratch;
+        \\    return memory.alloc(u8, 0);
+        \\}
+        \\pub fn duplicate(memory: std.mem.Allocator, choose: bool) !Pair {
+        \\    return .{ .a = try zero0(memory, choose), .b = try memory.alloc(u8, 16) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: nonzero helper result still owns storage" {
+    try expectImportedRuleCount(
+        \\const std = @import("std");
+        \\pub const Memory = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    cancelled: bool,
+        \\    pub fn alloc(self: *Memory, comptime T: type, count: usize) ![]T {
+        \\        if (self.cancelled) return error.Cancelled;
+        \\        const items = self.allocator.alloc(T, count) catch return error.OutOfMemory;
+        \\        return items;
+        \\    }
+        \\};
+    ,
+        \\const std = @import("std");
+        \\const Memory = @import("ranges.zig").Memory;
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\pub fn duplicate(memory: *Memory) !Pair {
+        \\    return .{ .a = try memory.alloc(u8, 16), .b = try memory.alloc(u8, 0) };
+        \\}
+    , 1);
+}
+
+test "struct-literal-multiple-try: zero-count helper with owning alternate return still fires" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn alloc(memory: std.mem.Allocator, count: usize, alternate: bool) ![]u8 {
+        \\    if (alternate) return memory.alloc(u8, 16);
+        \\    return memory.alloc(u8, count);
+        \\}
+        \\pub fn duplicate(memory: std.mem.Allocator, alternate: bool) !Pair {
+        \\    return .{ .a = try alloc(memory, 0, alternate), .b = try alloc(memory, 16, alternate) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: zero-count catch fallback can return owned storage" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn alloc(memory: std.mem.Allocator, count: usize) ![]u8 {
+        \\    return memory.alloc(u8, count) catch memory.alloc(u8, 16);
+        \\}
+        \\pub fn duplicate(memory: std.mem.Allocator) !Pair {
+        \\    return .{ .a = try alloc(memory, 0), .b = try alloc(memory, 16) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: unescaped local allocator field retains fixed-buffer identity" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate() !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: overwritten local allocator field still fires" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate(gpa: std.mem.Allocator) !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    engine.allocator = gpa;
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: escaped local allocator field remains caller-dependent" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate(change: *const fn (*Engine) void) !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    change(&engine);
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: loop-carried allocator field replacement still fires" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate(gpa: std.mem.Allocator, out: []Pair) !void {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    for (out) |*pair| {
+        \\        pair.* = .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\        engine.allocator = gpa;
+        \\    }
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: local allocator provider header must remain live" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate() !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    pool = undefined;
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: escaped local provider cannot lend an old header proof" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate(change: *const fn (*std.heap.FixedBufferAllocator) void) !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    change(&pool);
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: branch-conditional local field replacement still fires" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate(gpa: std.mem.Allocator, replace: bool) !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    if (replace) engine.allocator = gpa;
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: escaped zero result header can become owning" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\fn alloc(memory: std.mem.Allocator, count: usize, change: *const fn (*[]u8) void) ![]u8 {
+        \\    const items = try memory.alloc(u8, count);
+        \\    change(@constCast(&items));
+        \\    return items;
+        \\}
+        \\pub fn duplicate(memory: std.mem.Allocator, change: *const fn (*[]u8) void) !Pair {
+        \\    return .{ .a = try alloc(memory, 0, change), .b = try alloc(memory, 16, change) };
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: local fixed-buffer header stays valid through an initializer loop" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\fn tick(index: usize) !void {
+        \\    if (index == std.math.maxInt(usize)) return error.Bad;
+        \\}
+        \\pub fn duplicate(storage: []u8, out: []Pair) !void {
+        \\    var pool = std.heap.FixedBufferAllocator.init(storage);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    for (out, 0..) |*pair, index| {
+        \\        try tick(index);
+        \\        pair.* = .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\    }
+        \\}
+    );
+}
+
+test "struct-literal-multiple-try: copied allocator header can expose its mutable provider" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Pair = struct { a: []u8, b: []u8 };
+        \\const Engine = struct { allocator: std.mem.Allocator };
+        \\pub fn duplicate(change: *const fn (std.mem.Allocator) void) !Pair {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var pool = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine: Engine = .{ .allocator = pool.allocator() };
+        \\    const leaked = engine.allocator;
+        \\    change(leaked);
+        \\    return .{ .a = try engine.allocator.dupe(u8, "one"), .b = try engine.allocator.dupe(u8, "two") };
+        \\}
+    );
 }

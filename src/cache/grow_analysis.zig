@@ -1053,10 +1053,7 @@ pub fn sourceDocument(
     document.cache = FileCache.init(cache.gpa, &resolver.handle.document.tree);
     // Wired after the document is in its final place: the cache
     // borrows the resolver, and neither is ever moved.
-    document.cache.zls = resolver;
-    // A document is opened in the module that declared it, and that
-    // module — not the reader's — is what its own names mean.
-    document.cache.module_id = resolver.handle.module;
+    document.cache.setZls(resolver);
     document.cache.grow_state = state;
     document.cache.grow_on_demand = true;
     try state.documents.put(cache.gpa, key, document);

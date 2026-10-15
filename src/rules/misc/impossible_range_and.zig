@@ -13,12 +13,10 @@
 //!     retry   < 0   and retry   > 255
 //!   All silently never threw the intended RangeError.
 //!
-//! Detection (Tier 1, token walk):
-//!   Anchor on `identifier(X) angle_bracket_left` (t, t+1).
-//!   Scan forward up to 20 tokens for `keyword_and`.
-//!   After `keyword_and`, check `identifier(X) angle_bracket_right` appears
-//!   at positions +1 and +2 relative to `keyword_and`.
-//!   Fire at the `identifier(X)` anchor token.
+//! Detection (Tier 1, AST structure):
+//!   Match ordered comparisons of the same identifier within one conjunction.
+//!   Parentheses are transparent. Disjunctions, branches, calls, and statements
+//!   separate conjunctions. Inspect only the two parsed bound expressions.
 //!
 //!   Suppression:
 //!   - The reversed form `x > A and x < B` (valid in-range check) is NOT flagged.
@@ -34,6 +32,7 @@ const Ast = std.zig.Ast;
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
+const tokens = @import("../../ast/tokens.zig");
 
 const testing = @import("../../testing.zig");
 
@@ -51,81 +50,125 @@ pub fn check(
     if (!config_mod.isEnabled(config, .impossible_range_and)) return;
     _ = cache;
 
-    const tags = tree.tokens.items(.tag);
-    const last_tok = tree.lastToken(.root);
+    // Only conjunctions and parentheses have transparent parent links.
+    // An OR or any other expression therefore ends the upward walk.
+    var has_conjunction = false;
+    var has_lower = false;
+    for (tree.nodes.items(.tag)) |tag| {
+        has_conjunction = has_conjunction or tag == .bool_and;
+        has_lower = has_lower or tag == .less_than;
+    }
+    if (!has_conjunction or !has_lower) return;
+    const parents = try gpa.alloc(Ast.Node.Index, tree.nodes.len);
+    defer gpa.free(parents);
+    @memset(parents, .root);
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        switch (tag) {
+            .bool_and => {
+                const pair = tree.nodeData(node).node_and_node;
+                parents[@intFromEnum(pair[0])] = node;
+                parents[@intFromEnum(pair[1])] = node;
+            },
+            .grouped_expression => parents[@intFromEnum(tree.nodeData(node).node_and_token[0])] = node,
+            else => {},
+        }
+    }
 
-    var t: Ast.TokenIndex = 0;
-    while (t + 3 <= last_tok) : (t += 1) {
-        // Anchor: identifier(X) < ...
-        if (tags[t] != .identifier) continue;
-        if (tags[t + 1] != .angle_bracket_left) continue;
-
-        const x_name = tree.tokenSlice(t);
-
-        // Scan forward (capped) for `and`.
-        const scan_end = @min(last_tok, t + 20);
-        var u: Ast.TokenIndex = t + 2;
-        while (u + 2 <= scan_end) : (u += 1) {
-            if (tags[u] != .keyword_and) continue;
-            // After `and`: identifier(X) > ...
-            if (tags[u + 1] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(u + 1), x_name)) continue;
-            if (tags[u + 2] != .angle_bracket_right) continue;
-
-            // Suppress valid ranges.
-            // 1. `x < N and x > 0` — right bound is 0, a common in-range guard.
-            // 2. Both bounds are integer literals: fire only when left ≤ right
-            //    (impossible range).  When left > right the range is valid.
-            if (u + 3 <= last_tok and tags[u + 3] == .number_literal) {
-                const right_str = tree.tokenSlice(u + 3);
-                if (std.mem.eql(u8, right_str, "0")) break; // valid: x < N and x > 0
-                if (tags[t + 2] == .number_literal) {
-                    const left_str = tree.tokenSlice(t + 2);
-                    const lv = std.fmt.parseUnsigned(u64, left_str, 0) catch null;
-                    const rv = std.fmt.parseUnsigned(u64, right_str, 0) catch null;
-                    if (lv != null and rv != null and lv.? > rv.?) break; // valid range
+    var remaining: usize = 50_000;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .less_than) continue;
+        const lower: Ast.Node.Index = @enumFromInt(index);
+        const variable = try ungroup(tree, tree.nodeData(lower).node_and_node[0], &remaining);
+        if (tree.nodeTag(variable) != .identifier) continue;
+        const anchor = tree.nodeMainToken(variable);
+        const name = tree.tokenSlice(anchor);
+        var child = lower;
+        var depth: usize = 0;
+        while (parents[@intFromEnum(child)] != .root) {
+            try charge(&remaining);
+            if (depth == 64) return error.AnalysisBudgetExceeded;
+            depth += 1;
+            const parent = parents[@intFromEnum(child)];
+            if (tree.nodeTag(parent) == .bool_and) {
+                const pair = tree.nodeData(parent).node_and_node;
+                // Preserve the ordered lower-then-upper pattern. The reversed
+                // greater-then-less pattern remains an in-range candidate.
+                if (pair[0] == child and try findUpper(tree, pair[1], lower, name, &remaining, depth)) {
+                    try report(gpa, problems, tree, anchor, name);
+                    break;
                 }
             }
-
-            // 3. Valid in-range shapes where the LEFT operand is the UPPER
-            //    bound and the RIGHT operand is the LOWER bound — i.e.
-            //    `x < UPPER and x > LOWER`.  The impossible-range bug (which
-            //    should have used `or`) always has the MIN on the left, so
-            //    these are safe to suppress without losing the TP class:
-            //      (a) `x < maxInt(..) and x > minInt(..)` — maxInt > minInt
-            //          for every integer type, so this is the full-range
-            //          membership test (always valid).
-            //      (b) `x < something.len and x > LOWER` — a `.len` is the
-            //          natural upper bound of an index/slice range; this is a
-            //          bounded-range check, not an and/or confusion.
-            {
-                const left_has_maxint = rangeHasIdent(tree, tags, t + 2, u, "maxInt");
-                const right_end = @min(u + 12, last_tok + 1);
-                const right_has_minint = rangeHasIdent(tree, tags, u + 3, right_end, "minInt");
-                if (left_has_maxint and right_has_minint) break;
-                if (leftBoundIsDotLen(tags, tree, t + 2, u)) break;
-            }
-
-            try report(gpa, problems, tree, t, x_name);
-            break;
+            child = parent;
         }
     }
 }
 
-/// True iff the token range [start, end) contains an identifier whose slice
-/// equals `name`.
-fn rangeHasIdent(
+fn charge(remaining: *usize) error{AnalysisBudgetExceeded}!void {
+    if (remaining.* == 0) return error.AnalysisBudgetExceeded;
+    remaining.* -= 1;
+}
+
+fn ungroup(
     tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    name: []const u8,
-) bool {
-    var i = start;
-    while (i < end) : (i += 1) {
-        if (tags[i] == .identifier and std.mem.eql(u8, tree.tokenSlice(i), name)) return true;
+    expression: Ast.Node.Index,
+    remaining: *usize,
+) error{AnalysisBudgetExceeded}!Ast.Node.Index {
+    var node = expression;
+    for (0..64) |_| {
+        try charge(remaining);
+        if (tree.nodeTag(node) != .grouped_expression) return node;
+        node = tree.nodeData(node).node_and_token[0];
     }
-    return false;
+    return error.AnalysisBudgetExceeded;
+}
+
+fn findUpper(
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    lower: Ast.Node.Index,
+    name: []const u8,
+    remaining: *usize,
+    depth: usize,
+) error{AnalysisBudgetExceeded}!bool {
+    try charge(remaining);
+    if (depth >= 64) return error.AnalysisBudgetExceeded;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return findUpper(tree, tree.nodeData(node).node_and_token[0], lower, name, remaining, depth + 1),
+        .bool_and => {
+            const pair = tree.nodeData(node).node_and_node;
+            return try findUpper(tree, pair[0], lower, name, remaining, depth + 1) or
+                try findUpper(tree, pair[1], lower, name, remaining, depth + 1);
+        },
+        .greater_than => {
+            const pair = tree.nodeData(node).node_and_node;
+            const variable = try ungroup(tree, pair[0], remaining);
+            if (tree.nodeTag(variable) != .identifier or
+                !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(variable)), name)) return false;
+            const left = try ungroup(tree, tree.nodeData(lower).node_and_node[1], remaining);
+            const right = try ungroup(tree, pair[1], remaining);
+            return !validRange(tree, left, right);
+        },
+        // In particular, do not extract comparisons from boolean alternatives.
+        else => return false,
+    }
+}
+
+fn validRange(tree: *const Ast, left: Ast.Node.Index, right: Ast.Node.Index) bool {
+    if (tree.nodeTag(right) == .number_literal) {
+        const right_str = tree.tokenSlice(tree.nodeMainToken(right));
+        if (std.mem.eql(u8, right_str, "0")) return true;
+        if (tree.nodeTag(left) == .number_literal) {
+            const lv = std.fmt.parseUnsigned(u64, tree.tokenSlice(tree.nodeMainToken(left)), 0) catch null;
+            const rv = std.fmt.parseUnsigned(u64, right_str, 0) catch null;
+            if (lv != null and rv != null and lv.? > rv.?) return true;
+        }
+    }
+    const first = tree.firstToken(left);
+    const last = tree.lastToken(left);
+    if (tokens.hasIdentInRange(tree, first, last, "maxInt") and
+        tokens.hasIdentInRange(tree, tree.firstToken(right), tree.lastToken(right), "minInt")) return true;
+    return leftBoundIsDotLen(tree.tokens.items(.tag), tree, first, last + 1);
 }
 
 /// True iff the left-bound token range [start, end) contains a `. len` field
@@ -256,5 +299,106 @@ test "impossible-range-and: literal-left + named-max still fires" {
         \\    return id < 0 and id > MAX_STREAM_ID;
         \\}
         \\
+    );
+}
+
+test "impossible-range-and: optional maximum alternatives stay separate" {
+    try testing.expectNoFire(check,
+        \\fn validate(next_ordinal: u64, stream: anytype, source_contract: anytype) bool {
+        \\    return next_ordinal < stream.min_count or
+        \\        (stream.max_count != 0 and next_ordinal > stream.max_count) or
+        \\        next_ordinal < source_contract.min_count or
+        \\        (source_contract.max_count != 0 and next_ordinal > source_contract.max_count);
+        \\}
+    );
+}
+
+test "impossible-range-and: kind specific alternatives stay separate" {
+    try testing.expectNoFire(check,
+        \\fn validate(point_count: u32, needed: u32, kind: anytype) bool {
+        \\    return point_count < needed or (kind == .box and point_count > 5) or
+        \\        (kind != .box and kind != .polygon and kind != .wire and point_count > needed);
+        \\}
+    );
+}
+
+test "impossible-range-and: grouped OR inside conjunction does not fire" {
+    try testing.expectNoFire(check,
+        \\fn validate(x: i64, ready: bool) bool {
+        \\    return (x < 0 or ready) and x > 255;
+        \\}
+    );
+}
+
+test "impossible-range-and: ungrouped OR precedence does not fire" {
+    try testing.expectNoFire(check,
+        \\fn validate(x: i64, ready: bool) bool {
+        \\    return x < 0 or ready and x > 255;
+        \\}
+    );
+}
+
+test "impossible-range-and: comparisons in separate statements do not fire" {
+    try testing.expectNoFire(check,
+        \\fn validate(x: i64, ready: bool) bool {
+        \\    const below = x < 0;
+        \\    const above = ready and x > 255;
+        \\    return below or above;
+        \\}
+    );
+}
+
+test "impossible-range-and: comparisons in separate functions do not fire" {
+    try testing.expectNoFire(check,
+        \\fn below(x: i64) bool { return x < 0; }
+        \\fn above(x: i64, ready: bool) bool { return ready and x > 255; }
+    );
+}
+
+test "impossible-range-and: comparisons in separate conditional branches do not fire" {
+    try testing.expectNoFire(check,
+        \\fn validate(x: i64, ready: bool) bool {
+        \\    return if (ready) x < 0 else ready and x > 255;
+        \\}
+    );
+}
+
+test "impossible-range-and: grouped contradictory comparisons fire" {
+    try testing.expectFires(check, R,
+        \\fn validate(x: i64) bool {
+        \\    return ((x < (0))) and ((x > (255)));
+        \\}
+    );
+}
+
+test "impossible-range-and: contradictory comparisons across conjuncts fire" {
+    try testing.expectFires(check, R,
+        \\fn validate(x: i64, ready: bool, active: bool) bool {
+        \\    return (x < 0 and ready) and (active and x > 255);
+        \\}
+    );
+}
+
+test "impossible-range-and: contradictory alternative still fires" {
+    try testing.expectFires(check, R,
+        \\fn validate(x: i64, ready: bool) bool {
+        \\    return ready or ((x < 0) and (x > 255));
+        \\}
+    );
+}
+
+test "impossible-range-and: grouped valid literal range does not fire" {
+    try testing.expectNoFire(check,
+        \\fn validate(x: i64, ready: bool) bool {
+        \\    return (x < (76) and ready) and (x > (65));
+        \\}
+    );
+}
+
+test "impossible-range-and: unrelated bound names cannot exclude contradiction" {
+    try testing.expectFires(check, R,
+        \\fn validate(x: i64, minInt: bool) bool {
+        \\    return x < std.math.maxInt(i32) and x > UPPER and minInt;
+        \\}
     );
 }

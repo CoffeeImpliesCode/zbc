@@ -1,12 +1,26 @@
 # else-literal-absorbs-addend
 
-`if (COND) EXPR else 0 + ADDEND` — Zig's `if` expression has lower precedence than `+`, so this parses as `else (0 + ADDEND)`, silently dropping `ADDEND` from the result when `COND` is true.
+`base + if (COND) EXPR else 0 + ADDEND` can omit `ADDEND` when `COND` is true.
+Zig parses the last addition inside the else branch, not after the conditional.
 
 ## What the rule checks
 
-The rule fires on the 3-token sequence `else <0-or-1> +` at the top level of a token walk. This pattern is the exact shape of the operator-precedence trap: the addend after `else 0` or `else 1` is absorbed into the else-branch instead of being added unconditionally.
+The rule uses parsed parent and branch ownership.
+An addition must directly own an unparenthesized `if` expression as its right operand.
+That conditional's else branch must start with `0 +` or `1 +`.
 
-The naturally-correct form `(if (cond) x else 0) + n` has `)` at the third position rather than `+`, so it does not trigger the rule.
+Explicit parentheses around the conditional or its else-branch sum make the grouping clear.
+Standalone conditional branch arithmetic is not a candidate.
+These intentional forms do not trigger:
+
+```zig
+root.len + (if (suffix.len == 0) 0 else 1 + suffix.len)
+if (nullable) 0 else 1 + field_value
+base + if (cond) 1 else (0 + extra)
+```
+
+Parentheses around the complete outer sum do not change the conditional's ownership.
+Thus `(base + if (cond) 1 else 0 + extra)` still triggers.
 
 ## Why it matters
 

@@ -48,6 +48,7 @@ pub const Config = config_mod.Config;
 
 pub const BlockId = abstract_state.BlockId;
 pub const LocalId = abstract_state.LocalId;
+pub const OutputChannel = abstract_state.OutputChannel;
 /// Reserved diagnostic path: an optional has no source-level fields.
 pub const diagnostic_optional_tag = "$optional-tag";
 
@@ -91,6 +92,27 @@ pub const ValueInput = union(enum) {
     },
 };
 
+/// Exact physical value storage, independent of resource/lifetime provenance.
+/// Selected header paths borrow the CFG's canonical place identities.
+pub const StoredValuePlace = union(enum) {
+    local: LocalId,
+    field: struct { parent: LocalId, name: []const u8 },
+};
+
+/// Actual runtime value evidence. ExprKind is deliberately not a producer:
+/// lifetime summaries and allocation-shaped fallbacks may still return null.
+/// Nonnull requires an actual typed nonoptional pointer/address value on ALL
+/// returning alternatives. Empty-slice evidence grants no pointer safety.
+/// Copy names exact syntax-selected whole-value storage only.
+pub const StoredValueProof = union(enum) {
+    unknown,
+    nonnull_pointer,
+    /// Exact canonical empty slice literal/value, not a length heuristic.
+    /// This supplies no pointer-presence or lifetime certificate.
+    empty_slice,
+    copy: StoredValuePlace,
+};
+
 /// Canonical physical frame-cell loans, independent of those cells' values.
 /// `locals` always report, including integers that encode frame addresses.
 /// A complete proof is the whole stack decision. An incomplete proof permits
@@ -109,6 +131,7 @@ pub const StmtKind = union(enum) {
     decl: struct {
         local: LocalId,
         init_kind: ExprKind,
+        value_proof: StoredValueProof = .unknown,
         integer_value: ?u64 = null,
         value_defined: bool = false,
         value_inputs: [8]?ValueInput = .{null} ** 8,
@@ -124,6 +147,7 @@ pub const StmtKind = union(enum) {
     assign: struct {
         target: LocalId,
         rhs_kind: ExprKind,
+        value_proof: StoredValueProof = .unknown,
         integer_value: ?u64 = null,
         value_defined: bool = false,
         value_inputs: [8]?ValueInput = .{null} ** 8,
@@ -143,6 +167,9 @@ pub const StmtKind = union(enum) {
         index: IndexTerm,
         modulo: ?ModuloIndex = null,
         name: ?[]const u8 = null,
+        /// Physical child selected after the element, even for a dynamic index.
+        /// This is byte-read metadata, never a dynamic resource/lifetime key.
+        selected_member: ?[]const u8 = null,
         /// Stable fixed-array field identity; dynamic indices are not keys.
         field_array: ?[]const u8 = null,
         scaled: ?abstract_state.ScaledElement = null,
@@ -176,7 +203,13 @@ pub const StmtKind = union(enum) {
         result_is_computation: bool = false,
     },
     counter_step: struct { local: LocalId, step: i8 },
-    field_counter_step: struct { parent: LocalId, name: []const u8, step: i8 },
+    field_counter_step: struct {
+        parent: LocalId,
+        name: []const u8,
+        step: i8,
+        /// Actual component mutation of this selected slice header.
+        slice_header_owner: ?StoredValuePlace = null,
+    },
     compare_assume: Comparison,
     scaled_index: @import("bounded_prefix.zig").ScaledIndex,
     /// Existing exhaustive-fill proofs commit coverage explicitly.
@@ -277,6 +310,9 @@ pub const StmtKind = union(enum) {
         /// Null when the free's receiver isn't a known local
         /// (dotted chain, stdlib reference, etc.).
         allocator_local: ?LocalId = null,
+        /// Exact canonical SDK free semantics: zero-length slices are a no-op.
+        /// No project deallocator or destroy call receives this authority.
+        sdk_empty_slice_noop: bool = false,
     },
 
     /// `obj.field = RHS;` — write to a struct field.  We track field
@@ -286,6 +322,15 @@ pub const StmtKind = union(enum) {
         parent: LocalId,
         name: []const u8,
         rhs_kind: ExprKind,
+        value_proof: StoredValueProof = .unknown,
+        /// Actual ptr/len component mutation, not whole-value extraction.
+        slice_header_owner: ?StoredValuePlace = null,
+        /// Exact source-proved same-root inline paths disjoint from this write.
+        /// Borrowed immutable CFG/cache-owned certificate; no prefix inference.
+        disjoint_fields: []const []const u8 = &.{},
+        /// Component projection of ONE already stored whole value. It performs
+        /// no second physical mutation; unrelated synthetic stores leave null.
+        whole_value_companion: ?StoredValuePlace = null,
         /// Value-definedness is independent of pointer/resource lifetime.
         defined: bool = false,
         inputs: [8]?LocalId = .{null} ** 8,
@@ -300,6 +345,9 @@ pub const StmtKind = union(enum) {
         /// Replayed byte facts must not replace a resource/lifetime origin.
         /// An empty path denotes the whole value, or a pointer's pointee.
         diagnostic_only: bool = false,
+        /// Negative-only replay requires an exact settled field-copy source.
+        /// A repaired or unknown source contributes no diagnostic byte fact.
+        requires_entire_negative_source: bool = false,
         /// A source-proved append preserves old byte masks only when its
         /// saved entry count already describes initialized storage.
         prefix_entry: ?struct { array: LocalId, count: LocalId, path: []const u8 = "" } = null,
@@ -332,6 +380,7 @@ pub const StmtKind = union(enum) {
         /// state and fire UAF.  Without this, only fields with an
         /// in-function alloc + free pair were trackable.
         fallback_hid: abstract_state.HeapId,
+        sdk_empty_slice_noop: bool = false,
     },
 
     /// Read of `obj.field` — fires UAF / use-of-undef checks against
@@ -343,6 +392,9 @@ pub const StmtKind = union(enum) {
         counted_array: ?struct { array_path: []const u8, counter_path: []const u8 } = null,
         /// An inline aggregate prefix checks lifetime, not sibling payload.
         lifetime_only: bool = false,
+        /// Read only the selected pointer/slice descriptor, not its backing.
+        /// The containing object's lifetime and undefined bytes still apply.
+        descriptor_only: bool = false,
         /// Whole aggregate transport reads no selected member. It still
         /// rejects an entirely undefined value and retains all byte holes.
         aggregate_transport: bool = false,
@@ -405,6 +457,14 @@ pub const StmtKind = union(enum) {
     pointer_write: struct {
         target: LocalId,
         initializes: bool = true,
+        /// Authenticated current-call footprint cannot reach certified private
+        /// inline frame headers. Unknown/project effects retain false.
+        preserves_private_inline_fields: bool = false,
+        /// Callback byte/alias effects of an authenticated direct SDK release.
+        /// A MUST-empty selected input suppresses this mutation only. Operand
+        /// descriptor/owner reads remain independent, unconditional statements.
+        /// Never attach this guard to project-wrapper/global tail effects.
+        sdk_empty_noop_release: ?StoredValuePlace = null,
         /// The write goes through an element of the slice `target`, so its
         /// ptr/len words are unchanged. Element coverage is still revoked.
         payload_only: bool = false,
@@ -431,7 +491,24 @@ pub const StmtKind = union(enum) {
     /// reachable from caller-owned storage is an escape.  `out`
     /// is the pointer-typed local; `value_kind` is the RHS
     /// classification used to derive the written value's origin.
-    out_param_write: struct { out: LocalId, value_kind: ExprKind },
+    out_param_write: struct {
+        out: LocalId,
+        value_kind: ExprKind,
+        value_proof: StoredValueProof = .unknown,
+        /// Exact canonical selected place; empty selects the dereferenced pointee.
+        /// Null retains legacy unselected semantics and establishes no MUST fact.
+        name: ?[]const u8 = null,
+        /// A custody-only companion to an already evaluated physical store.
+        /// Read this destination's stored value; never evaluate the RHS again
+        /// or perform a second alias invalidation for the same source store.
+        written_value: ?StoredValuePlace = null,
+        /// Canonical CURRENT physical output selection with independently stable
+        /// root identity and no pointer/union/cast ancestor. Null is uncertified.
+        physical_selection: ?OutputChannel = null,
+        /// Preserve an existing scope-bounded stack-install exemption while
+        /// still recording every MAY heap output channel. No value proof.
+        heap_custody_only: bool = false,
+    },
     /// Calling a destructor on an interior pointer — UB under
     /// typical allocators since the pointer wasn't returned by
     /// `allocator.create()`.  The canonical oven-sh/bun#30166 pattern:
@@ -480,6 +557,9 @@ pub const StmtKind = union(enum) {
         /// Select a proved optional tag origin without changing lifetime checks.
         tag_only: bool = false,
         optional_payload: bool = false,
+        /// Read a proved pointer/slice descriptor without reading its backing.
+        /// This does not change byte facts or return/outparameter escape checks.
+        descriptor_only: bool = false,
     },
     /// A bare `if (COND)` whose condition carries a [GuardId].  The
     /// arm that COND holds records that fact; the arm it does not
@@ -573,12 +653,27 @@ pub const BooleanValue = union(enum) {
     constant: bool,
     local: LocalId,
     not_local: LocalId,
+    /// A selected optional pointer's stored value, not its pointee lifetime.
+    /// The builder supplies the exact typed place. Unknown presence never
+    /// constrains either arm; expected encodes comparison/negation polarity.
+    optional_present: struct {
+        parent: LocalId,
+        name: []const u8,
+        expected: bool = true,
+        physical_selection: ?OutputChannel = null,
+    },
 
     pub fn negate(value: BooleanValue) BooleanValue {
         return switch (value) {
             .constant => |v| .{ .constant = !v },
             .local => |v| .{ .not_local = v },
             .not_local => |v| .{ .local = v },
+            .optional_present => |place| .{ .optional_present = .{
+                .parent = place.parent,
+                .name = place.name,
+                .expected = !place.expected,
+                .physical_selection = place.physical_selection,
+            } },
         };
     }
 };
@@ -615,8 +710,9 @@ pub const Cfg = struct {
     /// Return and composite statements borrow these arrays. Each array is
     /// registered once, even when several statements share its proof.
     owned_stack_loans: [][]LocalId = &.{},
-    /// Runtime member names for diagnostic byte completeness. Locals borrow
-    /// these arrays; field-name bytes borrow source or owned_paths.
+    /// Diagnostic field layouts and immutable field-disjointness certificates.
+    /// Arrays are registered once; names borrow source or owned_paths. Locals
+    /// and statement certificates may share borrowed views of these arrays.
     owned_field_layouts: [][]const []const u8 = &.{},
     owned_index_domains: [][]u64 = &.{},
 
@@ -687,6 +783,9 @@ pub const LocalInfo = struct {
     is_slice: bool = false,
     /// Aliases can mutate this local; do not retain boolean path facts.
     address_taken: bool = false,
+    /// Exact inline header paths in independently proved private, unescaped
+    /// by-value frame storage. Pointer parameters/heap roots never qualify.
+    private_inline_fields: []const []const u8 = &.{},
     /// Coarse classification of the init expression — lets the
     /// composite-borrow walker decide at classify time whether a
     /// bare reference to this local in a returned struct should be

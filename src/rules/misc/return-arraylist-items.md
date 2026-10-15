@@ -6,17 +6,18 @@ receive when the caller frees it.
 
 ## What the rule checks
 
-The rule fires on the 5-token pattern `return identifier . items ;`. It suppresses `self` and `this` receivers because those access a struct field, not a local `ArrayList`.
+The rule checks the 5-token pattern `return identifier . items ;`. Receiver names,
+including `self` and `this`, do not establish ownership. A resolved scalar
+`items` field is not an allocation and is excluded.
 
 `return list.toOwnedSlice(gpa)` transfers an allocation sized for the returned slice and does not match this pattern.
 
 ## Suppressions
 
-The rule stays quiet in five cases, and each one has to be proved rather
-than assumed:
+The rule stays quiet only when one of these ownership cases is proved:
 
-1. **`self` / `this` receivers** — those read a struct field, not a local
-   list.
+1. **A resolved scalar field.** A numeric, Boolean, or enum `items` field
+   does not name an ArrayList allocation.
 2. **A full-capacity comparison** — `assert(list.items.len == list.capacity)`
    in the same function can prove that the returned slice covers the whole
    allocation. A mention of `.capacity`, a log statement, or a comparison
@@ -32,8 +33,21 @@ than assumed:
    that such an alias is harmless.
    Growth of another list does not invalidate this proof when no alias
    names the returned list.
-3. **A pointer-typed parameter** — `out: *std.ArrayList(u8)` is the caller's
-   own list; the caller still holds the handle.
+3. **A retained caller header.** A pointer parameter retains the original
+   handle. A local value copied directly from that parameter's dereferenced
+   header or one of its fields can borrow the same backing storage when the
+   resolved value type is the standard list. The complete initializer path
+   identifies the captured header; copying a pointer value is not this proof.
+   Neither constness nor the copy itself establishes an independent owner.
+   The caller's original header must remain alive and unchanged.
+   Calls need a complete canonical read-only effect across the whole interval
+   from function entry through the return, including calls before the copy.
+   A standard list grown directly through its caller-owned header can keep
+   that handle; growing a copied header cannot. Writes, release, address
+   escape, alias creation, and unclassified builtins refuse the proof on
+   either side of the copy. Another incoming pointer is not assumed disjoint.
+   The scoped binding at each use, not a same-named parameter, identifies
+   the source. A copy of a frame-local header does not retain an owner.
 4. **A header copied out of a memo table** — `if (self.memo.get(key)) |cached|
    return cached.items;` hands back a second name for a header the container
    still owns, so nothing is lost when the copy dies at the `return`.
@@ -68,8 +82,24 @@ than assumed:
    allocator lives in the list header rather than in each growth call.
    A bare allocator receiver is resolved at its use token, through the
    function's lexical local bindings before any file-scope declaration.
-   A local arena does not prove that the returned bytes outlive the call,
-   so that case stays diagnosed.
+   Following an allocator initializer requires an immutable binding. A
+   mutable local or global header is not a certificate for the provider
+   that reaches a later call.
+   A local arena alone does not prove that the returned bytes outlive the
+   call. A closed private helper can use a caller's local arena only when
+   the caller constructs the standard arena with its actual `.init`,
+   every normal return directly transfers that exact header in its result,
+   and no other use resets, releases, rebinds, copies, or exposes it.
+   Error-only `errdefer arena.deinit()` is allowed; a normal `defer` is not.
+   Every caller must satisfy this proof. One retaining caller cannot
+   establish the allocator authority of another caller.
+   The same closed-helper proof can use a standard `FixedBufferAllocator`
+   constructed directly from a named, immutable allocation. The allocation
+   must come from the actual SDK `Allocator.alloc` with a proved external
+   allocator contract. Every normal result must retain that exact backing
+   slice. Stack buffers, replacement buffers, normal frees, reset, rebind,
+   and aliases do not establish this custody. The stack-local fixed-buffer
+   header need not escape with its backing allocation.
    An explicit borrowed `*std.heap.ArenaAllocator` field also identifies
    the caller-owned arena. Query snapshots can use that typed owner without
    copying; resetting or releasing it before return still refuses the borrow.
@@ -116,6 +146,12 @@ canonical effect and storage-alias queries for the whole rule check. Their
 node scans charge work before scope and path filters. A new return site or
 nested query does not reset the allowance. Exhaustion reports the budget
 failure at its work site; it never proves a suppression.
+
+The cache binds its source module when it binds the source resolver. A private
+caller's declaration identity is the source document and its module instance,
+not the file path alone. Build-authenticated sources and synthetic unscoped
+sources use that same binding; a shared physical source in two modules does
+not merge their callers or allocator authority.
 
 ## Why it matters
 

@@ -17,6 +17,20 @@ cleanup methods. It follows `const` type aliases in their declaring scope.
 An alias to a struct with owned pointer or slice fields does not make
 that struct value-only.
 
+Typed checks also recognize the SDK `Allocator.alloc(T, 0)` fast path.
+It returns no owned storage and cannot propagate an allocation error.
+The proof authenticates the SDK declaration and checks the actual count operand.
+It follows immutable count aliases, but not arbitrary arithmetic or project allocator methods.
+A nested `try` operand prevents this proof.
+If an intervening field has this proof, the earlier allocation remains exposed to a later fallible field.
+
+A source helper can return the same zero-storage SDK result.
+The rule checks every return in the actual declaring frame and binds the SDK count to the caller's operand.
+Immutable local headers must remain unchanged. Owning alternate returns, escaped headers, recursive edges, and unknown results do not pass.
+This proves only that the first result has no owned storage.
+The helper can still reject the request before allocation, so a later call to it remains fallible.
+This proof never skips a later field or erases an earlier allocation.
+
 A separate proof covers a private helper whose allocator parameter receives
 storage from a scoped standard-library arena at every recognized call.
 The caller must construct the real `std.heap.ArenaAllocator` and place
@@ -33,6 +47,29 @@ An explicit `*std.heap.ArenaAllocator` field preserves the same declaration
 identity when its allocator is derived at the allocation site. A field typed
 only as `std.mem.Allocator` does not establish this ownership contract.
 
+Typed checks apply the same storage proof to the real SDK `FixedBufferAllocator`.
+Its allocator uses existing backing storage rather than a new independent heap allocation.
+The proof follows explicit typed fields and allocator accessors whose every return has the required declaration identity.
+An allocator field typed only as `std.mem.Allocator` still needs a complete field-state proof.
+Nearby backing storage and a field name do not supply that proof.
+
+A local aggregate literal can also preserve the allocator header stored in one explicit field.
+This local certificate requires a direct SDK `FixedBufferAllocator.allocator()` call.
+The local provider must come from SDK `FixedBufferAllocator.init` and preserve its live backing-storage identity through allocation.
+An escaped or overwritten provider cannot reuse the copied header's earlier identity.
+The field can serve only as an authenticated SDK allocator method receiver.
+Copying it into an alias or passing it to unknown code prevents this local proof.
+The rule uses the existing lexical bindings and complete body scanner.
+The aggregate must remain local and unchanged before the allocation.
+Taking its address, passing it as a value, calling its methods, or replacing a field prevents this proof.
+The scan includes the rest of every enclosing loop, because a later write can precede the next iteration.
+Scans that resolve callees or recurse into helper results retain a shallow,
+read-only view of cached lexical bindings. The cache owns the immutable binding
+items until teardown; growth of its binding map cannot invalidate the scan.
+The view is not rebuilt or deep-copied, and only the cache releases its arena.
+Pointer parameters, constructor results, public allocator parameters, and mutable context fields do not inherit this local certificate.
+One arena-backed caller cannot establish a universal contract for those values.
+
 For typed checks, the rule authenticates standard-library allocation
 declarations and binds result storage to the allocator formal. Unmanaged
 `std.array_hash_map` `clone` and `cloneContext` use the supplied allocator;
@@ -45,9 +82,11 @@ Every call that can acquire a non-value result must use proved arena
 storage or have a body with the same proof. Scalar and void results do not
 prove harmless effects: they can allocate through out-parameters or
 captured storage. Such calls require a complete read-only effect
-certificate or the same body check. Recursive edges retain the complete
-callable identity, including generic bindings; all other edges must still
-pass. Missing bodies and unknown effects remain unproved.
+certificate or the same body check. The body check binds each runtime allocator
+formal to its actual operand in the caller's frame.
+It does not reuse the type of a function as proof of its runtime allocator values.
+Recursive and completed edges require proved operands for every allocator formal.
+All other edges must still pass. Missing bodies and unknown effects remain unproved.
 The check also visits nested operands in the first initializer: an
 arena-allocated outer header cannot cover a payload allocated by a general
 allocator while its arguments are evaluated. Copies of existing headers
@@ -61,9 +100,10 @@ call must still resolve and pass the same proof. `@call`, `@extern`,
 `@wasmMemoryGrow`, frame intrinsics, and unknown builtins remain unproved.
 
 Each first-initializer query owns its effect memo and one existing 50,000-step
-allowance. Recursive helper depth remains bounded at 16. Completed helper
-proofs retain the actual callable identity and are reused only within this
-query. Declaration identity does not request a normal-cleanup summary; an
+allowance shared by the zero-result and arena proofs.
+Recursive helper depth remains bounded at 16.
+Completed helper proofs retain the actual callable identity and remain local to this query.
+Declaration identity does not request a normal-cleanup summary. An
 unrelated consumer's failed summary must not change allocation provenance.
 Budget exhaustion propagates as incomplete rule analysis, not a leak finding.
 

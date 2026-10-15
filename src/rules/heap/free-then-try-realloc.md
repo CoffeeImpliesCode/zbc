@@ -30,6 +30,35 @@ Fix:
         ColumnDefinition41, header.field_count,
     );
 
+## Cleanup domains
+
+`defer` and `errdefer` register actions; they do not free the value inline.
+A single registration before a fallible reassignment is valid when its
+initial owner is defined: failure leaves the old allocation available to
+cleanup. The rule does not suppress invalid registrations:
+
+- An undefined field registered before its first allocation remains invalid
+  if that allocation fails.
+- Two active registrations for the same rebound slot can release the new
+  allocation twice. Both actions read the slot's current value at exit,
+  including an error returned after the second registration; neither action
+  captures the old allocation at registration. Nested lexical cleanup
+  scopes are distinct domains.
+- A real inline release before `try` remains invalid if registered cleanup
+  can release the dangling old value on failure.
+
+An error-only reset can protect an inline release when it applies to the
+same slot and runs before any cleanup that reads that slot. Reverse
+registration order matters. An unrelated or later-running reset does not
+provide that guarantee.
+
+Standard allocator operations use authenticated SDK declarations. Member
+calls are looked up by the AST field-access token (`.`), not their method
+name. A project method named `free` is harmless only when its complete source
+summary proves the whole call read-only. Unresolved types or effects do not
+count as safe or suppress the existing syntactic release check. Source,
+allocation and analysis-budget errors propagate.
+
 ## When this might be a false positive
 
 - The enclosing function's caller guarantees `deinit` won't be

@@ -1,9 +1,9 @@
 # free-without-null-then-check
 
 A `<allocator>.destroy(<recv>.<field>);` or `.free(<recv>.<field>);`
-in a NON-destructor fn, without a subsequent `<recv>.<field> = null;`
-(or `= &.{}`, `= .empty`, or a fresh value).  The freed slot now
-holds a dangling pointer.
+leaves a persistent owner slot dangling unless every reachable exit resets
+the slot, retires its ownership, or consumes the owner. The rule also checks
+backing access and repeated release inside cleanup functions.
 
 The bug surfaces in two ways:
 
@@ -71,17 +71,42 @@ self.specifier = &.{};       // empty slice — checks like `.len == 0`
 
 ## Why the detector is precise
 
-- Skips destructor-named fns (`deinit`, `destroy`, `finalize`,
-  `dispose`, `free`, `close`) — leaving stale pointers in a
-  struct that's about to be discarded is fine.
-- Skips comptime type-builder fns.
-- Receiver pattern is narrow: `<recv>.<field>` (single identifier
-  receiver, single identifier field).  Chained receivers
-  (`self.parent.handlers`) are out of scope for the first cut.
-- Reset suppression is broad: ANY assignment `<recv>.<field> = ...`
-  later in the fn body (at any depth) is treated as a valid reset.
-  This matches `= null`, `= &.{}`, `= .empty`, `= undefined`, or
-  even reassignment to a fresh allocation.
+- Keeps the shipped destructor-entry policy: prefixes `deinit`, `destroy`,
+  `finalize`, `dispose`, `take`, `consume`, `into`, `free`; exact `close`;
+  and substrings `Deinit`, `Destroy`, `Cleanup`, `Finalize`, `Dispose`.
+  This policy excludes stale headers at cleanup exit. It does **not**
+  certify safety or hide in-body backing access, repeated release, or a
+  fallible replacement that exits with a dangling owner.
+- Skips comptime type-builder functions and deferred release registrations.
+  Deferred actions execute in their cleanup domain, not at registration.
+- Keeps the narrow `self.field` / `this.field` receiver shape. Authenticated
+  allocator declarations do not depend on the allocator variable's name.
+  Unresolved receivers retain the existing allocator-handle spelling filter;
+  no new names are accepted. A source-resolved project method is harmless
+  only with a complete whole-call read-only proof.
+- Resolves member calls through the AST field-access token (`.`), not the
+  method-name token used for the diagnostic. Missing type information does
+  not turn a syntactic release into a safe no-op.
+- Requires reset on every path, including every switch arm and both results
+  of a conditional or `catch` replacement. A reset only in a catch handler
+  leaves the success path unchanged; a fresh value assigned through `try`
+  does not cover failure. Registered cleanup runs in reverse order on the
+  applicable exits.
+- Distinguishes a copied slice's `.len` metadata from backing access.
+  Resetting the owner header does not repair a slice copied before release.
+  A plain, non-sentinel slice with length zero cannot be released again
+  through that header; reading its stale `.ptr` remains invalid.
+- Credits boolean ownership retirement only when all affected paths retire
+  the owner and the consumers are guarded or consume it. Atomic retirement
+  requires the authenticated standard-library `swap` declaration.
+- Caller consumption requires a closed, declaration-bound caller census.
+  Public one-shot APIs do not gain a closed-world certificate merely from
+  their current local callers. A local copied header, an enclosing owner
+  release, or canonical list-backing cleanup must consume the actual owner,
+  without an intervening backing use or a retained copy.
+
+These proofs are conservative. Unknown call effects or escaping owners do
+not count as safe. Source, allocation and analysis-budget errors propagate.
 
 ## Related rules
 

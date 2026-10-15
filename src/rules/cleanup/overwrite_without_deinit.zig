@@ -64,13 +64,14 @@ pub fn check(
         const ct_ti = model.containingTypeOf(node) orelse continue;
         const this_name = tokens.firstParamName(tree, fp) orelse continue;
         const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, model, ct_ti, this_name, body, problems);
+        try checkBody(gpa, tree, cache, model, ct_ti, this_name, body, problems);
     }
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     model: *const file_model.FileModel,
     ct_ti: *const file_model.TypeInfo,
     this_name: []const u8,
@@ -100,6 +101,11 @@ fn checkBody(
         // forward to the semicolon.
         const sc = findStmtSemicolon(tags, t + 4, last) orelse continue;
         const field_name = tree.tokenSlice(t + 2);
+        if (fieldOnlyReceivesBorrowedPointers(tree, ct_ti, field_name) and
+            try pointerFieldWritesAreLocal(cache, tree, ct_ti, field_name)) {
+            t = sc;
+            continue;
+        }
         // Field-type lookup: must have a known type whose `deinit` is
         // declared in this file AND non-trivial.  Trivial deinit
         // bodies (`{}` or `{ _ = self; }`) are common for trait
@@ -331,6 +337,115 @@ fn checkBody(
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// A pointer does not inherit the pointee's destructor. Require every
+/// receiver-field store to be a pointer parameter of the declared field type;
+/// allocation, call results, casts, and unknown writes retain the diagnostic.
+fn fieldOnlyReceivesBorrowedPointers(
+    tree: *const Ast,
+    owner: *const file_model.TypeInfo,
+    field_name: []const u8,
+) bool {
+    const field = owner.findField(field_name) orelse return false;
+    const tags = tree.tokens.items(.tag);
+    var type_start = field.type_first;
+    if (tags[type_start] == .question_mark) type_start += 1;
+    if (tags[type_start] != .asterisk) return false;
+    if (field.has_default) return false;
+    var saw_write = false;
+    for (owner.methods) |method| {
+        const receiver = method.receiver orelse continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &buffer, method.fn_decl) orelse return false;
+        var t = method.body_first;
+        while (t + 5 < method.body_last) : (t += 1) {
+            if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), receiver.name)) continue;
+            // Whole-object stores, address escapes and receiver escapes leave
+            // writes outside this census and cannot prove a borrowed slot.
+            if (tags[t + 1] == .period_asterisk or (t > method.body_first and tags[t - 1] == .ampersand)) return false;
+            if (tags[t + 1] != .period) return false;
+            if (tags[t + 2] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t + 2), field_name)) continue;
+            if (tags[t + 3] != .equal) {
+                if (tags[t + 3] != .period) return false;
+                if (tags[t + 4] == .identifier and method_names.isCleanupMethodName(tree.tokenSlice(t + 4))) return false;
+                continue;
+            }
+            if (tags[t + 4] != .identifier or tags[t + 5] != .semicolon) return false;
+            var parameters = proto.iterate(tree);
+            var matched = false;
+            while (parameters.next()) |parameter| {
+                const name = parameter.name_token orelse continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(name), tree.tokenSlice(t + 4))) continue;
+                const type_node = parameter.type_expr orelse return false;
+                const first = tree.firstToken(type_node);
+                const last = tree.lastToken(type_node);
+                if (last - first != field.type_last - field.type_first) return false;
+                var offset: Ast.TokenIndex = 0;
+                while (offset <= last - first) : (offset += 1) {
+                    if (!std.mem.eql(u8, tree.tokenSlice(first + offset), tree.tokenSlice(field.type_first + offset))) return false;
+                }
+                matched = true;
+                break;
+            }
+            if (!matched) return false;
+            saw_write = true;
+        }
+    }
+    return saw_write;
+}
+
+/// Close the source write census before treating method stores as borrowed.
+/// A same-field store on an unresolved receiver, an alias store, or a whole
+/// owner replacement cannot be answered by the receiver-method subset above.
+fn pointerFieldWritesAreLocal(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    owner: *const file_model.TypeInfo,
+    field_name: []const u8,
+) !bool {
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .assign) continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        const lhs = tree.nodeData(node).node_and_node[0];
+        if (tree.nodeTag(lhs) != .field_access and tree.nodeTag(lhs) != .deref) continue;
+        const whole = tree.nodeTag(lhs) == .deref;
+        if (!whole and !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(lhs).node_and_token[1]), field_name)) continue;
+        const base = if (whole) tree.nodeData(lhs).node else tree.nodeData(lhs).node_and_token[0];
+        if (cache.zls) |resolver| {
+            const same_owner = resolved: {
+                var ty = (try resolver.resolutionFrame().typeOfNode(base)) orelse return false;
+                for (0..32) |_| {
+                    if (ty.data == .container) {
+                        const scope = ty.data.container.scope_handle;
+                        break :resolved &scope.handle.document.tree == tree and scope.scope != .root and
+                            tree.lastToken(scope.toNode()) == owner.body_last;
+                    }
+                    ty = resolver.childType(ty) orelse {
+                        // A known scalar/function type is not this aggregate.
+                        // An unresolved type cannot close the write census.
+                        if (resolver.typeTag(ty) == null) return false;
+                        break :resolved false;
+                    };
+                }
+                return false;
+            };
+            if (!same_owner) continue;
+        }
+        if (whole) return false;
+        var matched = false;
+        const token = tree.firstToken(lhs);
+        for (owner.methods) |method| {
+            const receiver = method.receiver orelse continue;
+            if (token <= method.body_first or token >= method.body_last) continue;
+            if (tree.firstToken(base) != tree.lastToken(base) or
+                !std.mem.eql(u8, tree.tokenSlice(tree.firstToken(base)), receiver.name)) return false;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    return true;
 }
 
 /// Switch-arm awareness for tagged-union retag safety.  When the
@@ -1876,5 +1991,59 @@ test "overwrite-without-deinit: nested owner, optional null-default lazy init â€
         \\    };
         \\};
         \\
+    );
+}
+
+// ocean#1857: LeasedObject.host is a borrowed *Host assigned by begin.
+test "overwrite borrowed pointer does not inherit pointee destructor ownership" {
+    try testing.expectNoFire(check,
+        \\const Host = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Host) void { self.fd = -1; }
+        \\};
+        \\const Leased = struct {
+        \\    host: *Host,
+        \\    fn begin(self: *Leased, host: *Host) void { self.host = host; }
+        \\};
+    );
+    try testing.expectFires(check, "overwrite-without-deinit",
+        \\const Host = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Host) void { self.fd = -1; }
+        \\};
+        \\const Leased = struct {
+        \\    host: Host,
+        \\    fn begin(self: *Leased, host: Host) void { self.host = host; }
+        \\};
+    );
+}
+
+test "overwrite owned pointer writes retain the destructor obligation" {
+    try testing.expectFires(check, "overwrite-without-deinit",
+        \\const Host = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Host) void { self.fd = -1; }
+        \\};
+        \\const Leased = struct {
+        \\    host: *Host,
+        \\    fn replace(self: *Leased, allocator: Allocator) void {
+        \\        self.host = allocator.create(Host);
+        \\    }
+        \\};
+    );
+}
+
+test "overwrite borrowed pointer proof refuses out-of-owner writes" {
+    try testing.expectFiresTyped(check, "overwrite-without-deinit",
+        \\const Host = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Host) void { self.fd = -1; }
+        \\};
+        \\const Leased = struct {
+        \\    host: *Host,
+        \\    fn begin(self: *Leased, host: *Host) void { self.host = host; }
+        \\};
+        \\fn mutate(leased: *Leased, host: *Host) void { leased.host = host; }
+        \\pub fn run(leased: *Leased, host: *Host) void { mutate(leased, host); }
     );
 }

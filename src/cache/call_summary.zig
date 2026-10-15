@@ -3818,7 +3818,6 @@ const Typed = struct {
         errdefer gpa.destroy(self.cache);
         self.cache.* = FileCache.init(gpa, self.tree());
         self.cache.setZls(&self.resolver);
-        self.cache.module_id = self.resolver.handle.module;
         return self;
     }
 
@@ -3886,7 +3885,6 @@ test "excluded actual callees fail without publishing a null memo and can be ret
     cache.* = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const token = callNamed(tree, "read") orelse return error.TestExpectedCall;
     try std.testing.expectError(error.SourceExcluded, actualCallSummaryAt(cache, token, null));
     try std.testing.expect(!cache.actual_callees.contains(token));
@@ -3974,7 +3972,6 @@ test "scalar effect failures publish no witness memo and can be retried" {
         cache.* = FileCache.init(gpa, tree);
         defer cache.deinit();
         cache.setZls(&resolver);
-        cache.module_id = resolver.handle.module;
         const declaration = (try cache.fileModel()).findFn("write").?.fn_decl;
         var state: State = .{};
         defer state.deinit(gpa);
@@ -4797,10 +4794,6 @@ const canonical_call_boundary = struct {
             cache.* = FileCache.init(gpa, &resolver.handle.document.tree);
             errdefer cache.deinit();
             cache.setZls(resolver);
-            // A declaration's canonical identity is (tree, module): with the
-            // cache's default, every same-file question is asked of a
-            // document nobody opened.
-            cache.module_id = resolver.handle.module;
             // A fixture that does not parse resolves no declaration, so every
             // expectation below would be vacuously true.
             if (cache.tree.errors.len != 0) return error.InvalidSyntax;

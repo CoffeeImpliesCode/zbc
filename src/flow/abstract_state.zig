@@ -491,6 +491,67 @@ fn intersectPredicates(comptime Map: type, self_map: *Map, other: *const Map) bo
 
 // ── AbstractState ──────────────────────────────────────────
 
+/// Independent MUST properties of one physical stored value. Neither bit
+/// supplies a lifetime certificate or changes a MAY resource origin.
+pub const StoredValueFacts = struct {
+    nonnull_pointer: bool = false,
+    empty_slice: bool = false,
+
+    pub fn any(self: StoredValueFacts) bool {
+        return self.nonnull_pointer or self.empty_slice;
+    }
+
+    pub fn intersect(self: StoredValueFacts, other: StoredValueFacts) StoredValueFacts {
+        return .{
+            .nonnull_pointer = self.nonnull_pointer and other.nonnull_pointer,
+            .empty_slice = self.empty_slice and other.empty_slice,
+        };
+    }
+
+    pub fn eql(self: StoredValueFacts, other: StoredValueFacts) bool {
+        return self.nonnull_pointer == other.nonnull_pointer and self.empty_slice == other.empty_slice;
+    }
+};
+
+/// Canonical output channel. Null is a legacy unselected channel, distinct
+/// from the empty path naming the dereferenced pointee. Names borrow the CFG.
+pub const OutputChannel = struct {
+    out: LocalId,
+    name: ?[]const u8,
+
+    pub fn eql(self: OutputChannel, other: OutputChannel) bool {
+        if (self.out != other.out) return false;
+        const name = self.name orelse return other.name == null;
+        return other.name != null and std.mem.eql(u8, name, other.name.?);
+    }
+};
+
+/// Every possible published heap is retained, even when channels coincide.
+/// The map value is an independent MUST certificate of physical selection.
+pub const PendingOutputKey = struct {
+    channel: OutputChannel,
+    heap: HeapId,
+
+    pub const Context = struct {
+        pub fn hash(_: Context, key: PendingOutputKey) u32 {
+            var h: u32 = @intFromEnum(key.channel.out) *% 2654435761;
+            h = h *% 33 +% @intFromBool(key.channel.name != null);
+            if (key.channel.name) |name| for (name) |byte| {
+                h = h *% 33 +% byte;
+            };
+            return h ^ (@as(u32, @intFromEnum(key.heap)) *% 2654435761);
+        }
+
+        pub fn eql(_: Context, a: PendingOutputKey, b: PendingOutputKey, _: usize) bool {
+            return a.heap == b.heap and a.channel.eql(b.channel);
+        }
+    };
+};
+
+fn outputKeyIsRetained(keep: []const u8, key: PendingOutputKey) bool {
+    return isRetained(keep, key.channel.out);
+}
+
 pub const AbstractState = struct {
     feasible: bool = true,
     /// Borrowed immutable LocalId table, shared by every state in this CFG.
@@ -535,15 +596,17 @@ pub const AbstractState = struct {
     /// Possible positive writes suppress inherited holes only in their scope.
     /// Unlike written_fields, these are unioned and never certify coverage.
     uncertain_byte_writes: std.ArrayHashMapUnmanaged(FieldKey, void, FieldKey.Context, true) = .empty,
-    /// `*T` out-parameter writes that carried a heap origin.  Keyed
-    /// by the out-param local; value is the HeapId of the most
-    /// recently written value.  Checked at function exit
-    /// (`transferRet`): if the heap has been freed by a defer
-    /// between the write and the return, the caller's pointee now
-    /// dangles — fire `heap-use-after-free`.  See
-    /// `transferOutParamWrite` and `transferRet` for the producer
-    /// and consumer.
-    out_param_writes: std.AutoArrayHashMapUnmanaged(LocalId, HeapId) = .empty,
+    /// MAY heaps published through exact or legacy output channels. Values
+    /// certify stable physical selection, never pointer presence/liveness.
+    /// A null guard can retire only its exact selected certified channel.
+    out_param_writes: std.ArrayHashMapUnmanaged(PendingOutputKey, bool, PendingOutputKey.Context, true) = .empty,
+
+    /// MUST physical-value properties, independent of MAY resource origins.
+    /// Exact canonical place keys borrow CFG-owned paths. Empty selects a
+    /// dereferenced pointee, never the pointer local's own header.
+    stored_places: std.ArrayHashMapUnmanaged(FieldKey, StoredValueFacts, FieldKey.Context, true) = .empty,
+    /// Local headers share the same two-bit packet; no extra fact maps.
+    stored_values: std.AutoArrayHashMapUnmanaged(LocalId, StoredValueFacts) = .empty,
 
     /// Flat sparse keys own no nested allocations and never scale with array extent.
     exact_elements: std.AutoArrayHashMapUnmanaged(ElementKey, void) = .empty,
@@ -573,6 +636,8 @@ pub const AbstractState = struct {
         self.written_fields.deinit(gpa);
         self.uncertain_byte_writes.deinit(gpa);
         self.out_param_writes.deinit(gpa);
+        self.stored_places.deinit(gpa);
+        self.stored_values.deinit(gpa);
         self.facts.deinit(gpa);
         self.exact_elements.deinit(gpa);
         self.undefined_elements.deinit(gpa);
@@ -714,6 +779,8 @@ pub const AbstractState = struct {
         try copyMap(@TypeOf(self.written_fields), &self.written_fields, &src.written_fields, gpa);
         try copyMap(@TypeOf(self.uncertain_byte_writes), &self.uncertain_byte_writes, &src.uncertain_byte_writes, gpa);
         try copyMap(@TypeOf(self.out_param_writes), &self.out_param_writes, &src.out_param_writes, gpa);
+        try copyMap(@TypeOf(self.stored_places), &self.stored_places, &src.stored_places, gpa);
+        try copyMap(@TypeOf(self.stored_values), &self.stored_values, &src.stored_values, gpa);
         try self.facts.cloneFrom(&src.facts, gpa);
         try copyMap(@TypeOf(self.exact_elements), &self.exact_elements, &src.exact_elements, gpa);
         try copyMap(@TypeOf(self.undefined_elements), &self.undefined_elements, &src.undefined_elements, gpa);
@@ -728,15 +795,43 @@ pub const AbstractState = struct {
         try copyMap(@TypeOf(self.diagnostic_index_bounds), &self.diagnostic_index_bounds, &src.diagnostic_index_bounds, gpa);
     }
 
+    /// Rebinding a root changes the selected storage's identity. No path
+    /// prefix matching is needed: dropping every selection is conservative.
+    pub fn forgetStoredLocal(self: *AbstractState, local: LocalId) void {
+        _ = self.stored_values.swapRemove(local);
+        var index: usize = 0;
+        while (index < self.stored_places.count()) {
+            if (self.stored_places.keys()[index].parent == local) {
+                _ = self.stored_places.swapRemoveAt(index);
+            } else index += 1;
+        }
+    }
+
+    /// The caller must prove that CURRENT storage is this stable channel and
+    /// that its actual runtime value is null. No ambiguous record is retired.
+    pub fn retireOutputChannel(self: *AbstractState, channel: OutputChannel) void {
+        if (channel.name == null) return;
+        var index: usize = 0;
+        while (index < self.out_param_writes.count()) {
+            if (self.out_param_writes.values()[index] and
+                self.out_param_writes.keys()[index].channel.eql(channel))
+            {
+                _ = self.out_param_writes.swapRemoveAt(index);
+            } else index += 1;
+        }
+    }
+
     /// Drop every fact the target block can no longer observe, so two
     /// paths that differ only in temporaries nobody reads again become
     /// one state.
     ///
     /// `keep` is the caller's bitmap of locals whose origin is still
-    /// readable, derived from a backward fixpoint over the whole CFG;
-    /// `live_out_params` is the parallel set for `out_param_writes`,
-    /// which only a `return` reads.  `project` widens `keep` for the one
-    /// dynamic edge below and never narrows it.
+    /// readable, derived from a backward fixpoint over the whole CFG.
+    /// Pending output channels use a separate root live set propagated from
+    /// returns without root-wide store kills: one field cannot replace a
+    /// sibling's loan. Typed current-null guards retire exact records during
+    /// transfer. `project` widens `keep` for dynamic dependencies below and
+    /// never narrows it.
     ///
     /// Sound because a fact the block cannot read is a fact no statement
     /// reachable from it can read either, and because the solver stores
@@ -784,6 +879,8 @@ pub const AbstractState = struct {
         retainWhere(&self.entire_undefined_values, keep, isRetained);
         retainWhere(&self.written_fields, keep, fieldParentIsRetained);
         retainWhere(&self.uncertain_byte_writes, keep, fieldParentIsRetained);
+        retainWhere(&self.stored_values, keep, isRetained);
+        retainWhere(&self.stored_places, keep, fieldParentIsRetained);
         self.projectInitialization(keep);
 
         // An allocation record is only observable while something still
@@ -793,14 +890,15 @@ pub const AbstractState = struct {
         kept_arenas.clearRetainingCapacity();
         for (self.locals.values()) |origin| try noteAllocation(gpa, kept_heaps, kept_arenas, origin);
         for (self.fields.values()) |origin| try noteAllocation(gpa, kept_heaps, kept_arenas, origin);
-        for (self.out_param_writes.values()) |heap| try kept_heaps.append(gpa, @intFromEnum(heap));
+        for (self.out_param_writes.keys()) |pending|
+            try noteAllocation(gpa, kept_heaps, kept_arenas, .{ .heap = pending.heap });
 
         retainWhere(&self.heaps, kept_heaps.items, allocationIsNamed);
         retainWhere(&self.arenas, kept_arenas.items, allocationIsNamed);
 
         // Pending out-param writes carry their own live set: only a
         // `return` reads them, so the fixpoint over the CFG decides.
-        retainWhere(&self.out_param_writes, live_out_params, isRetained);
+        retainWhere(&self.out_param_writes, live_out_params, outputKeyIsRetained);
 
         // `facts` is NOT filtered here, and that is the sound direction
         // rather than an omission: a predicate records which way this
@@ -836,7 +934,9 @@ pub const AbstractState = struct {
         for (self.entire_undefined_values.keys()) |local| if (!isRetained(keep, local)) return false;
         for (self.written_fields.keys()) |key| if (!isRetained(keep, key.parent)) return false;
         for (self.uncertain_byte_writes.keys()) |key| if (!isRetained(keep, key.parent)) return false;
-        for (self.out_param_writes.keys()) |out| if (!isRetained(live_out_params, out)) return false;
+        for (self.stored_values.keys()) |local| if (!isRetained(keep, local)) return false;
+        for (self.stored_places.keys()) |key| if (!isRetained(keep, key.parent)) return false;
+        for (self.out_param_writes.keys()) |pending| if (!isRetained(live_out_params, pending.channel.out)) return false;
         if (!self.initializationProjectionIsIdentity(keep)) return false;
         // A handful of allocation records against a handful of origins:
         // cheaper than copying the whole map to find out the same thing.
@@ -851,8 +951,8 @@ pub const AbstractState = struct {
         for (self.locals.values()) |origin| if (originNamesAllocation(origin, wanted)) return true;
         for (self.fields.values()) |origin| if (originNamesAllocation(origin, wanted)) return true;
         if (wanted == .heap) {
-            for (self.out_param_writes.values()) |pending| {
-                if (pending == wanted.heap) return true;
+            for (self.out_param_writes.keys()) |pending| {
+                if (pending.heap == wanted.heap) return true;
             }
         }
         return false;
@@ -904,11 +1004,33 @@ pub const AbstractState = struct {
     /// partition and exhausted `max_path_states` on ordinary code.
     pub fn canMerge(self: *const AbstractState, other: *const AbstractState) bool {
         if (!self.originsAgree(other)) return false;
+        if (!self.possibleWritesPreserveNegativeWitnesses(other) or
+            !other.possibleWritesPreserveNegativeWitnesses(self)) return false;
         return switch (self.facts.relationTo(&other.facts)) {
             .identical => true,
             .requires_same_liveness => self.sameLiveness(other),
             .separate => false,
         };
+    }
+
+    /// Keep an untouched feasible path distinct from a possible overwrite
+    /// whose union would otherwise hide that path's entire-byte witness.
+    fn possibleWritesPreserveNegativeWitnesses(
+        self: *const AbstractState,
+        other: *const AbstractState,
+    ) bool {
+        if (other.entire_undefined_values.count() == 0 and
+            other.entire_undefined_fields.count() == 0) return true;
+        for (self.uncertain_byte_writes.keys()) |write| {
+            if (other.entire_undefined_values.contains(write.parent) and
+                !self.entire_undefined_values.contains(write.parent)) return false;
+            const witnessed = other.entireUndefinedFieldPrefix(write.parent, write.name) orelse
+                continue;
+            if (other.fieldBytesAreWritten(write.parent, write.name)) continue;
+            const retained = self.entireUndefinedFieldPrefix(write.parent, write.name);
+            if (retained == null or retained.? < witnessed) return false;
+        }
+        return true;
     }
 
     /// Every non-`.plain` origin tracked here is tracked in `other` with
@@ -956,7 +1078,7 @@ pub const AbstractState = struct {
         }
         if (self.out_param_writes.count() != other.out_param_writes.count()) return false;
         for (self.out_param_writes.keys(), self.out_param_writes.values()) |key, value| {
-            if (value != (other.out_param_writes.get(key) orelse return false)) return false;
+            if (value != (other.out_param_writes.getContext(key, .{}) orelse return false)) return false;
         }
         return true;
     }
@@ -2801,6 +2923,32 @@ pub fn join(
     // The predicate maps join on their own rule: a fact survives only
     // when BOTH paths carry it.  Nothing above or below may insert one.
     var changed = self.facts.joinFrom(&other.facts);
+    var stored_index: usize = 0;
+    while (stored_index < self.stored_places.count()) {
+        const key = self.stored_places.keys()[stored_index];
+        const old = self.stored_places.values()[stored_index];
+        const common = old.intersect(other.stored_places.getContext(key, .{}) orelse .{});
+        if (!common.eql(old)) changed = true;
+        if (!common.any()) {
+            _ = self.stored_places.swapRemoveAt(stored_index);
+        } else {
+            self.stored_places.values()[stored_index] = common;
+            stored_index += 1;
+        }
+    }
+    stored_index = 0;
+    while (stored_index < self.stored_values.count()) {
+        const key = self.stored_values.keys()[stored_index];
+        const old = self.stored_values.values()[stored_index];
+        const common = old.intersect(other.stored_values.get(key) orelse .{});
+        if (!common.eql(old)) changed = true;
+        if (!common.any()) {
+            _ = self.stored_values.swapRemoveAt(stored_index);
+        } else {
+            self.stored_values.values()[stored_index] = common;
+            stored_index += 1;
+        }
+    }
     changed = (try self.joinInitialization(other, gpa)) or changed;
     // Exact negative certificates require a covered scope on both paths.
     // Prefix containment keeps the narrower already interned key. A repair
@@ -2855,14 +3003,17 @@ pub fn join(
             changed = true;
         } else entire_value_index += 1;
     }
+    // Diagnostic whole-root repairs survive only when both paths carry them.
+    // An old strict undefined origin must not manufacture a fresh MAY mask
+    // after that intersection. Strict origins and UNKNOWN markers stay intact.
     for (self.locals.keys(), self.locals.values()) |local, origin| {
-        if (origin == .undef) {
+        if (origin == .undef and !self.fieldBytesAreWritten(local, "")) {
             const entry = try self.may_undefined_values.getOrPut(gpa, local);
             if (!entry.found_existing) changed = true;
         }
     }
     for (other.locals.keys(), other.locals.values()) |local, origin| {
-        if (origin == .undef) {
+        if (origin == .undef and !self.fieldBytesAreWritten(local, "")) {
             const entry = try self.may_undefined_values.getOrPut(gpa, local);
             if (!entry.found_existing) changed = true;
         }
@@ -2968,16 +3119,19 @@ pub fn join(
         }
     }
 
-    // Out-param writes: a write recorded on ANY merging path is
-    // potentially live at the join.  Keep existing entries; add new
-    // ones from `other`.  When the same out_local maps to different
-    // HeapIds across paths, keep the existing (conservative — at
-    // exit we'll check the kept entry's liveness; missing the
-    // other's heap is acceptable precision loss for v1).
-    for (other.out_param_writes.keys(), other.out_param_writes.values()) |out_local, other_hid| {
-        const gop = try self.out_param_writes.getOrPut(gpa, out_local);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = other_hid;
+    // Loan identities join by union. Their independent physical-selection
+    // certificates intersect; absence on either path supplies no certificate.
+    for (self.out_param_writes.keys(), self.out_param_writes.values()) |key, *certified| {
+        const common = certified.* and (other.out_param_writes.getContext(key, .{}) orelse false);
+        if (certified.* != common) {
+            certified.* = common;
+            changed = true;
+        }
+    }
+    for (other.out_param_writes.keys()) |key| {
+        const entry = try self.out_param_writes.getOrPutContext(gpa, key, .{});
+        if (!entry.found_existing) {
+            entry.value_ptr.* = false;
             changed = true;
         }
     }
@@ -2986,6 +3140,66 @@ pub fn join(
 }
 
 // ── Tests ──────────────────────────────────────────────────
+
+test "stored values: clone preserves both bits and joins intersect them independently" {
+    const gpa = std.testing.allocator;
+    const local: LocalId = @enumFromInt(0);
+    const field: FieldKey = .{ .parent = local, .name = "selected" };
+    const both: StoredValueFacts = .{ .nonnull_pointer = true, .empty_slice = true };
+    var source: AbstractState = .{};
+    defer source.deinit(gpa);
+    try source.stored_values.put(gpa, local, both);
+    try source.stored_places.putContext(gpa, field, both, .{});
+    var copied = try source.clone(gpa);
+    defer copied.deinit(gpa);
+    try std.testing.expect(copied.stored_values.get(local).?.eql(both));
+    try std.testing.expect(copied.stored_places.getContext(field, .{}).?.eql(both));
+    var only_empty: AbstractState = .{};
+    defer only_empty.deinit(gpa);
+    const empty: StoredValueFacts = .{ .empty_slice = true };
+    try only_empty.stored_values.put(gpa, local, empty);
+    try only_empty.stored_places.putContext(gpa, field, empty, .{});
+    try std.testing.expectEqual(JoinResult.changed, try join(&copied, &only_empty, gpa));
+    try std.testing.expect(copied.stored_values.get(local).?.eql(empty));
+    try std.testing.expect(copied.stored_places.getContext(field, .{}).?.eql(empty));
+    try std.testing.expectEqual(JoinResult.unchanged, try join(&copied, &only_empty, gpa));
+    var only_pointer: AbstractState = .{};
+    defer only_pointer.deinit(gpa);
+    try only_pointer.stored_values.put(gpa, local, .{ .nonnull_pointer = true });
+    try only_pointer.stored_places.putContext(gpa, field, .{ .nonnull_pointer = true }, .{});
+    _ = try join(&copied, &only_pointer, gpa);
+    try std.testing.expect(copied.stored_values.get(local) == null);
+    try std.testing.expect(copied.stored_places.getContext(field, .{}) == null);
+    try std.testing.expect(source.stored_values.get(local).?.eql(both));
+}
+
+test "optional place: clone reuse and joins preserve only common exact MUST facts" {
+    const gpa = std.testing.allocator;
+    var source: AbstractState = .{};
+    defer source.deinit(gpa);
+    const parent: LocalId = @enumFromInt(0);
+    const key: FieldKey = .{ .parent = parent, .name = "selected" };
+    try source.stored_places.putContext(gpa, key, .{ .nonnull_pointer = true }, .{});
+    try source.stored_values.put(gpa, parent, .{ .nonnull_pointer = true });
+    var cloned = try source.clone(gpa);
+    defer cloned.deinit(gpa);
+    try std.testing.expect(cloned.stored_places.containsContext(key, .{}));
+    try std.testing.expect(cloned.stored_values.contains(parent));
+    try std.testing.expectEqual(JoinResult.unchanged, try join(&cloned, &source, gpa));
+    var empty: AbstractState = .{};
+    defer empty.deinit(gpa);
+    try std.testing.expectEqual(JoinResult.changed, try join(&cloned, &empty, gpa));
+    try std.testing.expect(cloned.stored_places.count() == 0);
+    try std.testing.expect(cloned.stored_values.count() == 0);
+    try cloned.cloneFrom(&source, gpa);
+    try std.testing.expect(cloned.stored_places.containsContext(key, .{}));
+    try cloned.cloneFrom(&empty, gpa);
+    try std.testing.expect(cloned.stored_places.count() == 0);
+    try std.testing.expect(cloned.stored_values.count() == 0);
+    try empty.stored_places.putContext(gpa, .{ .parent = parent, .name = "different" }, .{ .empty_slice = true }, .{});
+    _ = try join(&source, &empty, gpa);
+    try std.testing.expect(source.stored_places.count() == 0);
+}
 
 test "Origin.eql arena-vs-arena" {
     const a: ArenaId = @enumFromInt(1);
@@ -3014,6 +3228,28 @@ test "canMerge: plain temporaries do not split a partition" {
     try rhs.locals.put(gpa, @enumFromInt(2), .plain);
     try rhs.locals.put(gpa, @enumFromInt(3), .plain);
     try std.testing.expect(lhs.canMerge(&rhs));
+}
+
+test "replay undefined prefix precise: a no-write witness is not merged with possible writes" {
+    // A possible write on one path must not erase a concrete untouched path.
+    const gpa = std.testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    var untouched: AbstractState = .{};
+    defer untouched.deinit(gpa);
+    try untouched.locals.put(gpa, array, .undef);
+    try untouched.bindEntireUndefinedField(gpa, .{ .parent = array, .name = "" }, true);
+    var possible = try untouched.clone(gpa);
+    defer possible.deinit(gpa);
+    possible.forgetEntireUndefinedFields(array);
+    try possible.uncertain_byte_writes.putContext(
+        gpa, .{ .parent = array, .name = "[0..4]" }, {}, .{},
+    );
+    try std.testing.expect(!untouched.canMerge(&possible));
+    try std.testing.expect(!possible.canMerge(&untouched));
+    var unknown = try possible.clone(gpa);
+    defer unknown.deinit(gpa);
+    try std.testing.expect(possible.canMerge(&unknown));
+    try std.testing.expect(!possible.fieldValueMayBeUndefined(array, "[0]"));
 }
 
 test "canMerge: differing origins keep their partitions apart" {
@@ -3231,7 +3467,9 @@ fn cloneOneEntryPerMap(gpa: std.mem.Allocator) !void {
     try src.locals.put(gpa, local, .{ .heap = heap });
     try src.arenas.put(gpa, @enumFromInt(0), .{ .state = .live });
     try src.heaps.put(gpa, heap, .{ .state = .live });
-    try src.out_param_writes.put(gpa, local, heap);
+    try src.out_param_writes.putContext(gpa, .{ .channel = .{ .out = local, .name = null }, .heap = heap }, false, .{});
+    try src.stored_places.putContext(gpa, .{ .parent = local, .name = "pointer" }, .{ .nonnull_pointer = true }, .{});
+    try src.stored_values.put(gpa, local, .{ .empty_slice = true });
     const field = try src.fields.getOrPutContext(gpa, .{ .parent = local, .name = "buf" }, .{});
     field.value_ptr.* = .{ .heap = heap };
     try src.unknown_field_values.putContext(gpa, .{ .parent = local, .name = "bytes" }, {}, .{});
@@ -3260,6 +3498,8 @@ fn cloneOneEntryPerMap(gpa: std.mem.Allocator) !void {
     // And a clone that succeeds is mergeable with its source, which is
     // only true when the fact maps came across too.
     try std.testing.expect(src.canMerge(&copy));
+    try std.testing.expect(copy.stored_places.containsContext(.{ .parent = local, .name = "pointer" }, .{}));
+    try std.testing.expect(copy.stored_values.contains(local));
     // Payload consumers must remain conservative in the independently owned copy.
     try std.testing.expect(!copy.fieldValueIsDefined(local, "bytes"));
     copy.forgetFields(local);
@@ -3279,6 +3519,9 @@ fn cloneOneEntryPerMap(gpa: std.mem.Allocator) !void {
     @memset(&keep, 0);
     try copy.project(gpa, &keep, &.{0}, &heaps, &arenas);
     try std.testing.expect(copy.fieldValueIsDefined(local, "bytes"));
+    // Stored pointer values follow storage liveness, not historical predicates.
+    try std.testing.expect(!copy.stored_places.containsContext(.{ .parent = local, .name = "pointer" }, .{}));
+    try std.testing.expect(!copy.stored_values.contains(local));
 }
 
 test "clone: a failure partway through leaves nothing allocated" {
@@ -3863,4 +4106,40 @@ test "field counted prefix: guarded selection snapshots and mutation revoke corr
     try std.testing.expect(state.hasInitializedFieldElement(parent, "fields", .{ .local = .{ .local = cursor } }));
     state.forgetFieldInitialization(.{ .parent = parent, .name = "fields[0]" });
     try std.testing.expect(!state.hasInitializedFieldElement(parent, "fields", .{ .local = .{ .local = cursor } }));
+}
+
+test "output channels: clone preserves selected heap sets and retires only certified exact records" {
+    const gpa = std.testing.allocator;
+    const out: LocalId = @enumFromInt(0);
+    const first: HeapId = @enumFromInt(0);
+    const second: HeapId = @enumFromInt(1);
+    const selected: PendingOutputKey = .{ .channel = .{ .out = out, .name = "" }, .heap = first };
+    const legacy: PendingOutputKey = .{ .channel = .{ .out = out, .name = null }, .heap = first };
+    const uncertain: PendingOutputKey = .{ .channel = selected.channel, .heap = second };
+    const sibling: PendingOutputKey = .{ .channel = .{ .out = out, .name = "other" }, .heap = first };
+    var source: AbstractState = .{};
+    defer source.deinit(gpa);
+    try source.heaps.put(gpa, first, .{ .state = .live });
+    try source.heaps.put(gpa, second, .{ .state = .dead });
+    try source.out_param_writes.putContext(gpa, selected, true, .{});
+    try source.out_param_writes.putContext(gpa, legacy, false, .{});
+    try source.out_param_writes.putContext(gpa, uncertain, false, .{});
+    try source.out_param_writes.putContext(gpa, sibling, true, .{});
+    var copy = try source.clone(gpa);
+    defer copy.deinit(gpa);
+    try std.testing.expect(source.sameLiveness(&copy));
+
+    // Null and empty selectors differ. Retiring a current selected output
+    // neither changes a cloned source nor hides another MAY heap or sibling.
+    copy.retireOutputChannel(legacy.channel);
+    try std.testing.expectEqual(@as(usize, 4), copy.out_param_writes.count());
+    copy.retireOutputChannel(selected.channel);
+    try std.testing.expectEqual(@as(usize, 4), source.out_param_writes.count());
+    try std.testing.expectEqual(@as(usize, 3), copy.out_param_writes.count());
+    try std.testing.expect(!copy.out_param_writes.containsContext(selected, .{}));
+    try std.testing.expect(copy.out_param_writes.containsContext(legacy, .{}));
+    try std.testing.expect(copy.out_param_writes.containsContext(uncertain, .{}));
+    try std.testing.expect(copy.out_param_writes.containsContext(sibling, .{}));
+    try std.testing.expectEqual(.dead, copy.heaps.get(second).?.state);
+    try std.testing.expect(!source.sameLiveness(&copy));
 }

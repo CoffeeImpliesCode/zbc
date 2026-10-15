@@ -2383,7 +2383,6 @@ test "index-type-narrowing-wraparound: relative embedded byte counts prove only 
         defer cache.deinit();
         cache.setZls(&resolver);
         cache.file_path = source_path;
-        cache.module_id = resolver.handle.module;
         var problems: std.ArrayListUnmanaged(Problem) = .empty;
         defer testing.freeProblems(gpa, &problems);
         if (case.source_error) |err| {

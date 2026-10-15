@@ -32,6 +32,12 @@ first assignment:
   Ignoring that result does not initialize the failure path.
   Opaque or unresolved calls establish no definite write.
   Names do not establish initialization.
+  Unsupported or opaque access revokes diagnostic byte witnesses for reachable
+  storage; it supplies no positive initialization credit. Explicit addresses,
+  pointer-bearing copies, and encoded address aliases carry that reach.
+  Ordinary scalar copies do not.
+  An unclosed callee can recover enclosing storage from a member address.
+  Only a completed source footprint permits narrower invalidation paths.
   A partial field store does not certify its containing aggregate.
 
   A direct pointer copy keeps the formal's identity.
@@ -41,6 +47,10 @@ first assignment:
   Reading the pointer or slice header does not read its payload.
   A namespace type does not prove its member values.
   Positive certificates for those values require defined initializers.
+  A value block's temporary undefined declarations are not its result.
+  Namespace-generated value blocks remain UNKNOWN without a byte-flow proof.
+  This grants no fill, return, or complete-payload certificate.
+  Runtime local holes and later undefined stores still report selected reads.
 - **Explicit aggregate values retain their element coverage.**
   Array literals, `@splat`, member arithmetic, and indexed inputs retain
   facts about the storage they read.

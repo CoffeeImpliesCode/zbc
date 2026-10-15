@@ -27,6 +27,7 @@ const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const method_names = @import("../../model/method_names.zig");
 const tokens = @import("../../ast/tokens.zig");
+const fn_summary = @import("../../model/fn_summary.zig");
 
 const R = "owned-field-no-outer-cleanup";
 
@@ -51,6 +52,7 @@ pub fn check(
     defer gpa.free(outers);
 
     for (outers) |outer| {
+        if (cache.zls != null and privateTypeHasNoUses(tree, outer)) continue;
         // HashMap-context skip: a type whose only methods are
         // `hash` / `eql` is a comparison-key shape, not an owner.
         // Fields are values used for comparison (FD-as-key, etc.),
@@ -120,6 +122,9 @@ pub fn check(
             //     };
             if (outerIsNestedInsideCleanupType(model, outer)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, f) orelse continue;
+            if (!hasReceiverResourceCleanup(tree, inner_ti)) continue;
+            if (try hasCanonicalFieldCleanup(cache, tree, outer, f, inner_ti)) continue;
+            if (try hasEquivalentFieldCleanup(cache, tree, outer, f, inner_ti)) continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
             if (cleanupOnlyClearsBorrowedFlags(tree, model, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
@@ -141,6 +146,289 @@ pub fn check(
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+/// A private declaration with no references cannot construct an abandoned
+/// instance. Reflection or namespace exposure prevents closing this census.
+/// Untyped fixtures retain the declaration-only diagnostic contract.
+fn privateTypeHasNoUses(tree: *const Ast, owner: *const file_model.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    const name = owner.name_token;
+    if (name < 1 or tags[name - 1] != .keyword_const) return false;
+    if (name >= 2 and tags[name - 2] == .keyword_pub) return false;
+    for (tags, 0..) |tag, raw| {
+        const token: Ast.TokenIndex = @intCast(raw);
+        if (tag == .identifier and token != name and std.mem.eql(u8, tree.tokenSlice(token), owner.name)) return false;
+        if (tag == .builtin) {
+            const builtin = tree.tokenSlice(token);
+            if (std.mem.eql(u8, builtin, "@field") or std.mem.eql(u8, builtin, "@typeInfo") or
+                std.mem.eql(u8, builtin, "@This") or std.mem.eql(u8, builtin, "@hasDecl") or
+                std.mem.eql(u8, builtin, "@export")) return false;
+        }
+    }
+    return true;
+}
+
+/// Static allocator callbacks are not receiver destructors. A reset-only
+/// interface releases no resource; scalar handle mutations remain obligations.
+fn hasReceiverResourceCleanup(tree: *const Ast, inner: *const file_model.TypeInfo) bool {
+    for (inner.methods) |method| {
+        const receiver = method.receiver orelse continue;
+        if (!isCleanupName(method.name) or tokens.isTrivialBody(tree, method.body_first, method.body_last)) continue;
+        const tags = tree.tokens.items(.tag);
+        const first = method.body_first + 1;
+        if (first + 5 == method.body_last and
+            tags[first] == .identifier and std.mem.eql(u8, tree.tokenSlice(first), receiver.name) and
+            tags[first + 1] == .period_asterisk and tags[first + 2] == .equal and
+            tags[first + 3] == .identifier and std.mem.eql(u8, tree.tokenSlice(first + 3), "undefined") and
+            tags[first + 4] == .semicolon) continue;
+        if (cleanupOnlyMarksClosed(tree, inner, method)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// An accounting close that checks counters and sets a boolean does not release
+/// storage. Calls, arithmetic writes and indirect stores refuse this proof.
+fn cleanupOnlyMarksClosed(tree: *const Ast, inner: *const file_model.TypeInfo, method: file_model.MethodInfo) bool {
+    const receiver = method.receiver orelse return false;
+    const tags = tree.tokens.items(.tag);
+    var saw_store = false;
+    var t = method.body_first + 1;
+    while (t < method.body_last) : (t += 1) {
+        if (tags[t] == .l_paren and t > method.body_first and
+            (tags[t - 1] == .identifier or tags[t - 1] == .builtin)) return false;
+        switch (tags[t]) {
+            .equal => {
+                if (t < 3 or tags[t - 3] != .identifier or
+                    !std.mem.eql(u8, tree.tokenSlice(t - 3), receiver.name) or
+                    tags[t - 2] != .period or tags[t - 1] != .identifier) return false;
+                const field = inner.findField(tree.tokenSlice(t - 1)) orelse return false;
+                if (field.type_first != field.type_last or !std.mem.eql(u8, tree.tokenSlice(field.type_first), "bool")) return false;
+                if (t + 2 >= method.body_last or tags[t + 1] != .identifier or tags[t + 2] != .semicolon) return false;
+                const value = tree.tokenSlice(t + 1);
+                if (!std.mem.eql(u8, value, "true") and !std.mem.eql(u8, value, "false")) return false;
+                saw_store = true;
+            },
+            .plus_equal, .minus_equal, .asterisk_equal, .slash_equal,
+            .period_asterisk, .ampersand,
+            => return false,
+            else => {},
+        }
+    }
+    return saw_store;
+}
+
+/// A cleanup entry point can live on the actual owner rather than on its row.
+/// Authenticate the receiver container and called declaration, not their names.
+fn hasCanonicalFieldCleanup(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    outer: *const file_model.TypeInfo,
+    field: *const file_model.FieldInfo,
+    inner: *const file_model.TypeInfo,
+) !bool {
+    const resolver = cache.zls orelse return false;
+    const frame = resolver.resolutionFrame();
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    const index = try cache.getCallIndex();
+    var calls = index.by_callee_token.iterator();
+    while (calls.next()) |entry| {
+        const node = entry.value_ptr.*;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+        const callee_access = tree.nodeData(call.ast.fn_expr).node_and_token;
+        const receiver = callee_access[0];
+        if (tree.nodeTag(receiver) != .field_access) continue;
+        const access = tree.nodeData(receiver).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(access[1]), field.name)) continue;
+        const method = inner.findMethod(tree.tokenSlice(callee_access[1])) orelse continue;
+        if (method.receiver == null or !isCleanupName(method.name)) continue;
+        try cache.chargeNormalCleanup(node);
+        const container = (try frame.containerOfNode(access[0])) orelse continue;
+        const scope = container.scope_handle;
+        if (&scope.handle.document.tree != tree or scope.scope == .root or
+            tree.lastToken(scope.toNode()) != outer.body_last) continue;
+        const canonical = (try cache.actualCallSummaryAt(entry.key_ptr.*, frame)) orelse continue;
+        if (canonical.callee.tree != tree or canonical.callee.declaration != method.fn_decl) continue;
+        if (!try cleanupHasOwnerScope(cache, tree, node, access[0], field.name, method.fn_decl)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Formal-rooted cleanup is an owner entry point. A local temporary instead
+/// needs an active defer, or paired error and normal cleanup in the same body.
+/// An error-arm call alone says nothing about a successful handoff.
+fn cleanupHasOwnerScope(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    call_node: Ast.Node.Index,
+    base: Ast.Node.Index,
+    field_name: []const u8,
+    destructor: Ast.Node.Index,
+) !bool {
+    const token = tree.firstToken(call_node);
+    var functions = tokens.iterFnDecls(tree);
+    var declaration: ?Ast.Node.Index = null;
+    var body_node: ?Ast.Node.Index = null;
+    var width: usize = std.math.maxInt(usize);
+    var function_buffer: [1]Ast.Node.Index = undefined;
+    while (functions.next(&function_buffer)) |candidate| {
+        const body = candidate.body;
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+        if (first < token and token < last and last - first < width) {
+            declaration = candidate.node;
+            body_node = body;
+            width = last - first;
+        }
+    }
+    const body = body_node orelse return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, declaration.?) orelse return false;
+    const bindings = (try cache.localBindings(proto, body)).*;
+    var arena = std.heap.ArenaAllocator.init(cache.gpa);
+    defer arena.deinit();
+    const owner = try fn_summary.ownerOfExpr(arena.allocator(), tree, proto, &bindings,
+        tree.firstToken(base), tree.lastToken(base), 0);
+    const tags = tree.tokens.items(.tag);
+    var prior = tree.firstToken(body) + 1;
+    while (prior + 2 < token) : (prior += 1) {
+        if (tags[prior] == .identifier and tags[prior + 1] == .period_asterisk and tags[prior + 2] == .equal and
+            std.mem.eql(u8, tree.tokenSlice(prior), tree.tokenSlice(tree.firstToken(base)))) return false;
+    }
+    if (owner == .param) return true;
+    const resolver = cache.zls orelse return false;
+    const index = try cache.getCallIndex();
+    var calls = index.by_callee_token.iterator();
+    var error_cleanup: ?Ast.TokenIndex = null;
+    var normal_cleanup: ?Ast.TokenIndex = null;
+    while (calls.next()) |entry| {
+        const node = entry.value_ptr.*;
+        const first = tree.firstToken(node);
+        if (first <= tree.firstToken(body) or first >= tree.lastToken(body)) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+        const access = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (tree.nodeTag(access[0]) != .field_access) continue;
+        const receiver = tree.nodeData(access[0]).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(receiver[1]), field_name) or
+            !std.mem.eql(u8, tree.getNodeSource(receiver[0]), tree.getNodeSource(base))) continue;
+        const actual = (try cache.actualCallSummaryAt(entry.key_ptr.*, resolver.resolutionFrame())) orelse continue;
+        if (actual.callee.tree != tree or actual.callee.declaration != destructor) continue;
+        if (first > 0 and tags[first - 1] == .keyword_defer) return true;
+        if (first > 0 and tags[first - 1] == .keyword_errdefer) {
+            error_cleanup = first;
+            continue;
+        }
+        var depth: usize = 0;
+        var t = tree.firstToken(body);
+        while (t < first) : (t += 1) {
+            if (tags[t] == .l_brace) depth += 1;
+            if (tags[t] == .r_brace) depth -= 1;
+        }
+        if (depth == 1) normal_cleanup = first;
+    }
+    const error_token = error_cleanup orelse return false;
+    const normal_token = normal_cleanup orelse return false;
+    if (error_token >= normal_token) return false;
+    var t = error_token;
+    while (t < normal_token) : (t += 1) {
+        if (tags[t] == .keyword_return and tags[t + 1] != .keyword_error) return false;
+    }
+    return true;
+}
+
+/// Match an entire small destructor, not an arbitrary subset of its fields:
+/// one authenticated call followed by at most an undefined whole-value reset.
+fn hasEquivalentFieldCleanup(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    outer: *const file_model.TypeInfo,
+    field: *const file_model.FieldInfo,
+    inner: *const file_model.TypeInfo,
+) !bool {
+    const resolver = cache.zls orelse return false;
+    const tags = tree.tokens.items(.tag);
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    var arena = std.heap.ArenaAllocator.init(cache.gpa);
+    defer arena.deinit();
+    for (inner.methods) |cleanup| {
+        const receiver = cleanup.receiver orelse continue;
+        if (!isCleanupName(cleanup.name)) continue;
+        const inner_call = (try firstStatementCall(cache, tree, cleanup)) orelse continue;
+        const tail = tree.lastToken(inner_call.node) + 2;
+        if (tail != cleanup.body_last) {
+            if (tail + 5 != cleanup.body_last or tags[tail] != .identifier or
+                !std.mem.eql(u8, tree.tokenSlice(tail), receiver.name) or
+                tags[tail + 1] != .period_asterisk or tags[tail + 2] != .equal or
+                !std.mem.eql(u8, tree.tokenSlice(tail + 3), "undefined") or tags[tail + 4] != .semicolon) continue;
+        }
+        var inner_buffer: [1]Ast.Node.Index = undefined;
+        const inner_proto = tokens.fnProto(tree, &inner_buffer, cleanup.fn_decl) orelse continue;
+        const inner_bindings = (try cache.localBindings(inner_proto, cleanup.body)).*;
+        const expected = (try cache.actualCallSummaryAt(inner_call.token, resolver.resolutionFrame())) orelse continue;
+        var callee_buffer: [1]Ast.Node.Index = undefined;
+        const callee_proto = tokens.fnProto(expected.callee.tree, &callee_buffer, expected.callee.declaration) orelse continue;
+        for (outer.methods) |candidate| {
+            if (candidate.receiver == null) continue;
+            const outer_call = (try firstStatementCall(cache, tree, candidate)) orelse continue;
+            const actual = (try cache.actualCallSummaryAt(outer_call.token, resolver.resolutionFrame())) orelse continue;
+            if (actual.callee.tree != expected.callee.tree or actual.callee.declaration != expected.callee.declaration or
+                !actual.callee.reference.actual_type.eql(expected.callee.reference.actual_type)) continue;
+            var outer_buffer: [1]Ast.Node.Index = undefined;
+            const outer_proto = tokens.fnProto(tree, &outer_buffer, candidate.fn_decl) orelse continue;
+            const outer_bindings = (try cache.localBindings(outer_proto, candidate.body)).*;
+            var parameters = callee_proto.iterate(expected.callee.tree);
+            var position: u32 = 0;
+            var matched = true;
+            while (parameters.next()) |_| : (position += 1) {
+                var first_buffer: [2]Ast.Node.Index = undefined;
+                var second_buffer: [2]Ast.Node.Index = undefined;
+                const first = (try expected.callArgumentFor(cache, &first_buffer, position)) orelse { matched = false; break; };
+                const second = (try actual.callArgumentFor(cache, &second_buffer, position)) orelse { matched = false; break; };
+                const source = try fn_summary.ownerOfExpr(arena.allocator(), tree, inner_proto, &inner_bindings,
+                    tree.firstToken(first), tree.lastToken(first), 0);
+                const destination = try fn_summary.ownerOfExpr(arena.allocator(), tree, outer_proto, &outer_bindings,
+                    tree.firstToken(second), tree.lastToken(second), 0);
+                if (source != .param or destination != .param or source.param.param != 0 or destination.param.param != 0 or
+                    !prefixedFieldPath(destination.param.path, field.name, source.param.path)) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched and position != 0) return true;
+        }
+    }
+    return false;
+}
+
+fn prefixedFieldPath(actual: []const u8, prefix: []const u8, suffix: []const u8) bool {
+    if (!std.mem.startsWith(u8, actual, prefix)) return false;
+    if (suffix.len == 0) return actual.len == prefix.len;
+    return actual.len == prefix.len + suffix.len + 1 and actual[prefix.len] == '.' and
+        std.mem.eql(u8, actual[prefix.len + 1 ..], suffix);
+}
+
+const StatementCall = struct { node: Ast.Node.Index, token: Ast.TokenIndex };
+
+fn firstStatementCall(cache: *file_cache_mod.FileCache, tree: *const Ast, method: file_model.MethodInfo) !?StatementCall {
+    const first = method.body_first + 1;
+    const end = tokens.findStmtSemicolon(tree.tokens.items(.tag), first, method.body_last) orelse return null;
+    var entries = (try cache.getCallIndex()).by_callee_token.iterator();
+    while (entries.next()) |entry| {
+        const node = entry.value_ptr.*;
+        if (tree.firstToken(node) == first and tree.lastToken(node) + 1 == end) {
+            try cache.chargeNormalCleanup(node);
+            return .{ .node = node, .token = entry.key_ptr.* };
+        }
+    }
+    return null;
 }
 
 /// True iff the type's only methods are the HashMap-context
@@ -889,5 +1177,161 @@ test "boolean cleanup does not hide embedded resource storage — fires" {
         \\    fn release(self: Lease) void { self.state.active = false; }
         \\};
         \\const Guard = struct { lease: Lease };
+    );
+}
+
+// Selected replay rows: ocean 78,220,384,699,859,1226,1228,1488,
+// 1548,1549,1762,1854,1858; nogui 106,124,138,159,175,221.
+// These exercise owner-specific entry points, non-owning destructors and
+// borrowed copies, rather than accepting a cleanup-like spelling.
+test "owner cleanup census uses the declared field and exact owner" {
+    try testing.expectNoFireTyped(check,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Carrier = struct { resource: Resource };
+        \\fn retire(carrier: *Carrier) void { carrier.resource.close(); }
+        \\pub fn run(carrier: *Carrier) void { retire(carrier); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Carrier = struct { resource: Resource };
+        \\const Other = struct { resource: Resource };
+        \\fn retire(other: *Other) void { other.resource.close(); }
+        \\pub fn run(carrier: *Carrier, other: *Other) void { _ = carrier; retire(other); }
+    );
+}
+
+test "owner cleanup census recognizes nonstandard self methods without name credit" {
+    try testing.expectNoFireTyped(check,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Carrier = struct {
+        \\    resource: Resource,
+        \\    fn finish(self: *Carrier) void { self.resource.close(); }
+        \\};
+        \\pub fn run(carrier: *Carrier) void { carrier.finish(); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Carrier = struct {
+        \\    resource: Resource,
+        \\    fn finish(self: *Carrier) void { inspect(self.resource); }
+        \\};
+        \\pub fn run(carrier: *Carrier) void { carrier.finish(); }
+    );
+}
+
+test "owner cleanup census excludes allocator callbacks and reset-only views" {
+    try testing.expectNoFireTyped(check,
+        \\const Accounting = struct {
+        \\    fn free(ctx: *anyopaque, bytes: []u8) void { consume(ctx, bytes); }
+        \\};
+        \\const View = struct {
+        \\    token: usize,
+        \\    fn deinit(self: *View) void { self.* = undefined; }
+        \\};
+        \\const Carrier = struct { accounting: Accounting, view: View };
+        \\pub fn run(carrier: *Carrier) void { _ = carrier; }
+    );
+}
+
+test "owner cleanup census keeps partial resource cleanup" {
+    try testing.expectFiresTyped(check, R,
+        \\const Resource = struct {
+        \\    first: i32, second: i32,
+        \\    fn close(self: *Resource) void { self.first = -1; self.second = -1; }
+        \\};
+        \\const Carrier = struct {
+        \\    resource: Resource,
+        \\    fn finish(self: *Carrier) void { self.resource.first = -1; }
+        \\};
+        \\pub fn run(carrier: *Carrier) void { carrier.finish(); }
+    );
+}
+
+test "owner cleanup census distinguishes complete inline destruction from a subset" {
+    try testing.expectNoFireTyped(check,
+        \\const Buffer = struct {
+        \\    fd: i32,
+        \\    fn release(self: *Buffer) void { self.fd = -1; }
+        \\};
+        \\const Field = struct {
+        \\    text: Buffer,
+        \\    fn deinit(self: *Field) void { self.text.release(); self.* = undefined; }
+        \\};
+        \\const Run = struct {
+        \\    field: Field,
+        \\    fn releaseReadback(self: *Run) void { self.field.text.release(); }
+        \\};
+        \\pub fn run(self: *Run) void { self.releaseReadback(); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Buffer = struct {
+        \\    fd: i32,
+        \\    fn release(self: *Buffer) void { self.fd = -1; }
+        \\};
+        \\const Field = struct {
+        \\    first: Buffer, second: Buffer,
+        \\    fn deinit(self: *Field) void { self.first.release(); self.second.release(); self.* = undefined; }
+        \\};
+        \\const Run = struct {
+        \\    field: Field,
+        \\    fn releaseReadback(self: *Run) void { self.field.first.release(); }
+        \\};
+        \\pub fn run(self: *Run) void { self.releaseReadback(); }
+    );
+}
+
+test "owner cleanup census closes only unused private nonreflective declarations" {
+    try testing.expectNoFireTyped(check,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Prepared = struct { resource: Resource };
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\pub const Prepared = struct { resource: Resource };
+    );
+}
+
+test "owner cleanup census does not borrow error-only cleanup for normal exits" {
+    try testing.expectFiresTyped(check, R,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Carrier = struct { resource: Resource };
+        \\pub fn run() !void {
+        \\    var carrier: Carrier = .{ .resource = .{ .fd = 3 } };
+        \\    errdefer carrier.resource.close();
+        \\    try unknownStep();
+        \\}
+    );
+}
+
+test "owner cleanup census rejects whole-owner reset before destructor" {
+    try testing.expectFiresTyped(check, R,
+        \\const Resource = struct {
+        \\    fd: i32,
+        \\    fn close(self: *Resource) void { self.fd = -1; }
+        \\};
+        \\const Carrier = struct { resource: Resource };
+        \\fn retire(carrier: *Carrier) void { carrier.* = undefined; carrier.resource.close(); }
+        \\pub fn run(carrier: *Carrier) void { retire(carrier); }
     );
 }

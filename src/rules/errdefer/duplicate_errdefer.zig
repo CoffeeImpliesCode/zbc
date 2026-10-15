@@ -3,15 +3,14 @@
 //! same cleanup against the same receiver.  On error both fire and
 //! the cleanup runs twice → double-free / assert.
 //!
-//! Detection (pure token scan per fn):
-//!   1. Walk fn body tokens for `keyword_errdefer` followed by
-//!      `<X-tokens> . <cleanup-method>` (inline form only — block
-//!      forms `errdefer { … }` are too varied to compare reliably
-//!      and rarely hit this bug).
-//!   2. Capture the full receiver token range and the cleanup
-//!      method name.
-//!   3. Within the same fn, if two entries have identical receiver
-//!      tokens AND identical cleanup method, fire on the SECOND one.
+//! Detection (per function):
+//!   1. Collect inline errdefer calls in their lexical block.
+//!   2. Compare the complete call and each lexical root declaration.
+//!   3. Equal numeric amounts alone do not identify one resource.
+//!      Typed scalar-only argument calls therefore supply no duplicate
+//!      certificate; equal receiver paths and resource arguments retain
+//!      the check. Deferred mutable paths are read at exit, not captured
+//!      at registration.
 //!
 //! Skip outer comptime type-builders so nested-fn errdefers aren't
 //! double-counted via the wrapping fn.
@@ -25,6 +24,7 @@ const file_cache_mod = @import("../../cache/file_cache.zig");
 
 const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
+const local_bindings = @import("../../model/local_bindings.zig");
 const returnsType = tokens.returnsType;
 const skipFnDecl = tokens.skipFnDecl;
 const bodyOf = tokens.bodyOf;
@@ -40,15 +40,19 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .duplicate_errdefer)) return;
-    _ = cache;
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
 
     var node_idx: u32 = 1;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         if (returnsType(tree, node)) continue;
         const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+        const proto = tokens.fnProto(tree, &proto_buffer, node) orelse continue;
+        const bindings = (try cache.localBindings(proto, body)).*;
+        try checkBody(gpa, tree, cache, &bindings, body, problems);
     }
 }
 
@@ -76,6 +80,8 @@ const Cleanup = struct {
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -107,7 +113,10 @@ fn checkBody(
     // left as the "intended" one.
     for (entries.items, 0..) |a, i| {
         for (entries.items[0..i]) |b| {
-            if (!callsEqual(tree, a, b)) continue;
+            if (!callsEqual(tree, bindings, a, b)) continue;
+            // Equal numeric amounts name no resource. Repeated accounting
+            // debits can discharge separate successful acquisitions.
+            if (try hasOnlyScalarArguments(cache, a)) continue;
             // Branch-disjoint guard: two errdefers in different
             // immediate scopes (different `{`s) are typically in
             // mutually exclusive arms of an `if/else if/else`
@@ -201,7 +210,7 @@ fn findEnclosingLBrace(
     return lo;
 }
 
-fn callsEqual(tree: *const Ast, a: Cleanup, b: Cleanup) bool {
+fn callsEqual(tree: *const Ast, bindings: *const local_bindings.LocalBindings, a: Cleanup, b: Cleanup) bool {
     const tags = tree.tokens.items(.tag);
     const a_len = a.call_last - a.call_first;
     const b_len = b.call_last - b.call_first;
@@ -212,6 +221,33 @@ fn callsEqual(tree: *const Ast, a: Cleanup, b: Cleanup) bool {
         const bi = b.call_first + @as(Ast.TokenIndex, @intCast(i));
         if (tags[ai] != tags[bi]) return false;
         if (!std.mem.eql(u8, tree.tokenSlice(ai), tree.tokenSlice(bi))) return false;
+        if (tags[ai] == .identifier and
+            (ai == a.call_first or tags[ai - 1] != .period))
+        {
+            const a_binding = bindings.findAt(tree.tokenSlice(ai), ai);
+            const b_binding = bindings.findAt(tree.tokenSlice(bi), bi);
+            if (a_binding != null and b_binding != null and
+                a_binding.?.name_token != b_binding.?.name_token) return false;
+            if ((a_binding == null) != (b_binding == null)) return false;
+        }
+    }
+    return true;
+}
+
+fn hasOnlyScalarArguments(cache: *file_cache_mod.FileCache, cleanup: Cleanup) file_cache_mod.SummaryError!bool {
+    const resolver = cache.zls orelse return false;
+    const tree = cache.tree;
+    const node = cache.nodeForExactSpan(cleanup.call_first, cleanup.call_last) orelse return false;
+    try cache.chargeNormalCleanup(node);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    if (call.ast.params.len == 0) return false;
+    for (call.ast.params) |argument| {
+        const actual = (try resolver.resolutionFrame().typeOfNode(argument)) orelse return false;
+        switch (resolver.typeTag(actual) orelse return false) {
+            .int, .comptime_int, .float, .comptime_float => {},
+            else => return false,
+        }
     }
     return true;
 }
@@ -364,4 +400,70 @@ test "duplicate-errdefer: nested fn errdefers don't bleed into outer scan" {
     defer freeProblems(gpa, &problems);
     // Inner fires once; outer skips past inner's body.
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "duplicate-errdefer: scalar accounting is not a resource identity" {
+    try testing.expectNoFireTyped(check,
+        \\const Ledger = struct {
+        \\    context: *anyopaque,
+        \\    acquire_fn: *const fn (*anyopaque, usize) anyerror!void,
+        \\    release_fn: *const fn (*anyopaque, usize) void,
+        \\    fn acquire(self: *Ledger, count: usize) !void { return self.acquire_fn(self.context, count); }
+        \\    fn release(self: *Ledger, count: usize) void { self.release_fn(self.context, count); }
+        \\};
+        \\pub fn build(ledger: *Ledger, count: usize) !void {
+        \\    try ledger.acquire(count);
+        \\    errdefer ledger.release(count);
+        \\    try ledger.acquire(count);
+        \\    errdefer ledger.release(count);
+        \\    try later();
+        \\}
+        \\fn later() !void {}
+    );
+}
+
+test "duplicate-errdefer: pointer resource argument still identifies duplicate cleanup" {
+    try testing.expectFiresTyped(check, "duplicate-errdefer",
+        \\const Allocator = struct { fn free(_: Allocator, _: []u8) void {} };
+        \\pub fn build(allocator: Allocator, bytes: []u8) !void {
+        \\    errdefer allocator.free(bytes);
+        \\    errdefer allocator.free(bytes);
+        \\    return error.Later;
+        \\}
+    );
+}
+
+test "duplicate-errdefer: deferred receivers read the rebound path on exit" {
+    try testing.expectFiresTyped(check, "duplicate-errdefer",
+        \\const Handle = struct { fn close(_: Handle) void {} };
+        \\pub fn build(first: Handle, second: Handle) !void {
+        \\    var handle = first;
+        \\    errdefer handle.close();
+        \\    handle = second;
+        \\    errdefer handle.close();
+        \\    return error.Later;
+        \\}
+    );
+}
+
+test "duplicate-errdefer: value snapshots and branch captures stay distinct" {
+    try testing.expectNoFireTyped(check,
+        \\const Handle = struct { fn close(_: Handle) void {} };
+        \\pub fn build(first: Handle, second: Handle) !void {
+        \\    var handle = first;
+        \\    const saved = handle;
+        \\    errdefer saved.close();
+        \\    handle = second;
+        \\    errdefer handle.close();
+        \\    return error.Later;
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const Handle = struct { fn close(_: Handle) void {} };
+        \\pub fn build(first: ?Handle, second: ?Handle) !void {
+        \\    if (first) |held| { errdefer held.close(); }
+        \\    if (second) |held| { errdefer held.close(); }
+        \\    return error.Later;
+        \\}
+    );
 }

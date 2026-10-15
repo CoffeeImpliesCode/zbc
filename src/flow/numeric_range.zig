@@ -114,6 +114,16 @@ pub const Range = union(enum) {
         };
     }
 
+    /// Check the destination before a sum is evaluated. Nonnegative i128
+    /// endpoints can sum beyond the interval carrier while still fitting u128.
+    pub fn additionFitsInteger(a: Range, b: Range, bits: u16, signed: bool) bool {
+        if (a.binary(b, .add).fitsInteger(bits, signed)) return true;
+        if (signed or bits != 128 or a != .integer or b != .integer or
+            a.integer.min < 0 or b.integer.min < 0) return false;
+        _ = std.math.add(u128, @intCast(a.integer.max), @intCast(b.integer.max)) catch return false;
+        return true;
+    }
+
     pub fn exactInF32(self: Range) bool {
         if (self != .integer) return false;
         const value = self.integer;

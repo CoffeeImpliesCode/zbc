@@ -40,18 +40,35 @@ query_string.* = ZigString.init(try alloc.dupe(u8, result.query_string));
 - The write must be at the top-level statement form:
   - `<out>.* = <RHS>` (deref-write through pointer)
   - `<out>.<field> = <RHS>` (field assignment through pointer)
-- The RHS must mention a deferred name as an identifier
-  somewhere — not necessarily as a direct argument.
-- With typed analysis, copied values are not reported when the complete
-  retained type graph is proved address-free. The proof reads fields in
-  their declaring resolution frame, including imported types and aliases.
-  Optional and array elements must also be address-free. A union is safe
-  only when **every** payload is address-free; payloadless members carry
-  no address. For example, `out.range = state.rangeOf("") orelse .unknown`
-  is safe after `defer state.deinit()` when the returned union contains
-  only numeric ranges. Adding a slice to any payload prevents that proof.
-  Unknown types, pointers, and slices do not qualify. Explicit address-bit
-  operations such as `@intFromPtr` also prevent this exemption.
+- The shared expression-loan query follows exact local declarations, aliases,
+  selected fields, and canonical call returns. An identifier spelling is not a loan proof.
+- Only proved loans cause findings. Unknown types, opaque callees, and incomplete
+  graph traversal add no definite lifetime violation.
+- Copied address-free values carry no storage loan. This includes scalar-only
+  optional, array, struct, and union payloads. Explicit address bits still carry provenance.
+- A retained pointer field also needs source-proved release of that payload.
+  A no-op destructor or cleanup of a different sibling field does not suffice.
+  An unchanged literal can connect selected metadata to the same private scalar buffer
+  that another field releases. A copied whole aggregate includes its released children.
+- Release proof checks both the selected payload and the released alias for rebinding.
+  A later-registered defer that replaces the payload runs before the cleanup,
+  even when registered before publication. An earlier-registered replacement
+  runs after that cleanup and does not keep the published payload live.
+  Completed inner normal defers also run before an outer cleanup.
+  Errdefer interference is checked within its own scope, after publication.
+  Normal exhaustion and normal breaks do not execute errdefer, even when the
+  break value is an error. A later outer error does not run a completed inner
+  scope's errdefers.
+- SDK identity comes from the canonical declaration, not method names.
+  An allocation through a local arena's allocator factory retains that arena's lifetime.
+  An allocation through its parent allocator does not. Copying an empty arena header
+  does not prove that its incoming allocator dies.
+- Publication RHS calls are checked for effects on their own path. A by-value
+  slice argument is not its mutable source header, but a receiver may still
+  rebind the selected payload before the out-param assignment. Unproved
+  pointer-bearing aggregates remain conservative; unrelated scalar writes do
+  not discharge a retained payload.
+
 - A write is **not** reported when a later `defer <same place> = <literal>;`
   clears it before the cleanup runs.  Defers unwind last-in-first-out, so a
   clearing defer in the cleanup's own scope and registered after it fires
@@ -60,14 +77,12 @@ query_string.* = ZigString.init(try alloc.dupe(u8, result.query_string));
   statement right after it (nothing can exit in between), and its value
   must be a literal (`null`, `.{}`, `&.{}`, a number or string).
 
-## Limitations (deliberate)
+## Limitations
 
-- Doesn't distinguish cloning vs borrowing constructors in the
-  RHS — `<out>.* = MyType.init(X)` fires whether `init` clones
-  or just stores a reference.  Most `init(X)`-style calls in
-  practice are non-cloning, so this is OK; cloning constructors
-  produce no FP because the rule fires on the assignment but the
-  semantic is benign.  Reviewer must verify.
-- Doesn't track multi-hop aliasing — `const tmp = X; out.* = tmp;`
-  wouldn't fire (only `X` is in deferred set, not `tmp`).
-- Same-fn scope only; cross-fn defer / cleanup is out of scope.
+- The detector selects deferred cleanup in the same function and lexical scope.
+  It can follow called helpers, but it does not invent cleanup for another invocation.
+- Unknown release, mutable alias, or graph evidence can prevent a finding.
+  An absent finding is not a complete lifetime-safety proof.
+- Source errors remain strict. Budget exhaustion marks the rule incomplete.
+  It does not produce a definite lifetime finding.
+

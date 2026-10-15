@@ -1,8 +1,8 @@
 # heap-use-after-free
 
-Reading or returning a heap pointer after the corresponding `free` /
-`destroy` call.  The value's storage has been returned to the
-allocator; reading it is undefined behavior.
+Reading heap payload after its corresponding `free` / `destroy`, or
+returning a dangling heap address. The allocator owns the released
+storage; dereferencing it is invalid.
 
 ## Example
 
@@ -30,14 +30,56 @@ through the same name before re-use:
   through an unrecognised builder method, the prior free state may
   persist.  Naming the constructor `init`/`create`/`new`/`open`
   helps the classifier recognise the fresh allocation.
-- **A slice argument is not automatically a read, and a copy out of
-  one is.**  `free(buf); use(buf[0..1]);` is a genuine
-  use-after-free — the slice aliases the freed allocation — and a
-  single index is reported for the same reason.  What zbc does NOT
-  do is report every `buf[a..b]`: building a slice reads nothing,
-  so passing one to a function that only writes through it is
-  silent, while `@memcpy(ptr, buf[0..])` on the source side is a
-  whole-array read and fires.
+- **A view is not a payload read.** `free(buf); _ = buf[0];` is
+  a use-after-free. Building `buf[a..b]` reads the descriptor, not
+  its elements. A call that reads those elements and the source
+  operand of `@memcpy(ptr, buf[0..])` must still check the backing
+  allocation.
+- **A pointer or slice header is not its backing allocation.** Reading
+  `bytes.len`, copying `bytes.ptr`, or copying the descriptor does not
+  read released elements. Copies keep the allocation identity: a later
+  index, dereference, payload-reading call, return, or output escape
+  must still check that identity. This distinction requires an exact
+  source expression and resolved pointer/slice type. An unresolved
+  field chain is not proof of a header-only read.
+- **The object holding a header must still be alive.** After
+  `allocator.destroy(owner)`, `owner.bytes.len` reads the released
+  owner's bytes. The slice's header-only classification does not
+  excuse this parent-object use-after-free. The same rule applies to
+  intermediate pointer fields in a nested chain.
+- **Runtime headers must be initialized.** An undefined slice's `.len`
+  is an undefined-value read, unlike a fixed array's static extent.
+  The SDK's empty-slice `free` no-op still evaluates its argument.
+  Its descriptor and every containing pointer owner are read before
+  release handling. An empty backing value does not excuse an
+  undefined header or a dead object that holds that header.
+- **A lifetime origin does not prove a non-null value.** An allocation
+  with `catch null` and a nullable borrowed return can both carry
+  lifetime evidence without proving that the optional contains a value.
+  Null-branch pruning needs a separate value proof for the exact
+  selected place. Every returning alternative must support that proof.
+  A physical store and its output-custody record share one evaluated
+  value. The custody record does not read or invalidate the source again.
+  Field facts also require a unique canonical path representation.
+  A quoted field such as `@"a.b"` must not supply a fact for the
+  distinct nested field `a.b`. Unions, unresolved layouts, and
+  ambiguous flat paths do not supply this proof. A current value
+  selection can cross a pointer ancestor only through exact typed
+  owner selections; mutation revokes that value fact. This does not
+  prove field independence or a stable physical output address.
+- **Heap output custody is separate from stack-escape policy.**
+  A proved scope-bound stack installation can omit a stack warning,
+  but it must still record any heap allocation published through
+  that output. A conditional defer may retire that custody only
+  for the same stable physical output slot. A sibling null check,
+  a pointer-ancestor selection, or a rebound root is not that slot.
+- **Loop allocation generations remain a precision limit.** Repeated
+  execution of one allocation site can merge distinct iterations.
+  A loop-carried slice replacement, followed by conditional deferred
+  cleanup, can therefore produce an extra lifetime warning. The
+  header and output-custody proofs above do not separate those
+  allocation instances or prove that a real release can be skipped.
+
 
 ## Borrow-tracking via inference
 
@@ -62,9 +104,9 @@ Example:
     };
 
     var owner = Owner{ .data = try gpa.alloc(u8, 16) };
-    const borrowed = owner.data; // borrowed origin tied to owner
-    owner.die(gpa);              // inferred as takes ownership(self)
-    _ = borrowed;                // ← heap-use-after-free fires
+    const borrowed = owner.data;
+    owner.die(gpa);
+    _ = borrowed[0];             // ← released backing storage is read
 
 ## Turning other rules off
 

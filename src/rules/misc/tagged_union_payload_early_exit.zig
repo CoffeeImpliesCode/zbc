@@ -64,7 +64,8 @@ fn checkBody(
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
-    const bindings = try cache.localBindings(proto, body);
+    const binding_view = (try cache.localBindings(proto, body)).*;
+    const bindings = &binding_view;
 
     var t: Ast.TokenIndex = first;
     while (t + 4 <= last) : (t += 1) {
@@ -106,15 +107,12 @@ fn checkBody(
         // The target must resolve to a tagged union.  A known struct or
         // untagged union is not this rule's bug class; unknown types remain
         // conservative and continue to the diagnostic.
-        switch (targetKind(tree, model, bindings, lhs_start, lhs_end, t)) {
-            .not_tagged_union => continue,
-            .tagged_union, .unknown => {},
-        }
-        if (!assignmentIsObservable(tree, cache, tags, bindings, first, last, t, lhs_start))
-            continue;
-
-        // Find the matching `}` of the outer literal.
+        const target_kind = try targetKind(tree, cache, model, bindings, lhs_start, lhs_end, t);
+        if (target_kind == .not_tagged_union) continue;
         const rbrace = matchBrace(tags, t + 2, last) orelse continue;
+        if (target_kind == .tagged_union and
+            !try assignmentIsObservable(tree, cache, tags, bindings, first, last, t, lhs_start, rbrace))
+            continue;
 
         // Scan inside `.{ ... }` for `keyword_try`; fire at the first one.
         var u: Ast.TokenIndex = t + 3;
@@ -183,13 +181,10 @@ const TypeRange = struct {
 /// The storage a `.loop_capture` iterates, when that storage is
 /// nameable.
 ///
-/// `for (fields) |*field|` records the capture with the ITERABLE's
-/// token span, so a single-identifier iterable names exactly the
-/// slice the capture writes through.  A slice expression
-/// (`fields[0..n]`), a pointer to an array (`&buf`) or a call
-/// (`list.items()`) is not nameable here and stays unresolved, which
-/// every caller reads as "report": a capture whose storage cannot be
-/// placed is not evidence of privacy.
+/// A name or a slice range over that name retains the storage declaration:
+/// `fields` and `fields[0..n]` both name `fields`. A field path, call, or
+/// pointer-to-array expression remains unresolved. Unknown storage does not
+/// prove privacy.
 ///
 /// The span is only the iterable for a `for` header.  `while` and
 /// `if` record their condition in the same field, and a capture over
@@ -200,10 +195,20 @@ fn captureIterableName(
     capture: *const local_bindings.Binding,
 ) ?[]const u8 {
     if (capture.origin != .loop_capture) return null;
-    if (capture.rhs_first != capture.rhs_last) return null;
     if (capture.rhs_first < 2) return null;
     if (tags[capture.rhs_first - 2] != .keyword_for) return null;
     if (tags[capture.rhs_first] != .identifier) return null;
+    if (capture.rhs_first != capture.rhs_last) {
+        const open = capture.rhs_first + 1;
+        if (tags[open] != .l_bracket) return null;
+        if ((tokens.matchBracket(tags, open, capture.rhs_last) orelse return null) != capture.rhs_last)
+            return null;
+        var range_seen = false;
+        for (tags[open + 1 .. capture.rhs_last]) |tag| {
+            if (tag == .ellipsis2) range_seen = true;
+        }
+        if (!range_seen) return null;
+    }
     return tree.tokenSlice(capture.rhs_first);
 }
 
@@ -365,12 +370,39 @@ fn terminalTypeName(tree: *const Ast, range: TypeRange) ?[]const u8 {
 
 fn targetKind(
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     model: *const file_model.FileModel,
     bindings: *const local_bindings.LocalBindings,
     lhs_start: Ast.TokenIndex,
     lhs_end: Ast.TokenIndex,
     use_tok: Ast.TokenIndex,
-) TargetKind {
+) !TargetKind {
+    // Resolve the complete LHS in its actual declaration context. In
+    // particular, `?Reader` is an optional STRUCT, not a tagged union
+    // merely because its assignment uses a one-field literal.
+    if (cache.zls) |resolver| {
+        if (cache.nodeForExactSpan(lhs_start, lhs_end)) |node| {
+            var actual = (try resolver.resolutionFrame().typeOfNode(node)) orelse return .unknown;
+            while (resolver.typeTag(actual) == .optional)
+                actual = (try resolver.normalizedType(resolver.childType(actual) orelse return .unknown)) orelse return .unknown;
+            switch (resolver.typeTag(actual) orelse return .unknown) {
+                .@"union" => {
+                    const container = switch (actual.data) {
+                        .container => |container| container,
+                        else => return .unknown,
+                    };
+                    const owner_tree = &container.scope_handle.handle.document.tree;
+                    const union_token = owner_tree.nodeMainToken(container.scope_handle.toNode());
+                    const owner_tags = owner_tree.tokens.items(.tag);
+                    if (owner_tags[union_token] != .keyword_union or union_token + 1 >= owner_tags.len)
+                        return .unknown;
+                    return if (owner_tags[union_token + 1] == .l_paren) .tagged_union else .not_tagged_union;
+                },
+                .@"struct", .@"enum", .int, .float, .pointer => return .not_tagged_union,
+                else => return .unknown,
+            }
+        }
+    }
     const tags = tree.tokens.items(.tag);
     const root_name = tree.tokenSlice(lhs_start);
     const binding = bindings.findAt(root_name, use_tok) orelse return .unknown;
@@ -461,12 +493,15 @@ fn assignmentIsObservable(
     body_last: Ast.TokenIndex,
     assignment_tok: Ast.TokenIndex,
     lhs_start: Ast.TokenIndex,
-) bool {
+    literal_end: Ast.TokenIndex,
+) !bool {
     const root_name = tree.tokenSlice(lhs_start);
     const binding = bindings.findAt(root_name, assignment_tok) orelse return true;
     if (binding.origin == .param) return true;
+    if (!try targetPathIsInline(tree, cache, bindings, binding, lhs_start, assignment_tok - 1))
+        return true;
     if (binding.origin == .loop_capture) {
-        if (!captureStorageIsFramePrivate(
+        if (!try captureStorageIsFramePrivate(
             tree,
             cache,
             tags,
@@ -475,8 +510,9 @@ fn assignmentIsObservable(
             body_last,
             assignment_tok,
             binding,
+            if (lhs_start + 2 < assignment_tok) tree.tokenSlice(lhs_start + 2) else null,
         )) return true;
-        if (captureReachesOutsideFrame(tree, tags, body_first, assignment_tok, binding))
+        if (captureReachesOutsideFrame(tree, tags, bindings, body_first, literal_end, binding))
             return true;
         const storage_name = captureIterableName(tree, tags, binding) orelse return true;
         if (hasEscapedAddressAlias(
@@ -485,7 +521,7 @@ fn assignmentIsObservable(
             bindings,
             body_first,
             body_last,
-            assignment_tok,
+            literal_end,
             storage_name,
         )) return true;
         return hasPreCommitPublication(
@@ -494,14 +530,25 @@ fn assignmentIsObservable(
             bindings,
             body_first,
             body_last,
-            assignment_tok,
+            literal_end,
             storage_name,
         );
     }
-    if (bindingTypeRange(tree, tags, bindings, binding, 0)) |range| {
-        if (typeRangeStartsPointer(tree, range)) return true;
+    // Annotation spellings can themselves alias pointers. Use the actual
+    // root type when available, including inferred call/orelse initializers.
+    if (cache.zls) |resolver| {
+        const node = cache.nodeForExactSpan(lhs_start, lhs_start) orelse return true;
+        const actual = (try resolver.resolutionFrame().typeOfNode(node)) orelse return true;
+        switch (resolver.typeTag(actual) orelse return true) {
+            .@"struct", .@"union" => {},
+            else => return true,
+        }
     } else {
-        return true;
+        const model = try cache.fileModel();
+        const root = rootTypeInfo(tree, model, bindings, binding) orelse return true;
+        if (root.kind != .struct_ and root.kind != .union_) return true;
+        const range = bindingTypeRange(tree, tags, bindings, binding, 0) orelse return true;
+        if (typeRangeStartsPointer(tree, range)) return true;
     }
     if (hasDeferredObserver(tree, tags, body_first, body_last, assignment_tok, root_name))
         return true;
@@ -511,7 +558,7 @@ fn assignmentIsObservable(
         bindings,
         body_first,
         body_last,
-        assignment_tok,
+        literal_end,
         root_name,
     )) return true;
     return hasPreCommitPublication(
@@ -520,9 +567,45 @@ fn assignmentIsObservable(
         bindings,
         body_first,
         body_last,
-        assignment_tok,
+        literal_end,
         root_name,
     );
+}
+
+/// A private header does not own a pointee reached through one of its fields.
+/// Every intermediate projection must stay in inline aggregate storage.
+fn targetPathIsInline(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    binding: *const local_bindings.Binding,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) !bool {
+    if (first + 2 >= last) return true;
+    if (cache.zls) |resolver| {
+        var end = first + 2;
+        while (end < last) : (end += 2) {
+            const node = cache.nodeForExactSpan(first, end) orelse return false;
+            const actual = (try resolver.resolutionFrame().typeOfNode(node)) orelse return false;
+            switch (resolver.typeTag(actual) orelse return false) {
+                .@"struct", .@"union" => {},
+                else => return false,
+            }
+        }
+        return true;
+    }
+    const model = try cache.fileModel();
+    var owner = rootTypeInfo(tree, model, bindings, binding) orelse return false;
+    var field = first + 2;
+    while (field < last) : (field += 2) {
+        const declaration = owner.findField(tree.tokenSlice(field)) orelse return false;
+        if (typeRangeStartsPointer(tree, .{ .first = declaration.type_first, .last = declaration.type_last }))
+            return false;
+        owner = model.resolveFieldTypeQualifiedTi(owner, tree.tokenSlice(field)) orelse return false;
+        if (owner.kind != .struct_ and owner.kind != .union_) return false;
+    }
+    return true;
 }
 
 /// True when the union element a loop capture writes through lives in
@@ -547,15 +630,13 @@ fn assignmentIsObservable(
 ///   - a `defer` / `errdefer` before the assignment DOMINATES the
 ///     write — its block is an ancestor of the block the write is
 ///     written in, and it is registered unconditionally — and that
-///     cleanup raw-frees the storage through a receiver whose declared
-///     type resolves to the standard allocator;
-///   - no cleanup before the assignment reaches the storage, or the
-///     captured element, by any route other than that release.  A
-///     cleanup that both releases raw and reads is an observer: the
-///     release hands the bytes back, and a read that follows it still
-///     interprets them.
+///     cleanup raw-frees the exact allocation through its own allocator,
+///     or releases its proved private standard arena;
+///   - no cleanup reads the retagged field. An exact loop capture can read
+///     another declared field without observing the union. A cleanup that
+///     releases raw and also reads the union remains an observer.
 ///   - every other mention of that storage before the assignment is
-///     its own declaration, a reassignment, an element write, or a loop header.
+///     its own declaration, a proved allocation, an element write, or a loop header.
 ///     Anything else could have published the slice.
 fn captureStorageIsFramePrivate(
     tree: *const Ast,
@@ -566,15 +647,25 @@ fn captureStorageIsFramePrivate(
     body_last: Ast.TokenIndex,
     assignment_tok: Ast.TokenIndex,
     capture: *const local_bindings.Binding,
-) bool {
+    target_field: ?[]const u8,
+) !bool {
     const iterable = captureIterableName(tree, tags, capture) orelse return false;
     const storage = bindings.findAt(iterable, capture.rhs_first) orelse return false;
     // The caller owns a parameter's slice and reads it on the error
     // path, even when the frame frees it afterwards.
     if (storage.origin == .param) return false;
-    if (storageElementTypeName(tree, tags, bindings, storage, 0) == null) return false;
+    const element_name = storageElementTypeName(tree, tags, bindings, storage, 0) orelse return false;
+    const element = if (cache.zls != null)
+        (try actualCaptureElement(cache, capture.rhs_first)) orelse return false
+    else
+        (try cache.fileModel()).findType(element_name) orelse return false;
+    const allocation = privateStorageAllocation(tree, cache, tags, bindings, storage, assignment_tok) orelse return false;
 
     var raw_free_seen = false;
+    if (allocation.arena) |arena| {
+        raw_free_seen = arenaReleasedBeforeWrite(tree, tags, bindings, body_first, body_last, assignment_tok, arena);
+        if (!raw_free_seen) return false;
+    }
     var t = body_first;
     while (t < assignment_tok) : (t += 1) {
         if (tags[t] == .keyword_fn) {
@@ -583,7 +674,7 @@ fn captureStorageIsFramePrivate(
         }
         if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
             const end = tokens.skipDeferStmt(tags, t, body_last) orelse return false;
-            switch (classifyCleanup(tree, cache, tags, bindings, t, end, iterable, capture.name)) {
+            switch (classifyCleanup(tree, cache, tags, bindings, t, end, iterable, capture.name, element, target_field, allocation.allocator)) {
                 // A cleanup that reads what the retag corrupted settles
                 // it, whether or not it also releases raw.
                 .observes => return false,
@@ -601,7 +692,7 @@ fn captureStorageIsFramePrivate(
         }
         if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), iterable)) continue;
         if (t == storage.name_token) continue;
-        if (isLoopIterableToken(bindings, t)) continue;
+        if (isLoopIterableToken(tree, tags, bindings, t)) continue;
         // `fields = allocator.alloc(…)` rebinds the name to a new
         // allocation; the frame still owns it, and the release that
         // follows it is what the privacy proof rests on.
@@ -613,6 +704,224 @@ fn captureStorageIsFramePrivate(
         return false;
     }
     return raw_free_seen;
+}
+
+/// The slice's actual element declaration owns its field names. This follows
+/// module aliases in the existing resolution frame, never by a leaf-name search.
+fn actualCaptureElement(
+    cache: *file_cache_mod.FileCache,
+    storage_token: Ast.TokenIndex,
+) !?*const file_model.TypeInfo {
+    const resolver = cache.zls orelse return null;
+    const node = cache.nodeForExactSpan(storage_token, storage_token) orelse return null;
+    const slice = (try resolver.resolutionFrame().typeOfNode(node)) orelse return null;
+    if (resolver.pointerSize(slice) != .slice) return null;
+    const element = (try resolver.normalizedType(resolver.childType(slice) orelse return null)) orelse return null;
+    const container = switch (element.data) {
+        .container => |container| container,
+        else => return null,
+    };
+    const handle = container.scope_handle.handle;
+    const owner_tree = &handle.document.tree;
+    const owner_cache = if (owner_tree == cache.tree)
+        cache
+    else
+        &(try cache.sourceDocument(handle)).cache;
+    const model = try owner_cache.fileModel();
+    for (model.types) |*candidate| {
+        if (container.scope_handle.scope == .root) {
+            if (candidate.body_first == 0) return candidate;
+        } else if (candidate.body_last == owner_tree.lastToken(container.scope_handle.toNode())) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+const PrivateAllocation = struct {
+    arena: ?*const local_bindings.Binding = null,
+    allocator: ?*const local_bindings.Binding = null,
+};
+
+/// Every generation of the slice must come from an exact allocator call.
+/// An annotation or a free of a copied caller header does not prove ownership.
+fn privateStorageAllocation(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    tags: []const std.zig.Token.Tag,
+    bindings: *const local_bindings.LocalBindings,
+    storage: *const local_bindings.Binding,
+    before: Ast.TokenIndex,
+) ?PrivateAllocation {
+    var allocation = privateAllocationExpression(tree, cache, tags, bindings, storage.rhs_first, storage.rhs_last);
+    if (allocation == null and !emptySliceInitializer(tags, storage.rhs_first, storage.rhs_last)) return null;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .assign) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const pair = tree.nodeData(node).node_and_node;
+        const lhs = pair[0];
+        const tok = tree.firstToken(lhs);
+        if (tok <= storage.name_token or tok >= before or tree.nodeTag(lhs) != .identifier) continue;
+        if (bindings.findAt(tree.tokenSlice(tok), tok) != storage) continue;
+        const next = privateAllocationExpression(tree, cache, tags, bindings, tree.firstToken(pair[1]), tree.lastToken(pair[1])) orelse return null;
+        if (allocation) |previous| {
+            if (previous.arena != next.arena or previous.allocator != next.allocator) return null;
+        }
+        allocation = next;
+    }
+    return allocation;
+}
+
+fn emptySliceInitializer(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
+    return last == first + 3 and tags[first] == .ampersand and
+        tags[first + 1] == .period and tags[first + 2] == .l_brace and tags[last] == .r_brace;
+}
+
+fn privateAllocationExpression(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    tags: []const std.zig.Token.Tag,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) ?PrivateAllocation {
+    var start = first;
+    if (tags[start] == .keyword_try) start += 1;
+    if (start + 3 > last or tags[start] != .identifier or tags[start + 1] != .period or
+        tags[start + 2] != .identifier or tags[start + 3] != .l_paren) return null;
+    if (!isElementTypedAllocMethod(tree.tokenSlice(start + 2))) return null;
+    const close = tokens.matchParen(tags, start + 3, last) orelse return null;
+    if (close != last and !(close + 2 <= last and tags[close + 1] == .keyword_catch and tags[close + 2] == .keyword_return))
+        return null;
+    if (receiverIsStandardAllocator(cache, tree, tags, bindings, start)) {
+        const owner = allocatorBinding(bindings, tree.tokenSlice(start), start, 0) orelse return null;
+        const range = bindingTypeRange(tree, tags, bindings, owner, 0) orelse return null;
+        if (typeRangeStartsPointer(tree, range)) return null;
+        return .{ .allocator = owner };
+    }
+    const allocator = bindings.findAt(tree.tokenSlice(start), start) orelse return null;
+    const call = allocator.asCall() orelse return null;
+    if (call.isChained() or !std.mem.eql(u8, call.method orelse return null, "allocator")) return null;
+    const arena = bindings.findAt(call.receiver, call.receiver_token) orelse return null;
+    const arena_first = arena.rhsFirstAfterTry(tags);
+    var paren = arena_first;
+    while (paren <= arena.rhs_last and tags[paren] != .l_paren) : (paren += 1) {}
+    if (paren < arena_first + 3 or paren > arena.rhs_last or
+        tags[paren - 2] != .period or !std.mem.eql(u8, tree.tokenSlice(paren - 1), "init")) return null;
+    if (!std_type_query.isType(cache, tree, arena_first, paren - 3, "heap", "ArenaAllocator", .{})) return null;
+    return .{ .arena = arena };
+}
+
+fn allocatorBinding(
+    bindings: *const local_bindings.LocalBindings,
+    name: []const u8,
+    use: Ast.TokenIndex,
+    depth: u8,
+) ?*const local_bindings.Binding {
+    if (depth >= 8) return null;
+    const binding = bindings.findAt(name, use) orelse return null;
+    if (!binding.is_const) return null;
+    return switch (binding.origin) {
+        .alias => |source| allocatorBinding(bindings, source, binding.rhs_first, depth + 1),
+        else => binding,
+    };
+}
+
+fn arenaReleasedBeforeWrite(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    before: Ast.TokenIndex,
+    arena: *const local_bindings.Binding,
+) bool {
+    var release_seen = false;
+    var t = arena.name_token + 1;
+    while (t < before) : (t += 1) {
+        if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
+            const end = tokens.skipDeferStmt(tags, t, last) orelse return false;
+            if (t + 6 == end and tags[t + 1] == .identifier and
+                bindings.findAt(tree.tokenSlice(t + 1), t + 1) == arena and
+                tags[t + 2] == .period and std.mem.eql(u8, tree.tokenSlice(t + 3), "deinit") and
+                tags[t + 4] == .l_paren and tags[t + 5] == .r_paren and
+                deferDominatesWrite(tags, first, last, before, t))
+            {
+                release_seen = true;
+                t = end;
+                continue;
+            }
+        }
+        if (tags[t] != .identifier or bindings.findAt(tree.tokenSlice(t), t) != arena) continue;
+        if (t + 4 < before and tags[t + 1] == .period and
+            std.mem.eql(u8, tree.tokenSlice(t + 2), "allocator") and
+            tags[t + 3] == .l_paren and tags[t + 4] == .r_paren) continue;
+        return false;
+    }
+    return release_seen;
+}
+
+fn disjointCaptureRead(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    tok: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    element: *const file_model.TypeInfo,
+    target: []const u8,
+) bool {
+    if (tok + 2 > last or tags[tok + 1] != .period or tags[tok + 2] != .identifier) return false;
+    if (tok > 0 and tags[tok - 1] == .ampersand) return false;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .address_of) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (tree.firstToken(node) <= tok and tree.lastToken(node) >= tok) return false;
+    }
+    var tail = tok;
+    while (tail + 2 <= last and tags[tail + 1] == .period and tags[tail + 2] == .identifier)
+        tail += 2;
+    if (tail < last and tags[tail + 1] == .l_paren) return false;
+    const field = tree.tokenSlice(tok + 2);
+    return !std.mem.eql(u8, field, target) and element.findField(field) != null;
+}
+
+/// A cleanup may read another declared field without interpreting the union.
+/// The whole loop is checked, including every use of its exact capture.
+fn cleanupReadsDisjointField(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    use: Ast.TokenIndex,
+    storage_name: []const u8,
+    element: *const file_model.TypeInfo,
+    target_field: ?[]const u8,
+) bool {
+    const target = target_field orelse return false;
+    if (bindings.findAt(tree.tokenSlice(use), use)) |capture| {
+        if (captureIterableName(tree, tags, capture)) |iterable| {
+            // findAt includes the declaration token. Only a value use takes
+            // this path; the binder must pass the whole-loop check below.
+            if (use != capture.name_token and std.mem.eql(u8, iterable, storage_name))
+                return disjointCaptureRead(tree, tags, use, last, element, target);
+        }
+    }
+    for (bindings.items) |*capture| {
+        if (capture.name_token < first or capture.name_token > last) continue;
+        // The capture declaration names the binding, not the element value.
+        // Certify its uses with the same whole-loop check as the iterable.
+        if (capture.rhs_first != use and capture.name_token != use) continue;
+        const iterable = captureIterableName(tree, tags, capture) orelse continue;
+        if (!std.mem.eql(u8, iterable, storage_name)) continue;
+        var t = capture.name_token + 1;
+        while (t <= @min(last, capture.scope_close)) : (t += 1) {
+            if (tags[t] != .identifier or bindings.findAt(tree.tokenSlice(t), t) != capture) continue;
+            if (t > 0 and tags[t - 1] == .period) continue;
+            if (!disjointCaptureRead(tree, tags, t, last, element, target)) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 /// True only for the root of `storage[index] = …`, not an indexed read
@@ -641,10 +950,47 @@ fn isIndexedStorageWrite(
 fn captureReachesOutsideFrame(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
+    bindings: *const local_bindings.LocalBindings,
     body_first: Ast.TokenIndex,
     assignment_tok: Ast.TokenIndex,
     capture: *const local_bindings.Binding,
 ) bool {
+    const storage_name = captureIterableName(tree, tags, capture) orelse return true;
+    var use = capture.name_token + 1;
+    while (use < @min(assignment_tok, capture.scope_close)) : (use += 1) {
+        if (tags[use] == .keyword_fn) {
+            use = skipNestedFn(tags, use, assignment_tok);
+            continue;
+        }
+        if (tags[use] != .identifier or (use > 0 and tags[use - 1] == .period)) continue;
+        if (bindings.findAt(tree.tokenSlice(use), use) == capture) {
+            if (use + 2 < assignment_tok and tags[use + 1] == .period) {
+                if (tags[use + 2] == .asterisk and use + 3 < assignment_tok and tags[use + 3] == .equal)
+                    continue;
+                if (tags[use + 2] == .identifier) {
+                    var tail = use + 2;
+                    while (tail + 2 < assignment_tok and tags[tail + 1] == .period and tags[tail + 2] == .identifier)
+                        tail += 2;
+                    if (tail + 1 >= assignment_tok or tags[tail + 1] != .l_paren) continue;
+                }
+            }
+            return true;
+        }
+        if (!std.mem.eql(u8, tree.tokenSlice(use), storage_name)) continue;
+        if (readsElementCountOnly(tree, tags, use) or isLoopIterableToken(tree, tags, bindings, use)) continue;
+        if (isIndexedStorageWrite(tags, use, assignment_tok - 1)) continue;
+        return true;
+    }
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .address_of) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const amp = tree.firstToken(node);
+        if (amp <= capture.name_token or amp >= assignment_tok) continue;
+        const root = addressOperandRoot(tree, tree.nodeData(node).node);
+        if (tree.nodeTag(root) != .identifier) continue;
+        const name = tree.tokenSlice(tree.nodeMainToken(root));
+        if (std.mem.eql(u8, name, capture.name) or std.mem.eql(u8, name, storage_name)) return true;
+    }
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         switch (tag) {
             .call, .call_one, .call_comma, .call_one_comma => {},
@@ -666,7 +1012,8 @@ fn captureReachesOutsideFrame(
                     continue;
                 }
                 if (tags[t] == .identifier and
-                    std.mem.eql(u8, tree.tokenSlice(t), capture.name) and
+                    (std.mem.eql(u8, tree.tokenSlice(t), capture.name) or
+                        std.mem.eql(u8, tree.tokenSlice(t), storage_name)) and
                     t > 0 and tags[t - 1] != .period)
                 {
                     return true;
@@ -715,6 +1062,9 @@ fn classifyCleanup(
     end: Ast.TokenIndex,
     storage_name: []const u8,
     capture_name: []const u8,
+    element: *const file_model.TypeInfo,
+    target_field: ?[]const u8,
+    allocator: ?*const local_bindings.Binding,
 ) CleanupVerdict {
     var releases_raw = false;
     var observes = false;
@@ -722,13 +1072,22 @@ fn classifyCleanup(
     while (t <= end) : (t += 1) {
         if (tags[t] != .identifier) continue;
         if (isResolvedAllocatorFree(tree, cache, tags, bindings, t, end)) |close| {
-            if (statementMentions(tree, tags, t + 1, close, storage_name)) releases_raw = true;
-            t = close;
-            continue;
+            // Only the exact storage argument is a raw release. Naming
+            // `storage.len` inside some other allocation's argument is not.
+            if (t + 3 == close and tags[t + 2] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 2), storage_name) and allocator != null and
+                allocatorBinding(bindings, tree.tokenSlice(t - 2), t - 2, 0) == allocator)
+            {
+                releases_raw = true;
+                t = close;
+                continue;
+            }
         }
         const text = tree.tokenSlice(t);
         if (!std.mem.eql(u8, text, storage_name) and !std.mem.eql(u8, text, capture_name)) continue;
         if (readsElementCountOnly(tree, tags, t)) continue;
+        if (cleanupReadsDisjointField(tree, tags, bindings, kw, end, t, storage_name, element, target_field))
+            continue;
         observes = true;
         break;
     }
@@ -866,30 +1225,19 @@ fn enclosingBlock(
     return .{ .open = open, .close = close };
 }
 
-fn statementMentions(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    name: []const u8,
-) bool {
-    var t = first;
-    while (t <= last) : (t += 1) {
-        if (tags[t] == .identifier and std.mem.eql(u8, tree.tokenSlice(t), name)) return true;
-    }
-    return false;
-}
 
 /// True when `tok` is the whole iterable of a `for` loop — the token
 /// a capture's `rhs` span points at.  Those mentions ARE the loop,
 /// so they publish nothing.
 fn isLoopIterableToken(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
     bindings: *const local_bindings.LocalBindings,
     tok: Ast.TokenIndex,
 ) bool {
     for (bindings.items) |*binding| {
         if (binding.origin != .loop_capture) continue;
-        if (binding.rhs_first == tok and binding.rhs_last == tok) return true;
+        if (binding.rhs_first == tok and captureIterableName(tree, tags, binding) != null) return true;
     }
     return false;
 }
@@ -942,7 +1290,7 @@ fn hasEscapedAddressAlias(
 }
 
 /// True iff the root's address reaches a destination outside this frame
-/// before the assignment.
+/// before the complete initializer commits.
 ///
 /// `assignmentIsObservable` suppresses a by-value local whose union field
 /// is written only inside the frame that owns it: on the error path that
@@ -975,8 +1323,8 @@ fn hasPreCommitPublication(
         const node: Ast.Node.Index = @enumFromInt(index);
         const amp = tree.firstToken(node);
         if (amp < body_first or amp > body_last) continue;
-        // Publication AFTER the assignment cannot see the half-retagged
-        // union: the `try` leaves the function before control reaches it.
+        // The boundary includes the fallible payload. Publication after
+        // the complete initializer cannot run on this error path.
         if (amp >= assignment_tok) continue;
         const operand = addressOperandToken(tree, tree.nodeData(node).node) orelse continue;
         if (tree.tokenTag(operand) != .identifier) continue;
@@ -997,6 +1345,14 @@ fn addressOperandToken(tree: *const Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
         return addressOperandToken(tree, tree.nodeData(node).node_and_token[0]);
     }
     return tree.nodeMainToken(node);
+}
+
+fn addressOperandRoot(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    return switch (tree.nodeTag(node)) {
+        .grouped_expression, .field_access => addressOperandRoot(tree, tree.nodeData(node).node_and_token[0]),
+        .array_access => addressOperandRoot(tree, tree.nodeData(node).node_and_node[0]),
+        else => node,
+    };
 }
 
 fn insideNestedFn(
@@ -2255,5 +2611,303 @@ test "tagged-union-payload-early-exit: a reached plain-root heap construction st
         \\    fields[0] = slot;
         \\}
         \\
+    );
+}
+
+test "tagged-union-payload-early-exit: inferred private result retains its frame boundary" {
+    try testing.expectNoFireTyped(check,
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Request = struct { state: State, prefix: u8 };
+        \\fn base() Request { return .{ .state = .empty, .prefix = 0 }; }
+        \\fn payload(prefix: *u8) !u32 { prefix.* = 1; return error.Failed; }
+        \\fn build() !Request {
+        \\    var result = base();
+        \\    result.state = .{ .ready = try payload(&result.prefix) };
+        \\    return result;
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: inferred private result published before retag still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Request = struct { state: State };
+        \\fn base() Request { return .{ .state = .empty }; }
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(sink: **Request) !Request {
+        \\    var result = base();
+        \\    sink.* = &result;
+        \\    result.state = .{ .ready = try payload() };
+        \\    return result;
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: optional borrowed reader is a struct not a union" {
+    try testing.expectNoFireTyped(check,
+        \\const Reader = struct { bytes: []const u8 };
+        \\const Cursor = struct {
+        \\    reader: ?Reader = null,
+        \\    fn load(self: *Cursor) !void {
+        \\        self.reader = .{ .bytes = try payload() };
+        \\    }
+        \\};
+        \\fn payload() ![]const u8 { return error.Failed; }
+    );
+}
+
+test "tagged-union-payload-early-exit: optional published union is not a borrowed-reader exemption" {
+    try testing.expectFiresTyped(check, R,
+        \\const Reader = union(enum) { empty, bytes: []const u8 };
+        \\const Cursor = struct {
+        \\    reader: ?Reader = null,
+        \\    fn load(self: *Cursor) !void {
+        \\        self.reader = .{ .bytes = try payload() };
+        \\    }
+        \\};
+        \\fn payload() ![]const u8 { return error.Failed; }
+    );
+}
+
+test "tagged-union-payload-early-exit: private arena element with disjoint cleanup stays quiet" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Provenance = union(enum) { derived, acquired: []const u8 };
+        \\const Source = struct { lease: u32, provenance: Provenance };
+        \\fn release(_: u32) void {}
+        \\fn build(gpa: std.mem.Allocator) !void {
+        \\    var region = std.heap.ArenaAllocator.init(gpa);
+        \\    errdefer region.deinit();
+        \\    const memory = region.allocator();
+        \\    const sources = try memory.alloc(Source, 1);
+        \\    sources[0] = .{ .lease = 1, .provenance = .{ .acquired = "path" } };
+        \\    errdefer for (sources[0..1]) |source| release(source.lease);
+        \\    for (sources[0..1]) |*source| {
+        \\        source.provenance = .{ .acquired = try memory.dupe(u8, "path") };
+        \\    }
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: arena cleanup reading retagged field still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Provenance = union(enum) { derived, acquired: []const u8 };
+        \\const Source = struct { lease: u32, provenance: Provenance };
+        \\fn observe(_: Provenance) void {}
+        \\fn build(gpa: std.mem.Allocator) !void {
+        \\    var region = std.heap.ArenaAllocator.init(gpa);
+        \\    errdefer region.deinit();
+        \\    const memory = region.allocator();
+        \\    const sources = try memory.alloc(Source, 1);
+        \\    errdefer for (sources[0..1]) |source| observe(source.provenance);
+        \\    for (sources[0..1]) |*source| {
+        \\        source.provenance = .{ .acquired = try memory.dupe(u8, "path") };
+        \\    }
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: copied caller storage is not a private allocation" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Kind = union(enum) { empty, value: u32 };
+        \\const Field = struct { kind: Kind };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn update(gpa: std.mem.Allocator, caller_fields: []Field) !void {
+        \\    const fields: []Field = caller_fields;
+        \\    defer gpa.free(fields);
+        \\    for (fields) |*field| field.kind = .{ .value = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: raw release through another allocator is not owning cleanup" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Kind = union(enum) { empty, value: u32 };
+        \\const Field = struct { kind: Kind };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(first: std.mem.Allocator, second: std.mem.Allocator) !void {
+        \\    const fields = try first.alloc(Field, 1);
+        \\    defer second.free(fields);
+        \\    for (fields) |*field| field.kind = .{ .value = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: raw free argument must be the exact allocation" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Kind = union(enum) { empty, value: u32 };
+        \\const Field = struct { kind: Kind };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(gpa: std.mem.Allocator, unrelated: [][]Field) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(unrelated[fields.len]);
+        \\    for (fields) |*field| field.kind = .{ .value = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: six mapped cleanup variants remain unsafe" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const std = @import("std");
+        \\const Frozen = union(enum) {
+        \\    combinational: []u8,
+        \\    lookup_table: []u8,
+        \\    sequential: []u8,
+        \\    memory: []u8,
+        \\    global_buffer: []u8,
+        \\    physical_only: []u8,
+        \\    fn release(self: Frozen, memory: std.mem.Allocator) void {
+        \\        switch (self) {
+        \\            inline else => |bytes| memory.free(bytes),
+        \\        }
+        \\    }
+        \\};
+        \\fn copy(memory: std.mem.Allocator, which: u8) !Frozen {
+        \\    var result: Frozen = .{ .physical_only = &.{} };
+        \\    errdefer result.release(memory);
+        \\    switch (which) {
+        \\        0 => result = .{ .combinational = try memory.alloc(u8, 1) },
+        \\        1 => result = .{ .lookup_table = try memory.alloc(u8, 1) },
+        \\        2 => result = .{ .sequential = try memory.alloc(u8, 1) },
+        \\        3 => result = .{ .memory = try memory.alloc(u8, 1) },
+        \\        4 => result = .{ .global_buffer = try memory.alloc(u8, 1) },
+        \\        else => result = .{ .physical_only = try memory.alloc(u8, 1) },
+        \\    }
+        \\    return result;
+        \\}
+    );
+    defer testing.freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 6), problems.items.len);
+    for (problems.items) |problem| try std.testing.expectEqualStrings(R, problem.rule_id);
+}
+
+test "tagged-union-payload-early-exit: publication inside the fallible payload still warns" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Request = struct { state: State };
+        \\fn base() Request { return .{ .state = .empty }; }
+        \\fn publishAndFail(request: *Request, sink: **Request) !u32 {
+        \\    sink.* = request;
+        \\    return error.Failed;
+        \\}
+        \\fn build(sink: **Request) !Request {
+        \\    var result = base();
+        \\    result.state = .{ .ready = try publishAndFail(&result, sink) };
+        \\    return result;
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: storing a capture pointer publishes the private element" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Kind = union(enum) { empty, value: u32 };
+        \\const Field = struct { kind: Kind };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(gpa: std.mem.Allocator, sink: **Field) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    for (fields) |*field| {
+        \\        sink.* = field;
+        \\        field.kind = .{ .value = try payload() };
+        \\    }
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: a field address can expose the enclosing union storage" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Kind = union(enum) { empty, value: u32 };
+        \\const Field = struct { kind: Kind, marker: u32 };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(gpa: std.mem.Allocator, sink: **u32) !void {
+        \\    const fields = try gpa.alloc(Field, 1);
+        \\    defer gpa.free(fields);
+        \\    for (fields) |*field| {
+        \\        sink.* = &((field.marker));
+        \\        field.kind = .{ .value = try payload() };
+        \\    }
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: mutable allocator header is not an exact owning path" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Kind = union(enum) { empty, value: u32 };
+        \\const Field = struct { kind: Kind };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(memory: *std.mem.Allocator, other: std.mem.Allocator) !void {
+        \\    const fields = try memory.alloc(Field, 1);
+        \\    defer memory.free(fields);
+        \\    memory.* = other;
+        \\    for (fields) |*field| field.kind = .{ .value = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: a private header does not own an intermediate pointee" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Owner = struct { state: State };
+        \\const Header = struct { borrowed: *Owner };
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn update(owner: *Owner) !void {
+        \\    var local: Header = .{ .borrowed = owner };
+        \\    local.borrowed.state = .{ .ready = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: an annotated pointer alias is not private value storage" {
+    try testing.expectFires(check, R,
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Owner = struct { state: State };
+        \\const Alias = *Owner;
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn update(owner: *Owner) !void {
+        \\    const local: Alias = owner;
+        \\    local.state = .{ .ready = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: raw allocation cleanup binder is not an element read" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Item = struct { lease: u32, state: State };
+        \\fn release(_: u32) void {}
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(memory: std.mem.Allocator) !void {
+        \\    const items = try memory.alloc(Item, 1);
+        \\    errdefer memory.free(items);
+        \\    items[0] = .{ .lease = 1, .state = .empty };
+        \\    errdefer { for (items) |item| release(item.lease); }
+        \\    for (items) |*item| item.state = .{ .ready = try payload() };
+        \\}
+    );
+}
+
+test "tagged-union-payload-early-exit: cleanup binder does not hide a whole-element observer" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const State = union(enum) { empty, ready: u32 };
+        \\const Item = struct { lease: u32, state: State };
+        \\fn observe(_: Item) void {}
+        \\fn payload() !u32 { return error.Failed; }
+        \\fn build(memory: std.mem.Allocator) !void {
+        \\    const items = try memory.alloc(Item, 1);
+        \\    errdefer memory.free(items);
+        \\    items[0] = .{ .lease = 1, .state = .empty };
+        \\    errdefer { for (items) |item| observe(item); }
+        \\    for (items) |*item| item.state = .{ .ready = try payload() };
+        \\}
     );
 }

@@ -19,18 +19,17 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const tokens = @import("../../ast/tokens.zig");
-const local_bindings = @import("../../model/local_bindings.zig");
 const query = @import("../../ast/token_query.zig");
 const problem_mod = @import("../../problem.zig");
 const testing = @import("../../testing.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const return_storage = @import("../../cache/return_storage.zig");
-const storage_alias = @import("../../cache/storage_alias.zig");
 const call_summary = @import("../../cache/call_summary.zig");
-const type_query = @import("../../model/type_query.zig");
-const fresh_storage = @import("../../cache/fresh_storage.zig");
-const type_engine = @import("type_engine");
+const bindings_mod = @import("../../model/local_bindings.zig");
+const resolver_mod = @import("../../type_resolver.zig");
+const Iterator = @import("type_engine").AstIterator;
+const budget_mod = @import("../../budget.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -78,7 +77,7 @@ pub fn check(
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, cache, fn_entry.node, fn_entry.proto, fn_entry.body, problems);
+        try checkFn(gpa, tree, cache, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
@@ -86,7 +85,6 @@ fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
-    fn_decl: Ast.Node.Index,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -101,14 +99,6 @@ fn checkFn(
 
     const bindings = try cache.localBindings(proto, body);
 
-    // Keep the complete parameter declaration and its lexical owner.
-    // A terminal name cannot distinguish nested or imported type graphs.
-    const model = try cache.fileModel();
-    const owner: ?file_cache_mod.FileCache.ResolvedType = if (model.containingTypeOf(fn_decl)) |ti|
-        .{ .model = model, .info = ti, .path = cache.file_path, .module = cache.module_id }
-    else
-        null;
-
     var pointer_params: std.ArrayListUnmanaged(PointerParam) = .empty;
     defer pointer_params.deinit(gpa);
     for (bindings.items) |b| {
@@ -116,7 +106,6 @@ fn checkFn(
         if (!isPointerType(tags, b.rhs_first, b.rhs_last)) continue;
         try pointer_params.append(gpa, .{
             .name = b.name,
-            .declared = .{ .tree = tree, .first = b.rhs_first, .last = b.rhs_last, .owner = owner, .allow_array_length_expr = true },
         });
     }
     if (pointer_params.items.len == 0) return;
@@ -146,11 +135,13 @@ fn checkFn(
             const name = m.captureText(tree, 0).?;
             // Skip module/namespace identifiers (e.g. `defer posix.close(fd)`
             // where `posix` is `std.posix`) — they are not local variables.
-            if (bindings.find(name) != null) {
+            if (bindings.findAt(name, m.captures[0].?)) |binding| {
                 const range = enclosingScope(tags, t, first, last);
                 try deferred.append(gpa, .{
                     .name = name,
+                    .binding_token = binding.name_token,
                     .token = t,
+                    .cleanup_token = t + 2,
                     .scope_open = range.open,
                     .scope_close = range.close,
                 });
@@ -159,13 +150,18 @@ fn checkFn(
             continue;
         }
         if (query.matchAt(tree, defer_free, t, last, null)) |m| {
-            const range = enclosingScope(tags, t, first, last);
-            try deferred.append(gpa, .{
-                .name = m.captureText(tree, 0).?,
-                .token = t,
-                .scope_open = range.open,
-                .scope_close = range.close,
-            });
+            const name = m.captureText(tree, 0).?;
+            if (bindings.findAt(name, m.captures[0].?)) |binding| {
+                const range = enclosingScope(tags, t, first, last);
+                try deferred.append(gpa, .{
+                    .name = name,
+                    .binding_token = binding.name_token,
+                    .token = t,
+                    .cleanup_token = t + 2,
+                    .scope_open = range.open,
+                    .scope_close = range.close,
+                });
+            }
             t = m.end + 1;
             continue;
         }
@@ -173,14 +169,16 @@ fn checkFn(
     }
     if (deferred.items.len == 0) return;
 
-    // Find writes through pointer params; check RHS for any deferred name.
-    try scanWrites(gpa, tree, cache, write_via_out, first, last, pointer_params.items, deferred.items, problems);
+    // Canonical expression provenance owns every positive loan, including
+    // aliases and call-valued payloads. Names select lexical declarations only.
+    try scanWrites(gpa, tree, cache, body, write_via_out, first, last, pointer_params.items, deferred.items, problems);
 }
 
 fn scanWrites(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
+    body: Ast.Node.Index,
     atoms: []const Atom,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
@@ -191,56 +189,567 @@ fn scanWrites(
     const tags = tree.tokens.items(.tag);
     const writes = try query.findAllInBody(gpa, tree, atoms, first, last);
     defer gpa.free(writes);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const retained = try arena.allocator().alloc(Ast.TokenIndex, deferred.len);
+    for (deferred, retained) |cleanup, *token| token.* = cleanup.binding_token;
+    var loans = return_storage.ExpressionLoanQuery.init(.{
+        .cache = cache,
+        .body = body,
+        .scratch = &arena,
+    });
+    var cleanup_proof: CleanupProof = .{ .arena = &arena };
     for (writes) |w| {
         const out_name = w.captureText(tree, 0).?;
-        const pp = findPointerParam(out_name, pointer_params) orelse continue;
+        _ = findPointerParam(out_name, pointer_params) orelse continue;
         const sc = tokens.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
         if (sc <= w.end + 1) continue;
-        const dn = rhsMentionsDeferred(tree, w.start, w.end, sc, first, last, deferred) orelse continue;
-        // A copied value is independent only if its entire retained graph
-        // carries no address. Resolve actual expressions in this document;
-        // the shared proof reads each nested field in its declaring frame.
-        // Integer representations of addresses still retain those addresses.
-        if (!rhsHasAddressBits(tree, w.end + 1, sc - 1)) {
-            if (try expressionIsAddressFree(cache, w.start, w.end - 1) or
-                try expressionIsAddressFree(cache, w.end + 1, sc - 1) or
-                (cache.zls == null and declaredFieldIsAddressFree(cache, pp, w.start, w.end - 1))) continue;
+        const rhs = cache.nodeForExactSpan(w.end + 1, sc - 1) orelse continue;
+        const answer = try loans.expressionLoansAt(.{
+            .selection = .{ .node = rhs },
+            .horizon = tree.firstToken(rhs),
+            .retained_bindings = retained,
+        });
+        for (answer.loans) |loan| {
+            if (!loan.proved) continue;
+            for (deferred) |cleanup| {
+                if (cleanup.binding_token != loan.binding_token) continue;
+                if (w.start < cleanup.scope_open or w.start > cleanup.scope_close) continue;
+                if (clearedBeforeCleanup(tree, cleanup, w.start, w.end, sc, first, last)) continue;
+                if (loan.origin == .retained_value and !try cleanup_proof.releases(cache, body, cleanup, loan.payload_path, sc, rhs)) continue;
+                try report(gpa, problems, tree, w.start, out_name, cleanup.name);
+                break;
+            } else continue;
+            break;
         }
-        // RHS-shape check: when the assigned value comes from a
-        // `*.toOwnedSlice(*)` / `*.dupe(*)` / `*.clone(*)` call, the
-        // value is OWNED (newly-allocated by the call's allocator
-        // arg), not a borrow of the deferred local.  The deferred
-        // cleanup happens AFTER the copy is made; out-param holds
-        // a valid allocation.
-        if (rhsContainsCopyingCall(tree, w.end + 1, sc - 1)) continue;
-        // RHS contains `<X>.create(... allocator ... <slice> ...)`
-        // — the call is an allocator-backed constructor that
-        // canonically dupes its non-allocator args (Bun's
-        // `Type.create(global, allocator, ..., slice)` pattern,
-        // body does `allocator.dupe(u8, slice)`).  The out-param
-        // receives the new owned copy, not a borrow.
-        if (rhsContainsAllocatorConstructor(tree, w.end + 1, sc - 1)) continue;
-        // The canonical returned-storage proof checks the complete retained
-        // graph, including fields stored through a freshly allocated pointer.
-        // A fresh outer allocation alone cannot discharge a borrowed payload.
-        if (try rhsCallDoesNotBorrowDeferred(tree, cache, w.end + 1, sc - 1, dn)) continue;
-        // Switch-scrutinee-only skip: when the RHS is
-        // `switch (<expr-mentioning-deferred>) { <arms-not-mentioning-it> }`,
-        // the deferred slice is consumed by the expression that the
-        // switch is BRANCHING on; the arms build the result from the
-        // unpacked union payloads, not from the slice.  Common shape
-        // around connect/dispatch APIs:
-        //   `this.socket = switch (group.connect(..., hostz, ...)) {
-        //        .failed => return error..., .socket => |s| ..., }`
-        // Net effect: the deferred slice is transient (lives only
-        // through the call), and the out-param holds independent
-        // bytes (the unpacked Socket).
-        if (deferredOnlyInSwitchScrutinee(tree, w.end + 1, sc - 1, dn)) continue;
-        try report(gpa, problems, tree, w.start, out_name, dn);
     }
 }
 
-const PointerParam = struct { name: []const u8, declared: type_query.TypeRef };
+/// Retained header provenance is only an alias coordinate. A definite
+/// lifetime report also requires source-proved release of that exact payload.
+const CleanupProof = struct {
+    arena: *std.heap.ArenaAllocator,
+    remaining: u32 = call_summary.actual_query_work_limit,
+
+    const Frame = struct {
+        cache: *file_cache_mod.FileCache,
+        resolution: resolver_mod.TypeResolver.ResolutionFrame,
+        bindings: bindings_mod.LocalBindings,
+        selected: Ast.TokenIndex,
+        body: Ast.Node.Index,
+        root: ?*const Root = null,
+        root_path: []const u8 = "",
+        exit_cleanup: ?Ast.TokenIndex = null,
+        publication_rhs: bool = false,
+    };
+
+    const Root = struct {
+        frame: Frame,
+        use_token: Ast.TokenIndex,
+        rhs: Ast.Node.Index,
+    };
+
+    fn charge(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, depth: u8) file_cache_mod.SummaryError!void {
+        if (depth >= 64 or self.remaining == 0) {
+            const pos = try Pos.fromTokenStart(frame.cache.tree, frame.cache.tree.firstToken(node));
+            var function_name: budget_mod.NameBuf = .{};
+            if (tokens.enclosingFnDecl(frame.cache.tree, frame.cache.tree.firstToken(node))) |declaration| {
+                var buffer: [1]Ast.Node.Index = undefined;
+                if (tokens.fnProto(frame.cache.tree, &buffer, declaration)) |proto| {
+                    if (proto.name_token) |name| function_name.set(frame.cache.tree.tokenSlice(name));
+                }
+            }
+            return budget_mod.fail(.{
+                .limit = if (depth >= 64) .normal_cleanup_depth else .normal_cleanup_nodes,
+                .limit_value = if (depth >= 64) 64 else call_summary.actual_query_work_limit,
+                .reached = if (depth >= 64) depth else call_summary.actual_query_work_limit,
+                .byte = pos.byte, .line = pos.line, .column = pos.column,
+                .document = budget_mod.documentForTree(frame.cache.tree),
+                .function = function_name,
+            });
+        }
+        self.remaining -= 1;
+    }
+
+    fn releases(self: *CleanupProof, cache: *file_cache_mod.FileCache, body: Ast.Node.Index, cleanup: DeferredItem, path: []const u8, use_token: Ast.TokenIndex, rhs: Ast.Node.Index) file_cache_mod.SummaryError!bool {
+        const resolver = cache.zls orelse return false;
+        const declaration = tokens.enclosingFnDecl(cache.tree, cleanup.token) orelse return false;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(cache.tree, &buffer, declaration) orelse return false;
+        var resolution = resolver.resolutionFrame();
+        const callable = (try resolution.resolveValueOfNode(declaration)) orelse return false;
+        if (callable.is_type_val or callable.data != .function) return false;
+        const function = callable.data.function;
+        if (function.fn_token != proto.ast.fn_token or
+            &function.handle.document.tree != cache.tree or function.handle.module != cache.module_id) return false;
+        resolution = resolver.frameForFunction(.{
+            .tree = cache.tree, .fn_token = proto.ast.fn_token,
+            .handle = function.handle, .actual_type = callable,
+        });
+        var frame: Frame = .{
+            .cache = cache, .resolution = resolution,
+            .bindings = (try cache.localBindings(proto, body)).*,
+            .selected = cleanup.binding_token, .body = body,
+            .exit_cleanup = cleanup.token,
+        };
+        const root: Root = .{ .frame = frame, .use_token = use_token, .rhs = rhs };
+        frame.root = &root;
+        const actual = (try cache.actualCallSummaryAt(cleanup.cleanup_token, frame.resolution)) orelse return false;
+        // The publication expression can transfer and clear the old header
+        // before its returned value is stored in the out-parameter.
+        var producing = frame;
+        producing.publication_rhs = true;
+        if (try self.redirectedIn(producing, rhs, path, 0, cache.tree.lastToken(rhs) + 1, 0)) return false;
+        if (try self.redirectedIn(frame, body, path, use_token, cleanup.scope_close, 0)) return false;
+        return self.callReleases(frame, actual, path, 0);
+    }
+
+    fn calleeFrame(self: *CleanupProof, caller: Frame, actual: file_cache_mod.FileCache.ActualCallSummary, parameter: u32, prefix: []const u8, track_release: bool) file_cache_mod.SummaryError!?Frame {
+        const cache = (try actual.declaringCache(caller.cache)) orelse return null;
+        const resolver = cache.zls orelse return null;
+        const body = tokens.bodyOf(cache.tree, actual.callee.declaration) orelse return null;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(cache.tree, &buffer, actual.callee.declaration) orelse return null;
+        var parameters = proto.iterate(cache.tree);
+        var index: u32 = 0;
+        while (parameters.next()) |formal| : (index += 1) {
+            if (index != parameter) continue;
+            return .{
+                .cache = cache, .resolution = resolver.frameForFunction(actual.callee.reference),
+                .bindings = (try cache.localBindings(proto, body)).*,
+                .selected = formal.name_token orelse return null, .body = body,
+                .root = if (track_release) caller.root else null,
+                .root_path = if (track_release and caller.root != null) try self.join(caller.root_path, prefix) else "",
+                .publication_rhs = caller.publication_rhs,
+            };
+        }
+        return null;
+    }
+
+    fn callReleases(self: *CleanupProof, frame: Frame, actual: file_cache_mod.FileCache.ActualCallSummary, wanted: []const u8, depth: u8) file_cache_mod.SummaryError!bool {
+        try self.charge(frame, actual.callee.call_node, depth);
+        const tree = actual.callee.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, actual.callee.declaration) orelse return false;
+        const sdk_free = std.mem.eql(u8, tree.tokenSlice(proto.name_token orelse return false), "free") and
+            try frame.resolution.resolver.declaredInToolchainFile(actual.callee.reference.handle, "/std/mem/Allocator.zig");
+        if (sdk_free) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const argument = (try actual.callArgumentFor(frame.cache, &buffer, 1)) orelse return false;
+            const released = (try self.pathOf(frame, argument, depth + 1)) orelse return false;
+            if (!std.mem.eql(u8, released, wanted) and !try self.samePayload(frame, wanted, released, depth + 1)) return false;
+            const before = frame.cache.tree.firstToken(actual.callee.call_node);
+            if (try self.redirectedBefore(frame, wanted, before, depth + 1)) return false;
+            return std.mem.eql(u8, released, wanted) or
+                !try self.redirectedBefore(frame, released, before, depth + 1);
+        }
+        if (std.mem.eql(u8, tree.tokenSlice(proto.name_token orelse return false), "deinit") and
+            try frame.resolution.resolver.declaredInToolchainFile(actual.callee.reference.handle, "/std/heap/ArenaAllocator.zig"))
+        {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const receiver = (try actual.callArgumentFor(frame.cache, &buffer, 0)) orelse return false;
+            const prefix = (try self.pathOf(frame, receiver, depth + 1)) orelse return false;
+            return self.arenaAllocation(frame, try self.join(frame.root_path, prefix), depth + 1);
+        }
+        var parameter: u32 = 0;
+        while (true) : (parameter += 1) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const argument = (try actual.callArgumentFor(frame.cache, &buffer, parameter)) orelse break;
+            const prefix = (try self.pathOf(frame, argument, depth + 1)) orelse continue;
+            const suffix = relativePath(prefix, wanted) orelse continue;
+            const callee = (try self.calleeFrame(frame, actual, parameter, prefix, true)) orelse continue;
+            if (try self.bodyReleases(callee, callee.body, suffix, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    /// The SDK destructor invalidates allocations made through this exact
+    /// arena's allocator factory, not copies of its parent allocator/header.
+    fn arenaAllocation(self: *CleanupProof, frame: Frame, owner: []const u8, depth: u8) file_cache_mod.SummaryError!bool {
+        const root = frame.root orelse return false;
+        const cache = root.frame.cache;
+        const tree = cache.tree;
+        var node = root.rhs;
+        for (0..64) |_| {
+            try self.charge(root.frame, node, depth);
+            switch (tree.nodeTag(node)) {
+                .@"try" => node = tree.nodeData(node).node,
+                .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+                else => break,
+            }
+        } else return false;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = resolver_mod.TypeResolver.CallOperands.full(tree, &buffer, node) orelse return false;
+        const allocation = (try cache.actualCallSummaryAt(call.queryToken(tree, node), root.frame.resolution)) orelse return false;
+        if (!try root.frame.resolution.resolver.declaredInToolchainFile(allocation.callee.reference.handle, "/std/mem/Allocator.zig")) return false;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(allocation.callee.tree, &proto_buffer, allocation.callee.declaration) orelse return false;
+        const name = allocation.callee.tree.tokenSlice(proto.name_token orelse return false);
+        if (!std.mem.eql(u8, name, "alloc") and !std.mem.eql(u8, name, "allocSentinel") and
+            !std.mem.eql(u8, name, "alignedAlloc") and !std.mem.eql(u8, name, "dupe") and
+            !std.mem.eql(u8, name, "dupeZ")) return false;
+        const allocator = (try allocation.callArgumentFor(cache, &buffer, 0)) orelse return false;
+        const factory_call = resolver_mod.TypeResolver.CallOperands.full(tree, &buffer, allocator) orelse return false;
+        const factory = (try cache.actualCallSummaryAt(factory_call.queryToken(tree, allocator), root.frame.resolution)) orelse return false;
+        if (!try root.frame.resolution.resolver.declaredInToolchainFile(factory.callee.reference.handle, "/std/heap/ArenaAllocator.zig")) return false;
+        const factory_proto = tokens.fnProto(factory.callee.tree, &proto_buffer, factory.callee.declaration) orelse return false;
+        if (!std.mem.eql(u8, factory.callee.tree.tokenSlice(factory_proto.name_token orelse return false), "allocator")) return false;
+        const receiver = (try factory.callArgumentFor(cache, &buffer, 0)) orelse return false;
+        const path = (try self.pathOf(root.frame, receiver, depth + 1)) orelse return false;
+        return std.mem.eql(u8, path, owner);
+    }
+
+    fn bodyReleases(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, wanted: []const u8, depth: u8) file_cache_mod.SummaryError!bool {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) == .fn_decl) return false;
+        if (tree.fullIf(node)) |conditional| {
+            if (tree.nodeTag(conditional.ast.cond_expr) != .identifier) return false;
+            const value = tree.tokenSlice(tree.nodeMainToken(conditional.ast.cond_expr));
+            if (std.mem.eql(u8, value, "true")) return self.bodyReleases(frame, conditional.ast.then_expr, wanted, depth + 1);
+            if (std.mem.eql(u8, value, "false")) {
+                const other = conditional.ast.else_expr.unwrap() orelse return false;
+                return self.bodyReleases(frame, other, wanted, depth + 1);
+            }
+            return false;
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (resolver_mod.TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
+            const token = call.queryToken(tree, node);
+            if (try frame.cache.actualCallSummaryAt(token, frame.resolution)) |actual| {
+                if (try self.callReleases(frame, actual, wanted, depth + 1)) return true;
+            }
+        }
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child| {
+            if (try self.bodyReleases(frame, child, wanted, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    fn pathOf(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, depth: u8) file_cache_mod.SummaryError!?[]const u8 {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier => {
+                const token = tree.nodeMainToken(node);
+                const binding = frame.bindings.findAt(tree.tokenSlice(token), token) orelse return null;
+                if (binding.name_token == frame.selected) return "";
+                if (binding.origin == .param) return null;
+                const rhs = frame.cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return null;
+                if (rhs == node) return null;
+                return self.pathOf(frame, rhs, depth + 1);
+            },
+            .field_access => {
+                const base, const field = tree.nodeData(node).node_and_token;
+                const prefix = (try self.pathOf(frame, base, depth + 1)) orelse return null;
+                const name = tree.tokenSlice(field);
+                if (std.mem.eql(u8, name, "ptr")) {
+                    if (try frame.resolution.typeOfNode(base)) |ty| {
+                        if (frame.resolution.resolver.pointerSize(ty) == .slice) return prefix;
+                    }
+                }
+                return if (prefix.len == 0) name else try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ prefix, name });
+            },
+            .deref, .address_of, .@"try" => return self.pathOf(frame, tree.nodeData(node).node, depth + 1),
+            .grouped_expression, .unwrap_optional => return self.pathOf(frame, tree.nodeData(node).node_and_token[0], depth + 1),
+            .slice, .slice_open, .slice_sentinel => return self.pathOf(frame, tree.fullSlice(node).?.ast.sliced, depth + 1),
+            .array_access => return self.pathOf(frame, tree.nodeData(node).node_and_node[0], depth + 1),
+            else => {},
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = resolver_mod.TypeResolver.CallOperands.full(tree, &buffer, node) orelse return null;
+        const token = call.queryToken(tree, node);
+        const actual = (try frame.cache.actualCallSummaryAt(token, frame.resolution)) orelse return null;
+        var parameter: u32 = 0;
+        while (true) : (parameter += 1) {
+            var argument_buffer: [2]Ast.Node.Index = undefined;
+            const argument = (try actual.callArgumentFor(frame.cache, &argument_buffer, parameter)) orelse break;
+            const prefix = (try self.pathOf(frame, argument, depth + 1)) orelse continue;
+            const callee = (try self.calleeFrame(frame, actual, parameter, prefix, false)) orelse continue;
+            const suffix = (try self.returnedPath(callee, callee.body, depth + 1)) orelse continue;
+            return if (prefix.len == 0) suffix else if (suffix.len == 0) prefix else
+                try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ prefix, suffix });
+        }
+        return null;
+    }
+
+    fn join(self: *CleanupProof, prefix: []const u8, suffix: []const u8) error{OutOfMemory}![]const u8 {
+        if (prefix.len == 0) return suffix;
+        if (suffix.len == 0) return prefix;
+        return std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ prefix, suffix });
+    }
+
+    /// A cleanup can free a child of a copied aggregate, or the same immutable
+    /// scalar buffer stored under a different field. Header names alone prove
+    /// neither relation. Unknown calls, indexed selections and changed roots
+    /// withhold this additional certificate.
+    fn samePayload(self: *CleanupProof, frame: Frame, wanted: []const u8, released: []const u8, depth: u8) file_cache_mod.SummaryError!bool {
+        const root = frame.root orelse return false;
+        const selected = try self.join(frame.root_path, wanted);
+        const freed = try self.join(frame.root_path, released);
+        if (relativePath(selected, freed) != null) {
+            if (try self.pathOf(root.frame, root.rhs, depth + 1)) |path| {
+                if (std.mem.eql(u8, path, selected) and !try self.containsIndex(root.frame, root.rhs, depth + 1))
+                    return true;
+            }
+        }
+        const binding = for (root.frame.bindings.items) |*candidate| {
+            if (candidate.name_token == root.frame.selected) break candidate;
+        } else return false;
+        // This fallback reads the constructor, so both projections must still
+        // have that exact value at publication, not an earlier captured value.
+        const tags = root.frame.cache.tree.tokens.items(.tag);
+        for (tags[binding.rhs_last + 1 .. root.use_token]) |tag| {
+            if (tag == .keyword_for or tag == .keyword_while) return false;
+        }
+        if (try self.redirectedIn(root.frame, root.frame.body, selected, binding.rhs_last, root.use_token, depth + 1) or
+            try self.redirectedIn(root.frame, root.frame.body, freed, binding.rhs_last, root.use_token, depth + 1) or
+            try self.redirectedIn(root.frame, root.frame.body, freed, root.use_token, root.frame.cache.tree.lastToken(root.frame.body), depth + 1)) return false;
+        const initializer = root.frame.cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return false;
+        const released_value = (try self.literalProjection(root.frame, initializer, freed, depth + 1)) orelse return false;
+        const origin = (try self.scalarBufferOrigin(root.frame, released_value, depth + 1)) orelse return false;
+        const selected_value = (try self.literalProjection(root.frame, initializer, selected, depth + 1)) orelse return false;
+        return self.containsBufferOrigin(root.frame, selected_value, origin, depth + 1);
+    }
+
+    fn containsIndex(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, depth: u8) file_cache_mod.SummaryError!bool {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) == .array_access) return true;
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child| {
+            if (try self.containsIndex(frame, child, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    fn literalProjection(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, path: []const u8, depth: u8) file_cache_mod.SummaryError!?Ast.Node.Index {
+        try self.charge(frame, node, depth);
+        if (path.len == 0) return node;
+        const tree = frame.cache.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const literal = tree.fullStructInit(&buffer, node) orelse return null;
+        const end = std.mem.indexOfScalar(u8, path, '.') orelse path.len;
+        for (literal.ast.fields) |field| {
+            const first = tree.firstToken(field);
+            if (first < 2 or tree.tokenTag(first - 2) != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(first - 2), path[0..end])) continue;
+            return self.literalProjection(frame, field, if (end == path.len) "" else path[end + 1 ..], depth + 1);
+        }
+        return null;
+    }
+
+    fn scalarBufferOrigin(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, depth: u8) file_cache_mod.SummaryError!?Ast.TokenIndex {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier => {
+                const token = tree.nodeMainToken(node);
+                const binding = frame.bindings.findAt(tree.tokenSlice(token), token) orelse return null;
+                if (!binding.is_const or binding.origin == .param or binding.origin == .loop_capture) return null;
+                const ty = (try frame.resolution.typeOfNode(node)) orelse return null;
+                const actual = (try frame.resolution.resolver.normalizedType(ty)) orelse return null;
+                if (frame.resolution.resolver.typeTag(actual) != .pointer) return null;
+                const child = frame.resolution.resolver.childType(actual) orelse return null;
+                // The type walk counts type layers, not this AST/helper depth.
+                if (!try @import("../../cache/fresh_storage.zig").actualTypeAddressFree(frame.resolution, child, 0, &self.remaining)) return null;
+                // Even a const header is no longer private after its address
+                // escapes. Addressing its elements is not a header escape.
+                for (tree.nodes.items(.tag), 0..) |tag, raw| {
+                    if (tag != .address_of) continue;
+                    const address: Ast.Node.Index = @enumFromInt(raw);
+                    if (tree.firstToken(address) < binding.rhs_last or tree.firstToken(address) > tree.lastToken(frame.body)) continue;
+                    try self.charge(frame, address, depth + 1);
+                    const operand = tree.nodeData(address).node;
+                    if (tree.nodeTag(operand) != .identifier) continue;
+                    const use = tree.nodeMainToken(operand);
+                    const target = frame.bindings.findAt(tree.tokenSlice(use), use) orelse continue;
+                    if (target.name_token == binding.name_token) return null;
+                }
+                return binding.name_token;
+            },
+            .field_access => {
+                const base, const field = tree.nodeData(node).node_and_token;
+                if (!std.mem.eql(u8, tree.tokenSlice(field), "ptr")) return null;
+                return self.scalarBufferOrigin(frame, base, depth + 1);
+            },
+            .address_of => return self.scalarBufferOrigin(frame, tree.nodeData(node).node, depth + 1),
+            .array_access => return self.scalarBufferOrigin(frame, tree.nodeData(node).node_and_node[0], depth + 1),
+            .grouped_expression => return self.scalarBufferOrigin(frame, tree.nodeData(node).node_and_token[0], depth + 1),
+            else => return null,
+        }
+    }
+
+    fn containsBufferOrigin(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, origin: Ast.TokenIndex, depth: u8) file_cache_mod.SummaryError!bool {
+        try self.charge(frame, node, depth);
+        if (try self.scalarBufferOrigin(frame, node, depth + 1)) |found| return found == origin;
+        const tree = frame.cache.tree;
+        switch (tree.nodeTag(node)) {
+            .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
+            .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+            .array_init, .array_init_comma, .array_init_one, .array_init_one_comma,
+            .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma,
+            => {
+                var children = Iterator.init(tree, node);
+                while (children.next(tree)) |child| {
+                    if (try self.containsBufferOrigin(frame, child, origin, depth + 1)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn returnedPath(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, depth: u8) file_cache_mod.SummaryError!?[]const u8 {
+        var result: ReturnedPath = .{};
+        try self.collectReturnedPath(frame, node, &result, depth);
+        return if (result.complete) result.path else null;
+    }
+
+    const ReturnedPath = struct { path: ?[]const u8 = null, complete: bool = true };
+
+    fn collectReturnedPath(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, result: *ReturnedPath, depth: u8) file_cache_mod.SummaryError!void {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) == .fn_decl) return;
+        if (tree.nodeTag(node) == .@"return") {
+            const value = tree.nodeData(node).opt_node.unwrap() orelse {
+                result.complete = false;
+                return;
+            };
+            const path = (try self.pathOf(frame, value, depth + 1)) orelse {
+                result.complete = false;
+                return;
+            };
+            if (result.path) |previous| {
+                if (!std.mem.eql(u8, previous, path)) result.complete = false;
+            } else result.path = path;
+            return;
+        }
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child| try self.collectReturnedPath(frame, child, result, depth + 1);
+    }
+
+    fn redirectedBefore(self: *CleanupProof, frame: Frame, wanted: []const u8, before: Ast.TokenIndex, depth: u8) file_cache_mod.SummaryError!bool {
+        return self.redirectedIn(frame, frame.body, wanted, 0, before, depth);
+    }
+
+    /// Errdefer needs an error transfer from its scope after publication.
+    /// An error after a nested scope has completed cannot run its errdefers.
+    fn errorExitIn(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, first: Ast.TokenIndex, last: Ast.TokenIndex, after: Ast.TokenIndex, depth: u8) file_cache_mod.SummaryError!bool {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) == .fn_decl or tree.firstToken(node) >= last or tree.lastToken(node) <= @max(first, after)) return false;
+        switch (tree.nodeTag(node)) {
+            .@"try" => return true,
+            .@"return" => {
+                const value = tree.nodeData(node).opt_node.unwrap() orelse return false;
+                if (tree.nodeTag(value) == .error_value) return true;
+                const actual = (try frame.resolution.typeOfNode(value)) orelse return true;
+                const tag = frame.resolution.resolver.typeTag(actual) orelse return true;
+                return tag == .error_set or tag == .error_union;
+            },
+            else => {},
+        }
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child|
+            if (try self.errorExitIn(frame, child, first, last, after, depth + 1)) return true;
+        return false;
+    }
+
+    fn redirectedIn(self: *CleanupProof, frame: Frame, node: Ast.Node.Index, wanted: []const u8, after: Ast.TokenIndex, before: Ast.TokenIndex, depth: u8) file_cache_mod.SummaryError!bool {
+        try self.charge(frame, node, depth);
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) == .fn_decl) return false;
+        if (tree.nodeTag(node) == .@"defer" or tree.nodeTag(node) == .@"errdefer") {
+            const token = tree.firstToken(node);
+            const scope = enclosingScope(tree.tokens.items(.tag), token, tree.firstToken(frame.body), tree.lastToken(frame.body));
+            const completed = scope.close > after and scope.close < before;
+            const precedes_cleanup = scope.close == before and
+                token > (frame.exit_cleanup orelse return false);
+            if (!completed and !precedes_cleanup) return false;
+            if (tree.nodeTag(node) == .@"errdefer" and
+                !try self.errorExitIn(frame, frame.body, scope.open, scope.close, after, depth + 1)) return false;
+            // Registration order differs from execution order. A later defer
+            // runs before this cleanup even if registered before publication.
+            var deferred_body = Iterator.init(tree, node);
+            while (deferred_body.next(tree)) |child|
+                if (try self.redirectedIn(frame, child, wanted, 0, tree.lastToken(child) + 1, depth + 1)) return true;
+            return false;
+        }
+        if (tree.firstToken(node) >= before or tree.lastToken(node) <= after) return false;
+        switch (tree.nodeTag(node)) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
+            .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_shl, .assign_shr,
+            => {
+                const destination = tree.nodeData(node).node_and_node[0];
+                if (try self.pathOf(frame, destination, depth + 1)) |path| {
+                    if (relativePath(path, wanted) != null or relativePath(wanted, path) != null) return true;
+                }
+            },
+            else => {},
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (resolver_mod.TypeResolver.CallOperands.full(tree, &buffer, node)) |call| {
+            const token = call.queryToken(tree, node);
+            if (try frame.cache.actualCallSummaryAt(token, frame.resolution)) |actual| {
+                var parameter: u32 = 0;
+                while (true) : (parameter += 1) {
+                    var argument_buffer: [2]Ast.Node.Index = undefined;
+                    const argument = (try actual.callArgumentFor(frame.cache, &argument_buffer, parameter)) orelse break;
+                    const path = (try self.pathOf(frame, argument, depth + 1)) orelse continue;
+                    if (relativePath(path, wanted) == null and relativePath(wanted, path) == null) continue;
+                    if (frame.publication_rhs) {
+                        // By-value slice payloads do not pass their source
+                        // header's address. An implicit *Self receiver does.
+                        const function = actual.callee.reference.actual_type.data.function;
+                        if (parameter >= function.parameters.len) return true;
+                        const formal = (try frame.resolution.resolver.normalizedType(function.parameters[parameter].type)) orelse return true;
+                        const size = frame.resolution.resolver.pointerSize(formal);
+                        if (size == .slice) continue;
+                        // Other by-value aggregates can transport an alias;
+                        // their header reach is not certified here.
+                        if (size != .one) return true;
+                        const selected_path = relativePath(path, wanted) orelse "";
+                        const callee = (try self.calleeFrame(frame, actual, parameter, path, false)) orelse return true;
+                        if (try self.redirectedIn(callee, callee.body, selected_path, 0, callee.cache.tree.lastToken(callee.body) + 1, depth + 1)) return true;
+                        continue;
+                    }
+                    const effect = try frame.cache.callEffectAt(token, .{ .whole = actual.callee }, .{ .frame = frame.resolution, .remaining = &self.remaining });
+                    if (effect != .read_only) return true;
+                }
+            } else {
+                if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+                    const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+                    if (try self.pathOf(frame, receiver, depth + 1)) |path| {
+                        if (relativePath(path, wanted) != null or relativePath(wanted, path) != null) return true;
+                    }
+                }
+                for (call.ast.params) |argument| {
+                    if (try self.pathOf(frame, argument, depth + 1)) |path| {
+                        if (relativePath(path, wanted) != null or relativePath(wanted, path) != null) return true;
+                    }
+                }
+            }
+        }
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child| {
+            if (try self.redirectedIn(frame, child, wanted, after, before, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    fn relativePath(prefix: []const u8, path: []const u8) ?[]const u8 {
+        if (prefix.len == 0) return path;
+        if (std.mem.eql(u8, prefix, path)) return "";
+        if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and path[prefix.len] == '.')
+            return path[prefix.len + 1 ..];
+        return null;
+    }
+};
+
+const PointerParam = struct { name: []const u8 };
 
 /// A `defer X.deinit()` / `defer alloc.free(X)` paired with the
 /// lexical `{ ... }` it was declared inside.  Writes outside that
@@ -248,8 +757,10 @@ const PointerParam = struct { name: []const u8, declared: type_query.TypeRef };
 /// executed when control passes a sibling branch.
 const DeferredItem = struct {
     name: []const u8,
+    binding_token: Ast.TokenIndex,
     /// The `defer` keyword that registered the cleanup.
     token: Ast.TokenIndex,
+    cleanup_token: Ast.TokenIndex,
     scope_open: Ast.TokenIndex,
     scope_close: Ast.TokenIndex,
 };
@@ -306,303 +817,6 @@ fn findPointerParam(name: []const u8, params: []const PointerParam) ?PointerPara
     return null;
 }
 
-/// Unknown and address-bearing types both refuse the shared deep proof.
-/// The SDK frame, not a local token spelling, owns every actual field type.
-fn expressionIsAddressFree(
-    cache: *file_cache_mod.FileCache,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-) !bool {
-    const resolver = cache.zls orelse return false;
-    const node = cache.nodeForExactSpan(first, last) orelse return false;
-    const frame = resolver.resolutionFrame();
-    const actual = (try frame.typeOfNode(node)) orelse return false;
-    return actualTypeIsAddressFree(frame, actual, 0);
-}
-
-/// Extend the shared scalar/struct proof to unions. Every possible payload
-/// must carry no address, not just the tag or the currently selected member.
-fn actualTypeIsAddressFree(
-    frame: type_engine.TypeResolver.ResolutionFrame,
-    ty: type_engine.TypeResolver.ActualType,
-    depth: u8,
-) file_cache_mod.SummaryError!bool {
-    if (depth > type_query.max_element_depth) return false;
-    const actual = (try frame.resolver.normalizedType(ty)) orelse return false;
-    switch (actual.data) {
-        .array => |array| return actualTypeIsAddressFree(frame, array.elem_ty.*, depth + 1),
-        .optional => |payload| return actualTypeIsAddressFree(frame, payload.*, depth + 1),
-        .ip_index => {
-            const index = actual.ipIndex() orelse return false;
-            switch (frame.resolver.ctx.ip.zigTypeTag(index) orelse return false) {
-                .array, .vector, .optional => {
-                    const child = frame.resolver.childType(actual) orelse return false;
-                    return actualTypeIsAddressFree(frame, child, depth + 1);
-                },
-                else => {},
-            }
-        },
-        .container => |container| {
-            const declaring = frame.resolver.frameForContainer(container);
-            const tree = &declaring.handle.document.tree;
-            const node = container.scope_handle.toNode();
-            const kind = tree.tokenTag(tree.nodeMainToken(node));
-            switch (kind) {
-                .keyword_struct, .keyword_union => {},
-                else => return fresh_storage.actualTypeAddressFree(frame, actual, depth, null),
-            }
-            var buffer: [2]Ast.Node.Index = undefined;
-            const declaration = tree.fullContainerDecl(&buffer, node) orelse return false;
-            for (declaration.ast.members) |member| {
-                const field = tree.fullContainerField(member) orelse continue;
-                const type_node = field.ast.type_expr.unwrap() orelse {
-                    // A payloadless union member is void, not an unknown type.
-                    if (kind == .keyword_union) continue;
-                    return false;
-                };
-                const field_type = (try declaring.typeOfNode(type_node)) orelse return false;
-                if (!try actualTypeIsAddressFree(declaring, field_type, depth + 1)) return false;
-            }
-            return true;
-        },
-        else => {},
-    }
-    return fresh_storage.actualTypeAddressFree(frame, actual, depth, null);
-}
-
-/// Declaration fallback for runs without the SDK. Never look up a leaf
-/// name globally, or inspect a foreign field through the caller's tree.
-fn declaredFieldIsAddressFree(
-    cache: *file_cache_mod.FileCache,
-    param: PointerParam,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-) bool {
-    const tree = param.declared.tree;
-    const tags = tree.tokens.items(.tag);
-    if (last != first + 2 or tags[first + 1] != .period or tags[last] != .identifier) return false;
-    var base = type_query.stripPointers(param.declared);
-    while (base.first <= base.last and tags[base.first] == .keyword_const) base.first += 1;
-    if (base.first > base.last) return false;
-    const owner = if (tags[base.first] == .builtin and
-        std.mem.eql(u8, tree.tokenSlice(base.first), "@This") and base.last == base.first + 2)
-        base.owner orelse return false
-    else blk: {
-        var buffer: [256]u8 = undefined;
-        const name = type_query.typePathName(&buffer, base) orelse return false;
-        break :blk if (base.owner) |scope|
-            cache.typePathInOwnerScope(scope, name) orelse return false
-        else
-            cache.resolvedTypePathAcrossImports(name) orelse return false;
-    };
-    const field = owner.info.findField(tree.tokenSlice(last)) orelse return false;
-    return type_query.typeRangeIsAddressFree(cache, .{
-        .tree = owner.model.tree,
-        .first = field.type_first,
-        .last = field.type_last,
-        .owner = owner,
-        .allow_array_length_expr = true,
-    }, 0);
-}
-
-fn rhsHasAddressBits(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
-    var t = first;
-    while (t <= last) : (t += 1) {
-        if (tags[t] != .builtin) continue;
-        const name = tree.tokenSlice(t);
-        if (std.mem.eql(u8, name, "@intFromPtr") or std.mem.eql(u8, name, "@ptrFromInt") or
-            std.mem.eql(u8, name, "@bitCast")) return true;
-    }
-    return false;
-}
-
-fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start + 2 > end) return false;
-    var t: Ast.TokenIndex = start;
-    while (t + 2 <= end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        const m = tree.tokenSlice(t + 1);
-        if (isCopyingMethodName(m)) return true;
-        // Singleton-store .append pattern: `<X>.<...>.instance.append(`
-        // — Bun's `FileSystem.DirnameStore.instance.append(T, slice)`
-        // dupes the slice into the static store.  Recognising the
-        // `.instance.append(` shape catches the canonical case
-        // without broadening `.append` (which is also used by
-        // ArrayList for non-duping appends).
-        if (std.mem.eql(u8, m, "append") and t >= 2 and
-            tags[t - 2] == .period and
-            tags[t - 1] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(t - 1), "instance")) return true;
-    }
-    return false;
-}
-
-fn isCopyingMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "toOwnedSlice") or
-        std.mem.eql(u8, name, "toOwnedSliceSentinel") or
-        std.mem.eql(u8, name, "toOwned") or
-        std.mem.eql(u8, name, "intoOwned") or
-        std.mem.eql(u8, name, "dupe") or
-        std.mem.eql(u8, name, "dupeZ") or
-        std.mem.eql(u8, name, "clone") or
-        std.mem.eql(u8, name, "cloneZ") or
-        std.mem.eql(u8, name, "copyFrom") or
-        std.mem.eql(u8, name, "copyForwards") or
-        std.mem.eql(u8, name, "copyBackwards");
-}
-
-/// An unresolved callee, incomplete storage set, or possible alias refuses
-/// independence. All semantic and source errors propagate to the caller.
-fn rhsCallDoesNotBorrowDeferred(
-    tree: *const Ast,
-    cache: *file_cache_mod.FileCache,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    deferred_name: []const u8,
-) file_cache_mod.SummaryError!bool {
-    const tags = tree.tokens.items(.tag);
-    var first = start;
-    if (first <= end and tags[first] == .keyword_try) first += 1;
-    if (first > end) return false;
-    const node = cache.nodeForExactSpan(first, end) orelse return false;
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, node) orelse return false;
-    const token = fresh_storage.calleeQueryToken(tree, call);
-    var remaining: u32 = call_summary.actual_query_work_limit;
-    const context: storage_alias.QueryContext = .{ .remaining = &remaining };
-    const returned = try return_storage.returnedStorageAt(cache, token, context);
-    if (!returned.complete) return false;
-    if (returned.alternatives.len == 0) return true;
-    const actual = (try cache.actualCallSummaryAt(token, null)) orelse return false;
-    var saw_deferred = false;
-    var t = first;
-    while (t <= end) : (t += 1) {
-        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), deferred_name)) continue;
-        if (t > first and tags[t - 1] == .period) continue;
-        saw_deferred = true;
-        const deferred_node = cache.nodeForExactSpan(t, t) orelse return false;
-        for (returned.alternatives) |alternative| {
-            var argument_buffer: [2]Ast.Node.Index = undefined;
-            const selected = (try return_storage.mappedStorageAt(
-                cache,
-                actual,
-                alternative,
-                &argument_buffer,
-            )) orelse return false;
-            if (try storage_alias.mayShareStorageAt(
-                cache,
-                node,
-                selected,
-                .{ .node = deferred_node },
-                .reachable_storage,
-                context,
-            )) return false;
-        }
-    }
-    return saw_deferred;
-}
-
-/// True iff the RHS at `[start..end]` is a `switch (...) { ... }`
-/// expression whose `<deferred_name>` mentions appear ONLY inside
-/// the switch's scrutinee `(...)` — i.e., never inside the arms
-/// block `{ ... }`.  When the deferred slice is consumed by the
-/// expression the switch branches on, and the arms build the
-/// result from unpacked union payloads (not from the slice), the
-/// slice is transient and can't reach the out-param.
-fn deferredOnlyInSwitchScrutinee(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    deferred_name: []const u8,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    // Peel optional leading `try`.
-    var t: Ast.TokenIndex = start;
-    if (t <= end and tags[t] == .keyword_try) t += 1;
-    if (t > end or tags[t] != .keyword_switch) return false;
-    // Scrutinee starts at the next `(`.
-    var p = t + 1;
-    while (p <= end and tags[p] != .l_paren) : (p += 1) {}
-    if (p > end or tags[p] != .l_paren) return false;
-    const scrut_end = matchParenEnd(tags, p, end) orelse return false;
-    if (scrut_end + 1 > end or tags[scrut_end + 1] != .l_brace) return false;
-    const arms_open: Ast.TokenIndex = scrut_end + 1;
-    const arms_close = matchBraceEnd(tags, arms_open, end) orelse return false;
-    // Walk RHS; ensure all deferred-name mentions land in
-    // (p, scrut_end) and NONE land in (arms_open, arms_close].
-    var saw_in_scrut = false;
-    var k: Ast.TokenIndex = start;
-    while (k <= end) : (k += 1) {
-        if (tags[k] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(k), deferred_name)) continue;
-        if (k > p and k < scrut_end) {
-            saw_in_scrut = true;
-        } else if (k > arms_open and k <= arms_close) {
-            // Mention in the arm block — slice CAN reach the result.
-            return false;
-        } else {
-            // Mention outside both — unexpected shape, bail.
-            return false;
-        }
-    }
-    return saw_in_scrut;
-}
-
-const matchBraceEnd = tokens.matchBrace;
-const matchParenEnd = tokens.matchParen;
-
-fn rhsContainsAllocatorConstructor(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start + 2 > end) return false;
-    var t: Ast.TokenIndex = start;
-    while (t + 2 <= end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        const m = tree.tokenSlice(t + 1);
-        const is_ctor = std.mem.eql(u8, m, "create") or
-            std.mem.eql(u8, m, "init") or
-            std.mem.eql(u8, m, "new") or
-            std.mem.eql(u8, m, "from") or
-            std.mem.eql(u8, m, "fromJS") or
-            std.mem.eql(u8, m, "fromUTF8") or
-            std.mem.eql(u8, m, "make");
-        if (!is_ctor) continue;
-        // Walk arg tokens balanced to the matching `)`, checking
-        // for an allocator name.
-        var depth: u32 = 1;
-        var u: Ast.TokenIndex = t + 3;
-        while (u <= end and depth > 0) : (u += 1) {
-            switch (tags[u]) {
-                .l_paren => depth += 1,
-                .r_paren => {
-                    depth -= 1;
-                    if (depth == 0) break;
-                },
-                .identifier => {
-                    const id = tree.tokenSlice(u);
-                    if (std.mem.eql(u8, id, "allocator") or
-                        std.mem.eql(u8, id, "alloc") or
-                        std.mem.eql(u8, id, "gpa") or
-                        std.mem.endsWith(u8, id, "_allocator") or
-                        std.mem.endsWith(u8, id, "Allocator"))
-                        return true;
-                },
-                else => {},
-            }
-        }
-    }
-    return false;
-}
-
 /// True iff the type expression starts with a pointer, including the
 /// lexer's combined `**` token and an optional pointer qualifier.
 fn isPointerType(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
@@ -617,47 +831,6 @@ fn isPointerType(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: A
 
 fn isDeinitOrClose(name: []const u8) bool {
     return std.mem.eql(u8, name, "deinit") or std.mem.eql(u8, name, "close");
-}
-
-/// Return a deferred local used by the RHS. An address of a local is
-/// still a borrow; transient call arguments require a callee proof.
-/// `write_first`/`write_eq` span the written place and its `=`; `stmt_end`
-/// is the write's `;`.  A cleanup that a later clearing defer outruns is
-/// not a registered cleanup for this write (see `clearedBeforeCleanup`).
-fn rhsMentionsDeferred(
-    tree: *const Ast,
-    write_first: Ast.TokenIndex,
-    write_eq: Ast.TokenIndex,
-    stmt_end: Ast.TokenIndex,
-    fn_first: Ast.TokenIndex,
-    fn_last: Ast.TokenIndex,
-    deferred: []const DeferredItem,
-) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    const start = write_eq + 1;
-    const end = stmt_end - 1;
-    if (start > end) return null;
-    var t: Ast.TokenIndex = start;
-    while (t <= end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        // Skip `<recv>.<deferred>` — a field/method named the
-        // same as a deferred local isn't the local itself.
-        // Without this, `ctx.body` matches a `body` local on the
-        // post-`.` identifier.
-        if (t > 0 and tags[t - 1] == .period) continue;
-        const name = tree.tokenSlice(t);
-        for (deferred) |d| {
-            if (!std.mem.eql(u8, d.name, name)) continue;
-            // A defer in a sibling branch (or any block that doesn't
-            // contain the write) hasn't executed when the write
-            // runs — it can't have registered cleanup.  Only count
-            // defers whose enclosing scope encloses this write.
-            if (t < d.scope_open or t > d.scope_close) continue;
-            if (clearedBeforeCleanup(tree, d, write_first, write_eq, stmt_end, fn_first, fn_last)) continue;
-            return d.name;
-        }
-    }
-    return null;
 }
 
 /// True when the written place is reset by a `defer <place> = <literal>;`
@@ -737,24 +910,22 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 test "defer arena.deinit + out-param write using arena fires" {
-    try testing.expectFires(check, R,
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
         \\const ZigString = struct {
-        \\    raw: u64 = 0,
-        \\    // Returns a borrow of `s` — captures it into the
-        \\    // result, so the result's lifetime is tied to `s`.
-        \\    pub fn init(s: anytype) ZigString { return .{ .raw = s }; }
+        \\    raw: *std.heap.ArenaAllocator,
+        \\    pub fn init(s: *std.heap.ArenaAllocator) ZigString { return .{ .raw = s }; }
         \\};
         \\pub fn parse(out: *ZigString, gpa_alloc: std.mem.Allocator) !void {
         \\    var arena = std.heap.ArenaAllocator.init(gpa_alloc);
         \\    defer arena.deinit();
-        \\    out.* = ZigString.init(arena);
+        \\    out.* = ZigString.init(&arena);
         \\}
     );
 }
 
 test "defer alloc.free(X) + out-param write using X fires" {
-    try testing.expectFires(check, R,
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
         \\const Str = struct { ptr: usize };
         \\pub fn parse(install: *Str, alloc: std.mem.Allocator) !void {
@@ -1156,7 +1327,7 @@ test "later defer clearing the out-param before the cleanup doesn't fire" {
 }
 
 test "clearing defer registered before the cleanup still fires" {
-    try testing.expectFires(check, R,
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
         \\const Capture = struct {
         \\    gpa: std.mem.Allocator,
@@ -1173,7 +1344,7 @@ test "clearing defer registered before the cleanup still fires" {
 }
 
 test "clearing defer registered after a possible early exit still fires" {
-    try testing.expectFires(check, R,
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
         \\const Capture = struct {
         \\    gpa: std.mem.Allocator,
@@ -1192,7 +1363,7 @@ test "clearing defer registered after a possible early exit still fires" {
 }
 
 test "defer resetting the out-param to a local doesn't count as clearing" {
-    try testing.expectFires(check, R,
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
         \\const Capture = struct {
         \\    gpa: std.mem.Allocator,
@@ -1283,8 +1454,8 @@ test "deferred module borrowed return cannot inherit a same named owning summary
     );
 }
 
-test "snapshot copied into a deferred local arena still escapes" {
-    try testing.expectFiresTyped(check, R,
+test "callee-local arena escape is not attributed to the deferred caller module" {
+    try testing.expectNoFireTyped(check,
         \\const std = @import("std");
         \\const Module = struct {
         \\    allocator: std.mem.Allocator,
@@ -1302,6 +1473,390 @@ test "snapshot copied into a deferred local arena still escapes" {
         \\    };
         \\    defer module.deinit();
         \\    out.* = try module.snapshotData(gpa);
+        \\}
+    );
+}
+
+test "opaque deferred receiver result is not a proved out-param loan" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\    extern fn view(self: *const Buffer) []const u8;
+        \\};
+        \\pub fn publish(out: *[]const u8, allocator: std.mem.Allocator) !void {
+        \\    var buffer: Buffer = .{
+        \\        .bytes = try allocator.dupe(u8, "opaque"), .allocator = allocator,
+        \\    };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.view();
+        \\}
+    );
+}
+
+test "one proved borrowed return arm survives an opaque sibling" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\extern fn unknownView() []const u8;
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\    fn view(self: *const Buffer, borrow: bool) []const u8 {
+        \\        if (borrow) return self.bytes;
+        \\        return unknownView();
+        \\    }
+        \\};
+        \\pub fn publish(out: *[]const u8, allocator: std.mem.Allocator, borrow: bool) !void {
+        \\    var buffer: Buffer = .{
+        \\        .bytes = try allocator.dupe(u8, "borrowed"), .allocator = allocator,
+        \\    };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.view(borrow);
+        \\}
+    );
+}
+
+test "opaque call inside an out-param literal is not a proved loan" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\extern fn unknownView(bytes: []const u8) []const u8;
+        \\const Output = struct { bytes: []const u8 };
+        \\pub fn publish(out: *Output, allocator: std.mem.Allocator) !void {
+        \\    const bytes = try allocator.dupe(u8, "opaque");
+        \\    defer allocator.free(bytes);
+        \\    out.* = .{ .bytes = unknownView(bytes) };
+        \\}
+    );
+}
+
+test "direct literal payload preserves a proved loan beside an opaque sibling" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\extern fn unknownView(bytes: []const u8) []const u8;
+        \\const Output = struct { bytes: []const u8, other: []const u8 };
+        \\pub fn publish(out: *Output, allocator: std.mem.Allocator) !void {
+        \\    const bytes = try allocator.dupe(u8, "borrowed");
+        \\    defer allocator.free(bytes);
+        \\    out.* = .{ .bytes = bytes, .other = unknownView(bytes) };
+        \\}
+    );
+}
+
+test "out-param allocation from its deferred local arena retains the provider loan" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn publish(out: *[]u8, allocator: std.mem.Allocator) !void {
+        \\    var arena = std.heap.ArenaAllocator.init(allocator);
+        \\    defer arena.deinit();
+        \\    out.* = try arena.allocator().dupe(u8, "borrowed");
+        \\}
+    );
+}
+
+test "a borrowed clone spelling cannot erase its source loan" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\    fn clone(self: *const Buffer) []const u8 { return self.bytes; }
+        \\};
+        \\pub fn publish(out: *[]const u8, allocator: std.mem.Allocator) !void {
+        \\    var buffer: Buffer = .{
+        \\        .bytes = try allocator.dupe(u8, "borrowed"), .allocator = allocator,
+        \\    };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.clone();
+        \\}
+    );
+}
+
+test "deferred no-op header does not own an external payload loan" {
+    try testing.expectNoFireTyped(check,
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\    fn deinit(_: *Buffer) void {}
+        \\    fn view(self: *Buffer) []u8 { return self.bytes; }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8) void {
+        \\    var buffer: Buffer = .{ .bytes = input };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.view();
+        \\}
+    );
+}
+
+test "deferred sibling cleanup does not invalidate an independent pointer field" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, other: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.other); }
+        \\    fn view(self: *Buffer) []u8 { return self.bytes; }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) !void {
+        \\    var buffer: Buffer = .{
+        \\        .bytes = input, .other = try allocator.dupe(u8, "other"), .allocator = allocator,
+        \\    };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.view();
+        \\}
+    );
+}
+
+test "rebound deferred payload does not release its former external value" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void {
+        \\        self.bytes = &.{};
+        \\        self.allocator.free(self.bytes);
+        \\    }
+        \\    fn view(self: *Buffer) []u8 { return self.bytes; }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.view();
+        \\}
+    );
+}
+
+test "selected metadata does not alias a different freed allocation" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Status = struct { detail: ?*u8 };
+        \\const Scratch = struct {
+        \\    released: []u8, status: Status, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Scratch) void { self.allocator.free(self.released); }
+        \\};
+        \\fn publish(out: *Status, allocator: std.mem.Allocator) !void {
+        \\    const released = try allocator.alloc(u8, 1);
+        \\    const retained = try allocator.alloc(u8, 1);
+        \\    var scratch: Scratch = .{
+        \\        .released = released, .status = .{ .detail = &retained[0] }, .allocator = allocator,
+        \\    };
+        \\    defer scratch.deinit();
+        \\    out.* = scratch.status;
+        \\}
+    );
+}
+
+test "selected indexed sibling does not inherit another element cleanup" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Payload = struct { data: []const u8 };
+        \\const Scratch = struct {
+        \\    nested: [2]Payload, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Scratch) void { self.allocator.free(self.nested[0].data); }
+        \\};
+        \\fn publish(out: *Payload, input: []const u8, allocator: std.mem.Allocator) !void {
+        \\    const owned = try allocator.alloc(u8, 1);
+        \\    var scratch: Scratch = .{ .nested = .{.{ .data = owned }, .{ .data = input }}, .allocator = allocator };
+        \\    defer scratch.deinit();
+        \\    out.* = scratch.nested[1];
+        \\}
+    );
+}
+
+test "deferred arena does not own allocations from its parent allocator" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn publish(out: *[]u8, allocator: std.mem.Allocator) !void {
+        \\    var arena = std.heap.ArenaAllocator.init(allocator);
+        \\    defer arena.deinit();
+        \\    out.* = try arena.child_allocator.dupe(u8, "parent-owned");
+        \\}
+    );
+}
+
+test "copying an empty deferred arena does not free its incoming allocator" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn publish(out: *std.heap.ArenaAllocator, allocator: std.mem.Allocator) void {
+        \\    var arena = std.heap.ArenaAllocator.init(allocator);
+        \\    defer arena.deinit();
+        \\    out.* = arena;
+        \\}
+    );
+}
+
+test "later registered deferred payload rebinding does not release the published input" {
+    for ([_]bool{ false, true }) |before_publication| {
+        const source = try std.fmt.allocPrint(std.testing.allocator,
+            \\const std = @import("std");
+            \\const Buffer = struct {{
+            \\    bytes: []u8, allocator: std.mem.Allocator,
+            \\    fn deinit(self: *Buffer) void {{ self.allocator.free(self.bytes); }}
+            \\}};
+            \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) void {{
+            \\    var buffer: Buffer = .{{ .bytes = input, .allocator = allocator }};
+            \\    defer buffer.deinit();
+            \\    {s}
+            \\    out.* = buffer.bytes;
+            \\    {s}
+            \\}}
+        , .{
+            if (before_publication) "defer buffer.bytes = &.{};" else "",
+            if (before_publication) "" else "defer buffer.bytes = &.{};",
+        });
+        defer std.testing.allocator.free(source);
+        try testing.expectNoFireTyped(check, source);
+    }
+}
+
+test "earlier registered deferred rebinding does not prevent selected cleanup" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.bytes = &.{};
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.bytes;
+        \\}
+    );
+}
+
+test "rebinding a released sibling inside cleanup does not free the published alias" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Child = struct {
+        \\    detail: *const u8, released: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Child) void {
+        \\        self.released = &.{};
+        \\        self.allocator.free(self.released);
+        \\    }
+        \\};
+        \\fn publish(out: **const u8, input: []u8, allocator: std.mem.Allocator) void {
+        \\    const shared = input;
+        \\    var child: Child = .{ .detail = &shared[0], .released = shared, .allocator = allocator };
+        \\    defer child.deinit();
+        \\    out.* = child.detail;
+        \\}
+    );
+}
+
+test "completed inner deferred payload rebinding precedes outer cleanup" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    {
+        \\        defer buffer.bytes = &.{};
+        \\        out.* = buffer.bytes;
+        \\    }
+        \\}
+    );
+}
+
+test "completed inner errdefer does not rebind a payload on normal exhaustion" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) !void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    {
+        \\        errdefer buffer.bytes = &.{};
+        \\        out.* = buffer.bytes;
+        \\    }
+        \\}
+    );
+}
+
+test "error exit deferred payload rebinding precedes normal cleanup" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) !void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    errdefer buffer.bytes = &.{};
+        \\    out.* = buffer.bytes;
+        \\    return error.Failed;
+        \\}
+    );
+}
+
+test "error-valued normal break does not run an inner errdefer" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) !void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    const rejected: anyerror!void = block: {
+        \\        errdefer buffer.bytes = &.{};
+        \\        out.* = buffer.bytes;
+        \\        break :block error.Failed;
+        \\    };
+        \\    rejected catch {};
+        \\}
+    );
+}
+test "publication RHS transfers backing storage before deferred cleanup" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\fn publish(out: *[]u32, allocator: std.mem.Allocator) !void {
+        \\    var values: std.ArrayList(u32) = .empty;
+        \\    defer values.deinit(allocator);
+        \\    try values.append(allocator, 7);
+        \\    out.* = try values.toOwnedSlice(allocator);
+        \\}
+    );
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\    fn handoff(self: *Buffer) []u8 {
+        \\        const result = self.bytes;
+        \\        self.bytes = &.{};
+        \\        return result;
+        \\    }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.handoff();
+        \\}
+    );
+}
+
+test "publication RHS unrelated scalar mutation does not transfer its payload" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []u8, counter: u32 = 0, allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Buffer) void { self.allocator.free(self.bytes); }
+        \\    fn view(self: *Buffer) []u8 { self.counter += 1; return self.bytes; }
+        \\};
+        \\fn publish(out: *[]u8, input: []u8, allocator: std.mem.Allocator) void {
+        \\    var buffer: Buffer = .{ .bytes = input, .allocator = allocator };
+        \\    defer buffer.deinit();
+        \\    out.* = buffer.view();
         \\}
     );
 }

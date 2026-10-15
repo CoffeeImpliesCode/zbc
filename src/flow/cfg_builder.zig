@@ -406,7 +406,7 @@ fn integerDomainSemanticLoweringAllocationFailures(gpa: std.mem.Allocator) !void
     const tree = &resolver.handle.document.tree;
     var cache = file_cache.FileCache.init(gpa, tree);
     defer cache.deinit();
-    cache.zls = &resolver;
+    cache.setZls(&resolver);
     var graph = (try lowerFunctionFullWithZls(
         gpa,
         tree,
@@ -1081,6 +1081,17 @@ const Builder = struct {
         end: usize,
         pending_effects: bool = true,
     };
+    const InlineHeaderLayout = struct {
+        actual: zls_resolver_mod.TypeResolver.ActualType,
+        doubled_paths: []const []const u8,
+        indices: std.StringHashMapUnmanaged(usize),
+    };
+    const BindingExposure = struct { inline_storage: bool = false, header: bool = false };
+    const CheckedDifference = struct { upper: LocalId, start: LocalId, scale: u64 };
+    const InlineLayoutRepresentation = struct {
+        actual: zls_resolver_mod.TypeResolver.ActualType,
+        represented: bool,
+    };
     gpa: std.mem.Allocator,
     tree: *const Ast,
     /// Per-file FileCache for FnSummary / FileModel queries — the
@@ -1285,6 +1296,11 @@ const Builder = struct {
     owned_stack_loans: std.ArrayListUnmanaged([]LocalId) = .empty,
     owned_field_layouts: std.ArrayListUnmanaged([]const []const u8) = .empty,
     owned_index_domains: std.ArrayListUnmanaged([]u64) = .empty,
+    inline_header_layouts: std.AutoHashMapUnmanaged(LocalId, InlineHeaderLayout) = .empty,
+    inline_layout_representations: std.ArrayListUnmanaged(InlineLayoutRepresentation) = .empty,
+    inline_binding_exposures: std.AutoHashMapUnmanaged(u32, BindingExposure) = .empty,
+    inline_exposures_scanned: bool = false,
+    inline_exposures_asm: bool = false,
     diagnostic_fields_mode: bool = false,
     /// Pre-built table of byte offsets where each line starts (line_offsets[i]
     /// = byte offset of the first char on line i).  Built once per file in
@@ -1294,7 +1310,6 @@ const Builder = struct {
     /// True when Builder owns line_offsets and must free it.  False when
     /// the slice is borrowed from FileCache (which owns and frees it).
     owns_line_offsets: bool = false,
-    const CheckedDifference = struct { upper: LocalId, start: LocalId, scale: u64 };
 
     /// Record that a bounded walk gave up.  First failure wins: a walk
     /// that exhausts keeps unwinding and may trip further limits, but
@@ -1595,6 +1610,11 @@ const Builder = struct {
         self.owned_field_layouts.deinit(self.gpa);
         for (self.owned_index_domains.items) |domain| self.gpa.free(domain);
         self.owned_index_domains.deinit(self.gpa);
+        var layouts = self.inline_header_layouts.valueIterator();
+        while (layouts.next()) |layout| layout.indices.deinit(self.gpa);
+        self.inline_header_layouts.deinit(self.gpa);
+        self.inline_layout_representations.deinit(self.gpa);
+        self.inline_binding_exposures.deinit(self.gpa);
     }
 
     fn newBlock(self: *Builder) !BlockId {
@@ -1632,6 +1652,7 @@ const Builder = struct {
                 },
                 .equal_equal, .bang_equal => |tag| {
                     const pair = self.tree.nodeData(node).node_and_node;
+                    if (self.optionalPresentComparison(node, inverted)) |condition| return condition;
                     if (self.integerResolutionFrame()) |frame| {
                         if (self.queryOrUnknown(bool, frame.boolValueOfNode(node))) |value|
                             return .{ .constant = value != inverted };
@@ -1652,6 +1673,721 @@ const Builder = struct {
         self.noteBudgetFailure(.boolean_unwind, max_boolean_unwind, max_boolean_unwind, expression);
         return null;
     }
+
+    /// Runtime selected-place presence is not a source initializer constant.
+    /// Only a canonical optional pointer can consume the physical MUST fact.
+    fn optionalPresentComparison(self: *Builder, node: Ast.Node.Index, inverted: bool) ?cfg_types.BooleanValue {
+        const operand = initShapeNode(self, nullComparisonOperand(self.tree, node) orelse return null);
+        const frame = self.integerResolutionFrame() orelse return null;
+        const ty = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.typeOfNode(operand)) orelse return null;
+        const actual = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(ty)) orelse return null;
+        if (frame.resolver.typeTag(actual) != .optional) return null;
+        const child = frame.resolver.childType(actual) orelse return null;
+        const payload = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(child)) orelse return null;
+        const payload_size = frame.resolver.pointerSize(payload) orelse return null;
+        if (payload_size == .slice) return null;
+        const place: FieldRef = switch (self.tree.nodeTag(operand)) {
+            .deref => .{ .parent = self.derefOfPointerLocal(operand) orelse return null, .name = "" },
+            .field_access => self.fieldLhsFor(operand) orelse return null,
+            else => return null,
+        };
+        if (!self.fieldValuePathRepresentable(operand, place)) return null;
+        return .{ .optional_present = .{
+            .parent = place.parent,
+            .name = place.name,
+            .expected = (self.tree.nodeTag(node) == .bang_equal) != inverted,
+            .physical_selection = self.physicalOutputChannel(nullComparisonOperand(self.tree, node) orelse return null, place),
+        } };
+    }
+
+    const InlineSelection = struct {
+        root: Ast.Node.Index,
+        local: LocalId,
+        root_type: zls_resolver_mod.TypeResolver.ActualType,
+        container: ?zls_resolver_mod.TypeResolver.ActualType.Data.Container,
+        declared_local: bool = false,
+    };
+
+    /// A stable parameter address and inline struct hops select one physical
+    /// output slot. This is address identity, not a value or lifetime proof.
+    fn physicalOutputChannel(self: *Builder, node: Ast.Node.Index, place: FieldRef) ?cfg_types.OutputChannel {
+        if (!self.fieldValuePathRepresentable(node, place)) return null;
+        const selected = self.inlineSelection(node, place) orelse return null;
+        const binding = self.frameBindingAt(self.tree.nodeMainToken(selected.root)) orelse return null;
+        if (binding.origin != .param) return null;
+        self.scanInlineBindingExposures() catch |err| {
+            self.noteResolutionError(err);
+            return null;
+        };
+        if (!self.inline_exposures_scanned or self.inline_exposures_asm) return null;
+        if (self.inline_binding_exposures.get(self.tree.tokenStart(binding.name_token))) |exposure|
+            if (exposure.header) return null;
+        const frame = self.integerResolutionFrame() orelse return null;
+        if (frame.resolver.pointerSize(selected.root_type) != .one or
+            frame.resolver.pointerAllowsZero(selected.root_type) != false) return null;
+        return .{ .out = selected.local, .name = place.name };
+    }
+
+    fn inlineSelection(self: *Builder, node: Ast.Node.Index, place: FieldRef) ?InlineSelection {
+        const cache = self.cache orelse return null;
+        if (cache.tree != self.tree) return null;
+        const frame = self.integerResolutionFrame() orelse return null;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        cache.enterNormalCleanup(node) catch |err| {
+            self.noteResolutionError(err);
+            return null;
+        };
+        defer cache.leaveNormalCleanup();
+        const tree = self.tree;
+        var cursor = node;
+        var depth: u32 = 0;
+        var fields: u32 = 0;
+        const root = root: while (true) {
+            if (depth == max_classify_depth) {
+                self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, node);
+                return null;
+            }
+            depth += 1;
+            cache.chargeNormalCleanup(cursor) catch |err| {
+                self.noteResolutionError(err);
+                return null;
+            };
+            switch (tree.nodeTag(cursor)) {
+                .grouped_expression => cursor = tree.nodeData(cursor).node_and_token[0],
+                .field_access => {
+                    var base = tree.nodeData(cursor).node_and_token[0];
+                    while (tree.nodeTag(base) == .grouped_expression) {
+                        if (depth == max_classify_depth) {
+                            self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, node);
+                            return null;
+                        }
+                        depth += 1;
+                        cache.chargeNormalCleanup(base) catch |err| {
+                            self.noteResolutionError(err);
+                            return null;
+                        };
+                        base = tree.nodeData(base).node_and_token[0];
+                    }
+                    fields += 1;
+                    if (tree.nodeTag(base) != .identifier) {
+                        const ty = self.queryOrUnknown(
+                            zls_resolver_mod.TypeResolver.ActualType,
+                            frame.typeOfNode(base),
+                        ) orelse return null;
+                        const actual = self.queryOrUnknown(
+                            zls_resolver_mod.TypeResolver.ActualType,
+                            frame.resolver.normalizedType(ty),
+                        ) orelse return null;
+                        if (frame.resolver.typeTag(actual) != .@"struct") return null;
+                    }
+                    cursor = base;
+                },
+                .deref => {
+                    const base = tree.nodeData(cursor).node;
+                    if (tree.nodeTag(base) != .identifier) return null;
+                    break :root base;
+                },
+                .identifier => {
+                    break :root cursor;
+                },
+                else => return null,
+            }
+        };
+        const token = tree.nodeMainToken(root);
+        const local = self.indexLocalAt(token) orelse return null;
+        if (place.parent != local or (fields == 0) != (place.name.len == 0)) return null;
+        const ty = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.typeOfNode(root),
+        ) orelse return null;
+        const actual = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(ty),
+        ) orelse return null;
+        var container: ?zls_resolver_mod.TypeResolver.ActualType.Data.Container = null;
+        var owner = actual;
+        if (frame.resolver.pointerSize(owner)) |size| {
+            if (size == .one and frame.resolver.pointerAllowsZero(owner) == false) {
+                const child = frame.resolver.childType(owner) orelse return null;
+                owner = self.queryOrUnknown(
+                    zls_resolver_mod.TypeResolver.ActualType,
+                    frame.resolver.normalizedType(child),
+                ) orelse return null;
+            } else if (fields != 0) return null;
+        }
+        if (owner.data == .container and frame.resolver.typeTag(owner) == .@"struct")
+            container = owner.data.container
+        else if (fields != 0)
+            return null;
+        return .{ .root = root, .local = local, .root_type = actual, .container = container };
+    }
+
+    /// The shared address index includes unproved implicit receivers. Do not
+    /// replace it with the positive-write query, which drops those exposures.
+    fn scanInlineBindingExposures(self: *Builder) LoweringError!void {
+        if (self.inline_exposures_scanned) return;
+        const cache = self.cache orelse return;
+        const body = self.fn_body_node orelse return;
+        if (cache.tree != self.tree) return;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        try cache.enterNormalCleanup(body);
+        defer cache.leaveNormalCleanup();
+        const first = self.tree.firstToken(body);
+        const last = self.tree.lastToken(body);
+        try cache.normalCleanupStorageWork(body, @as(usize, last - first) + 1);
+        var token = first;
+        while (token <= last) : (token += 1) {
+            const tag = self.tree.tokenTag(token);
+            if (tag == .keyword_asm or (tag == .builtin and
+                std.mem.eql(u8, self.tree.tokenSlice(token), "@frameAddress")))
+                self.inline_exposures_asm = true;
+            if (tag != .identifier) continue;
+            const use = (try cache.possibleAddressUseAt(token)) orelse continue;
+            const binding = self.frameBindingAt(token) orelse continue;
+            const entry = try self.inline_binding_exposures.getOrPut(self.gpa, self.tree.tokenStart(binding.name_token));
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.inline_storage = true;
+            if (!use.receiver) {
+                var operand = use.operand;
+                var depth: u32 = 0;
+                while (self.tree.nodeTag(operand) == .grouped_expression) {
+                    if (depth == max_classify_depth) {
+                        self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, body);
+                        return error.AnalysisBudgetExceeded;
+                    }
+                    depth += 1;
+                    try cache.chargeNormalCleanup(operand);
+                    operand = self.tree.nodeData(operand).node_and_token[0];
+                }
+                if (self.tree.nodeTag(operand) == .identifier) entry.value_ptr.header = true;
+            }
+        }
+        self.inline_exposures_scanned = true;
+    }
+
+    fn privateInlineRoot(self: *Builder, selected: InlineSelection) LoweringError!bool {
+        // root_type came from a TYPE query. Its type-valued flag does not
+        // classify the source binding as a type alias or runtime storage.
+        if (selected.root_type.data != .container or
+            self.file_scope_storage.contains(selected.local)) return false;
+        const info = self.locals.items[@intFromEnum(selected.local)];
+        if (info.is_pointer or info.is_slice or info.address_taken or info.init_hint == .type_alias) return false;
+        if (!selected.declared_local) {
+            const binding = self.frameBindingAt(self.tree.nodeMainToken(selected.root)) orelse return false;
+            if (binding.origin == .param or binding.origin == .loop_capture) return false;
+        }
+        try self.scanInlineBindingExposures();
+        if (!self.inline_exposures_scanned or self.inline_exposures_asm) return false;
+        const exposure = self.inline_binding_exposures.get(info.decl_pos.byte) orelse return true;
+        return !exposure.inline_storage;
+    }
+
+    /// Collect only pointer/slice leaves reached through inline struct fields.
+    /// Distinct leaves cannot overlap; unions and pointer ancestors stop proof.
+    fn collectInlineHeaderPaths(
+        self: *Builder,
+        at: Ast.Node.Index,
+        actual: zls_resolver_mod.TypeResolver.ActualType.Data.Container,
+        components: *[max_classify_depth][]const u8,
+        depth: usize,
+        paths: ?*std.ArrayListUnmanaged([]const u8),
+    ) LoweringError!bool {
+        const cache = self.cache orelse return false;
+        try cache.enterNormalCleanup(at);
+        defer cache.leaveNormalCleanup();
+        if (depth == components.len) {
+            self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, @intCast(depth), at);
+            return error.AnalysisBudgetExceeded;
+        }
+        const resolver = (self.integerResolutionFrame() orelse return false).resolver;
+        const frame = resolver.frameForContainer(actual);
+        const tree = &frame.handle.document.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const declaration = tree.fullContainerDecl(&buffer, actual.scope_handle.toNode()) orelse return false;
+        if (tree.tokenTag(declaration.ast.main_token) != .keyword_struct) return false;
+        for (declaration.ast.members) |member| {
+            try cache.chargeNormalCleanupAt(tree, member);
+            const field = tree.fullContainerField(member) orelse continue;
+            if (field.comptime_token != null) continue;
+            if (field.ast.tuple_like) return false;
+            const name = self.normalizedFieldComponentInTree(tree, field.ast.main_token) orelse return false;
+            // Flat CFG path keys cannot distinguish a quoted separator from
+            // a structural hop. Such a layout supplies no alias certificate.
+            if (name.len == 0 or std.mem.indexOfAny(u8, name, ".[]") != null) return false;
+            const type_node = field.ast.type_expr.unwrap() orelse return false;
+            const value = self.queryOrUnknown(
+                zls_resolver_mod.TypeResolver.ActualType,
+                frame.resolveValueOfNode(type_node),
+            ) orelse return false;
+            if (!value.is_type_val) return false;
+            const ty = self.queryOrUnknown(
+                zls_resolver_mod.TypeResolver.ActualType,
+                resolver.normalizedType(value),
+            ) orelse return false;
+            var pointer = resolver.pointerSize(ty) != null;
+            if (!pointer and resolver.typeTag(ty) == .optional) {
+                const child = resolver.childType(ty) orelse return false;
+                const payload = self.queryOrUnknown(
+                    zls_resolver_mod.TypeResolver.ActualType,
+                    resolver.normalizedType(child),
+                ) orelse return false;
+                pointer = resolver.pointerSize(payload) != null;
+            }
+            components[depth] = name;
+            if (pointer) {
+                const output = paths orelse continue;
+                var bytes: usize = depth;
+                for (components[0 .. depth + 1]) |part|
+                    bytes = std.math.add(usize, bytes, part.len) catch return error.SourceTooWide;
+                try cache.normalCleanupStorageWork(at, bytes + 1);
+                const path = if (depth == 0 and tree == self.tree) name else owned: {
+                    const joined = try std.mem.join(self.gpa, ".", components[0 .. depth + 1]);
+                    errdefer self.gpa.free(joined);
+                    try self.owned_paths.append(self.gpa, joined);
+                    break :owned joined;
+                };
+                try output.append(self.gpa, path);
+            } else if (ty.data == .container and resolver.typeTag(ty) == .@"struct") {
+                if (!try self.collectInlineHeaderPaths(at, ty.data.container, components, depth + 1, paths)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn inlineHeaderLayout(self: *Builder, at: Ast.Node.Index, selected: InlineSelection) LoweringError!?*const InlineHeaderLayout {
+        const container = selected.container orelse return null;
+        const actual: zls_resolver_mod.TypeResolver.ActualType = .{
+            .data = .{ .container = container }, .is_type_val = true,
+        };
+        if (self.inline_header_layouts.getPtr(selected.local)) |layout| {
+            if (!layout.actual.eql(actual)) return null;
+            if (try self.privateInlineRoot(selected))
+                self.locals.items[@intFromEnum(selected.local)].private_inline_fields =
+                    layout.doubled_paths[0 .. layout.doubled_paths.len / 2];
+            return layout;
+        }
+        const cache = self.cache orelse return null;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        try cache.enterNormalCleanup(at);
+        defer cache.leaveNormalCleanup();
+        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer paths.deinit(self.gpa);
+        var components: [max_classify_depth][]const u8 = undefined;
+        var published = false;
+        const owned_start = self.owned_paths.items.len;
+        defer if (!published) {
+            for (self.owned_paths.items[owned_start..]) |path| self.gpa.free(path);
+            self.owned_paths.shrinkRetainingCapacity(owned_start);
+        };
+        if (!try self.collectInlineHeaderPaths(at, container, &components, 0, &paths)) return null;
+        try cache.normalCleanupStorageWork(at, paths.items.len * 3);
+        var indices: std.StringHashMapUnmanaged(usize) = .empty;
+        defer if (!published) indices.deinit(self.gpa);
+        try indices.ensureTotalCapacity(self.gpa, std.math.cast(u32, paths.items.len) orelse return error.SourceTooWide);
+        for (paths.items, 0..) |path, index| {
+            const entry = indices.getOrPutAssumeCapacity(path);
+            if (entry.found_existing) return null;
+            entry.value_ptr.* = index;
+        }
+        const private = try self.privateInlineRoot(selected);
+        try self.inline_header_layouts.ensureUnusedCapacity(self.gpa, 1);
+        const doubled = try self.gpa.alloc([]const u8, paths.items.len * 2);
+        errdefer self.gpa.free(doubled);
+        @memcpy(doubled[0..paths.items.len], paths.items);
+        @memcpy(doubled[paths.items.len..], paths.items);
+        try self.owned_field_layouts.append(self.gpa, doubled);
+        self.inline_header_layouts.putAssumeCapacity(selected.local, .{
+            .actual = actual, .doubled_paths = doubled, .indices = indices,
+        });
+        published = true;
+        if (private) self.locals.items[@intFromEnum(selected.local)].private_inline_fields = doubled[0..paths.items.len];
+        return self.inline_header_layouts.getPtr(selected.local);
+    }
+
+    fn inlineLayoutRepresentable(
+        self: *Builder,
+        at: Ast.Node.Index,
+        actual: zls_resolver_mod.TypeResolver.ActualType,
+    ) LoweringError!bool {
+        const cache = self.cache orelse return false;
+        if (actual.data != .container) return false;
+        for (self.inline_layout_representations.items) |entry| {
+            try cache.normalCleanupStorageWork(at, 1);
+            if (entry.actual.eql(actual)) return entry.represented;
+        }
+        var components: [max_classify_depth][]const u8 = undefined;
+        const represented = try self.collectInlineHeaderPaths(at, actual.data.container, &components, 0, null);
+        try self.inline_layout_representations.append(self.gpa, .{
+            .actual = actual,
+            .represented = represented,
+        });
+        return represented;
+    }
+
+    /// A current VALUE selection may cross a pointer ancestor, but every
+    /// typed owner still needs an unambiguous complete inline field layout.
+    /// This is not a private/disjoint/stable-output address certificate.
+    fn fieldValuePathRepresentable(self: *Builder, node: Ast.Node.Index, place: FieldRef) bool {
+        if (place.name.len == 0) return true;
+        const selected = self.fieldLhsFor(node) orelse return false;
+        if (selected.parent != place.parent or !std.mem.eql(u8, selected.name, place.name)) return false;
+        const cache = self.cache orelse return false;
+        const frame = self.integerResolutionFrame() orelse return false;
+        if (self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.typeOfNode(node)) == null)
+            return false;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        cache.enterNormalCleanup(node) catch |err| {
+            self.noteResolutionError(err);
+            return false;
+        };
+        defer cache.leaveNormalCleanup();
+        var cursor = node;
+        for (0..max_classify_depth) |_| {
+            cache.chargeNormalCleanup(cursor) catch |err| {
+                self.noteResolutionError(err);
+                return false;
+            };
+            switch (self.tree.nodeTag(cursor)) {
+                .grouped_expression => cursor = self.tree.nodeData(cursor).node_and_token[0],
+                .deref => cursor = self.tree.nodeData(cursor).node,
+                .field_access => {
+                    const base, const token = self.tree.nodeData(cursor).node_and_token;
+                    const name = self.normalizedFieldComponent(token) orelse return false;
+                    if (name.len == 0 or std.mem.indexOfAny(u8, name, ".[]") != null) return false;
+                    const ty = self.queryOrUnknown(
+                        zls_resolver_mod.TypeResolver.ActualType,
+                        frame.typeOfNode(base),
+                    ) orelse return false;
+                    var owner = self.queryOrUnknown(
+                        zls_resolver_mod.TypeResolver.ActualType,
+                        frame.resolver.normalizedType(ty),
+                    ) orelse return false;
+                    if (frame.resolver.pointerSize(owner)) |size| {
+                        if (size != .one or frame.resolver.pointerAllowsZero(owner) != false) return false;
+                        owner = self.queryOrUnknown(
+                            zls_resolver_mod.TypeResolver.ActualType,
+                            frame.resolver.normalizedType(frame.resolver.childType(owner) orelse return false),
+                        ) orelse return false;
+                    }
+                    if (owner.data != .container or frame.resolver.typeTag(owner) != .@"struct") return false;
+                    owner.is_type_val = true;
+                    if (!(self.inlineLayoutRepresentable(node, owner) catch |err| {
+                        self.noteResolutionError(err);
+                        return false;
+                    })) return false;
+                    cursor = base;
+                },
+                .identifier => return self.indexLocalAt(self.tree.nodeMainToken(cursor)) == place.parent,
+                else => return false,
+            }
+        }
+        self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, max_classify_depth, node);
+        return false;
+    }
+
+    fn knownStoredFieldPath(self: *Builder, parent: LocalId, name: []const u8) bool {
+        if (name.len == 0) return true;
+        const layout = self.inline_header_layouts.getPtr(parent) orelse return false;
+        return layout.indices.contains(name);
+    }
+
+
+
+    /// One doubled immutable layout supplies each rotated N-1 sibling view.
+    /// Do not materialize a separate sibling array for each source write.
+    fn disjointInlineFields(self: *Builder, node: Ast.Node.Index, place: FieldRef) LoweringError![]const []const u8 {
+        const selected = self.inlineSelection(node, place) orelse return &.{};
+        const layout = (try self.inlineHeaderLayout(node, selected)) orelse return &.{};
+        const index = layout.indices.get(place.name) orelse return &.{};
+        const count = layout.doubled_paths.len / 2;
+        return layout.doubled_paths[index + 1 .. index + count];
+    }
+
+    const MappedInlineFields = struct {
+        represented: bool = false,
+        disjoint: []const []const u8 = &.{},
+    };
+
+    fn mappedInlineFields(
+        self: *Builder,
+        actual: file_cache.FileCache.ActualCallSummary,
+        argument: Ast.Node.Index,
+        path: ActualLocalPath,
+        field: []const u8,
+        parameter: u32,
+        call_node: Ast.Node.Index,
+    ) LoweringError!MappedInlineFields {
+        const cache = self.cache orelse return .{};
+        const frame = self.integerResolutionFrame() orelse return .{};
+        const callable = actual.callee.reference.actual_type;
+        if (callable.data != .function or parameter >= callable.data.function.parameters.len) return .{};
+        const argument_type = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.typeOfNode(argument),
+        ) orelse return .{};
+        const actual_type = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(argument_type),
+        ) orelse return .{};
+        const formal_type = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(callable.data.function.parameters[parameter].type),
+        ) orelse return .{};
+        if (frame.resolver.pointerSize(formal_type) != .one or
+            frame.resolver.pointerAllowsZero(formal_type) != false) return .{};
+        var actual_owner = if (frame.resolver.pointerSize(actual_type) == .one and
+            frame.resolver.pointerAllowsZero(actual_type) == false)
+            self.queryOrUnknown(
+                zls_resolver_mod.TypeResolver.ActualType,
+                frame.resolver.normalizedType(frame.resolver.childType(actual_type) orelse return .{}),
+            ) orelse return .{}
+        else if (actual.argument_offset == 1 and parameter == 0 and path.prefix_len == 0 and
+            actual_type.data == .container and frame.resolver.typeTag(actual_type) == .@"struct")
+        receiver: {
+            var direct = argument;
+            var receiver_depth: u32 = 0;
+            while (self.tree.nodeTag(direct) == .grouped_expression) {
+                if (receiver_depth == max_classify_depth) {
+                    self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, receiver_depth, call_node);
+                    return error.AnalysisBudgetExceeded;
+                }
+                receiver_depth += 1;
+                try cache.chargeNormalCleanup(direct);
+                direct = self.tree.nodeData(direct).node_and_token[0];
+            }
+            if (self.tree.nodeTag(direct) != .identifier) return .{};
+            const token = self.tree.nodeMainToken(direct);
+            if (self.indexLocalAt(token) != path.local or self.frameBindingAt(token) == null) return .{};
+            break :receiver actual_type;
+        } else return .{};
+        var formal_owner = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(frame.resolver.childType(formal_type) orelse return .{}),
+        ) orelse return .{};
+        actual_owner.is_type_val = true;
+        formal_owner.is_type_val = true;
+        if (!actual_owner.eql(formal_owner)) return .{};
+        var operand = argument;
+        var depth: u32 = 0;
+        while (self.tree.nodeTag(operand) == .grouped_expression or self.tree.nodeTag(operand) == .address_of) {
+            if (depth == max_classify_depth) {
+                self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, call_node);
+                return error.AnalysisBudgetExceeded;
+            }
+            depth += 1;
+            try cache.normalCleanupStorageWork(call_node, 1);
+            operand = if (self.tree.nodeTag(operand) == .address_of)
+                self.tree.nodeData(operand).node
+            else
+                self.tree.nodeData(operand).node_and_token[0];
+        }
+        const selected = self.inlineSelection(operand, .{ .parent = path.local, .name = if (path.prefix_len == 0) "" else field }) orelse return .{};
+        const layout = (try self.inlineHeaderLayout(call_node, selected)) orelse return .{};
+        const index = layout.indices.get(field) orelse return .{};
+        const count = layout.doubled_paths.len / 2;
+        return .{ .represented = true, .disjoint = layout.doubled_paths[index + 1 .. index + count] };
+    }
+
+    fn mappedStoredPathRepresentable(
+        self: *Builder,
+        actual: file_cache.FileCache.ActualCallSummary,
+        argument: Ast.Node.Index,
+        path: ActualLocalPath,
+        field: []const u8,
+        source: fn_summary.ParamPath,
+        call_node: Ast.Node.Index,
+    ) LoweringError!bool {
+        if (field.len == 0) return true;
+        if (source.path.len == 0)
+            return self.fieldValuePathRepresentable(argument, .{ .parent = path.local, .name = field });
+        return (try self.mappedInlineFields(actual, argument, path, field, source.param, call_node)).represented;
+    }
+
+
+    /// This VALUE proof never reads lifetime ExprKind or a callee's MAY loans.
+    fn storedValueProof(self: *Builder, node: Ast.Node.Index) cfg_types.StoredValueProof {
+        return self.storedValueProofInContext(node, false);
+    }
+
+    fn storedValueProofInContext(self: *Builder, node: Ast.Node.Index, slice_context: bool) cfg_types.StoredValueProof {
+        if (self.integerResolutionFrame() == null) return .unknown;
+        const cache = self.cache orelse return .unknown;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        cache.enterNormalCleanup(node) catch |err| {
+            self.noteResolutionError(err);
+            return .unknown;
+        };
+        defer cache.leaveNormalCleanup();
+        return self.storedValueProofAt(node, 0, false, slice_context) orelse .unknown;
+    }
+
+    fn joinStoredValueProof(a: ?cfg_types.StoredValueProof, b: ?cfg_types.StoredValueProof) ?cfg_types.StoredValueProof {
+        const left = a orelse return b;
+        const right = b orelse return a;
+        if (left == .nonnull_pointer and right == .nonnull_pointer) return .nonnull_pointer;
+        if (left == .empty_slice and right == .empty_slice) return .empty_slice;
+        if (left == .copy and right == .copy) {
+            if (left.copy == .local and right.copy == .local and left.copy.local == right.copy.local) return left;
+            if (left.copy == .field and right.copy == .field and
+                left.copy.field.parent == right.copy.field.parent and
+                std.mem.eql(u8, left.copy.field.name, right.copy.field.name)) return left;
+        }
+        return .unknown;
+    }
+
+    /// A null result means this alternative does not return a value.
+    fn storedValueProofAt(self: *Builder, node: Ast.Node.Index, depth: usize, unwrap_payload: bool, slice_context: bool) ?cfg_types.StoredValueProof {
+        if (depth == max_classify_depth) {
+            self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, @intCast(depth), node);
+            return .unknown;
+        }
+        self.cache.?.chargeNormalCleanup(node) catch |err| {
+            self.noteResolutionError(err);
+            return .unknown;
+        };
+        const tree = self.tree;
+        const tag = tree.nodeTag(node);
+        if (tag == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined")) return .unknown;
+        if (tag == .grouped_expression) return self.storedValueProofAt(tree.nodeData(node).node_and_token[0], depth + 1, unwrap_payload, slice_context);
+        if (tag == .@"try") return self.storedValueProofAt(tree.nodeData(node).node, depth + 1, true, slice_context);
+        if (tag == .@"catch" or tag == .@"orelse") {
+            const pair = tree.nodeData(node).node_and_node;
+            return joinStoredValueProof(
+                self.storedValueProofAt(pair[0], depth + 1, true, slice_context),
+                self.storedValueProofAt(pair[1], depth + 1, unwrap_payload, slice_context),
+            );
+        }
+        if (tree.fullIf(node)) |branch| {
+            const otherwise = branch.ast.else_expr.unwrap() orelse return .unknown;
+            return joinStoredValueProof(
+                self.storedValueProofAt(branch.ast.then_expr, depth + 1, unwrap_payload, slice_context),
+                self.storedValueProofAt(otherwise, depth + 1, unwrap_payload, slice_context),
+            );
+        }
+        if (self.transparentCastSource(node)) |source| {
+            const proof = self.storedValueProofAt(source, depth + 1, unwrap_payload, false) orelse return null;
+            // Casts do not certify whole-header copies or an empty slice.
+            // Only a proved nonnull source can reach the result-type check.
+            if (proof != .nonnull_pointer) return .unknown;
+        }
+        if (slice_context and fn_summary.isStaticEmptyDescriptor(tree, node)) return .empty_slice;
+        if (tag == .field_access) {
+            const field = self.fieldLhsFor(node) orelse return .unknown;
+            if (!self.fieldValuePathRepresentable(node, field)) return .unknown;
+        }
+        const frame = self.integerResolutionFrame() orelse return .unknown;
+        const ty = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.typeOfNode(node)) orelse return .unknown;
+        var actual = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(ty)) orelse return .unknown;
+        if (frame.resolver.typeTag(actual) == .noreturn) return null;
+        if (unwrap_payload and (frame.resolver.typeTag(actual) == .error_union or frame.resolver.typeTag(actual) == .optional)) {
+            const child = frame.resolver.childType(actual) orelse return .unknown;
+            actual = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(child)) orelse return .unknown;
+        }
+        actual.is_type_val = true;
+        const pointer_size = frame.resolver.pointerSize(actual);
+        if (pointer_size != null and pointer_size != .slice and
+            frame.resolver.pointerAllowsZero(actual) == false) return .nonnull_pointer;
+        if (pointer_size != .slice) {
+            if (frame.resolver.typeTag(actual) != .optional) return .unknown;
+            const child = frame.resolver.childType(actual) orelse return .unknown;
+            const payload = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(child)) orelse return .unknown;
+            const size = frame.resolver.pointerSize(payload) orelse return .unknown;
+            if (size == .slice) return .unknown;
+        }
+        return switch (tag) {
+            .identifier => .{ .copy = .{ .local = self.indexLocalAt(tree.nodeMainToken(node)) orelse return .unknown } },
+            .field_access => if (self.fieldLhsFor(node)) |field|
+                .{ .copy = .{ .field = .{ .parent = field.parent, .name = field.name } } }
+            else
+                .unknown,
+            .deref => if (self.derefOfPointerLocal(node)) |local|
+                .{ .copy = .{ .field = .{ .parent = local, .name = "" } } }
+            else
+                .unknown,
+            else => .unknown,
+        };
+    }
+
+    /// Only a source component write changes this packet. Whole-value
+    /// descriptor extraction must leave this metadata unset.
+    fn sliceHeaderOwner(self: *Builder, lhs: Ast.Node.Index) ?cfg_types.StoredValuePlace {
+        const tree = self.tree;
+        if (tree.nodeTag(lhs) != .field_access) return null;
+        var base, const token = tree.nodeData(lhs).node_and_token;
+        const component = self.normalizedFieldComponentInTree(tree, token) orelse return null;
+        if (!std.mem.eql(u8, component, "ptr") and !std.mem.eql(u8, component, "len")) return null;
+        var depth: u32 = 0;
+        while (tree.nodeTag(base) == .grouped_expression) {
+            if (depth == max_classify_depth) {
+                self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, lhs);
+                return null;
+            }
+            depth += 1;
+            base = tree.nodeData(base).node_and_token[0];
+        }
+        const frame = self.integerResolutionFrame() orelse return null;
+        const ty = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.typeOfNode(base),
+        ) orelse return null;
+        const actual = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(ty),
+        ) orelse return null;
+        if (frame.resolver.pointerSize(actual) != .slice) return null;
+        return switch (tree.nodeTag(base)) {
+            .identifier => .{ .local = self.indexLocalAt(tree.nodeMainToken(base)) orelse return null },
+            .field_access => if (self.fieldLhsFor(base)) |field|
+                .{ .field = .{ .parent = field.parent, .name = field.name } }
+            else
+                null,
+            .deref => if (self.derefOfPointerLocal(base)) |local|
+                .{ .field = .{ .parent = local, .name = "" } }
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn canonicalNonsentinelSlice(self: *Builder, node: Ast.Node.Index, is_type: bool) bool {
+        const frame = self.integerResolutionFrame() orelse return false;
+        const ty = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType,
+            if (is_type) frame.resolveValueOfNode(node) else frame.typeOfNode(node)) orelse return false;
+        if (is_type and !ty.is_type_val) return false;
+        return self.canonicalNonsentinelSliceType(frame, ty);
+    }
+
+    fn canonicalNonsentinelSliceType(self: *Builder, frame: zls_resolver_mod.TypeResolver.ResolutionFrame, ty: zls_resolver_mod.TypeResolver.ActualType) bool {
+        const actual = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(ty)) orelse return false;
+        if (frame.resolver.pointerSize(actual) != .slice) return false;
+        return switch (actual.data) {
+            .pointer => |pointer| pointer.sentinel == .none,
+            .ip_index => switch (frame.resolver.ctx.ip.indexToKey(actual.ipIndex() orelse return false)) {
+                .pointer_type => |pointer| pointer.sentinel == .none,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn canonicalSliceValue(self: *Builder, node: Ast.Node.Index) bool {
+        const frame = self.integerResolutionFrame() orelse return false;
+        const ty = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.typeOfNode(node),
+        ) orelse return false;
+        const actual = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(ty),
+        ) orelse return false;
+        return frame.resolver.pointerSize(actual) == .slice;
+    }
+
 
     fn booleanLiteral(self: *const Builder, node: Ast.Node.Index) ?bool {
         if (self.tree.nodeTag(node) != .identifier) return null;
@@ -1785,6 +2521,18 @@ const Builder = struct {
                 cur.* = merge;
             },
             .@"try" => try self.lowerWrappedValue(node, cur, result_frame),
+            .equal_equal, .bang_equal, .less_than, .less_or_equal,
+            .greater_than, .greater_or_equal => {
+                const operands = tree.nodeData(node).node_and_node;
+                inline for (operands) |operand| {
+                    try self.lowerConditionValue(operand, cur, null);
+                    // This operand is evaluated before the comparison. Its
+                    // normal effects apply even when it has no bool-result arm.
+                    try self.applyTopLevelCallEffects(operand, cur, false);
+                }
+                if (result_frame) |frame| if (frame.scalar_local) |local|
+                    try self.emitScalarValue(cur.*, local, node, frame.scalar_guard);
+            },
             else => {
                 try self.emitUsesInExpr(node, cur.*, null);
                 if (self.directValueCall(node)) |call| try self.prepareAddressByteSources(call, cur);
@@ -1795,6 +2543,15 @@ const Builder = struct {
     }
 
     fn integerValue(self: *Builder, node: Ast.Node.Index) ?u64 {
+        if (self.tree.nodeTag(node) == .identifier) {
+            if (self.cache) |cache| {
+                if (self.indexLocalAt(self.tree.nodeMainToken(node))) |local| {
+                    const byte = self.locals.items[@intFromEnum(local)].decl_pos.byte;
+                    for (cache.diagnostic_actual_integers) |binding|
+                        if (binding.parameter_byte == byte) return binding.value;
+                }
+            }
+        }
         return self.fill.comptimeIntTokens(.{ .first = self.tree.firstToken(node), .last = self.tree.lastToken(node) }, 0);
     }
 
@@ -2558,6 +3315,7 @@ const Builder = struct {
             .kind = .{ .field_assign = .{
                 .parent = local,
                 .name = "ptr",
+                .whole_value_companion = .{ .local = local },
                 .rhs_kind = pointer_kind,
                 .defined = pointer_kind != .undef and pointer_kind != .unknown,
                 .interior_view = interior_view,
@@ -2569,6 +3327,7 @@ const Builder = struct {
             .kind = .{ .field_assign = .{
                 .parent = local,
                 .name = "len",
+                .whole_value_companion = .{ .local = local },
                 .rhs_kind = kind,
                 .defined = defined,
                 .inputs = inputs,
@@ -2618,13 +3377,23 @@ const Builder = struct {
     fn emitDescriptorFields(self: *Builder, block: BlockId, parent: LocalId, prefix: ?[]const u8, pointer: ExprKind, length_kind: ExprKind, length: cfg_types.IndexTerm, node: Ast.Node.Index) LoweringError!void {
         const pointer_path = if (prefix) |path| try self.allocDottedPath(path, "ptr") else "ptr";
         const length_path = if (prefix) |path| try self.allocDottedPath(path, "len") else "len";
+        const whole: cfg_types.StoredValuePlace = if (prefix) |path|
+            .{ .field = .{ .parent = parent, .name = path } }
+        else
+            .{ .local = parent };
         try self.appendStmt(block, .{
-            .kind = .{ .field_assign = .{ .parent = parent, .name = pointer_path, .rhs_kind = pointer, .defined = true } },
+            .kind = .{ .field_assign = .{
+                .parent = parent, .name = pointer_path, .rhs_kind = pointer, .defined = true,
+                .whole_value_companion = whole,
+            } },
             .pos = self.posOf(node),
             .end_pos = self.endPosOf(node),
         });
         try self.appendStmt(block, .{
-            .kind = .{ .field_assign = .{ .parent = parent, .name = length_path, .rhs_kind = length_kind, .defined = true } },
+            .kind = .{ .field_assign = .{
+                .parent = parent, .name = length_path, .rhs_kind = length_kind, .defined = true,
+                .whole_value_companion = whole,
+            } },
             .pos = self.posOf(node),
             .end_pos = self.endPosOf(node),
         });
@@ -3479,37 +4248,151 @@ const Builder = struct {
         }
     }
 
-    fn emitBoundedRangePrefix(self: *Builder, natural_exit: BlockId, loop: Ast.full.For) !void {
+    fn emitBoundedRangePrefix(self: *Builder, natural_exit: BlockId, loop: Ast.full.For, negative_seed: ?LocalId) !void {
         const shape = bounded_prefix.rangeFill(self.tree, loop) orelse return;
         const array = self.name_to_local.get(self.tree.tokenSlice(shape.array_token)) orelse return;
         const count = self.name_to_local.get(self.tree.tokenSlice(shape.count_token)) orelse return;
         const capture = self.name_to_local.get(self.tree.tokenSlice(shape.capture_token)) orelse return;
         if (array == count or array == capture or count == capture) return;
+        if (self.locals.items[@intFromEnum(capture)].address_taken) return;
         const array_info = self.locals.items[@intFromEnum(array)];
         const count_info = self.locals.items[@intFromEnum(count)];
         if (array_info.array_extent == null or array_info.address_taken or
             !count_info.is_unsigned or count_info.address_taken or !self.immutable_locals.contains(count)) return;
         const declaration = self.fill.declaredTypeSpanOfLocal(array) orelse return;
         if (declaration.is_const or !declaration.init_is_undefined or declaration.name_tok >= loop.ast.for_token) return;
-        if (!self.rhsIsDefined(shape.rhs)) return;
+        const rhs_defined = self.rhsIsDefined(shape.rhs);
+        var call_buffer: [2]Ast.Node.Index = undefined;
+        const call = zls_resolver_mod.TypeResolver.CallOperands.full(self.tree, &call_buffer, shape.rhs);
+        if (!rhs_defined and call == null) return;
+        if (self.scalarExpressionHasUndefinedOrigin(shape.rhs) or
+            self.sourceEntirelyUndefined(self.tree, self.integerResolutionFrame(), shape.rhs, 0)) return;
         var inputs: [8]?LocalId = .{null} ** 8;
+        var selected: [8]?cfg_types.ValueInput = .{null} ** 8;
+        var diagnostic_only = !rhs_defined;
         if (!self.valueInputs(shape.rhs, &inputs)) {
-            var call_buffer: [2]Ast.Node.Index = undefined;
-            if (zls_resolver_mod.TypeResolver.CallOperands.full(self.tree, &call_buffer, shape.rhs) == null) return;
-            var selected: [8]?cfg_types.ValueInput = .{null} ** 8;
-            if (!self.selectedValueInputs(shape.rhs, &selected, false)) return;
-            inputs = .{null} ** 8;
-            for (selected, 0..) |dependency, index| {
-                const value = dependency orelse continue;
-                if (value != .local) return;
-                inputs[index] = value.local;
+            if (call == null) return;
+            if (!self.selectedValueInputs(shape.rhs, &selected, false)) {
+                // A successful opaque call still physically replaces this slot.
+                // Its unavailable value recipe is UNKNOWN, not the old seed.
+                diagnostic_only = true;
+                selected = .{null} ** 8;
+            } else {
+                for (selected, 0..) |dependency, index| {
+                    const value = dependency orelse continue;
+                    if (value == .local) {
+                        inputs[index] = value.local;
+                    } else {
+                        diagnostic_only = true;
+                    }
+                }
             }
         }
+        // The capture exists on every executed store, even though its state at
+        // natural exit also includes a zero-trip path with an empty prefix.
+        for (&inputs) |*input| {
+            if (input.* != null and input.*.? == capture) input.* = null;
+        }
+        for (&selected) |*input| {
+            if (input.* != null and input.*.? == .local and input.*.?.local == capture)
+                input.* = null;
+        }
+        if (diagnostic_only) {
+            var retains_count = false;
+            for (&selected) |*input| {
+                if (input.* != null) continue;
+                input.* = .{ .local = count };
+                retains_count = true;
+                break;
+            }
+            if (!retains_count) return;
+        }
         try self.appendStmt(natural_exit, .{
-            .kind = .{ .array_prefix = .{ .array = array, .count = count, .inputs = inputs } },
+            .kind = .{ .array_prefix = .{
+                .array = array, .count = count, .inputs = inputs,
+                .selected_inputs = selected, .diagnostic_only = diagnostic_only,
+            } },
             .pos = self.posOfToken(loop.ast.for_token),
             .end_pos = self.endPosOf(loop.ast.then_expr),
         });
+        if (diagnostic_only and call != null) if (negative_seed) |seed|
+            try self.emitBoundedRangeUndefinedChildren(natural_exit, array, shape.rhs, seed);
+    }
+
+    /// The saved entry bytes and every returned alternative must agree on an
+    /// exact negative child. The accepted non-aliased loop writes only whole
+    /// elements, so that child remains undefined inside and outside its prefix.
+    /// These negative byte witnesses never certify an initialized value.
+    fn emitBoundedRangeUndefinedChildren(self: *Builder, block: BlockId, array: LocalId, rhs: Ast.Node.Index, seed: LocalId) LoweringError!void {
+        const masks = self.callResultUndefinedBytes(rhs);
+        if (masks.len == 0) return;
+        const extent = self.locals.items[@intFromEnum(array)].array_extent orelse return;
+        var emitted: std.StringHashMapUnmanaged(void) = .empty;
+        defer emitted.deinit(self.gpa);
+        for (masks) |mask| for (mask.entire_bases.items) |child| {
+            if (emitted.contains(child) or !commonEntirePhysicalChild(masks, child)) continue;
+            try emitted.put(self.gpa, child, {});
+            const path = try std.fmt.allocPrint(self.gpa, "[0..{d}]{s}{s}", .{
+                extent, if (child[0] == '[') "" else ".", child,
+            });
+            self.owned_paths.append(self.gpa, path) catch |err| {
+                self.gpa.free(path);
+                return err;
+            };
+            try self.appendStmt(block, .{
+                .kind = .{ .field_assign = .{
+                    .parent = array, .name = path,
+                    .rhs_kind = .{ .field_copy_of = .{ .parent = seed, .name = path } },
+                    .diagnostic_only = true, .requires_entire_negative_source = true,
+                    .preserve_undefined_descendants = true,
+                    .entire_value_undefined = true,
+                } },
+                .pos = self.posOf(rhs), .end_pos = self.endPosOf(rhs),
+            });
+        };
+    }
+
+    fn commonEntirePhysicalChild(masks: []const worklist_mod.UndefinedReturnBytes, child: []const u8) bool {
+        // A foreign counter or pointee is not a physical element child.
+        if (masks.len == 0 or child.len == 0 or
+            std.mem.indexOfScalar(u8, child, '$') != null or
+            std.mem.indexOf(u8, child, ".*") != null) return false;
+        for (masks) |alternative|
+            if (!alternative.regionIsEntirelyUndefined(child)) return false;
+        return true;
+    }
+
+    fn boundedRangeNegativeSeed(self: *Builder, block: BlockId, loop: Ast.full.For) LoweringError!?LocalId {
+        const shape = bounded_prefix.rangeFill(self.tree, loop) orelse return null;
+        const array = self.name_to_local.get(self.tree.tokenSlice(shape.array_token)) orelse return null;
+        const info = self.locals.items[@intFromEnum(array)];
+        if (!info.is_array or info.is_pointer or info.is_slice or
+            info.address_taken or info.array_extent == null) return null;
+        const masks = self.callResultUndefinedBytes(shape.rhs);
+        var has_child = false;
+        children: for (masks) |mask| {
+            for (mask.entire_bases.items) |child| {
+                if (!commonEntirePhysicalChild(masks, child)) continue;
+                has_child = true;
+                break :children;
+            }
+        }
+        if (!has_child) return null;
+        const seed = try self.appendLocal(.{
+            .name = "$range-negative-seed", .decl_pos = self.posOf(shape.rhs),
+            .is_array = true, .array_extent = info.array_extent, .is_control_local = true,
+        });
+        try self.appendStmt(block, .{
+            .kind = .{ .decl = .{ .local = seed, .init_kind = .{ .copy_of = array } } },
+            .pos = self.posOf(shape.rhs), .end_pos = self.endPosOf(shape.rhs),
+        });
+        try self.appendStmt(block, .{
+            .kind = .{ .array_value = .{
+                .target = seed, .source = .{ .copy_of = array }, .diagnostic_only = true,
+            } },
+            .pos = self.posOf(shape.rhs), .end_pos = self.endPosOf(shape.rhs),
+        });
+        return seed;
     }
 
     fn unsignedType(tree: *const Ast, node: Ast.Node.Index) bool {
@@ -4506,7 +5389,12 @@ const Builder = struct {
                     if (self.fieldLhsFor(pair[0])) |field| {
                         if (self.fieldIsUnsigned(field.parent, field.name)) {
                             try self.appendStmt(cur.*, .{
-                                .kind = .{ .field_counter_step = .{ .parent = field.parent, .name = field.name, .step = if (tag == .assign_add) 1 else -1 } },
+                                .kind = .{ .field_counter_step = .{
+                                    .parent = field.parent,
+                                    .name = field.name,
+                                    .step = if (tag == .assign_add) 1 else -1,
+                                    .slice_header_owner = self.sliceHeaderOwner(pair[0]),
+                                } },
                                 .pos = self.posOf(stmt_node), .end_pos = self.endPosOf(stmt_node),
                             });
                             return;
@@ -4560,8 +5448,9 @@ const Builder = struct {
                 } else if (self.indexedMemberTarget(pair[0])) |access| {
                     try self.emitIndexedMemberWrite(cur.*, pair[0], pair[1], access);
                 } else if (self.fieldLhsFor(pair[0])) |field| {
+                    const header_owner = self.sliceHeaderOwner(pair[0]);
                     if (self.fieldIsUnsigned(field.parent, field.name) or
-                        self.bindingValueType(null, pair[0], .unknown).runtime_scalar)
+                        self.bindingValueType(null, pair[0], .unknown).runtime_scalar or header_owner != null)
                     {
                         // A scalar compound store consumes only this field's
                         // previous value and the RHS, not sibling payloads.
@@ -4575,6 +5464,7 @@ const Builder = struct {
                                 .defined = defined,
                                 .selected_inputs = inputs,
                                 .reads_old_value = true,
+                                .slice_header_owner = header_owner,
                             } },
                             .pos = self.posOf(pair[0]),
                             .end_pos = self.endPosOf(pair[0]),
@@ -5572,6 +6462,7 @@ const Builder = struct {
             return null;
         };
         if (!creator_found) return null;
+        if (self.callbackReleasesCreatedOwner()) return null;
 
         // Two-stage cleanup pattern: when fn is `deinit` / `finalize`
         // AND the type ALSO defines a separate `destroy` method,
@@ -5650,6 +6541,59 @@ const Builder = struct {
         // or `.free(first-param)`, the destructor does free self.
         if (self.bodyFreesFirstParam()) return null;
         return ct;
+    }
+
+    /// A cast callback must release the exact lexical allocation owner at the
+    /// incoming address. A child release or parent projection is not that proof.
+    fn callbackReleasesCreatedOwner(self: *Builder) bool {
+        const cache = self.cache orelse return false;
+        if (cache.tree != self.tree) return false;
+        const initial = self.integerResolutionFrame() orelse return false;
+        const body = self.fn_body_node orelse return false;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        cache.enterNormalCleanup(body) catch |err| {
+            self.noteResolutionError(err);
+            return false;
+        };
+        defer cache.leaveNormalCleanup();
+        const declaration = self.queryOrUnknown(
+            Ast.Node.Index,
+            initial.enclosingFunctionAt(self.tree.firstToken(body)),
+        ) orelse return false;
+        const callable = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            initial.resolveValueOfNode(declaration),
+        ) orelse return false;
+        if (callable.is_type_val or callable.data != .function) return false;
+        const function = callable.data.function;
+        const proto = self.fn_proto orelse return false;
+        if (!function.handle.eql(initial.handle) or function.fn_token != proto.ast.fn_token) return false;
+        const frame = initial.resolver.frameForFunction(.{
+            .tree = self.tree,
+            .handle = function.handle,
+            .fn_token = function.fn_token,
+            .actual_type = callable,
+        });
+        var owner = frame.container_type orelse return false;
+        owner = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            initial.resolver.normalizedType(owner),
+        ) orelse return false;
+        if (owner.data != .container) return false;
+        owner.is_type_val = true;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const released = self.queryOrUnknown(
+            fn_summary.AllocationRelease,
+            fn_summary.callbackAllocationRelease(cache, self.expression_loan_scratch orelse scratch.allocator(), declaration),
+        ) orelse return false;
+        if (released.parameter != 0 or released.relation != .same_address) return false;
+        const actual: zls_resolver_mod.TypeResolver.ActualType = .{
+            .data = .{ .container = released.owner },
+            .is_type_val = true,
+        };
+        return actual.eql(owner);
     }
 
     /// Returns true iff the fn body contains a direct
@@ -5923,6 +6867,7 @@ const Builder = struct {
     fn lowerFor(self: *Builder, for_node: Ast.Node.Index, cur: *BlockId) !void {
         const loop = self.tree.fullFor(for_node).?;
         for (loop.ast.inputs) |input| try self.emitUsesInExpr(input, cur.*, null);
+        const negative_seed = try self.boundedRangeNegativeSeed(cur.*, loop);
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
@@ -5943,7 +6888,14 @@ const Builder = struct {
         // A statically nonempty zip must execute its first iteration.
         try self.addEdge(cur.*, if (nonempty and bounded) body else header);
         const empty = for (loop.ast.inputs) |input| {
-            if (self.tree.nodeTag(input) == .for_range) continue;
+            if (self.tree.nodeTag(input) == .for_range) {
+                const pair = self.tree.nodeData(input).node_and_opt_node;
+                const end = pair[1].unwrap() orelse continue;
+                const start = self.integerValue(pair[0]) orelse continue;
+                const finish = self.integerValue(end) orelse continue;
+                if (finish == start) break true;
+                continue;
+            }
             const length = self.iterationLength(input);
             if (length == .constant and length.constant == 0) break true;
         } else false;
@@ -5982,7 +6934,7 @@ const Builder = struct {
         // in scope and can't be mistaken for the written local.
         const field_fill = self.exhaustiveAggregateFill(loop);
         const diagnostic_field_fill = if (field_fill == null) self.exhaustiveDiagnosticFieldFill(loop) else null;
-        try self.emitBoundedRangePrefix(natural_exit, loop);
+        try self.emitBoundedRangePrefix(natural_exit, loop, negative_seed);
         try self.emitConstantForFillCoverage(natural_exit, body_cur, loop);
         const ended_loop = self.loop_stack.pop().?;
         std.debug.assert(ended_loop.merge == merge);
@@ -9051,6 +10003,7 @@ const Builder = struct {
     /// most once. A returning catch handler can share that pair's id
     /// when its straight-line prefix restores the same tested value.
     fn establishGuardPairs(self: *Builder, stmts: []const Ast.Node.Index) !void {
+        try self.establishSwitchGuardPairs(stmts);
         const tree = self.tree;
         const ifs: usize = blk: {
             var n: usize = 0;
@@ -9097,6 +10050,68 @@ const Builder = struct {
             }
         }
         try self.establishCatchGuardPairs(stmts);
+    }
+
+    /// A by-value parameter cannot be rebound. With no escaped address, its
+    /// union tag is stable for the whole invocation, including loop re-tests.
+    /// Each shared singleton tag has its own fact; every other arm negates it.
+    fn stableSwitchParameter(self: *Builder, condition: Ast.Node.Index) LoweringError!?LocalId {
+        const tree = self.tree;
+        if (tree.nodeTag(condition) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(condition));
+        const local = self.name_to_local.get(name) orelse return null;
+        if (self.paramTypeSpanOfLocal(local) == null or
+            self.locals.items[@intFromEnum(local)].is_pointer or
+            !self.switchSelectorIsUnion(condition)) return null;
+        const cache = self.cache orelse return null;
+        const body = self.fn_body_node orelse return null;
+        const roots = try cache.escapeRoots(body);
+        for (roots.addressed) |root| if (std.mem.eql(u8, root, name)) return null;
+        return local;
+    }
+
+    fn singletonSwitchTag(self: *Builder, case_node: Ast.Node.Index) ?[]const u8 {
+        const case = self.tree.fullSwitchCase(case_node) orelse return null;
+        if (case.ast.values.len != 1) return null;
+        const value = case.ast.values[0];
+        if (self.tree.nodeTag(value) != .enum_literal) return null;
+        return self.constantSwitchTag(value);
+    }
+
+    fn establishSwitchGuardPairs(self: *Builder, stmts: []const Ast.Node.Index) LoweringError!void {
+        const tree = self.tree;
+        for (stmts, 0..) |use_node, index| {
+            const use_switch = tree.fullSwitch(use_node) orelse continue;
+            if (use_switch.label_token != null) continue;
+            const local = (try self.stableSwitchParameter(use_switch.ast.condition)) orelse continue;
+            var back = index;
+            var steps: usize = 0;
+            while (back > 0 and steps < max_guard_pair_scan) : (steps += 1) {
+                back -= 1;
+                const established = tree.fullSwitch(stmts[back]) orelse continue;
+                if (established.label_token != null) continue;
+                const previous = (try self.stableSwitchParameter(established.ast.condition)) orelse continue;
+                if (local != previous) continue;
+                for (use_switch.ast.cases) |use_case| {
+                    const use_tag = self.singletonSwitchTag(use_case) orelse continue;
+                    for (established.ast.cases) |est_case| {
+                        const est_tag = self.singletonSwitchTag(est_case) orelse continue;
+                        if (!std.mem.eql(u8, use_tag, est_tag)) continue;
+                        const fact = if (self.guard_facts.get(est_case)) |existing|
+                            existing
+                        else new: {
+                            if (self.next_guard == std.math.maxInt(u32)) return;
+                            const guard: GuardId = @enumFromInt(self.next_guard);
+                            self.next_guard += 1;
+                            break :new GuardFact{ .guard = guard, .negated = false };
+                        };
+                        try self.guard_facts.put(self.gpa, est_case, fact);
+                        try self.guard_facts.put(self.gpa, use_case, fact);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// A catch following the establishing test has two continuations:
@@ -9778,6 +10793,16 @@ const Builder = struct {
                 try self.newBlock();
             if (selected_entry == null or selected_entry.? == case_block)
                 try self.addEdge(cur.*, case_block);
+            for (sw.ast.cases) |guarded_case| {
+                const fact = self.guard_facts.get(guarded_case) orelse continue;
+                try self.appendStmt(case_block, .{
+                    .kind = .{ .guard_fact = .{
+                        .guard = fact.guard, .holds = guarded_case == case_node,
+                    } },
+                    .pos = self.posOf(case_node),
+                    .end_pos = self.endPosOf(case_node),
+                });
+            }
             // `.tag => |val| ...` capture binds inside this case only.
             // Emit reset_capture into case_block so that stale field
             // state from a prior iteration (when the switch is inside
@@ -11650,6 +12675,8 @@ const Builder = struct {
             .kind = .{ .decl = .{
                 .local = local,
                 .init_kind = effective_init_kind,
+                .value_proof = if (init_opt) |init| self.storedValueProofInContext(init,
+                    if (var_decl.ast.type_node.unwrap()) |type_node| self.canonicalNonsentinelSlice(type_node, true) else false) else .unknown,
                 .integer_value = if (init_opt) |init| self.integerValue(init) else null,
                 .value_defined = init_defined,
                 .value_inputs = init_inputs,
@@ -11725,6 +12752,21 @@ const Builder = struct {
             const complete = try self.unpackStructInitFields(cur.*, local, null, init, self.posOf(decl_node), self.endPosOf(decl_node), value_type.container);
             self.block_stmts.items[@intFromEnum(cur.*)].items[decl_index].kind.decl.value_defined =
                 init_defined and complete;
+            if (!value_type.pointer_header and !value_type.slice_header) if (value_type.container) |container| {
+                for (self.block_stmts.items[@intFromEnum(cur.*)].items[decl_index + 1 ..]) |statement| {
+                    if (statement.kind != .field_assign) continue;
+                    const field = statement.kind.field_assign;
+                    if (field.parent != local or field.diagnostic_only or field.value_proof == .unknown) continue;
+                    _ = try self.inlineHeaderLayout(decl_node, .{
+                        .root = decl_node,
+                        .local = local,
+                        .root_type = .{ .data = .{ .container = container }, .is_type_val = false },
+                        .container = container,
+                        .declared_local = true,
+                    });
+                    break;
+                }
+            };
             // Constructor-call result with heap fields: when init is
             // `T.constructor(...)` and that fn's body returned
             // `.{ .X = <heap_alloc> }`, emit a synthetic
@@ -12253,6 +13295,7 @@ const Builder = struct {
     }
 
     fn annotateFieldScalarValue(self: *Builder, assignment: *@TypeOf(@as(StmtKind, undefined).field_assign), value: Ast.Node.Index) void {
+        assignment.value_proof = .unknown;
         const frame = self.integerResolutionFrame();
         const origin = !self.wholeAggregateValueSyntax(value) and
             if (frame) |actual| self.scalarOperandHasUndefinedOrigin(actual, value, 0) else false;
@@ -13636,6 +14679,25 @@ const Builder = struct {
             try self.emitUsesInExpr(rhs, cur.*, null);
             try self.applyTopLevelCallEffects(rhs, cur, false);
         }
+        var rhs_proof = self.storedValueProofInContext(rhs, self.canonicalNonsentinelSlice(lhs, false));
+        if (tree.nodeTag(lhs) == .field_access) {
+            const target = self.fieldLhsFor(lhs);
+            if (target == null or !self.fieldValuePathRepresentable(lhs, target.?)) rhs_proof = .unknown;
+        }
+        if (self.derefOfPointerLocal(lhs) != null and rhs_proof == .copy) {
+            // Freeze the evaluated header before pointer_write can revoke its
+            // source place. This local's address never enters source storage.
+            const snapshot = try self.appendLocal(.{
+                .name = "<evaluated stored value>",
+                .decl_pos = self.posOf(rhs),
+                .is_control_local = true,
+            });
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .decl = .{ .local = snapshot, .init_kind = .unknown, .value_proof = rhs_proof } },
+                .pos = self.posOf(rhs), .end_pos = self.endPosOf(rhs),
+            });
+            rhs_proof = .{ .copy = .{ .local = snapshot } };
+        }
 
         if (target_local) |t| {
             // Evaluate literal inputs before rebinding the old array value.
@@ -13672,6 +14734,7 @@ const Builder = struct {
                 .kind = .{ .assign = .{
                     .target = t,
                     .rhs_kind = rhs_kind,
+                    .value_proof = rhs_proof,
                     .integer_value = self.integerValue(rhs),
                     .value_defined = value_defined,
                     .value_inputs = value_inputs,
@@ -13743,12 +14806,15 @@ const Builder = struct {
             var assignment: @TypeOf(@as(StmtKind, undefined).field_assign) = .{
                 .parent = fref.parent,
                 .name = fref.name,
+                .slice_header_owner = self.sliceHeaderOwner(lhs),
+                .disjoint_fields = try self.disjointInlineFields(lhs, fref),
                 .rhs_kind = self.classifyExpr(rhs),
                 .defined = defined,
                 .inputs = inputs,
                 .selected_inputs = selected,
             };
             self.annotateFieldScalarValue(&assignment, rhs);
+            assignment.value_proof = rhs_proof;
             const store_index = self.block_stmts.items[@intFromEnum(cur.*)].items.len;
             try self.appendStmt(cur.*, .{
                 .kind = .{ .field_assign = assignment },
@@ -13781,29 +14847,30 @@ const Builder = struct {
             // — fire the same escape diagnostics as a borrowed-shape
             // return.
             //
-            // Save-restore-via-defer skip: when the fn body has a
-            // `defer <recv>.<path> = ...` that targets the SAME
-            // field, the temporary stack borrow is bounded by the
-            // defer — by the time the fn returns the prior value
-            // has been restored.  Don't emit the escape stmt for
-            // that case.
+            // These legacy exceptions concern immediate stack escape only.
+            // Heap custody still reaches the caller and must be recorded,
+            // including when a later null guard frees the published value.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
                 const recv_name = self.locals.items[@intFromEnum(fref.parent)].name;
                 const assign_tok = tree.firstToken(assign_node);
-                if (!self.fieldPathRestoredByDefer(recv_name, fref.name) and
+                const stack_escape = !self.fieldPathRestoredByDefer(recv_name, fref.name) and
                     !self.is_noreturn_fn and
                     !self.installIsScopeBoundedByCall(recv_name, fref.name, assign_tok) and
-                    !self.installIsConsumedByCrossFnRead(recv_name, fref.name, assign_tok))
-                {
-                    try self.appendStmt(cur.*, .{
-                        .kind = .{ .out_param_write = .{
-                            .out = fref.parent,
-                            .value_kind = self.classifyExpr(rhs),
-                        } },
-                        .pos = self.posOf(assign_node),
-                        .end_pos = self.endPosOf(assign_node),
-                    });
-                }
+                    !self.installIsConsumedByCrossFnRead(recv_name, fref.name, assign_tok);
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .out_param_write = .{
+                        .out = fref.parent,
+                        .name = fref.name,
+                        .value_kind = assignment.rhs_kind,
+                        .written_value = if (self.fieldValuePathRepresentable(lhs, fref))
+                            .{ .field = .{ .parent = fref.parent, .name = fref.name } }
+                        else null,
+                        .heap_custody_only = !stack_escape,
+                        .physical_selection = self.physicalOutputChannel(lhs, fref),
+                    } },
+                    .pos = self.posOf(assign_node),
+                    .end_pos = self.endPosOf(assign_node),
+                });
             }
         } else if (self.derefOfPointerLocal(lhs)) |out_local| {
             // `<local>.* = RHS` — when local is pointer-typed, this
@@ -13811,13 +14878,15 @@ const Builder = struct {
             // Mirror the field-of-pointer case above: emit a
             // pointer_write to clear .undef on the pointer and an
             // out_param_write for the escape check.
+            var written_value: ?cfg_types.StoredValuePlace = null;
+            const kind = self.classifyExpr(rhs);
             if (self.locals.items[@intFromEnum(out_local)].array_element_owner) |array| {
                 // This capture denotes one unplaced element. A defined whole
                 // store can retain complete coverage; it cannot fill a hole.
                 var write: @TypeOf(@as(StmtKind, undefined).indexed_write) = .{
                     .array = array,
                     .index = .unknown,
-                    .rhs_kind = self.classifyExpr(rhs),
+                    .rhs_kind = kind,
                 };
                 write.defined = tree.nodeTag(assign_node) == .assign and
                     self.selectedValueInputs(rhs, &write.selected_inputs, false);
@@ -13845,40 +14914,51 @@ const Builder = struct {
             if (self.locals.items[@intFromEnum(out_local)].array_element_owner == null) {
                 var selected: [8]?cfg_types.ValueInput = .{null} ** 8;
                 _ = self.selectedValueInputs(rhs, &selected, false);
-                const kind = self.classifyExpr(rhs);
                 const pointee = self.pointer_value_sources.get(out_local);
                 if (pointee) |source| {
                     switch (source) {
-                        .copy_of => |owner| try self.appendStmt(cur.*, .{
-                            .kind = .{ .assign = .{ .target = owner, .rhs_kind = kind, .value_inputs = selected } },
-                            .pos = self.posOf(assign_node),
-                            .end_pos = self.endPosOf(assign_node),
-                        }),
+                        .copy_of => |owner| {
+                            try self.appendStmt(cur.*, .{
+                                .kind = .{ .assign = .{ .target = owner, .rhs_kind = kind, .value_inputs = selected, .value_proof = rhs_proof } },
+                                .pos = self.posOf(assign_node),
+                                .end_pos = self.endPosOf(assign_node),
+                            });
+                            written_value = .{ .local = owner };
+                        },
                         .field_copy_of => |field| {
                             var assignment: @TypeOf(@as(StmtKind, undefined).field_assign) = .{ .parent = field.parent, .name = field.name, .rhs_kind = kind, .selected_inputs = selected };
                             self.annotateFieldScalarValue(&assignment, rhs);
+                            assignment.value_proof = if (self.knownStoredFieldPath(field.parent, field.name)) rhs_proof else .unknown;
                             try self.appendStmt(cur.*, .{
                                 .kind = .{ .field_assign = assignment },
                                 .pos = self.posOf(assign_node),
                                 .end_pos = self.endPosOf(assign_node),
                             });
+                            if (self.knownStoredFieldPath(field.parent, field.name))
+                                written_value = .{ .field = .{ .parent = field.parent, .name = field.name } };
                         },
                         else => {},
                     }
                 } else {
                     var assignment: @TypeOf(@as(StmtKind, undefined).field_assign) = .{ .parent = out_local, .name = "", .rhs_kind = kind, .selected_inputs = selected };
                     self.annotateFieldScalarValue(&assignment, rhs);
+                    assignment.value_proof = rhs_proof;
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .field_assign = assignment },
                         .pos = self.posOf(assign_node),
                         .end_pos = self.endPosOf(assign_node),
                     });
+                    written_value = .{ .field = .{ .parent = out_local, .name = "" } };
                 }
             }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .out_param_write = .{
                     .out = out_local,
-                    .value_kind = self.classifyExpr(rhs),
+                    .name = "",
+                    .value_kind = kind,
+                    .value_proof = rhs_proof,
+                    .written_value = written_value,
+                    .physical_selection = self.physicalOutputChannel(lhs, .{ .parent = out_local, .name = "" }),
                 } },
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
@@ -14637,7 +15717,9 @@ const Builder = struct {
         argument: Ast.Node.Index,
         array: LocalId,
         diagnostic_inputs: *[2]?cfg_types.ValueInput,
+        diagnostic_copy: ?*bool,
     ) LoweringError!bool {
+        if (diagnostic_copy) |known| known.* = false;
         if (!self.locals.items[@intFromEnum(array)].is_array) return false;
         var call_buffer: [2]Ast.Node.Index = undefined;
         const call = zls_resolver_mod.TypeResolver.CallOperands.full(
@@ -14692,6 +15774,9 @@ const Builder = struct {
                 .index = self.indexTerm(self.tree.nodeData(node).node_and_node[1]),
             } };
         }
+        // Cross-array copies carry the same negative byte dependencies, but
+        // cannot preserve a target's complete-array value certificate.
+        if (diagnostic_copy) |known| known.* = selected;
         return selected and same_array;
     }
 
@@ -14844,6 +15929,11 @@ const Builder = struct {
     }
 
     fn invalidateCallAliases(self: *Builder, call_node: Ast.Node.Index, block: BlockId) !void {
+        var release: SdkReleaseQuery = .unchecked;
+        try self.invalidateCallAliasesWithRelease(call_node, block, &release);
+    }
+
+    fn invalidateCallAliasesWithRelease(self: *Builder, call_node: Ast.Node.Index, block: BlockId, release: *SdkReleaseQuery) !void {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = self.tree.fullCall(&buffer, call_node) orelse return;
         for (call.ast.params) |argument| {
@@ -14865,7 +15955,12 @@ const Builder = struct {
             // Transfer follows the alias's current origin, not its original
             // binding, so a pointer rebind cannot leave stale coverage live.
             try self.appendStmt(block, .{
-                .kind = .{ .pointer_write = .{ .target = alias, .initializes = false } },
+                .kind = .{ .pointer_write = .{
+                    .target = alias,
+                    .initializes = false,
+                    .preserves_private_inline_fields = (try self.sdkReleaseInfo(call_node, release)) != null,
+                    .sdk_empty_noop_release = if (try self.sdkReleaseInfo(call_node, release)) |selected| selected.empty_slice_place else null,
+                } },
                 .pos = self.posOf(argument),
                 .end_pos = self.endPosOf(argument),
             });
@@ -14906,7 +16001,12 @@ const Builder = struct {
             if (try self.callArgumentReadOnly(cache, call_node, receiver)) return;
         }
         try self.appendStmt(block, .{
-            .kind = .{ .pointer_write = .{ .target = alias, .initializes = false } },
+            .kind = .{ .pointer_write = .{
+                .target = alias,
+                .initializes = false,
+                .preserves_private_inline_fields = (try self.sdkReleaseInfo(call_node, release)) != null,
+                .sdk_empty_noop_release = if (try self.sdkReleaseInfo(call_node, release)) |selected| selected.empty_slice_place else null,
+            } },
             .pos = self.posOf(receiver),
             .end_pos = self.endPosOf(receiver),
         });
@@ -14939,12 +16039,13 @@ const Builder = struct {
         self.next_heap += 1;
         const free = Stmt{
             .kind = if (release.field.len == 0)
-                .{ .heap_free = .{ .freed_local = release.parent, .fallback_hid = heap } }
+                .{ .heap_free = .{ .freed_local = release.parent, .fallback_hid = heap, .sdk_empty_slice_noop = release.sdk_empty_slice_noop } }
             else
                 .{ .field_heap_free = .{
                     .parent = release.parent,
                     .name = release.field,
                     .fallback_hid = heap,
+                    .sdk_empty_slice_noop = release.sdk_empty_slice_noop,
                 } },
             .pos = pos,
             .end_pos = end_pos,
@@ -14998,7 +16099,11 @@ const Builder = struct {
     const CalleeStorageOperation = struct {
         parent: LocalId,
         field: []const u8,
+        disjoint_fields: []const []const u8 = &.{},
         kind: @FieldType(fn_summary.StorageOperation, "kind"),
+        replacement: @FieldType(fn_summary.StorageOperation, "replacement") = .fresh_heap,
+        sdk_empty_slice_noop: bool = false,
+        stored_value_path_representable: bool = false,
         allocator: ?cfg_types.ValueInput = null,
         version: ?usize = null,
     };
@@ -15030,7 +16135,10 @@ const Builder = struct {
             for (operations[0..index]) |previous| {
                 try cache.normalCleanupStorageWork(call_node, 1 + @min(previous.field.len, operation.field.len));
                 if (previous.kind == .replace and previous.parent == operation.parent and
-                    std.mem.eql(u8, previous.field, operation.field)) version += 1;
+                    std.mem.eql(u8, previous.field, operation.field))
+                {
+                    version += 1;
+                }
             }
             const released_version = if (operation.kind == .release_entry) 0 else
                 operation.version orelse version;
@@ -15076,6 +16184,12 @@ const Builder = struct {
                                     .{ .copy_of = operation.parent }
                                 else
                                     .{ .field_copy_of = .{ .parent = operation.parent, .name = operation.field } },
+                                .value_proof = if (operation.stored_value_path_representable)
+                                    .{ .copy = if (operation.field.len == 0)
+                                        .{ .local = operation.parent }
+                                    else
+                                        .{ .field = .{ .parent = operation.parent, .name = operation.field } } }
+                                else .unknown,
                             } },
                             .pos = pos,
                             .end_pos = end_pos,
@@ -15087,24 +16201,35 @@ const Builder = struct {
                             .version = version,
                         });
                     }
-                    const heap: abstract_state.HeapId = @enumFromInt(self.next_heap);
-                    self.next_heap += 1;
-                    const allocation: ExprKind = .{ .heap_alloc = .{
-                        .id = heap,
-                        .allocator_local = if (operation.allocator) |source| switch (source) {
-                            .local => |local| local,
-                            .field, .indexed => null,
-                        } else null,
-                        .allocator_source = operation.allocator,
-                    } };
+                    const allocation: ExprKind = if (operation.replacement == .static_empty)
+                        .plain
+                    else allocation: {
+                        const heap: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                        self.next_heap += 1;
+                        break :allocation .{ .heap_alloc = .{
+                            .id = heap,
+                            .allocator_local = if (operation.allocator) |source| switch (source) {
+                                .local => |local| local,
+                                .field, .indexed => null,
+                            } else null,
+                            .allocator_source = operation.allocator,
+                        } };
+                    };
                     try self.appendStmt(block, .{
                         .kind = if (operation.field.len == 0)
-                            .{ .assign = .{ .target = operation.parent, .rhs_kind = allocation } }
+                            .{ .assign = .{
+                                .target = operation.parent,
+                                .rhs_kind = allocation,
+                                .value_proof = if (operation.replacement == .static_empty) .empty_slice else .unknown,
+                            } }
                         else
                             .{ .field_assign = .{
                                 .parent = operation.parent,
                                 .name = operation.field,
+                                .disjoint_fields = operation.disjoint_fields,
                                 .rhs_kind = allocation,
+                                .value_proof = if (operation.replacement == .static_empty and
+                                    operation.stored_value_path_representable) .empty_slice else .unknown,
                             } },
                         .pos = pos,
                         .end_pos = end_pos,
@@ -15115,7 +16240,11 @@ const Builder = struct {
                         const heap: abstract_state.HeapId = @enumFromInt(self.next_heap);
                         self.next_heap += 1;
                         try self.appendStmt(block, .{
-                            .kind = .{ .heap_free = .{ .freed_local = entry.?, .fallback_hid = heap } },
+                            .kind = .{ .heap_free = .{
+                                .freed_local = entry.?,
+                                .fallback_hid = heap,
+                                .sdk_empty_slice_noop = operation.sdk_empty_slice_noop,
+                            } },
                             .pos = pos,
                             .end_pos = end_pos,
                         });
@@ -15125,6 +16254,7 @@ const Builder = struct {
                             .parent = operation.parent,
                             .field = operation.field,
                             .certainty = .definite,
+                            .sdk_empty_slice_noop = operation.sdk_empty_slice_noop,
                         }, pos, end_pos);
                     }
                 },
@@ -15176,7 +16306,7 @@ const Builder = struct {
                 const path = self.actualLocalPath(argument) orelse return null;
                 try cache.normalCleanupStorageWork(call_node, 1 + path.prefix_len + operation.path.path.len +
                     if (operations.items.len == operations.capacity) operations.items.len else @as(usize, 0));
-                const allocator = if (operation.kind == .replace)
+                const allocator = if (operation.kind == .replace and operation.replacement == .fresh_heap)
                     try self.storageAllocatorSource(actual, operation.allocator orelse return null, call_node) orelse return null
                 else
                     null;
@@ -15193,10 +16323,20 @@ const Builder = struct {
                         return null;
                 }
                 std.debug.assert(operations.items.len - start == source_index);
+                const inline_fields: MappedInlineFields = if (field.len != 0)
+                    try self.mappedInlineFields(actual, argument, path, field, operation.path.param, call_node)
+                else .{};
+                const represented = try self.mappedStoredPathRepresentable(
+                    actual, argument, path, field, operation.path, call_node,
+                );
                 try operations.append(self.gpa, .{
                     .parent = path.local,
                     .field = field,
                     .kind = operation.kind,
+                    .replacement = operation.replacement,
+                    .sdk_empty_slice_noop = operation.sdk_empty_slice_noop and represented,
+                    .stored_value_path_representable = represented,
+                    .disjoint_fields = if (operation.kind == .replace) inline_fields.disjoint else &.{},
                     .allocator = allocator,
                     .version = operation.version,
                 });
@@ -16166,15 +17306,23 @@ const Builder = struct {
         try self.diagnostic_address_backings.put(self.gpa, local, .{ .value = candidate, .block = block, .stable = stable });
     }
 
+    fn addressHasWholeRecipe(use: *const file_cache.FileCache.AddressUse) bool {
+        // Original plus UNKNOWN is a completed diagnostic alternative recipe,
+        // not a must-write or initialized-value certificate.
+        return use.location_computed_complete and
+            (use.location_written or use.location_computed_sources != 0 or
+                (use.location_computed_original_alternative and use.location_computed_opaque_alternative)) and
+            (use.whole_source != null or use.location_computed_sources != 0 or
+                use.location_computed_original_alternative or use.location_computed_opaque_alternative);
+    }
+
     fn addressSnapshotDemand(use: *const file_cache.FileCache.AddressUse) AddressSnapshotDemand {
         var demand: AddressSnapshotDemand = .{};
-        if ((use.location_written or use.location_computed_sources != 0) and use.location_computed_complete) {
+        if (addressHasWholeRecipe(use)) {
             demand.source(use.whole_source);
             demand.computations |= use.location_computed_sources;
         }
-        const whole_recipe = (use.location_written or use.location_computed_sources != 0) and use.location_computed_complete and
-            (use.whole_source != null or use.location_computed_sources != 0 or
-                use.location_computed_original_alternative or use.location_computed_opaque_alternative);
+        const whole_recipe = addressHasWholeRecipe(use);
         if (!whole_recipe) for (use.location_field_sources[0..use.location_field_count], use.location_field_dependencies[0..use.location_field_count]) |source, dependencies| {
             if (use.location_computed_complete and source != null and
                 (source.?.sources != 0 or source.?.projections != 0))
@@ -16236,7 +17384,8 @@ const Builder = struct {
         cur: *BlockId,
     ) LoweringError!?AddressByteSource {
         const has_effect = use.location_written or use.location_field_count != 0 or
-            use.may_written_stores.count != 0 or use.undefined_field_count != 0;
+            use.may_written_stores.count != 0 or use.undefined_field_count != 0 or
+            addressHasWholeRecipe(use);
         if (!has_effect) return null;
         const call_node = use.call_node orelse return null;
         var plan: AddressByteSource = .{
@@ -16296,9 +17445,7 @@ const Builder = struct {
                 plan.backing_snapshot, source_block, cur, &memo, &active,
             );
         }
-        const has_recipe = use.whole_source != null or use.location_computed_sources != 0 or
-            use.location_computed_original_alternative or use.location_computed_opaque_alternative;
-        if ((use.location_written or use.location_computed_sources != 0) and has_recipe and use.location_computed_complete) {
+        if (addressHasWholeRecipe(use)) {
             const base: file_cache.FileCache.ComputedStoreBase = .{
                 .source = use.whole_source,
                 .computations = use.location_computed_sources,
@@ -16574,13 +17721,34 @@ const Builder = struct {
             if (!address.may_write or address.call_node != call_node or address.address_node != candidate.address_node) continue;
             if (try self.callArgumentReadOnly(cache, call_node, candidate.address_node)) continue;
             if (address.definite_write and address.location_computed_complete and self.callReturnsWithoutError(call_node)) continue;
+            // Partial must-store coverage does not account for every opaque
+            // write. The separate complete footprint controls diagnostic bytes.
             const root = tokens.rootIdentifier(tree, address.operand) orelse continue;
             const id = self.indexLocalAt(tree.nodeMainToken(root)) orelse continue;
+            if (tree.nodeTag(address.address_node) == .address_of and
+                tree.nodeTag(address.operand) == .identifier and
+                self.locals.items[@intFromEnum(id)].is_pointer)
+            {
+                // `&pointer` exposes the pointer header, not its old pointee.
+                // An opaque write revokes header facts without initializing
+                // or changing diagnostic bytes in the former backing storage.
+                try self.appendStmt(block, .{
+                    .kind = .{ .assign = .{ .target = id, .rhs_kind = .unknown } },
+                    .pos = self.posOf(address.address_node), .end_pos = self.endPosOf(address.address_node),
+                });
+                continue;
+            }
             const output: ExprKind = self.classifySourceProjection(address.operand, 0) orelse .{ .copy_of = id };
             const bytes = self.pointer_value_sources.get(id) orelse output;
             const parent = if (bytes == .copy_of) bytes.copy_of else if (bytes == .field_copy_of) bytes.field_copy_of.parent else continue;
             if (try self.receiverPrefixAt(call_node)) |proof| if (proof.parent == parent) continue;
             if (self.locals.items[@intFromEnum(parent)].is_pointer) continue;
+            var copy_inputs: [2]?cfg_types.ValueInput = .{null} ** 2;
+            var known_copy = false;
+            _ = try self.callPermutesArray(cache, call_node, address.address_node, parent, &copy_inputs, &known_copy);
+            // The authenticated swap byte recipe already froze both indexed
+            // inputs. Its casts/captures are not an additional opaque write.
+            if (known_copy) continue;
             const empty_assignment: StmtKind = .{ .field_assign = .{ .parent = parent, .name = "", .rhs_kind = .unknown } };
             var prefix_entry: @TypeOf(empty_assignment.field_assign.prefix_entry) = null;
             if (bytes == .copy_of) if (self.pointer_prefix_calls.get(call_node)) |plans| {
@@ -16605,7 +17773,12 @@ const Builder = struct {
             const touches = try cache.diagnosticOutputTouchesAt(call.queryToken(tree, call_node), self.integerResolutionFrame(), address.address_node);
             const prefix = if (bytes == .field_copy_of) bytes.field_copy_of.name else "";
             const unknown_whole = [1][]const u8{""};
-            const paths = if (touches) |*scope| scope.fields[0..scope.field_count] else &unknown_whole;
+            // A completed source walk can publish an empty overlay: all of its
+            // stores already have byte/loop/negative effects, or never reach
+            // this actual. Recipe abstention alone is not an opaque write.
+            const paths = if (touches) |*scope|
+                scope.fields[0..scope.field_count]
+            else &unknown_whole;
             for (paths) |path| {
                 if (address.location_computed_complete) {
                     if (address.location_written) continue;
@@ -17021,9 +18194,9 @@ const Builder = struct {
                 });
             }
         }
-        const has_transport = use.location_written and use.location_computed_complete and
-            prepared_plan != null and prepared_plan.?.transport_complete;
-        const transport_prefix = if (has_transport and use.location_element_index != null) blk: {
+        const has_transport = use.location_computed_complete and prepared_plan != null and
+            prepared_plan.?.transport_complete and prepared_plan.?.snapshot != null;
+        const transport_prefix = if (use.location_element_index != null) blk: {
             const index = use.location_element_index.?;
             const path = try std.fmt.allocPrint(self.gpa, "{s}[{d}]", .{ diagnostic_prefix orelse "", index });
             errdefer self.gpa.free(path);
@@ -17037,6 +18210,18 @@ const Builder = struct {
             } },
             .pos = pos, .end_pos = end,
         });
+        if (!has_transport and use.location_written and
+            (!use.definite_write or use.physical_store_only or diagnostic_address_only))
+        {
+            // A definite physical store replaces the old destination bytes.
+            // An unavailable value recipe is UNKNOWN, not evidence that the
+            // pre-call undefined bytes survived. Precise negative effects below
+            // still override this repair; no value certificate is granted.
+            try self.appendStmt(block, .{ .kind = .{ .field_assign = .{
+                .parent = diagnostic_id, .name = transport_prefix orelse "",
+                .rhs_kind = .unknown, .diagnostic_only = true,
+            } }, .pos = pos, .end_pos = end });
+        }
         const empty_snapshots: [8]?LocalId = .{null} ** 8;
         const input_snapshots = if (prepared_plan) |plan| &plan.input_snapshots else &empty_snapshots;
         const read_snapshots = if (prepared_plan) |plan| &plan.read_snapshots else &empty_snapshots;
@@ -17047,11 +18232,11 @@ const Builder = struct {
             if (diagnostic_address_only and use.definite_write and use.location_field_count == 0) {
                 try self.appendStmt(block, .{ .kind = .{ .field_assign = .{
                     .parent = diagnostic_id, .name = diagnostic_prefix orelse "", .rhs_kind = .unknown,
-                    .diagnostic_only = true, .may_write_only = !use.location_computed_complete,
+                    .diagnostic_only = true,
                 } }, .pos = pos, .end_pos = end });
             }
-            // No aggregate global-dependency poisoning. Incomplete publication
-            // retains negatives only and cannot repair a prior destination hole.
+            // These fields have independently proved must-stores. An absent
+            // dependency recipe supplies UNKNOWN bytes, not a no-write path.
             for (use.location_fields[0..use.location_field_count], use.location_field_dependencies[0..use.location_field_count], 0..) |field, dependencies, index| {
                 const path = if (diagnostic_prefix != null)
                     try self.allocDottedPath(diagnostic_prefix, field)
@@ -17074,7 +18259,7 @@ const Builder = struct {
                 try self.appendStmt(block, .{ .kind = .{ .field_assign = .{
                     .parent = diagnostic_id, .name = path, .rhs_kind = .unknown,
                     .selected_inputs = self.computedWriteInputs(dependencies, input_snapshots, read_snapshots),
-                    .diagnostic_only = true, .may_write_only = !use.location_computed_complete,
+                    .diagnostic_only = true,
                 } }, .pos = pos, .end_pos = end });
             }
         }
@@ -17338,13 +18523,88 @@ const Builder = struct {
         cur.* = merge;
     }
 
+    const SdkReleaseInfo = struct {
+        argument: Ast.Node.Index,
+        empty_slice_noop: bool,
+        empty_slice_place: ?cfg_types.StoredValuePlace = null,
+    };
+    const SdkReleaseQuery = union(enum) { unchecked, resolved: ?SdkReleaseInfo };
+
+    fn sdkReleaseInfo(self: *Builder, call_node: Ast.Node.Index, query: *SdkReleaseQuery) LoweringError!?SdkReleaseInfo {
+        if (query.* == .unchecked) query.* = .{ .resolved = try self.resolveSdkReleaseInfo(call_node) };
+        return query.resolved;
+    }
+
+    fn sdkReleaseEmptyPlace(self: *Builder, argument: Ast.Node.Index) ?cfg_types.StoredValuePlace {
+        var node = argument;
+        for (0..max_classify_depth) |_| {
+            if (self.tree.nodeTag(node) == .grouped_expression) {
+                node = self.tree.nodeData(node).node_and_token[0];
+                continue;
+            }
+            return switch (self.tree.nodeTag(node)) {
+                .identifier => .{ .local = self.indexLocalAt(self.tree.nodeMainToken(node)) orelse return null },
+                .field_access => field: {
+                    const field = self.fieldLhsFor(node) orelse break :field null;
+                    if (!self.fieldValuePathRepresentable(node, field)) break :field null;
+                    break :field .{ .field = .{ .parent = field.parent, .name = field.name } };
+                },
+                .deref => .{ .field = .{ .parent = self.derefOfPointerLocal(node) orelse return null, .name = "" } },
+                else => null,
+            };
+        }
+        self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, max_classify_depth, argument);
+        return null;
+    }
+
+
+    /// Zero-length no-op authority belongs to the selected SDK declaration,
+    /// not a project deallocator's spelling or a MAY lifetime origin.
+    fn resolveSdkReleaseInfo(self: *Builder, call_node: Ast.Node.Index) LoweringError!?SdkReleaseInfo {
+        const cache = self.cache orelse return null;
+        const frame = self.integerResolutionFrame() orelse return null;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = self.tree.fullCall(&call_buffer, call_node) orelse return null;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        try cache.enterNormalCleanup(call_node);
+        defer cache.leaveNormalCleanup();
+        try cache.chargeNormalCleanup(call_node);
+        const actual = (try cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(self.tree, call), frame)) orelse return null;
+        var remaining: u32 = 50_000;
+        const primitive = (try fresh_storage.allocatorPrimitive(cache, actual, .{
+            .claim = .{ .first = self.tree.firstToken(call_node), .last = self.tree.lastToken(call_node) },
+            .depth = 0,
+            .remaining = &remaining,
+            .frame = frame,
+        })) orelse return null;
+        if (primitive.operation != .release) return null;
+        const declaration_tree = actual.callee.tree;
+        const name = actual.callee.fn_token + 1;
+        const sdk_free = name < declaration_tree.tokens.len and declaration_tree.tokenTag(name) == .identifier and
+            std.mem.eql(u8, declaration_tree.tokenSlice(name), "free");
+        var arguments: [2]Ast.Node.Index = undefined;
+        const argument = (try actual.callArgumentFor(cache, &arguments, primitive.previous_parameter orelse return null)) orelse return null;
+        const empty_slice_noop = sdk_free and self.canonicalNonsentinelSlice(argument, false);
+        return .{
+            .argument = argument,
+            .empty_slice_noop = empty_slice_noop,
+            .empty_slice_place = if (empty_slice_noop) self.sdkReleaseEmptyPlace(argument) else null,
+        };
+    }
+
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
         // Detect arena.deinit() patterns; otherwise emit nothing
         // (call has no side-effect from our pov).
         const tree = self.tree;
         try self.prepareAddressByteSources(call_node, cur);
         defer self.finishAddressEvaluation(call_node);
-        try self.invalidateCallAliases(call_node, cur.*);
+        var release: SdkReleaseQuery = .unchecked;
+        const sdk = try self.sdkReleaseInfo(call_node, &release);
+        // Operand and containing-owner reads precede every possible mutation.
+        // An SDK empty no-op guards effects only, never these header reads.
+        if (sdk) |selected| try self.emitUsesInExpr(selected.argument, cur.*, null);
+        try self.invalidateCallAliasesWithRelease(call_node, cur.*, &release);
         const first = tree.firstToken(call_node);
         const last = tree.lastToken(call_node);
         const start = tree.tokens.items(.start)[first];
@@ -17398,6 +18658,7 @@ const Builder = struct {
         }
 
         if (anyPatternMatches(text, self.config.heap_free_patterns)) {
+            const sdk_empty_slice_noop = if (sdk) |selected| selected.empty_slice_noop else false;
             // `<recv>.destroy(<allocator>)` — struct-method shape
             // where the method frees the receiver and takes the
             // allocator as an arg.  Inverse of `allocator.destroy(p)`.
@@ -17440,6 +18701,7 @@ const Builder = struct {
                             break :blk_h h;
                         },
                         .allocator_local = self.allocReceiverLocal(call_node),
+                        .sdk_empty_slice_noop = sdk_empty_slice_noop,
                     } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
@@ -17453,7 +18715,8 @@ const Builder = struct {
                         const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
                         self.next_heap += 1;
                         break :blk_hid h;
-                    } } },
+                    }, .sdk_empty_slice_noop = sdk_empty_slice_noop and
+                        self.fieldValuePathRepresentable(fref.argument, fref.field) } },
                     .pos = self.posOf(fref.argument),
                     .end_pos = self.endPosOf(fref.argument),
                 });
@@ -18019,6 +19282,7 @@ const Builder = struct {
         certainty: FreeCertainty,
         entry_only: bool = false,
         invalidate_only: bool = false,
+        sdk_empty_slice_noop: bool = false,
     };
 
     /// Map selected-outcome frees to caller locals. The return value says
@@ -18039,6 +19303,10 @@ const Builder = struct {
         const frame = if (self.zls) |resolver| resolver.resolutionFrame() else null;
         const actual = (try cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(tree, call_full), frame)) orelse return false;
         const summary = (try cache.summaryOfResolvedMethod(actual.callee)) orelse return false;
+        const traces = switch (outcome) {
+            .normal_success => summary.normal_success_storage_outcomes,
+            .error_return => summary.error_storage_outcomes,
+        };
 
         const definite_paths: []const fn_summary.ParamPath = switch (outcome) {
             .normal_success => summary.normal_success_definite_freed_paths,
@@ -18074,6 +19342,8 @@ const Builder = struct {
                 gpa,
                 out,
                 &complete,
+                call_node,
+                traces,
             );
         }
         // A payload-only builtin can make the general cleanup summary
@@ -18119,7 +19389,7 @@ const Builder = struct {
                 if (operation.kind != .release_entry or operation.path.param != parameter or
                     operation.path.path.len != 0) break :payload_release;
             }
-            try self.appendMappedCalleeFieldFree(actual, parameter, "", .definite, gpa, out, &complete);
+            try self.appendMappedCalleeFieldFree(actual, parameter, "", .definite, gpa, out, &complete, call_node, traces);
         }
         for (may_paths) |free| {
             if (!containsParamPath(definite_paths, free)) complete = false;
@@ -18133,14 +19403,12 @@ const Builder = struct {
                 gpa,
                 out,
                 &complete,
+                call_node,
+                traces,
             );
         }
         // Incomplete traces still retain positively observed entry releases.
         // Intersect exact identities across every exit, not the MAY union.
-        const traces = switch (outcome) {
-            .normal_success => summary.normal_success_storage_outcomes,
-            .error_return => summary.error_storage_outcomes,
-        };
         if (traces.len != 0) for (traces[0].operations) |candidate| {
             try cache.normalCleanupStorageWork(call_node, 1);
             if (candidate.kind != .release_entry or !candidate.identity_proved) continue;
@@ -18159,11 +19427,15 @@ const Builder = struct {
             var argument_buffer: [2]Ast.Node.Index = undefined;
             const argument = (try actual.callArgumentFor(cache, &argument_buffer, candidate.path.param)) orelse continue;
             const path = self.actualLocalPath(argument) orelse continue;
+            const field = try self.allocActualDottedPath(path, candidate.path.path);
+            const empty_noop = try fn_summary.entrySdkEmptyNoop(cache, call_node, traces, candidate.path) and
+                try self.mappedStoredPathRepresentable(actual, argument, path, field, candidate.path, call_node);
             try appendCalleeFieldFree(gpa, out, .{
                 .parent = path.local,
-                .field = try self.allocActualDottedPath(path, candidate.path.path),
+                .field = field,
                 .certainty = .definite,
                 .entry_only = candidate.path.path.len != 0,
+                .sdk_empty_slice_noop = empty_noop,
             });
         };
         // A proved store invalidates the caller's current field binding
@@ -18201,6 +19473,8 @@ const Builder = struct {
         gpa: std.mem.Allocator,
         out: *std.ArrayListUnmanaged(CalleeFieldFree),
         complete: *bool,
+        call_node: Ast.Node.Index,
+        traces: []const fn_summary.StorageOutcome,
     ) LoweringError!void {
         var buffer: [2]Ast.Node.Index = undefined;
         const arg_node = (try actual.callArgumentFor(self.cache.?, &buffer, param)) orelse {
@@ -18212,10 +19486,14 @@ const Builder = struct {
             return;
         };
         const mapped_field = try self.allocActualDottedPath(actual_path, field);
+        const source: fn_summary.ParamPath = .{ .param = param, .path = field };
+        const empty_noop = try fn_summary.entrySdkEmptyNoop(self.cache.?, call_node, traces, source) and
+            try self.mappedStoredPathRepresentable(actual, arg_node, actual_path, mapped_field, source, call_node);
         try appendCalleeFieldFree(gpa, out, .{
             .parent = actual_path.local,
             .field = mapped_field,
             .certainty = certainty,
+            .sdk_empty_slice_noop = empty_noop,
         });
     }
 
@@ -18228,10 +19506,14 @@ const Builder = struct {
             if (existing.parent != release.parent or !std.mem.eql(u8, existing.field, release.field)) continue;
             const invalidate_only = existing.invalidate_only and release.invalidate_only;
             const forget_current = existing.invalidate_only or release.invalidate_only;
+            const empty_noop = if (existing.invalidate_only) release.sdk_empty_slice_noop
+                else if (release.invalidate_only) existing.sdk_empty_slice_noop
+                else existing.sdk_empty_slice_noop and release.sdk_empty_slice_noop;
             if (existing.invalidate_only and !release.invalidate_only) existing.* = release;
             if (release.certainty == .definite) existing.certainty = .definite;
             existing.invalidate_only = invalidate_only;
             existing.entry_only = forget_current or (existing.entry_only and release.entry_only);
+            existing.sdk_empty_slice_noop = empty_noop;
             return;
         }
         try out.append(gpa, release);
@@ -18516,6 +19798,13 @@ const Builder = struct {
 
     fn sourceUndefinedLiteral(tree: *const Ast, node: Ast.Node.Index, members: []const Ast.Node.Index, depth: u32) bool {
         if (depth == max_classify_depth) return false;
+        // A value block's intermediate storage is not its result. Namespace
+        // evaluation has no byte-flow proof here; retain UNKNOWN rather than
+        // treating a temporary undefined declaration as a returned hole.
+        switch (tree.nodeTag(node)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => return false,
+            else => {},
+        }
         // A namespace/type value does not evaluate declarations inside it.
         // In particular, selecting a method address does not read its body.
         var owner = node;
@@ -19160,12 +20449,9 @@ const Builder = struct {
                 }
                 const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
                 self.next_heap += 1;
-                // Record the allocator local — the leftmost ident
-                // of the callee chain (e.g. `gpa` in
-                // `gpa.alloc(...)`).  Null when the receiver isn't
-                // a known local (stdlib reference, dotted chain,
-                // etc.); the matching free site will skip the
-                // mismatch check.
+                // Lifetime classification does not prove allocator identity.
+                // Stamp a provider only for an authenticated SDK primitive
+                // whose exact allocator argument is a canonical local value.
                 const allocator_local = self.allocReceiverLocal(expr_node);
                 return .{ .heap_alloc = .{ .id = hid, .allocator_local = allocator_local } };
             }
@@ -19205,27 +20491,21 @@ const Builder = struct {
             if (self.sliceCallValue(expr_node)) return self.classifyCall(expr_node);
             return source;
         }
-        // `obj.field` where obj is a known local → .field_copy_of.
-        // Lets free / use of a field be tracked against its own
-        // origin separately from the parent local.
-        //
-        // EXCEPTION: `.ptr` on a slice is the raw data pointer of the
-        // slice descriptor itself — it points into the SAME allocation
-        // as the slice.  Inherit the parent's origin (.copy_of) so
-        // `@ptrCast(raw.ptr)` correctly carries raw's heap/arena.
+        // `slice.ptr` transports the data pointer's allocation identity.
+        // It reads the slice header, not its payload, and must retain the
+        // backing origin through later transparent pointer casts.
         if (tag == .field_access) {
             const fa = tree.nodeData(expr_node).node_and_token;
             const recv = fa[0];
             const field_tok = fa[1];
+            const fname = self.normalizedFieldComponent(field_tok) orelse return .unknown;
+            if (std.mem.eql(u8, fname, "ptr") and self.canonicalSliceValue(recv)) {
+                return self.classifyExpr(recv);
+            }
             if (tree.nodeTag(recv) == .identifier) {
                 const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
-                if (self.name_to_local.get(recv_name)) |id| {
-                    const fname = self.normalizedFieldComponent(field_tok) orelse return .unknown;
-                    if (std.mem.eql(u8, fname, "ptr") and self.locals.items[@intFromEnum(id)].is_slice) {
-                        return .{ .copy_of = id };
-                    }
+                if (self.name_to_local.get(recv_name)) |id|
                     return .{ .field_copy_of = .{ .parent = id, .name = fname } };
-                }
             }
         }
 
@@ -19881,32 +21161,73 @@ const Builder = struct {
         return .{ .receiver = recv_local, .container = container };
     }
 
-    /// For a call like `<recv>.alloc(...)`, `<recv>.free(...)`,
-    /// `<recv>.destroy(...)`, return the LocalId of `<recv>` when
-    /// it's a bare identifier resolving to a known local.  Walks
-    /// through `.allocator()` chains so `arena.allocator().alloc(...)`
-    /// returns `arena`.  Returns null when the receiver is itself
-    /// a call (other than `.allocator()`), a stdlib namespace
-    /// (`std.heap.page_allocator`), or anything else not resolvable
-    /// to a single local.
+    /// A method receiver is not necessarily the allocation provider. Select
+    /// the exact allocator formal only after authenticating the SDK primitive,
+    /// then require the local value's canonical type to equal that formal.
+    /// Unproved wrapper/field/call providers stay unknown; lifetime is retained.
     fn allocReceiverLocal(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
+        const cache = self.cache orelse return null;
+        const frame = self.integerResolutionFrame() orelse return null;
         const tree = self.tree;
-        var buf: [1]Ast.Node.Index = undefined;
-        const call_full = tree.fullCall(&buf, call_node) orelse return null;
-        const callee = call_full.ast.fn_expr;
-        if (tree.nodeTag(callee) != .field_access) return null;
-        const fa = tree.nodeData(callee).node_and_token;
-        const cur = fa[0];
-        switch (tree.nodeTag(cur)) {
-            .identifier => {
-                const name = tree.tokenSlice(tree.nodeMainToken(cur));
-                return self.name_to_local.get(name);
-            },
-            .call, .call_one, .call_comma, .call_one_comma => {
-                return self.arenaLocalDotAllocatorReceiver(cur);
-            },
-            else => return null,
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, call_node) orelse return null;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        cache.enterNormalCleanup(call_node) catch |err| {
+            self.noteResolutionError(err);
+            return null;
+        };
+        defer cache.leaveNormalCleanup();
+        const actual = self.queryOrUnknown(
+            file_cache.FileCache.ActualCallSummary,
+            cache.actualCallSummaryAt(fresh_storage.calleeQueryToken(tree, call), frame),
+        ) orelse return null;
+        var remaining: u32 = 50_000;
+        const primitive = self.queryOrUnknown(
+            fresh_storage.AllocatorPrimitive,
+            fresh_storage.allocatorPrimitive(cache, actual, .{
+                .claim = .{ .first = tree.firstToken(call_node), .last = tree.lastToken(call_node) },
+                .depth = 0,
+                .remaining = &remaining,
+                .frame = frame,
+            }),
+        ) orelse return null;
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        var argument = self.queryOrUnknown(
+            Ast.Node.Index,
+            actual.callArgumentFor(cache, &argument_buffer, primitive.allocator_parameter),
+        ) orelse return null;
+        var depth: u32 = 0;
+        while (tree.nodeTag(argument) == .grouped_expression) {
+            if (depth == max_classify_depth) {
+                self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, depth, call_node);
+                return null;
+            }
+            depth += 1;
+            cache.chargeNormalCleanup(argument) catch |err| {
+                self.noteResolutionError(err);
+                return null;
+            };
+            argument = tree.nodeData(argument).node_and_token[0];
         }
+        if (tree.nodeTag(argument) != .identifier) return null;
+        const local = self.indexLocalAt(tree.nodeMainToken(argument)) orelse return null;
+        const callable = actual.callee.reference.actual_type;
+        if (callable.data != .function or primitive.allocator_parameter >= callable.data.function.parameters.len)
+            return null;
+        const argument_type = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.typeOfNode(argument),
+        ) orelse return null;
+        const allocator_type = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(argument_type),
+        ) orelse return null;
+        const formal_type = self.queryOrUnknown(
+            zls_resolver_mod.TypeResolver.ActualType,
+            frame.resolver.normalizedType(callable.data.function.parameters[primitive.allocator_parameter].type),
+        ) orelse return null;
+        return if (allocator_type.eql(formal_type)) local else null;
     }
 
     fn arenaBoundReceiverOfCall(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
@@ -21348,6 +22669,39 @@ const Builder = struct {
         return complete;
     }
 
+    fn selectedStructFieldType(
+        self: *Builder,
+        container: zls_resolver_mod.TypeResolver.ActualType.Data.Container,
+        name: []const u8,
+        at: Ast.Node.Index,
+    ) LoweringError!?zls_resolver_mod.TypeResolver.ActualType {
+        const cache = self.cache orelse return null;
+        cache.beginNormalCleanup();
+        defer cache.endNormalCleanup();
+        try cache.enterNormalCleanup(at);
+        defer cache.leaveNormalCleanup();
+        const resolver = (self.integerResolutionFrame() orelse return null).resolver;
+        const frame = resolver.frameForContainer(container);
+        const tree = &frame.handle.document.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const declaration = tree.fullContainerDecl(&buffer, container.scope_handle.toNode()) orelse return null;
+        for (declaration.ast.members) |member| {
+            try cache.chargeNormalCleanupAt(tree, member);
+            const field = tree.fullContainerField(member) orelse continue;
+            if (field.ast.tuple_like or field.comptime_token != null) continue;
+            const selected = self.normalizedFieldComponentInTree(tree, field.ast.main_token) orelse continue;
+            if (!std.mem.eql(u8, selected, name)) continue;
+            const type_node = field.ast.type_expr.unwrap() orelse return null;
+            const value = self.queryOrUnknown(
+                zls_resolver_mod.TypeResolver.ActualType,
+                frame.resolveValueOfNode(type_node),
+            ) orelse return null;
+            if (!value.is_type_val) return null;
+            return self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, resolver.normalizedType(value));
+        }
+        return null;
+    }
+
     /// Unpack a struct-literal RHS into per-field `field_assign`
     /// statements so that aliases buried inside the literal are
     /// tracked by name.  Example: for `install.ca = .{ .str = buf }`
@@ -21395,6 +22749,14 @@ const Builder = struct {
                 }
             }
         };
+        if (prefix == null) if (container) |actual| {
+            _ = try self.inlineHeaderLayout(rhs_node, .{
+                .root = rhs_node,
+                .local = parent,
+                .root_type = .{ .data = .{ .container = actual }, .is_type_val = false },
+                .container = actual,
+            });
+        };
         var supplied: std.StringHashMapUnmanaged(void) = .empty;
         defer supplied.deinit(self.gpa);
         const field_count = std.math.cast(u32, init.ast.fields.len) orelse return error.SourceTooWide;
@@ -21403,6 +22765,9 @@ const Builder = struct {
             const leaf = self.fieldInitName(field_value) orelse continue;
             try supplied.put(self.gpa, leaf, {});
             const path = try self.allocDottedPath(prefix, leaf);
+            const selected_type = if (container) |actual|
+                try self.selectedStructFieldType(actual, leaf, field_value)
+            else null;
             var rhs_kind = self.classifyExpr(field_value);
             var array_buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullArrayInit(&array_buffer, field_value)) |array| {
@@ -21472,6 +22837,16 @@ const Builder = struct {
                 .diagnostic_only = self.diagnostic_fields_mode,
             };
             self.annotateFieldScalarValue(&assignment, field_value);
+            if (self.inline_header_layouts.getPtr(parent)) |layout| {
+                if (layout.indices.contains(path)) {
+                    if (selected_type) |ty| if (self.integerResolutionFrame()) |frame| {
+                        assignment.value_proof = self.storedValueProofInContext(
+                            field_value,
+                            self.canonicalNonsentinelSliceType(frame, ty),
+                        );
+                    };
+                }
+            }
             const store_index = self.block_stmts.items[@intFromEnum(cur)].items.len;
             try self.appendStmt(cur, .{
                 .kind = .{ .field_assign = assignment },
@@ -21496,7 +22871,10 @@ const Builder = struct {
                 .end_pos = end_pos,
             });
             try self.emitOptionalFieldTagStore(cur, parent, path, null, field_value);
-            const complete = try self.unpackStructInitFields(cur, parent, path, field_value, pos, end_pos, null);
+            const nested_container = if (selected_type) |ty|
+                (if (ty.data == .container) ty.data.container else null)
+            else null;
+            const complete = try self.unpackStructInitFields(cur, parent, path, field_value, pos, end_pos, nested_container);
             self.block_stmts.items[@intFromEnum(cur)].items[store_index].kind.field_assign.defined =
                 defined and complete;
         }
@@ -22020,7 +23398,7 @@ const Builder = struct {
                         if (t + 1 <= last and tags[t + 1] == .period) {
                             try self.emitFieldUsePrefixes(
                                 cur, id, t, last,
-                                self.posOfToken(t), self.posOfTokenEnd(t), true, .transport,
+                                self.posOfToken(t), self.posOfTokenEnd(t), true, .transport, false,
                             );
                         } else {
                             try self.appendStmt(cur, .{
@@ -22049,6 +23427,7 @@ const Builder = struct {
                     address.address_node,
                     id,
                     &diagnostic_inputs,
+                    null,
                 );
                 var preserve_inputs: [8]?cfg_types.ValueInput = .{null} ** 8;
                 var preserve_whole_payload = false;
@@ -22184,6 +23563,7 @@ const Builder = struct {
                                     .index = index,
                                     .modulo = modulo,
                                     .name = name,
+                                    .selected_member = self.indexedMemberPath(close, last),
                                     .scaled = if (close <= last and close > t + 2) self.scaledOutputIndexTokens(t + 2, close - 1) else null,
                                 } },
                                 .pos = self.posOfToken(t),
@@ -22254,7 +23634,18 @@ const Builder = struct {
                     // and no `id[a..b]` was ever recognised as a range
                     // — building a slice over undefined storage was
                     // reported as reading it.
-                    if (!memcpy_src_active and isRangeSubscript(tags, t + 1, last)) continue;
+                    if (!memcpy_src_active and isRangeSubscript(tags, t + 1, last)) {
+                        if (self.fieldChainTypeFacts(t, t, null).pointer_size == .slice) {
+                            if (self.name_to_local.get(tree.tokenSlice(t))) |local| {
+                                try self.appendStmt(cur, .{
+                                    .kind = .{ .use = .{ .local = local, .descriptor_only = true } },
+                                    .pos = use_pos,
+                                    .end_pos = use_end,
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     // Fall through to the shared `.use` tail below,
                     // which reads the base identifier and emits the
                     // read once per local.
@@ -22266,6 +23657,20 @@ const Builder = struct {
                         if (self.name_to_local.get(tree.tokenSlice(t))) |local| {
                             const info = self.locals.items[@intFromEnum(local)];
                             if (info.is_array and !info.is_pointer and !info.is_slice) continue;
+                            // A slice's runtime header remains in its local
+                            // slot after its backing allocation is released.
+                            // A pointer to a slice still dereferences its owner.
+                            if (self.fieldChainTypeFacts(t, t, null).pointer_size == .slice and
+                                (t + 3 > last or (tags[t + 3] != .l_bracket and
+                                    tags[t + 3] != .period_asterisk and tags[t + 3] != .period)))
+                            {
+                                try self.appendStmt(cur, .{
+                                    .kind = .{ .use = .{ .local = local, .descriptor_only = true } },
+                                    .pos = use_pos,
+                                    .end_pos = use_end,
+                                });
+                                continue;
+                            }
                         }
                     }
                     if ((std.mem.eql(u8, field, "len") or std.mem.eql(u8, field, "ptr")) and
@@ -22306,6 +23711,7 @@ const Builder = struct {
                                 cur, id, t, last, use_pos, use_end,
                                 memcpy_src_active and write_dest_is_copy,
                                 optional_read,
+                                !memcpy_src_active and self.descriptorTransportAt(expr_node, t),
                             );
                             continue;
                         }
@@ -22325,6 +23731,8 @@ const Builder = struct {
                     .from_method_call = ident_in_method_recv_pos,
                     .tag_only = optional_read == .tag,
                     .optional_payload = optional_read == .scalar_payload,
+                    .descriptor_only = !memcpy_src_active and !ident_in_method_recv_pos and
+                        self.descriptorTransportAt(expr_node, t),
                 } },
                 .pos = use_pos,
                 .end_pos = use_end,
@@ -22974,6 +24382,35 @@ const Builder = struct {
         return self.fieldChainTypeFacts(first, last - 2, memo).pointer_size == .slice;
     }
 
+    /// Only the complete value expression can certify transport. An argument
+    /// inside an opaque call is not a certificate that its payload is unread.
+    fn descriptorTransportAt(self: *Builder, expression: Ast.Node.Index, first: Ast.TokenIndex) bool {
+        var node = expression;
+        for (0..max_classify_depth) |_| {
+            if (self.tree.nodeTag(node) == .grouped_expression) {
+                node = self.tree.nodeData(node).node_and_token[0];
+                continue;
+            }
+            if (self.transparentCastSource(node)) |source| {
+                node = source;
+                continue;
+            }
+            break;
+        } else {
+            self.noteBudgetFailure(.expr_classify_depth, max_classify_depth, max_classify_depth, expression);
+            return false;
+        }
+        if (self.tree.firstToken(node) != first) return false;
+        switch (self.tree.nodeTag(node)) {
+            .identifier, .field_access, .slice_open, .slice, .slice_sentinel => {},
+            else => return false,
+        }
+        const frame = self.integerResolutionFrame() orelse return false;
+        const ty = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.typeOfNode(node)) orelse return false;
+        const actual = self.queryOrUnknown(zls_resolver_mod.TypeResolver.ActualType, frame.resolver.normalizedType(ty)) orelse return false;
+        return frame.resolver.pointerSize(actual) != null;
+    }
+
     /// Emit a `.field_use` for every PREFIX of the dotted chain
     /// starting at `obj` (token `t`): "f1", "f1.f2", "f1.f2.f3",
     /// etc.  This way a free recorded at any depth (e.g.
@@ -22990,6 +24427,7 @@ const Builder = struct {
         end_pos: SrcPos,
         aggregate_transport: bool,
         optional_read: OptionalRead,
+        descriptor_transport: bool,
     ) (LoweringError)!void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
@@ -23017,6 +24455,8 @@ const Builder = struct {
         var aggregate_value = false;
         var type_memo: FieldChainTypeMemo = .{};
         const runtime_descriptor = !ends_in_call and self.runtimeSliceDescriptorWithMemo(t, chain_end, &type_memo);
+        const descriptor_value = !ends_in_call and !selected_index and !runtime_index and
+            (runtime_descriptor or descriptor_transport);
         const value_projection = !ends_in_call and
             (runtime_descriptor or self.inlineValueFieldChain(t, chain_end, true, &aggregate_value, &type_memo));
         var borrowed_receiver = false;
@@ -23065,6 +24505,10 @@ const Builder = struct {
         var f: Ast.TokenIndex = first_field;
         while (f <= last_field.?) : (f += 2) {
             const path = self.normalizedFieldPath(first_field, f) orelse continue;
+            const descriptor_only = descriptor_value and
+                self.fieldChainTypeFacts(t, f, &type_memo).pointer_size != null and
+                ((runtime_descriptor and f + 2 == chain_end) or
+                    (!runtime_descriptor and f == chain_end));
             // Inline prefixes locate the selected bytes; they do not read
             // entire parent records or fixed-array payloads.
             var lifetime_only = f < last_field.? or selected_index or runtime_index or range_subscript;
@@ -23076,11 +24520,15 @@ const Builder = struct {
                 // still read their headers before the next field is selected.
                 if (borrowed_receiver and facts.tag == .@"struct") lifetime_only = true;
             }
+            // Reading the descriptor still reads initialized header bytes.
+            // Earlier pointer prefixes remain real dereferences of their owner.
+            if (descriptor_only) lifetime_only = false;
             try self.appendStmt(cur, .{
                 .kind = .{ .field_use = .{
                     .parent = parent,
                     .name = path,
                     .lifetime_only = lifetime_only,
+                    .descriptor_only = descriptor_only,
                     .optional_payload = optional_read == .scalar_payload and f == last_field.?,
                     .optional_tag_path = if (optional_read == .tag and f == last_field.?)
                         try self.allocDottedPath(path, cfg_types.diagnostic_optional_tag)
@@ -23128,6 +24576,32 @@ const Builder = struct {
                 .pos = pos, .end_pos = end_pos,
             });
         }
+    }
+
+    /// Preserve the physical child independently of a dynamic element index.
+    /// Resource/lifetime paths remain literal-only in subscriptFieldPath.
+    fn indexedMemberPath(self: *Builder, close: Ast.TokenIndex, last: Ast.TokenIndex) ?[]const u8 {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (close + 2 > last or tags[close] != .r_bracket or
+            tags[close + 1] != .period or tags[close + 2] != .identifier) return null;
+        var end = close;
+        var previous = close;
+        while (true) {
+            if (end + 2 <= last and tags[end + 1] == .period and tags[end + 2] == .identifier) {
+                previous = end;
+                end += 2;
+            } else if (end + 3 <= last and tags[end + 1] == .l_bracket and
+                tags[end + 2] == .number_literal and tags[end + 3] == .r_bracket)
+            {
+                previous = end;
+                end += 3;
+            } else break;
+        }
+        if (end + 1 <= last and tags[end] == .identifier and tags[end + 1] == .l_paren)
+            end = previous;
+        if (end == close) return null;
+        return self.normalizedFieldPath(close + 2, end);
     }
 
     /// `<id>[<literal>].<f>(.<g>)*` — return the path slice
@@ -23906,7 +25380,7 @@ fn checkHeapIdentityFixture(
         if (tree.nodeTag(node) != .fn_decl) continue;
         var graph = (try lowerFunctionFullWithZls(gpa, tree, node, config, cache, cache.zls)) orelse continue;
         defer graph.deinit(gpa);
-        try @import("worklist.zig").check(gpa, &graph, .{ .path = "<heap-identity>", .config = config }, problems);
+        try @import("worklist.zig").check(gpa, &graph, .{ .path = "<heap-frontier>", .config = config }, problems);
     }
 }
 
@@ -25767,3 +27241,787 @@ test "optional tag guard followup: defined field tag leaves result opaque" {
         \\}
     , &.{4}, &.{});
 }
+
+test "heap headers: local slice accounting does not read released elements" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\fn release(a: std.mem.Allocator, bytes: []u8) usize {
+        \\    a.free(bytes);
+        \\    return bytes.len * @sizeOf(u8);
+        \\}
+    );
+}
+
+test "heap headers: nested owner slice accounting does not read released elements" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Witness = struct { rows: []u8 };
+        \\const Owner = struct {
+        \\    witness: Witness,
+        \\    fn release(self: *Owner, a: std.mem.Allocator) usize {
+        \\        a.free(self.witness.rows);
+        \\        return self.witness.rows.len * @sizeOf(u8);
+        \\    }
+        \\};
+    );
+}
+
+test "heap headers: copying a dangling descriptor is transport not a payload read" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\fn release(a: std.mem.Allocator, bytes: []u8) usize {
+        \\    a.free(bytes);
+        \\    const saved = bytes;
+        \\    return saved.len;
+        \\}
+    );
+}
+
+test "heap headers: copying a dangling pointer does not dereference it" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\fn release(a: std.mem.Allocator, item: *u8) void {
+        \\    a.destroy(item);
+        \\    const saved = item;
+        \\    _ = saved;
+        \\}
+    );
+}
+
+test "heap headers: selected pointer transport retains later payload hazards" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\fn release(a: std.mem.Allocator, bytes: []u8) u8 {
+        \\    a.free(bytes);
+        \\    const saved = bytes.ptr;
+        \\    return saved[0];
+        \\}
+    );
+}
+
+test "heap headers: released slice payload reads remain diagnosed" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    bytes: []u8,
+        \\    fn release(self: *Owner, a: std.mem.Allocator) u8 {
+        \\        a.free(self.bytes);
+        \\        return self.bytes[0];
+        \\    }
+        \\};
+    );
+}
+
+test "heap headers: freed owner cannot supply a live slice header" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Owner = struct { bytes: []u8 };
+        \\fn release(a: std.mem.Allocator, owner: *Owner) usize {
+        \\    a.destroy(owner);
+        \\    return owner.bytes.len;
+        \\}
+    );
+}
+
+test "heap headers: freed intermediate owner cannot supply a slice header" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Inner = struct { bytes: []u8 };
+        \\const Owner = struct { inner: *Inner };
+        \\fn release(a: std.mem.Allocator, owner: *Owner) usize {
+        \\    a.destroy(owner.inner);
+        \\    return owner.inner.bytes.len;
+        \\}
+    );
+}
+
+test "heap headers: undefined slice headers are not metadata constants" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "use-undefined",
+        \\fn length() void {
+        \\    var bytes: []u8 = undefined;
+        \\    _ = bytes.len;
+        \\}
+    );
+}
+
+test "heap headers: returning a dangling descriptor remains an escape" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\fn release(a: std.mem.Allocator, bytes: []u8) []u8 {
+        \\    a.free(bytes);
+        \\    return bytes;
+        \\}
+    );
+}
+
+test "heap cleanup: transferred output disarms conditional error cleanup" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\fn open(a: std.mem.Allocator, instance: *?*u8) !void {
+        \\    const state = try a.create(u8);
+        \\    errdefer if (instance.* == null) a.destroy(state);
+        \\    state.* = 0;
+        \\    instance.* = state;
+        \\    try fallible();
+        \\}
+    );
+}
+
+test "heap cleanup: armed conditional error cleanup still invalidates output" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\fn open(a: std.mem.Allocator, instance: *?*u8) !void {
+        \\    const state = try a.create(u8);
+        \\    errdefer if (instance.* != null) a.destroy(state);
+        \\    state.* = 0;
+        \\    instance.* = state;
+        \\    try fallible();
+        \\}
+    );
+}
+
+test "heap cleanup: clearing a saved field prevents repeated cleanup" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\const Manager = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    restore_text: []const u8 = &.{},
+        \\    fn drop(self: *Manager) void {
+        \\        self.gpa.free(self.restore_text);
+        \\        self.restore_text = &.{};
+        \\    }
+        \\    fn cancel(self: *Manager) !void {
+        \\        const restore = self.restore_text;
+        \\        self.restore_text = &.{};
+        \\        defer self.gpa.free(restore);
+        \\        try fallible();
+        \\    }
+        \\    fn release(self: *Manager) void {
+        \\        self.cancel() catch self.drop();
+        \\        self.drop();
+        \\    }
+        \\};
+    );
+}
+
+test "heap cleanup: uncleared field still diagnoses repeated cleanup" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-double-free",
+        \\const std = @import("std");
+        \\const Manager = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    restore_text: []const u8,
+        \\    fn drop(self: *Manager) void { self.gpa.free(self.restore_text); }
+        \\    fn release(self: *Manager) void { self.drop(); self.drop(); }
+        \\};
+    );
+}
+
+test "heap allocators: wrapper allocation retains its selected allocator identity" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Plan = struct { allocator: std.mem.Allocator };
+        \\const Work = struct {
+        \\    plan: *Plan,
+        \\    fn alloc(self: *Work, comptime T: type, n: usize) ![]T {
+        \\        return self.plan.allocator.alloc(T, n);
+        \\    }
+        \\};
+        \\fn allocate(work: *Work) !void {
+        \\    const allocator = work.plan.allocator;
+        \\    const blocks = try work.alloc(u8, 8);
+        \\    defer allocator.free(blocks);
+        \\}
+    );
+}
+
+test "heap allocators: genuinely different allocator still diagnoses mismatch" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "allocator-mismatch",
+        \\const std = @import("std");
+        \\fn allocate(first: std.mem.Allocator, second: std.mem.Allocator) !void {
+        \\    const blocks = try first.alloc(u8, 8);
+        \\    second.free(blocks);
+        \\}
+    );
+}
+
+test "heap cleanup: cast callback destroys the exact created owner" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const OwnedHook = struct {
+        \\    active: bool,
+        \\    fn install() !*OwnedHook {
+        \\        const state = try std.testing.allocator.create(OwnedHook);
+        \\        state.* = .{ .active = true };
+        \\        return state;
+        \\    }
+        \\    fn destroy(context: *anyopaque) void {
+        \\        const state: *OwnedHook = @ptrCast(@alignCast(context));
+        \\        std.testing.allocator.destroy(state);
+        \\    }
+        \\};
+    );
+}
+
+test "heap cleanup: freeing a callback child does not release its owner" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-leak",
+        \\const std = @import("std");
+        \\const OwnedHook = struct {
+        \\    child: *u8,
+        \\    fn install(child: *u8) !*OwnedHook {
+        \\        const state = try std.testing.allocator.create(OwnedHook);
+        \\        state.* = .{ .child = child };
+        \\        return state;
+        \\    }
+        \\    fn destroy(context: *anyopaque) void {
+        \\        const state: *OwnedHook = @ptrCast(@alignCast(context));
+        \\        std.testing.allocator.destroy(state.child);
+        \\    }
+        \\};
+    );
+}
+
+test "heap cleanup: embedded callback destroys its enclosing allocation" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Job = struct { value: u8 };
+        \\const Session = struct { gpa: std.mem.Allocator };
+        \\fn Service(comptime Payload: type) type {
+        \\    return struct {
+        \\        const Concrete = struct {
+        \\            const Self = @This();
+        \\            base: Job,
+        \\            payload: Payload,
+        \\            fn destroy(base: *Job, session: *Session) void {
+        \\                const item: *Self = @fieldParentPtr("base", base);
+        \\                session.gpa.destroy(item);
+        \\            }
+        \\        };
+        \\        fn install(session: *Session, payload: Payload) !*Concrete {
+        \\            const item = try session.gpa.create(Concrete);
+        \\            item.* = .{ .base = .{ .value = 0 }, .payload = payload };
+        \\            return item;
+        \\        }
+        \\    };
+        \\}
+    );
+}
+
+test "heap cleanup: releasing an embedded child leaves its owner allocation leaked" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-leak",
+        \\const std = @import("std");
+        \\const Job = struct { value: u8 };
+        \\const Concrete = struct {
+        \\    base: Job,
+        \\    child: *u8,
+        \\    fn install(a: std.mem.Allocator, child: *u8) !*Concrete {
+        \\        const item = try a.create(Concrete);
+        \\        item.* = .{ .base = .{ .value = 0 }, .child = child };
+        \\        return item;
+        \\    }
+        \\    fn destroy(base: *Job, a: std.mem.Allocator) void {
+        \\        const item: *Concrete = @fieldParentPtr("base", base);
+        \\        a.destroy(item.child);
+        \\    }
+        \\};
+    );
+}
+
+test "heap headers: zero reslice changes only a released slice descriptor" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Queue = struct {
+        \\    entries: []u8,
+        \\    fn release(self: *Queue, a: std.mem.Allocator) void {
+        \\        a.free(self.entries);
+        \\        self.entries = self.entries[0..0];
+        \\    }
+        \\};
+    );
+}
+
+test "heap headers: source memcpy after reslicing still reads released payload" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Queue = struct {
+        \\    entries: []u8,
+        \\    fn release(self: *Queue, a: std.mem.Allocator, output: []u8) void {
+        \\        a.free(self.entries);
+        \\        @memcpy(output, self.entries[0..output.len]);
+        \\    }
+        \\};
+    );
+}
+
+test "heap cleanup: armed loop cleanup preserves the final release witness" {
+    const testing = @import("../testing.zig");
+    const source =
+        \\const std = @import("std");
+        \\fn decode(a: std.mem.Allocator, count: usize) !void {
+        \\    var uris: []u8 = &.{};
+        \\    defer a.free(uris);
+        \\    for (0..count) |_| {
+        \\        const owned = try a.alloc(u8, 1);
+        \\        defer a.free(owned);
+        \\        a.free(uris);
+        \\        uris = owned;
+        \\    }
+        \\}
+    ;
+    var problems = try testing.runRuleTyped(std.testing.allocator, checkHeapIdentityFixture, source);
+    defer testing.freeProblems(std.testing.allocator, &problems);
+    const final_release = "a.free(uris);";
+    const final_start = std.mem.indexOf(u8, source, final_release).?;
+    const first_release = "a.free(owned);";
+    const first_start = std.mem.indexOf(u8, source, first_release).?;
+    var witnessed = false;
+    for (problems.items) |problem| {
+        if (!std.mem.eql(u8, problem.rule_id, "heap-double-free")) continue;
+        if (problem.start.byte < final_start or problem.start.byte >= final_start + final_release.len) continue;
+        for (problem.notes) |note| {
+            if (note.start.byte >= first_start and note.start.byte < first_start + first_release.len)
+                witnessed = true;
+        }
+    }
+    try std.testing.expect(witnessed);
+}
+
+test "heap presence: allocation catch null keeps the null arm feasible" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\fn probe(a: std.mem.Allocator, dead: *u8, out: *?*u8) void {
+        \\    a.destroy(dead);
+        \\    out.* = a.create(u8) catch null;
+        \\    if (out.* == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap presence: nullable borrowed result keeps the null arm feasible" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\fn maybe(value: *u8, take: bool) ?*u8 {
+        \\    return if (take) value else null;
+        \\}
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8, out: *?*u8, take: bool) void {
+        \\    a.destroy(dead);
+        \\    out.* = maybe(live, take);
+        \\    if (out.* == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap presence: canonical nonoptional pointer makes the null arm infeasible" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8, out: *?*u8) void {
+        \\    a.destroy(dead);
+        \\    out.* = live;
+        \\    if (out.* == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap presence: companion custody write reuses evaluated field presence" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Holder = struct { p: ?*u8 };
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8, out: *Holder) void {
+        \\    var holder = Holder{ .p = null };
+        \\    holder.p = live;
+        \\    a.destroy(dead);
+        \\    out.p = holder.p;
+        \\    if (out.p == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap presence: nullable field copy does not prove companion presence" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Holder = struct { p: ?*u8 };
+        \\fn probe(a: std.mem.Allocator, dead: *u8, holder: Holder, out: *Holder) void {
+        \\    a.destroy(dead);
+        \\    out.p = holder.p;
+        \\    if (out.p == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap cleanup generations: repeated release of static replacement is not double free" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []const u8,
+        \\    fn clear(self: *Buffer, a: std.mem.Allocator) void {
+        \\        self.bytes = &.{};
+        \\        a.free(self.bytes);
+        \\        a.free(self.bytes);
+        \\    }
+        \\};
+        \\fn caller(a: std.mem.Allocator) !void {
+        \\    var buffer = Buffer{ .bytes = try a.alloc(u8, 4) };
+        \\    const saved = buffer.bytes;
+        \\    buffer.clear(a);
+        \\    a.free(saved);
+        \\}
+    );
+}
+
+test "heap cleanup generations: static replacement does not erase saved entry double free" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-double-free",
+        \\const std = @import("std");
+        \\const Buffer = struct {
+        \\    bytes: []const u8,
+        \\    fn clear(self: *Buffer, a: std.mem.Allocator) void {
+        \\        self.bytes = &.{};
+        \\        a.free(self.bytes);
+        \\        a.free(self.bytes);
+        \\    }
+        \\};
+        \\fn caller(a: std.mem.Allocator) !void {
+        \\    var buffer = Buffer{ .bytes = try a.alloc(u8, 4) };
+        \\    const saved = buffer.bytes;
+        \\    buffer.clear(a);
+        \\    a.free(saved);
+        \\    a.free(saved);
+        \\}
+    );
+}
+
+test "heap frontier: SDK empty free still reads each dead containing owner" {
+    const testing = @import("../testing.zig");
+    const source =
+        \\const std = @import("std");
+        \\const Inner = struct { bytes: []const u8 };
+        \\const Holder = struct { inner: *Inner };
+        \\fn probe(a: std.mem.Allocator) !void {
+        \\    var holder = Holder{ .inner = try a.create(Inner) };
+        \\    holder.inner.bytes = &.{};
+        \\    a.destroy(holder.inner);
+        \\    a.free(holder.inner.bytes);
+        \\    a.free(holder.inner.bytes);
+        \\}
+    ;
+    var problems = try testing.runRuleTyped(std.testing.allocator, checkHeapIdentityFixture, source);
+    defer testing.freeProblems(std.testing.allocator, &problems);
+    const owner_release = "a.destroy(holder.inner);";
+    const owner_start = std.mem.indexOf(u8, source, owner_release).?;
+    const free_call = "a.free(holder.inner.bytes);";
+    const first = std.mem.indexOf(u8, source, free_call).?;
+    const second = std.mem.indexOfPos(u8, source, first + free_call.len, free_call).?;
+    var witnessed: [2]bool = .{ false, false };
+    for (problems.items) |problem| {
+        if (!std.mem.eql(u8, problem.rule_id, "heap-use-after-free")) continue;
+        var names_destroyed_owner = false;
+        for (problem.notes) |note| {
+            if (note.start.byte >= owner_start and note.start.byte < owner_start + owner_release.len)
+                names_destroyed_owner = true;
+        }
+        if (!names_destroyed_owner) continue;
+        for ([_]usize{ first, second }, 0..) |call_start, index| {
+            if (problem.start.byte >= call_start and problem.start.byte < call_start + free_call.len)
+                witnessed[index] = true;
+        }
+    }
+    try std.testing.expect(witnessed[0]);
+    try std.testing.expect(witnessed[1]);
+}
+
+test "heap frontier: SDK empty free keeps a live containing owner clean" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Inner = struct { bytes: []const u8 };
+        \\const Holder = struct { inner: *Inner };
+        \\fn probe(a: std.mem.Allocator) !void {
+        \\    var holder = Holder{ .inner = try a.create(Inner) };
+        \\    holder.inner.bytes = &.{};
+        \\    a.free(holder.inner.bytes);
+        \\    a.free(holder.inner.bytes);
+        \\    a.destroy(holder.inner);
+        \\}
+    );
+}
+
+test "heap frontier: SDK free reads an undefined slice header" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "use-undefined",
+        \\const std = @import("std");
+        \\fn probe(a: std.mem.Allocator) void {
+        \\    var bytes: []u8 = undefined;
+        \\    a.free(bytes);
+        \\}
+    );
+}
+
+test "heap frontier: free header reads do not read already freed elements" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-double-free",
+        \\const std = @import("std");
+        \\fn probe(a: std.mem.Allocator, bytes: []u8) void {
+        \\    a.free(bytes);
+        \\    a.free(bytes);
+        \\}
+    );
+}
+
+test "heap frontier: separate inline empty replacements preserve exact sibling packets" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Both = struct {
+        \\    first: []const u8,
+        \\    second: []const u8,
+        \\    fn clear(self: *Both, a: std.mem.Allocator) void {
+        \\        self.first = &.{};
+        \\        self.second = &.{};
+        \\        a.free(self.first);
+        \\        a.free(self.first);
+        \\    }
+        \\};
+        \\fn probe(a: std.mem.Allocator) void {
+        \\    var both = Both{ .first = &.{}, .second = &.{} };
+        \\    both.clear(a);
+        \\}
+    );
+}
+
+test "heap frontier: an empty initializer carries its exact selected slice type" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Holder = struct { bytes: []const u8 };
+        \\fn probe(a: std.mem.Allocator) void {
+        \\    var holder = Holder{ .bytes = &.{} };
+        \\    a.free(holder.bytes);
+        \\    a.free(holder.bytes);
+        \\}
+    );
+}
+
+test "heap frontier: entry SDK empty free authority survives an opaque tail" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\extern fn opaqueCall() void;
+        \\fn release(a: std.mem.Allocator, bytes: []const u8) void {
+        \\    a.free(bytes);
+        \\    opaqueCall();
+        \\}
+        \\fn probe(a: std.mem.Allocator) void {
+        \\    const bytes: []const u8 = &.{};
+        \\    release(a, bytes);
+        \\    release(a, bytes);
+        \\}
+    );
+}
+
+test "heap frontier: opaque tail authority cannot excuse a real repeated release" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-double-free",
+        \\const std = @import("std");
+        \\extern fn opaqueCall() void;
+        \\fn release(a: std.mem.Allocator, bytes: []const u8) void {
+        \\    a.free(bytes);
+        \\    opaqueCall();
+        \\}
+        \\fn probe(a: std.mem.Allocator) !void {
+        \\    const bytes = try a.alloc(u8, 4);
+        \\    release(a, bytes);
+        \\    release(a, bytes);
+        \\}
+    );
+}
+
+test "heap frontier: a null sibling cannot retire a published allocation" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\const Outputs = struct { first: ?*u8, second: ?*u8 };
+        \\fn probe(a: std.mem.Allocator, outputs: *Outputs) !void {
+        \\    const state = try a.create(u8);
+        \\    errdefer if (outputs.second == null) a.destroy(state);
+        \\    state.* = 0;
+        \\    outputs.first = state;
+        \\    try fallible();
+        \\}
+    );
+}
+
+test "heap frontier: a null selection through a pointer ancestor is not the old output" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\const Inner = struct { state: ?*u8 };
+        \\const Outputs = struct { inner: *Inner };
+        \\fn probe(a: std.mem.Allocator, outputs: *Outputs) !void {
+        \\    const state = try a.create(u8);
+        \\    errdefer if (outputs.inner.state == null) a.destroy(state);
+        \\    state.* = 0;
+        \\    outputs.inner.state = state;
+        \\    try fallible();
+        \\}
+    );
+}
+
+test "heap frontier: a rebound guard root cannot retire another output slot" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\fn probe(a: std.mem.Allocator, output: *?*u8, alternate: *?*u8) !void {
+        \\    const state = try a.create(u8);
+        \\    var selected = output;
+        \\    errdefer if (selected.* == null) a.destroy(state);
+        \\    state.* = 0;
+        \\    output.* = state;
+        \\    selected = alternate;
+        \\    try fallible();
+        \\}
+    );
+}
+
+test "heap frontier: a private inline header survives an unrelated SDK release" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\const Holder = struct { p: ?*u8 };
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8, out: *Holder) void {
+        \\    var holder = Holder{ .p = null };
+        \\    holder.p = live;
+        \\    a.destroy(dead);
+        \\    out.p = holder.p;
+        \\    if (out.p == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap frontier: a nonnull physical output disarms conditional cleanup" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\extern fn fallible() anyerror!void;
+        \\fn probe(a: std.mem.Allocator, instance: *?*u8) !void {
+        \\    const state = try a.create(u8);
+        \\    errdefer if (instance.* == null) a.destroy(state);
+        \\    state.* = 0;
+        \\    instance.* = state;
+        \\    try fallible();
+        \\}
+    );
+}
+
+test "heap pointer transport: casts retain the released slice allocation on return" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\fn probe(a: std.mem.Allocator) !*u32 {
+        \\    const raw = try a.alloc(u8, 4);
+        \\    const pointer: *u32 = @ptrCast(@alignCast(raw.ptr));
+        \\    a.free(raw);
+        \\    return pointer;
+        \\}
+    );
+}
+
+test "heap pointer transport: a cast slice pointer can return live allocation storage" {
+    try @import("../testing.zig").expectNoFireTyped(checkHeapIdentityFixture,
+        \\const std = @import("std");
+        \\fn probe(a: std.mem.Allocator) !*u32 {
+        \\    const raw = try a.alloc(u8, 4);
+        \\    const pointer: *u32 = @ptrCast(@alignCast(raw.ptr));
+        \\    return pointer;
+        \\}
+    );
+}
+
+test "heap frontier private: an explicitly exposed header remains mutable by allocator callbacks" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Holder = struct { p: ?*u8 };
+        \\extern fn remember(holder: *Holder) void;
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8, out: *Holder) void {
+        \\    var holder = Holder{ .p = null };
+        \\    remember(&holder);
+        \\    holder.p = live;
+        \\    a.destroy(dead);
+        \\    out.p = holder.p;
+        \\    if (out.p == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap frontier private: an implicit receiver can expose a header before SDK release" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\extern fn remember(holder: *Holder) void;
+        \\const Holder = struct {
+        \\    p: ?*u8,
+        \\    fn expose(self: *Holder) void { remember(self); }
+        \\};
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8, out: *Holder) void {
+        \\    var holder = Holder{ .p = null };
+        \\    holder.expose();
+        \\    holder.p = live;
+        \\    a.destroy(dead);
+        \\    out.p = holder.p;
+        \\    if (out.p == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap field identity: quoted separator cannot prove a nested optional present" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-use-after-free",
+        \\const std = @import("std");
+        \\const Inner = struct { b: ?*u8 };
+        \\const Holder = struct { @"a.b": ?*u8, a: Inner };
+        \\fn probe(a: std.mem.Allocator, dead: *u8, live: *u8) void {
+        \\    var holder = Holder{ .@"a.b" = null, .a = .{ .b = null } };
+        \\    a.destroy(dead);
+        \\    holder.@"a.b" = live;
+        \\    if (holder.a.b == null) _ = dead.*;
+        \\}
+    );
+}
+
+test "heap frontier callback: release callback revokes an explicit empty sibling" {
+    try @import("../testing.zig").expectFiresTyped(checkHeapIdentityFixture, "heap-double-free",
+        \\const std = @import("std");
+        \\const Holder = struct { first: []u8, second: []u8 };
+        \\fn fresh(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        \\    _ = context;
+        \\    _ = alignment;
+        \\    _ = ret_addr;
+        \\    const memory = std.heap.page_allocator.alloc(u8, len) catch return null;
+        \\    return memory.ptr;
+        \\}
+        \\fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        \\    _ = context;
+        \\    _ = memory;
+        \\    _ = alignment;
+        \\    _ = new_len;
+        \\    _ = ret_addr;
+        \\    return false;
+        \\}
+        \\fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        \\    _ = context;
+        \\    _ = memory;
+        \\    _ = alignment;
+        \\    _ = new_len;
+        \\    _ = ret_addr;
+        \\    return null;
+        \\}
+        \\fn release(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        \\    _ = alignment;
+        \\    _ = ret_addr;
+        \\    const owner: *Holder = @ptrCast(@alignCast(context));
+        \\    owner.second = memory;
+        \\    std.heap.page_allocator.free(memory);
+        \\}
+        \\fn probe() !void {
+        \\    var holder = Holder{ .first = &.{}, .second = &.{} };
+        \\    const allocator = std.mem.Allocator{ .ptr = &holder, .vtable = &.{
+        \\        .alloc = fresh, .resize = resize, .remap = remap, .free = release,
+        \\    } };
+        \\    holder.first = try allocator.alloc(u8, 1);
+        \\    holder.second = &.{};
+        \\    allocator.free(holder.first);
+        \\    allocator.free(holder.second);
+        \\    allocator.free(holder.second);
+        \\}
+    );
+}
+
+

@@ -1216,11 +1216,15 @@ test "a live child does not make its freed owner field readable" {
     );
     defer freeAnalysis(gpa, analysis);
     const problems = analysis.problems;
-    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "heap-use-after-free"));
+    var witnessed = false;
     for (problems) |problem| {
         if (!std.mem.eql(u8, problem.rule_id, "heap-use-after-free")) continue;
-        try std.testing.expectEqual(@as(u32, 10), problem.start.line);
+        if (problem.start.line != 10) continue;
+        for (problem.notes) |note| {
+            if (note.start.line == 9) witnessed = true;
+        }
     }
+    try std.testing.expect(witnessed);
 }
 
 // ── Borrowed storage versus copied scalars ───────────────────────
@@ -1439,4 +1443,402 @@ test "catch-noreturn payload: exit lookalike retains its returning fallback" {
             problem.start.byte >= caller_start) reported_codepoint = true;
     }
     try std.testing.expect(reported_codepoint);
+}
+
+test "replay undefined: physical prefix survives unrelated receiver effects" {
+    // Successful stores replace negative bytes without certifying opaque values.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\extern fn get(index: usize) u32;
+        \\extern fn release(receiver: *usize) void;
+        \\extern fn emit(receiver: *usize, value: u32) void;
+        \\pub fn copy(receiver: *usize, count: u8) void {
+        \\    var values: [256]u32 = undefined;
+        \\    for (0..count) |offset| values[offset] = get(offset);
+        \\    release(receiver);
+        \\    receiver.* = 0;
+        \\    for (0..count) |offset| emit(receiver, values[offset]);
+        \\}
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "use-undefined"));
+}
+
+test "replay undefined: counted stack transports selected union fields" {
+    // Every reachable stack slot is assigned before its active payload is read.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\const Item = union(enum) { pair: struct { a: u32, b: u32 }, done: void };
+        \\extern fn next(value: u32) u32;
+        \\pub fn walk(value: u32) u32 {
+        \\    var pending: [8]Item = undefined;
+        \\    var length: usize = 1;
+        \\    pending[0] = .{ .pair = .{ .a = value, .b = 0 } };
+        \\    while (length > 0) {
+        \\        length -= 1;
+        \\        switch (pending[length]) {
+        \\            .done => return 0,
+        \\            .pair => |pair| {
+        \\                if (pair.a == 0) return pair.b;
+        \\                if (length >= 8) return 0;
+        \\                pending[length] = .{ .pair = .{ .a = next(pair.a), .b = pair.b } };
+        \\                length += 1;
+        \\            },
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "use-undefined"));
+}
+
+test "replay undefined: aliased scalar stores defeat only their old negative bytes" {
+    // Unknown arithmetic remains unknown after a definite physical output store.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\extern fn fused(a: f64, b: f64, c: f64) f64;
+        \\fn multiply(arg_h: [*c]f64, arg_l: [*c]f64, a: f64, b: f64) void {
+        \\    var h = arg_h;
+        \\    _ = &h;
+        \\    var l = arg_l;
+        \\    _ = &l;
+        \\    h.* = a * b;
+        \\    l.* = fused(a, b, -h.*);
+        \\}
+        \\fn sum(a: f64, b: f64, low: *f64) f64 {
+        \\    const high = a + b;
+        \\    low.* = b - (high - a);
+        \\    return high;
+        \\}
+        \\pub fn polynomial(a: f64, b: f64) f64 {
+        \\    var high: f64 = undefined;
+        \\    var low: f64 = undefined;
+        \\    multiply(&high, &low, a, b);
+        \\    high = sum(high, low, &low);
+        \\    return high + low;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "use-undefined"));
+}
+
+test "replay undefined: repeated immutable guard restores a selected value" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn attempt(receiver: *usize) !void {
+        \\    if (receiver.* == 0) return error.Empty;
+        \\    receiver.* -= 1;
+        \\}
+        \\pub fn restore(receiver: *usize, index: usize, input: []const u32) !u32 {
+        \\    const saved_length = input.len;
+        \\    var saved: u32 = undefined;
+        \\    if (index < saved_length) saved = input[index];
+        \\    attempt(receiver) catch |err| {
+        \\        receiver.* = saved_length;
+        \\        if (index < saved_length) return saved;
+        \\        return err;
+        \\    };
+        \\    return 0;
+        \\}
+    );
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(analysis.problems, "use-undefined"));
+}
+
+test "replay undefined: genuine holes conditional writes and zero trips remain reports" {
+    // A skipped store and an untouched suffix retain independent negative evidence.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\pub fn skipped(count: u8, write: bool) u32 {
+        \\    var values: [256]u32 = undefined;
+        \\    for (0..count) |offset| if (write) { values[offset] = 1; };
+        \\    return values[0];
+        \\}
+        \\pub fn suffix(count: u8) u32 {
+        \\    var values: [256]u32 = undefined;
+        \\    for (0..count) |offset| values[offset] = 1;
+        \\    return values[255];
+        \\}
+        \\pub fn zero(count: usize) u8 {
+        \\    var value: u8 = undefined;
+        \\    for (0..count) |_| value = 1;
+        \\    return value;
+        \\}
+        \\pub fn poison() u32 {
+        \\    var values: [4]u32 = undefined;
+        \\    for (&values) |*value| value.* = undefined;
+        \\    return values[0];
+        \\}
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    for ([_][]const u8{ "pub fn skipped", "pub fn suffix", "pub fn zero", "pub fn poison" }) |function| {
+        const start = std.mem.indexOf(u8, source, function).?;
+        const returned = std.mem.indexOfPos(u8, source, start, "return ").?;
+        const end = std.mem.indexOfPos(u8, source, returned, ";").?;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expect(reported);
+    }
+}
+
+test "replay undefined scalar exact: translated sum overwrites unknown temporary before low store" {
+    // Match erfd's mutable argument copies and addressed undefined temporary.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\extern fn opaqueInput() f64;
+        \\fn sum(arg_hi: [*c]f64, arg_lo: [*c]f64, arg_a: f64, arg_b: f64) void {
+        \\    var hi = arg_hi;
+        \\    _ = &hi;
+        \\    var lo = arg_lo;
+        \\    _ = &lo;
+        \\    var a = arg_a;
+        \\    _ = &a;
+        \\    var b = arg_b;
+        \\    _ = &b;
+        \\    var e: f64 = undefined;
+        \\    _ = &e;
+        \\    hi.* = a + b;
+        \\    e = hi.* - a;
+        \\    lo.* = b - e;
+        \\}
+        \\pub fn physical() f64 {
+        \\    var high: f64 = undefined;
+        \\    var low: f64 = undefined;
+        \\    sum(&high, &low, opaqueInput(), 1.0);
+        \\    sum(&high, &low, high, 2.0);
+        \\    return high + low;
+        \\}
+        \\pub fn selected() f64 {
+        \\    var high: f64 = undefined;
+        \\    var low: f64 = undefined;
+        \\    sum(&high, &low, opaqueInput(), 1.0);
+        \\    return low;
+        \\}
+        \\pub fn poison() f64 {
+        \\    var high: f64 = undefined;
+        \\    var low: f64 = undefined;
+        \\    sum(&high, &low, opaqueInput(), 1.0);
+        \\    low = undefined;
+        \\    return low;
+        \\}
+        \\pub fn sibling() f64 {
+        \\    var high: f64 = undefined;
+        \\    var low: f64 = undefined;
+        \\    var spare: f64 = undefined;
+        \\    _ = &spare;
+        \\    sum(&high, &low, opaqueInput(), 1.0);
+        \\    return spare;
+        \\}
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    for ([_]struct { function: []const u8, warns: bool }{
+        .{ .function = "pub fn physical", .warns = false },
+        .{ .function = "pub fn selected", .warns = false },
+        .{ .function = "pub fn poison", .warns = true },
+        .{ .function = "pub fn sibling", .warns = true },
+    }) |case| {
+        const start = std.mem.indexOf(u8, source, case.function).?;
+        const returned = std.mem.indexOfPos(u8, source, start, "return ").?;
+        const end = std.mem.indexOfPos(u8, source, returned, ";").?;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expectEqual(case.warns, reported);
+    }
+}
+
+test "replay undefined prefix precise: capture discharge retains actual RHS poison" {
+    // A source-authenticated poison return cannot become a written-value proof.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\extern fn unknown(index: usize) u32;
+        \\fn poison(index: usize) u32 { _ = index; return undefined; }
+        \\pub fn unknownPrefix(count: u8) u32 {
+        \\    var values: [256]u32 = undefined;
+        \\    for (0..count) |offset| values[offset] = unknown(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[count - 1];
+        \\}
+        \\pub fn poisonedPrefix(count: u8) u32 {
+        \\    var values: [256]u32 = undefined;
+        \\    for (0..count) |offset| values[offset] = poison(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[count - 1];
+        \\}
+        \\pub fn poisonedOperand(count: u8) u32 {
+        \\    var input: u32 = undefined;
+        \\    var values: [256]u32 = undefined;
+        \\    for (0..count) |offset| values[offset] = input + @as(u32, @intCast(offset));
+        \\    if (count == 0) return 0;
+        \\    return values[count - 1];
+        \\}
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    for ([_]struct { function: []const u8, warns: bool }{
+        .{ .function = "pub fn unknownPrefix", .warns = false },
+        .{ .function = "pub fn poisonedPrefix", .warns = true },
+        .{ .function = "pub fn poisonedOperand", .warns = true },
+    }) |case| {
+        const start = std.mem.indexOf(u8, source, case.function).?;
+        const returned = std.mem.indexOfPos(u8, source, start, "return values").?;
+        const end = std.mem.indexOfPos(u8, source, returned, ";").?;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expectEqual(case.warns, reported);
+    }
+}
+
+test "replay undefined prefix precise: physical getter prefix retains aggregate child holes" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\const Pair = struct { a: u32, b: u32 };
+        \\fn poison(index: usize) Pair { _ = index; return undefined; }
+        \\fn partial(index: usize) Pair { _ = index; return .{ .a = 1, .b = undefined }; }
+        \\pub fn allPoison(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = poison(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[count - 1].a;
+        \\}
+        \\pub fn selectedWritten(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = partial(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[count - 1].a;
+        \\}
+        \\pub fn selectedHole(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = partial(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[count - 1].b;
+        \\}
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    for ([_]struct { function: []const u8, warns: bool }{
+        .{ .function = "pub fn allPoison", .warns = true },
+        .{ .function = "pub fn selectedWritten", .warns = false },
+        .{ .function = "pub fn selectedHole", .warns = true },
+    }) |case| {
+        const start = std.mem.indexOf(u8, source, case.function).?;
+        const returned = std.mem.indexOfPos(u8, source, start, "return values").?;
+        const end = std.mem.indexOfPos(u8, source, returned, ";").?;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expectEqual(case.warns, reported);
+    }
+}
+
+test "replay undefined prefix precise: negative child deposits respect seeds alternatives and overwrites" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\const Pair = struct { a: u32, b: u32 };
+        \\extern fn unknownScalar() u32;
+        \\extern fn mutate(*[256]Pair) void;
+        \\fn partial(index: usize) Pair { _ = index; return .{ .a = 1, .b = undefined }; }
+        \\fn oneSafe(index: usize) Pair {
+        \\    if (index == 0) return .{ .a = 1, .b = 9 };
+        \\    return .{ .a = 1, .b = undefined };
+        \\}
+        \\fn oneUnknown(index: usize) Pair {
+        \\    if (index == 0) return .{ .a = 1, .b = unknownScalar() };
+        \\    return .{ .a = 1, .b = undefined };
+        \\}
+        \\pub fn priorChild(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    values[255].b = 9;
+        \\    for (0..count) |offset| values[offset] = partial(offset);
+        \\    if (count != 0) return 0;
+        \\    return values[255].b;
+        \\}
+        \\pub fn safeArm(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = oneSafe(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[0].b;
+        \\}
+        \\pub fn unknownArm(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = oneUnknown(offset);
+        \\    if (count == 0) return 0;
+        \\    return values[0].b;
+        \\}
+        \\pub fn laterChild(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = partial(offset);
+        \\    values[0].b = 7;
+        \\    return values[0].b;
+        \\}
+        \\pub fn priorAlias(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    mutate(&values);
+        \\    for (0..count) |offset| values[offset] = partial(offset);
+        \\    return values[255].b;
+        \\}
+        \\pub fn laterAlias(count: u8) u32 {
+        \\    var values: [256]Pair = undefined;
+        \\    for (0..count) |offset| values[offset] = partial(offset);
+        \\    mutate(&values);
+        \\    return values[255].b;
+        \\}
+    ;
+    const analysis = try analyzeSrc(gpa, std.testing.io, &tmp, source);
+    defer freeAnalysis(gpa, analysis);
+    try std.testing.expectEqual(@as(usize, 0), analysis.incomplete.len);
+    for ([_][]const u8{
+        "pub fn priorChild", "pub fn safeArm", "pub fn unknownArm",
+        "pub fn laterChild", "pub fn priorAlias", "pub fn laterAlias",
+    }) |function| {
+        const start = std.mem.indexOf(u8, source, function).?;
+        const returned = std.mem.indexOfPos(u8, source, start, "return values").?;
+        const end = std.mem.indexOfPos(u8, source, returned, ";").?;
+        var reported = false;
+        for (analysis.problems) |problem| {
+            if (std.mem.eql(u8, problem.rule_id, "use-undefined") and
+                problem.start.byte >= returned and problem.start.byte < end) reported = true;
+        }
+        try std.testing.expect(!reported);
+    }
 }

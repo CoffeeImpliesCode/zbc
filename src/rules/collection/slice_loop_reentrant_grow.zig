@@ -13,17 +13,14 @@
 //! grow calls) and `iterator-invalidation-mutation` (HashMap variant).
 //!
 //! Detection:
-//!   1. For each `for ( <expr> ) |...|` loop, check if the iterated
-//!      expression contains `<path>.items`, where `<path>` is the whole
-//!      receiver chain (`origin.allocations`), not just its last field.
-//!   2. Inside the loop body, scan for:
-//!      a. Direct grow: `<path>.<growMethod>(` on the same receiver
-//!         chain — fire.  A grown chain that spells a different object
-//!         (`output.allocations` vs `origin.allocations`) is another
-//!         list that merely shares a field name — skip.
-//!      b. Bare call: `<fn>( ` (not preceded by `.`) — look up callee
-//!         FnSummary; if `may_grow_collections`, fire.
-//!   3. Fire at the call token.
+//!   1. For each `for ( <expr> ) |...|` loop, find a backing `.items`
+//!      view at the iterable root, not a view used to compute an index.
+//!   2. Resolve grow receivers and growth-bearing call arguments through
+//!      their binding origins. Different pointer parameters and copied
+//!      list headers can share a buffer. Proved private fresh storage is
+//!      independent; unknown provenance remains possibly shared.
+//!   3. Use the callee's canonical growth paths for indirect calls.
+//!   4. Fire at the call token.
 //!
 //! A by-value capture (`|item|`) is detached from the list, so a grow that
 //! is immediately followed by `return` (optionally `catch {}` and `;`)
@@ -48,6 +45,7 @@ const budget_mod = @import("../../budget.zig");
 const grow_mod = @import("../../cache/grow_analysis.zig");
 const method_names = @import("../../model/method_names.zig");
 const local_bindings = @import("../../model/local_bindings.zig");
+const fn_summary = @import("../../model/fn_summary.zig");
 
 const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
@@ -103,7 +101,8 @@ fn checkFn(
 
         const rp = matchParen(tags, t + 1, last) orelse continue;
 
-        // Look for `<recv>.items` inside the for-condition parens.
+        // Only an iterable's backing view is borrowed. An `.items` used
+        // inside a call or subscript merely computes that iterable.
         const recv = findItemsRecv(tree, t + 2, rp - 1) orelse continue;
 
         // Find the loop body `{...}` after the capture `|...|`.
@@ -113,9 +112,6 @@ fn checkFn(
         // Scan the loop body for calls that may grow collections.
         const capture_by_value = loopCaptureByValue(tags, rp + 1, body_start);
         try checkLoopBody(gpa, tree, cache, scope, body_start + 1, body_end - 1, recv, capture_by_value, problems);
-
-        // Skip past the loop body to avoid re-scanning its contents.
-        t = body_end;
     }
 }
 
@@ -129,13 +125,31 @@ fn findItemsRecv(
 ) ?Recv {
     const tags = tree.tokens.items(.tag);
     if (start > end) return null;
+    var depth: usize = 0;
+    var input_first = start;
     var s: Ast.TokenIndex = start;
-    while (s + 2 <= end) : (s += 1) {
-        if (tags[s] != .identifier) continue;
-        if (tags[s + 1] != .period) continue;
-        if (tags[s + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(s + 2), "items")) continue;
-        return recvAt(tree, s);
+    while (s <= end) : (s += 1) {
+        switch (tags[s]) {
+            .l_paren, .l_bracket, .l_brace => {
+                depth += 1;
+                continue;
+            },
+            .r_paren, .r_bracket, .r_brace => {
+                if (depth > 0) depth -= 1;
+                continue;
+            },
+            .comma => {
+                if (depth == 0) input_first = s + 1;
+                continue;
+            },
+            else => {},
+        }
+        if (depth != 0 or s + 2 > end or tags[s] != .identifier or
+            tags[s + 1] != .period or tags[s + 2] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(s + 2), "items")) continue;
+        const receiver = recvAt(tree, s);
+        if (receiver.first != input_first) continue;
+        return receiver;
     }
     return null;
 }
@@ -171,63 +185,303 @@ const Scope = struct {
     last: Ast.TokenIndex,
 };
 
-/// True when `grown` is provably another object than the iterated
-/// `iterated`: both chains are plain identifier paths with different roots,
-/// and each root is a name nothing else can reach this body's other root
-/// through — a parameter, or a local this body built from `.{}` and never
-/// let go of (`isPrivateLocal`).  A shared field name proves nothing about
-/// the object that owns it.  Anything else — chains fed by a call, index or
-/// dereference, one root spelled twice, a local that may be an alias — stays
-/// possibly-equal.
-fn namesOtherObject(tree: *const Ast, scope: Scope, iterated: Recv, grown: Recv) bool {
+/// Resolve aliases through the shared binding-origin walk. Different
+/// parameter numbers are not disjointness: both pointers (or copied headers)
+/// can name the same buffer. Only private fresh storage proves independence.
+fn namesOtherObject(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    scope: Scope,
+    iterated: Recv,
+    grown: Recv,
+    horizon: Ast.TokenIndex,
+) !bool {
     if (iterated.chained or grown.chained) return false;
-    const iterated_root = tree.tokenSlice(iterated.first);
-    const grown_root = tree.tokenSlice(grown.first);
-    if (std.mem.eql(u8, iterated_root, grown_root)) return false;
-    return independentRoot(tree, scope, iterated.first, grown_root) and
-        independentRoot(tree, scope, grown.first, iterated_root);
+    const arena = if (cache.summary_arena) |*summary_arena| summary_arena.allocator() else return false;
+    const a = try fn_summary.growBaseOfExpr(arena, tree, scope.proto, &scope.bindings, iterated.first, iterated.last);
+    const b = try fn_summary.growBaseOfExpr(arena, tree, scope.proto, &scope.bindings, grown.first, grown.last);
+    if (a == .unproven and b == .unproven and
+        a.unproven.first == b.unproven.first and a.unproven.last == b.unproven.last) return false;
+    if (a == .storage and b == .storage and a.storage == .param and b.storage == .param and
+        a.storage.param.param == b.storage.param.param)
+    {
+        const ap = a.storage.param.path;
+        const bp = b.storage.param.path;
+        return !grow_mod.growFieldCovers(ap, bp) and !grow_mod.growFieldCovers(bp, ap) and
+            !try headerWrittenBefore(cache, tree, scope, a.storage.param.param, ap, bp, horizon);
+    }
+    return try independentRoot(cache, tree, scope, a, tree.tokenSlice(grown.first), horizon) or
+        try independentRoot(cache, tree, scope, b, tree.tokenSlice(iterated.first), horizon) or
+        try callbackBackingSeparate(cache, tree, scope, iterated, grown, horizon);
 }
 
-/// `other` is the root of the list this one is compared with: a call that
-/// is handed this root's address AND `other` could copy one list header
-/// into the other, so such a call keeps the pair possibly-equal.
-fn independentRoot(tree: *const Ast, scope: Scope, root: Ast.TokenIndex, other: []const u8) bool {
-    const binding = scope.bindings.findAt(tree.tokenSlice(root), root) orelse return false;
-    return switch (binding.origin) {
-        .param => true,
-        .literal => isPrivateLocal(tree, scope, binding, other),
-        else => false,
-    };
-}
-
-/// A local declared as exactly `.{}` whose storage no other name can hold:
-/// its address is never kept (taking it as a call argument is allowed when
-/// that call is not handed `other` — it can write the local, but has nothing
-/// to copy the other list's header from), it is never named as a bare value
-/// (a copy of a list header shares the buffer), and no field of it is
-/// overwritten with a copy of another path.  Reads that cannot copy a list
-/// header — a method call, `.items`, `.len`, `.capacity`, a comparison, a
-/// negation — are fine.
-fn isPrivateLocal(tree: *const Ast, scope: Scope, binding: *const local_bindings.Binding, other: []const u8) bool {
+/// Field layout does not prove independent backing after a header store.
+/// Resolve each target through the same binding-origin walk as receivers.
+fn headerWrittenBefore(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    scope: Scope,
+    parameter: u32,
+    a: []const u8,
+    b: []const u8,
+    horizon: Ast.TokenIndex,
+) !bool {
     const tags = tree.tokens.items(.tag);
-    if (binding.rhs_last != binding.rhs_first + 2 or tags[binding.rhs_first] != .period or
-        tags[binding.rhs_first + 1] != .l_brace or tags[binding.rhs_first + 2] != .r_brace) return false;
+    const arena = if (cache.summary_arena) |*summary_arena| summary_arena.allocator() else return true;
+    var t = scope.first;
+    while (t < horizon) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, scope.last);
+            continue;
+        }
+        if (tags[t] != .identifier or (t > scope.first and tags[t - 1] == .period)) continue;
+        var last = t;
+        while (last + 2 < horizon and tags[last + 1] == .period and tags[last + 2] == .identifier) last += 2;
+        var next = last + 1;
+        if (next < horizon and tags[next] == .period_asterisk) next += 1;
+        if (next >= horizon or tags[next] != .equal) continue;
+        const target = try fn_summary.growBaseOfExpr(arena, tree, scope.proto, &scope.bindings, t, last);
+        if (target != .storage or target.storage != .param or target.storage.param.param != parameter) continue;
+        const path = target.storage.param.path;
+        if (grow_mod.growFieldCovers(path, a) or grow_mod.growFieldCovers(a, path) or
+            grow_mod.growFieldCovers(path, b) or grow_mod.growFieldCovers(b, path)) return true;
+    }
+    return false;
+}
+
+fn independentRoot(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    scope: Scope,
+    base: fn_summary.GrowBase,
+    other: []const u8,
+    horizon: Ast.TokenIndex,
+) !bool {
+    if (base != .unproven) return false;
+    const claim = base.unproven;
+    const binding = for (scope.bindings.items) |*candidate| {
+        if (candidate.rhs_first == claim.first and candidate.rhs_last == claim.last and
+            candidate.origin != .param) break candidate;
+    } else return false;
+    if (!try isPrivateLocal(cache, tree, scope, binding, other, horizon)) return false;
+    return try cache.provesFreshStorage(claim, null);
+}
+/// The neutral callback census supplies every registration and transport,
+/// never storage safety. Prove a private fresh input at every leaf dispatch.
+/// A NULL context, a copied header, an escaped dispatcher, or any unclosed
+/// transport refuses the certificate. Casts only locate the context formal.
+fn callbackBackingSeparate(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    scope: Scope,
+    iterated: Recv,
+    grown: Recv,
+    horizon: Ast.TokenIndex,
+) !bool {
+    const provenance = @import("../../model/callback_provenance.zig");
+    if (cache.zls == null) return false;
+    if (iterated.first != iterated.last or grown.first == grown.last) return false;
+    const input_binding = scope.bindings.findAt(tree.tokenSlice(iterated.first), iterated.first) orelse return false;
+    if (input_binding.origin != .param) return false;
+    const input_parameter = file_cache_mod.paramIndexFor(tree, scope.proto, tree.tokenSlice(iterated.first)) orelse return false;
+    const context_binding = scope.bindings.findAt(tree.tokenSlice(grown.first), grown.first) orelse return false;
+    if (!context_binding.is_const or context_binding.origin == .param) return false;
+    // This exact adapter shape preserves the context value; its alignment
+    // says nothing about which collection allocation that value can reach.
+    const tags = tree.tokens.items(.tag);
+    const first = context_binding.rhs_first;
+    const last = context_binding.rhs_last;
+    if (last != first + 8 or tags[first] != .builtin or
+        !std.mem.eql(u8, tree.tokenSlice(first), "@ptrCast") or tags[first + 1] != .l_paren or
+        tags[first + 2] != .builtin or !std.mem.eql(u8, tree.tokenSlice(first + 2), "@alignCast") or
+        tags[first + 3] != .l_paren or tags[first + 4] != .identifier or
+        tags[first + 5] != .period or tags[first + 6] != .question_mark or
+        tags[first + 7] != .r_paren or tags[first + 8] != .r_paren) return false;
+    const context_parameter = file_cache_mod.paramIndexFor(tree, scope.proto, tree.tokenSlice(first + 4)) orelse return false;
+    const context_formal = scope.bindings.findAt(tree.tokenSlice(first + 4), first + 4) orelse return false;
+    if (context_formal.origin != .param) return false;
+    // No assignment may replace a header through either incoming route.
+    if (try headerWrittenBefore(cache, tree, scope, context_parameter, "", "", horizon) or
+        try headerWrittenBefore(cache, tree, scope, input_parameter, "", "", horizon)) return false;
+    const fresh = @import("../../cache/fresh_storage.zig");
+    const frame = cache.zls.?.resolutionFrame();
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (raw == 0 or tree.firstToken(node) < scope.first or tree.lastToken(node) >= horizon) continue;
+        switch (tag) {
+            .assign => {
+                const target = tree.nodeData(node).node_and_node[0];
+                if (tree.nodeTag(target) == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) continue;
+                const ty = (try frame.typeOfNode(target)) orelse return false;
+                if (!try fresh.actualTypeAddressFree(frame, ty, 0, null)) return false;
+            },
+            .assign_destructure => return false,
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (!std.mem.eql(u8, name, "@ptrCast") and !std.mem.eql(u8, name, "@alignCast")) return false;
+            },
+            .call, .call_comma, .call_one, .call_one_comma => {
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, node) orelse return false;
+                if (!try privatePopulation(cache, tree.nodeMainToken(call.ast.fn_expr))) return false;
+            },
+            else => {},
+        }
+    }
+    // The actual leaf must be authenticated SDK growth, not a same-named
+    // project operation that may publish or substitute the selected header.
+    if (!try privatePopulation(cache, grown.last + 1)) return false;
+    const declaration = tokens.enclosingFnDecl(tree, scope.proto.ast.fn_token) orelse return false;
+    var census = try provenance.closedDispatchCensus(cache, declaration, context_parameter, cache.gpa);
+    defer census.deinit(cache.gpa);
+    if (census != .complete or census.complete.len == 0) return false;
+    for (census.complete) |dispatch| {
+        if (input_parameter >= dispatch.arguments.len or context_parameter >= dispatch.arguments.len) return false;
+        const context = dispatch.context;
+        const context_type = (try context.frame.typeOfNode(context.node)) orelse return false;
+        if (context.frame.resolver.pointerSize(context_type) != .one) return false;
+        if (!try privateDispatchInput(cache, dispatch, input_parameter)) return false;
+    }
+    return true;
+}
+
+fn privateDispatchInput(
+    root: *file_cache_mod.FileCache,
+    dispatch: @import("../../model/callback_provenance.zig").CallbackDispatch,
+    input_parameter: usize,
+) !bool {
+    const fresh = @import("../../cache/fresh_storage.zig");
+    const point = dispatch.arguments[input_parameter];
+    const tree = &point.frame.handle.document.tree;
+    // A direct address of the fresh local list is an allocation identity,
+    // unlike a field read, a copied header, or a conditional pointer.
+    if (tree.nodeTag(point.node) != .address_of) return false;
+    const operand = tree.nodeData(point.node).node;
+    if (tree.nodeTag(operand) != .identifier) return false;
+    const document = try grow_mod.sourceDocument(root, point.frame.handle, point.frame.resolver.ctx);
+    const cache = &document.cache;
+    const declaration = tokens.enclosingFnDecl(tree, tree.firstToken(point.node)) orelse return false;
+    const body = tokens.bodyOf(tree, declaration) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration) orelse return false;
+    const scope: Scope = .{
+        .proto = proto,
+        .bindings = (try cache.localBindings(proto, body)).*,
+        .first = tree.firstToken(body),
+        .last = tree.lastToken(body),
+    };
+    const token = tree.nodeMainToken(operand);
+    const binding = scope.bindings.findAt(tree.tokenSlice(token), token) orelse return false;
+    if (binding.origin == .param) return false;
+    const horizon = tree.firstToken(dispatch.invocation.node);
+    if (!try isPrivateLocal(cache, tree, scope, binding, "", horizon)) return false;
+    if (!try fresh.freshStorageAt(cache, .{
+        .claim = .{ .first = binding.rhs_first, .last = binding.rhs_last },
+        .depth = 0,
+        .frame = point.frame,
+    })) return false;
+    // No paired operand can hand the same local back as the context. This
+    // also covers a nested expression evaluated within the invocation.
+    for (dispatch.arguments, 0..) |argument, index| {
+        if (index == input_parameter) continue;
+        if (!argument.frame.handle.eql(point.frame.handle)) continue;
+        var use = tree.firstToken(argument.node);
+        while (use <= tree.lastToken(argument.node)) : (use += 1) {
+            if (tree.tokenTag(use) == .identifier and aliasesBinding(tree, scope, use, binding)) return false;
+        }
+    }
+    // Check all transport edges, not one selected caller. A source edge in
+    // another frame cannot access a private local born inside this frame;
+    // an edge in this frame must not already have transported that local.
+    for (dispatch.edges) |edge| {
+        if (!edge.caller.frame.handle.eql(point.frame.handle)) continue;
+        if (tokens.enclosingFnDecl(tree, tree.firstToken(edge.caller.node)) != declaration) continue;
+        for (edge.actuals) |actual| {
+            if (!actual.actual.frame.handle.eql(point.frame.handle)) return false;
+            var use = tree.firstToken(actual.actual.node);
+            while (use <= tree.lastToken(actual.actual.node)) : (use += 1) {
+                if (tree.tokenTag(use) == .identifier and aliasesBinding(tree, scope, use, binding)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+
+/// A simple immutable alias may transport an address or a list header. It
+/// does not create a new storage identity. Mutable aliases and assignments
+/// are deliberately refused by the privacy scan.
+fn aliasesBinding(
+    tree: *const Ast,
+    scope: Scope,
+    use: Ast.TokenIndex,
+    target: *const local_bindings.Binding,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var current = use;
+    var visited: usize = 0;
+    // Every initializer refers to an earlier visible declaration. Walk
+    // iteratively so a long chain cannot consume the native call stack.
+    while (visited < scope.bindings.items.len) : (visited += 1) {
+        const binding = scope.bindings.findAt(tree.tokenSlice(current), current) orelse return false;
+        if (binding.name_token == target.name_token) return true;
+        if (!binding.is_const) return false;
+        switch (binding.origin) {
+            .alias, .addr_of, .field_access => {},
+            else => return false,
+        }
+        var first = binding.rhs_first;
+        if (tags[first] == .ampersand) first += 1;
+        if (first > binding.rhs_last or tags[first] != .identifier) return false;
+        current = first;
+    }
+    return false;
+}
+
+/// Before this grow, no write, stored address, unknown handover, or header
+/// copy may connect the fresh local (including its immutable aliases) to
+/// the other root. Later returns do not retroactively alias an earlier loop.
+fn isPrivateLocal(
+    cache: *file_cache_mod.FileCache,
+    tree: *const Ast,
+    scope: Scope,
+    binding: *const local_bindings.Binding,
+    other: []const u8,
+    horizon: Ast.TokenIndex,
+) !bool {
+    const tags = tree.tokens.items(.tag);
     var t: Ast.TokenIndex = binding.name_token + 1;
-    while (t <= scope.last) : (t += 1) {
-        if (tags[t] != .identifier or !std.mem.eql(u8, tree.tokenSlice(t), binding.name)) continue;
-        if (tags[t - 1] == .period) continue;
+    while (t < horizon) : (t += 1) {
+        if (tags[t] != .identifier or tags[t - 1] == .period or
+            !aliasesBinding(tree, scope, t, binding)) continue;
+        const named = scope.bindings.findAt(tree.tokenSlice(t), t) orelse return false;
+        if (named.name_token == t) continue;
+        var alias_initializer = false;
+        for (scope.bindings.items) |*candidate| {
+            if (!candidate.is_const or candidate.name_token <= binding.name_token) continue;
+            if (candidate.origin != .alias and candidate.origin != .addr_of and candidate.origin != .field_access) continue;
+            if (candidate.rhs_first <= t and t <= candidate.rhs_last and
+                aliasesBinding(tree, scope, candidate.name_token, binding))
+            {
+                alias_initializer = true;
+                break;
+            }
+        }
+        if (alias_initializer) continue;
         if (tags[t - 1] == .ampersand) {
-            if (!addressIsPlainCallArgument(tree, tags, scope, t - 1, other)) return false;
+            if (!try addressIsPlainCallArgument(cache, tree, tags, scope, t - 1, other)) return false;
             continue;
         }
         if (t + 1 > scope.last or tags[t + 1] != .period) return false;
-        // The end of the `a.b.c` chain.
         var end = t;
         while (end + 2 <= scope.last and tags[end + 1] == .period and tags[end + 2] == .identifier) end += 2;
         const next = if (end + 1 <= scope.last) tags[end + 1] else .semicolon;
-        if (next == .l_paren) continue;
+        if (next == .l_paren) {
+            if (end < horizon and !try privatePopulation(cache, end - 1)) return false;
+            continue;
+        }
         if (next == .equal) {
-            // `<local>.<field> = <path>;` copies the other path's contents.
             var rhs = end + 2;
             const literal = rhs <= scope.last and tags[rhs] == .identifier and isPrimitiveValue(tree.tokenSlice(rhs));
             const path_start = !literal and rhs <= scope.last and tags[rhs] == .identifier;
@@ -238,7 +492,6 @@ fn isPrivateLocal(tree: *const Ast, scope: Scope, binding: *const local_bindings
         const terminal = tree.tokenSlice(end);
         if (std.mem.eql(u8, terminal, "items") or std.mem.eql(u8, terminal, "len") or
             std.mem.eql(u8, terminal, "capacity")) continue;
-        // A bare field value in a position that stores or passes it on.
         switch (tags[t - 1]) {
             .equal, .comma, .l_paren, .keyword_return, .colon => return false,
             else => {},
@@ -255,12 +508,13 @@ fn isPrivateLocal(tree: *const Ast, scope: Scope, binding: *const local_bindings
 /// address stored, returned, nested in another call or expression — may
 /// keep it.
 fn addressIsPlainCallArgument(
+    cache: *file_cache_mod.FileCache,
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
     scope: Scope,
     amp: Ast.TokenIndex,
     other: []const u8,
-) bool {
+) !bool {
     if (amp < 1) return false;
     if (tags[amp - 1] != .l_paren and tags[amp - 1] != .comma) return false;
     // The `(` that opens the enclosing call's argument list.
@@ -315,7 +569,58 @@ fn addressIsPlainCallArgument(
         .semicolon, .l_brace, .r_brace => {},
         else => return false,
     }
-    return !identAppearsIn(tree, tags, first, rp, other);
+    if (identAppearsIn(tree, tags, first, rp, other)) return false;
+    const callee_token = if (lp >= 2 and tags[lp - 2] == .period) lp - 2 else lp - 1;
+    return privatePopulation(cache, callee_token);
+}
+
+/// A handover can preserve privacy only with a readable canonical body.
+/// Accept scalar stores and authenticated SDK list growth. Refuse header
+/// stores, opaque calls, and computed builtin writes rather than assuming
+/// that a helper cannot acquire the other list through another route.
+fn privatePopulation(cache: *file_cache_mod.FileCache, callee_token: Ast.TokenIndex) !bool {
+    const fresh = @import("../../cache/fresh_storage.zig");
+    const actual = (try cache.actualCallSummaryAt(callee_token, null)) orelse return false;
+    const resolver = if (actual.callee.caller_frame) |frame| frame.resolver else cache.zls orelse return false;
+    const frame = resolver.frameForFunction(actual.callee.reference);
+    const declaring = (try actual.declaringCache(cache)) orelse return false;
+    const tree = actual.callee.tree;
+    const std_tree = (try fresh.toolchainArrayListTree(declaring, frame)) orelse return false;
+    if (tree == std_tree) {
+        const name = tree.tokenSlice(actual.callee.fn_token + 1);
+        return method_names.isArrayListGrowMethodName(name) or
+            try grow_mod.isStandardListLifecycleCall(cache, callee_token);
+    }
+    const body = tokens.bodyOf(tree, actual.callee.declaration) orelse return false;
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        if (index == 0 or tree.firstToken(node) < first or tree.lastToken(node) > last) continue;
+        switch (tag) {
+            .assign => {
+                const target = tree.nodeData(node).node_and_node[0];
+                if (tree.nodeTag(target) == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) continue;
+                const ty = (try frame.typeOfNode(target)) orelse return false;
+                if (!try fresh.actualTypeAddressFree(frame, ty, 0, null)) return false;
+            },
+            .assign_destructure => return false,
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => return false,
+            else => {},
+        }
+    }
+    const index = try declaring.getCallIndex();
+    var calls = index.by_callee_token.iterator();
+    while (calls.next()) |call| {
+        const node = call.value_ptr.*;
+        if (tree.firstToken(node) < first or tree.lastToken(node) > last) continue;
+        const child = (try declaring.actualCallSummaryAt(call.key_ptr.*, frame)) orelse return false;
+        if (child.callee.tree != std_tree) return false;
+        const name = std_tree.tokenSlice(child.callee.fn_token + 1);
+        if (!method_names.isArrayListGrowMethodName(name)) return false;
+    }
+    return true;
 }
 
 fn isPrimitiveValue(name: []const u8) bool {
@@ -377,7 +682,6 @@ fn checkLoopBody(
 
         // Direct grow: `recv.growMethod(` on the same receiver chain.
         if (tags[t] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(t), recv.name) and
             t + 3 <= end and
             tags[t + 1] == .period and
             tags[t + 2] == .identifier and
@@ -385,7 +689,7 @@ fn checkLoopBody(
         {
             const callee = tree.tokenSlice(t + 2);
             if (method_names.isArrayListGrowMethodName(callee) and
-                !namesOtherObject(tree, scope, recv, recvAt(tree, t)))
+                !try namesOtherObject(cache, tree, scope, recv, recvAt(tree, t), t + 2))
             {
                 if (!(capture_by_value and callImmediatelyReturns(tags, t + 3, end))) {
                     try report(gpa, problems, tree, t + 2, callee, recv.name);
@@ -423,21 +727,12 @@ fn checkLoopBody(
         };
         if (!reading.may_grow) continue;
 
-        // Suppress when the iterated list's root object doesn't appear
-        // anywhere in the call's argument list.  If the callee can't reach
-        // the iterated collection (it isn't passed as an argument), it
-        // cannot reallocate it — the slice pointer remains valid.  The
-        // ROOT identifier is what a callee reaches a nested receiver
-        // through (`grow(tally, e)` grows `tally.entries`), not the last
-        // field name.
+        // Resolve the storage of each growth-bearing argument below; an
+        // absent receiver spelling does not prove absent aliases.
         const call_rp = matchParen(tags, t + 1, end) orelse {
             try reportCallee(gpa, problems, tree, t, callee, recv.name);
             continue;
         };
-        if (!identAppearsIn(tree, tags, t + 2, call_rp - 1, tree.tokenSlice(recv.first))) {
-            t = call_rp;
-            continue;
-        }
 
         // The callee's own verdict says WHICH storage it reallocates.  The
         // declaration the call really reaches (the type engine's answer, which
@@ -447,11 +742,7 @@ fn checkLoopBody(
         const named = t == start or tags[t - 1] != .period;
         const verdict = (try grow_mod.calleeGrowVerdict(cache, if (named) t else t - 1)) orelse
             (if (named) try grow_mod.ownFnGrowVerdict(cache, callee) else null) orelse reading.verdict;
-        // A `*const` parameter's storage cannot be reallocated through the
-        // pointer a callee receives, so a call handed only that pointer
-        // cannot move the list the loop walks.
-        const const_root = !recv.chained and isConstPointerParam(tree, scope, recv.first);
-        if (!verdictReachesIterated(tree, tags, t + 1, call_rp, recv, const_root, verdict)) {
+        if (!try verdictReachesIterated(cache, tree, tags, scope, t + 1, call_rp, recv, verdict)) {
             t = call_rp;
             continue;
         }
@@ -550,77 +841,28 @@ fn chainText(
     return buffer[0..len];
 }
 
-/// True when `root` names a parameter declared `*const T`.  Storage reached
-/// only through such a pointer cannot be reallocated by whoever receives it.
-fn isConstPointerParam(tree: *const Ast, scope: Scope, root: Ast.TokenIndex) bool {
-    const binding = scope.bindings.findAt(tree.tokenSlice(root), root) orelse return false;
-    if (binding.origin != .param) return false;
-    var params = scope.proto.iterate(tree);
-    while (params.next()) |param| {
-        const name_token = param.name_token orelse continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(name_token), binding.name)) continue;
-        const type_node = param.type_expr orelse return false;
-        const pointer = tree.fullPtrType(type_node) orelse return false;
-        return pointer.size == .one and pointer.const_token != null;
-    }
-    return false;
-}
 
-/// True when argument `arg` passes the const pointer `root` itself, or the
-/// address of a path below it (`root`, `&root.nodes`): a const pointer
-/// either way.  A path read by value (`root.nodes`) copies a list header and
-/// is not one.
-fn handsOverConstPointer(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    arg: TokenSpan,
-    root: []const u8,
-) bool {
-    var s = arg.first;
-    const address = tags[s] == .ampersand;
-    if (address) s += 1;
-    if (s > arg.last or tags[s] != .identifier or !std.mem.eql(u8, tree.tokenSlice(s), root)) return false;
-    if (s == arg.last) return true;
-    if (!address) return false;
-    var buffer: [path_capacity]u8 = undefined;
-    return s + 2 <= arg.last and tags[s + 1] == .period and chainText(tree, tags, s + 2, arg.last, &buffer) != null;
-}
-
-/// True when `verdict` — which storage the callee reallocates, by parameter —
-/// can move the iterated list through the call whose parentheses are `lp` and
-/// `rp`.  The iterated list is `recv.first`'s root plus its field path.  A
-/// grow charged to a parameter whose argument does not name that root moves
-/// another object, and one charged to a field path that neither contains nor
-/// lies inside the iterated field path moves another list of the same
-/// object.  A `*const` root passed on as the pointer itself moves nothing.  A
-/// grow the callee reaches through a name of its own, a handover it could not
-/// root, an argument that is more than a plain path of the root, or a call
-/// that does not pass the parameter at all stays possibly the iterated list.
+/// Every complete growth path must be separate from the iterated backing.
+/// Constness restricts writes through one pointer, not aliases of its buffer.
 fn verdictReachesIterated(
+    cache: *file_cache_mod.FileCache,
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
+    scope: Scope,
     lp: Ast.TokenIndex,
     rp: Ast.TokenIndex,
     recv: Recv,
-    const_root: bool,
     verdict: grow_mod.GrowVerdict,
-) bool {
+) !bool {
     if (verdict.unknown) return true;
     const root = tree.tokenSlice(recv.first);
-    for (verdict.unplaced) |param| {
-        const arg = argumentSpan(tags, lp, rp, param) orelse return true;
-        if (!identAppearsIn(tree, tags, arg.first, arg.last, root)) continue;
-        if (const_root and handsOverConstPointer(tree, tags, arg, root)) continue;
-        return true;
-    }
+    if (verdict.unplaced.len != 0) return true;
     if (verdict.paths.len == 0) return false;
     var iterated_buffer: [path_capacity]u8 = undefined;
     var arg_buffer: [path_capacity]u8 = undefined;
     var full_buffer: [2 * path_capacity + 1]u8 = undefined;
     for (verdict.paths) |gp| {
         const arg = argumentSpan(tags, lp, rp, gp.param) orelse return true;
-        if (!identAppearsIn(tree, tags, arg.first, arg.last, root)) continue;
-        if (const_root and handsOverConstPointer(tree, tags, arg, root)) continue;
         if (recv.chained) return true;
         const iterated: []const u8 = if (recv.first == recv.last)
             ""
@@ -629,7 +871,14 @@ fn verdictReachesIterated(
         // The argument must be exactly `[&]root(.field)*`.
         var s = arg.first;
         if (tags[s] == .ampersand) s += 1;
-        if (s > arg.last or tags[s] != .identifier or !std.mem.eql(u8, tree.tokenSlice(s), root)) return true;
+        if (s > arg.last or tags[s] != .identifier) return true;
+        const grown = recvAt(tree, arg.last);
+        // The complete growth paths, private caller storage and canonical
+        // header-preserving leaf suffice; a generic write summary also
+        // charges legitimate SDK growth as a header write.
+        if (grown.first == s and try namesOtherObject(cache, tree, scope, recv, grown, lp - 1) and
+            try privatePopulation(cache, lp - 1)) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(s), root)) return true;
         if (s != arg.last and (s + 2 > arg.last or tags[s + 1] != .period)) return true;
         const arg_path: []const u8 = if (s == arg.last)
             ""
@@ -642,9 +891,14 @@ fn verdictReachesIterated(
         else
             std.fmt.bufPrint(&full_buffer, "{s}.{s}", .{ arg_path, gp.field }) catch return true;
         if (grow_mod.growFieldCovers(iterated, full) or grow_mod.growFieldCovers(full, iterated)) return true;
+        const arena = if (cache.summary_arena) |*summary_arena| summary_arena.allocator() else return true;
+        const base = try fn_summary.growBaseOfExpr(arena, tree, scope.proto, &scope.bindings, recv.first, recv.first);
+        if (base != .storage or base.storage != .param) return true;
+        if (try headerWrittenBefore(cache, tree, scope, base.storage.param.param, iterated, full, lp - 1)) return true;
     }
     return false;
 }
+
 
 fn identAppearsIn(
     tree: *const Ast,
@@ -754,8 +1008,8 @@ test "slice-loop-reentrant-grow: grow outside loop doesn't fire" {
     );
 }
 
-test "slice-loop-reentrant-grow: grow on different recv doesn't fire" {
-    try testing.expectNoFire(check,
+test "slice-loop-reentrant-grow: different pointer parameters can name the same list" {
+    try testing.expectFires(check, R,
         \\const List = std.ArrayList(u32);
         \\pub fn safe(a: *List, b: *List) void {
         \\    for (a.items) |item| {
@@ -767,8 +1021,8 @@ test "slice-loop-reentrant-grow: grow on different recv doesn't fire" {
     );
 }
 
-test "slice-loop-reentrant-grow: may_grow callee not passed recv doesn't fire" {
-    try testing.expectNoFire(check,
+test "slice-loop-reentrant-grow: a callee handed another pointer parameter can grow the same list" {
+    try testing.expectFires(check, R,
         \\const List = std.ArrayList(u32);
         \\fn growOther(other: *List) void {
         \\    other.append(1) catch {};
@@ -800,17 +1054,13 @@ test "slice-loop-reentrant-grow: may_grow callee passed recv fires" {
 }
 
 test "slice-loop-reentrant-grow: same field name on another object doesn't fire" {
-    try testing.expectNoFire(check,
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
         \\const Output = struct { allocations: std.ArrayListUnmanaged(u32) = .empty };
         \\pub fn forward(gpa: std.mem.Allocator, output: *Output) !void {
         \\    var origin: Output = .{};
         \\    for (origin.allocations.items) |requirement| {
         \\        try output.allocations.append(gpa, requirement);
-        \\    }
-        \\}
-        \\pub fn join(self: *Output, other: *const Output, gpa: std.mem.Allocator) !void {
-        \\    for (other.allocations.items) |premise| {
-        \\        try self.allocations.append(gpa, premise);
         \\    }
         \\}
         \\
@@ -953,7 +1203,7 @@ test "slice-loop-reentrant-grow: a pointer alias of the iterated list still fire
 }
 
 test "slice-loop-reentrant-grow: a local only a callee fills through its address does not fire" {
-    try testing.expectNoFire(check,
+    try testing.expectNoFireTyped(check,
         \\const std = @import("std");
         \\const Output = struct { allocations: std.ArrayListUnmanaged(u32) = .empty };
         \\const Query = struct {
@@ -974,7 +1224,7 @@ test "slice-loop-reentrant-grow: a local only a callee fills through its address
 }
 
 test "slice-loop-reentrant-grow: conditional private local population does not fire" {
-    try testing.expectNoFire(check,
+    try testing.expectNoFireTyped(check,
         \\const std = @import("std");
         \\const Output = struct { allocations: std.ArrayListUnmanaged(u32) = .empty, complete: bool = true };
         \\const Query = struct {
@@ -1178,39 +1428,39 @@ test "slice-loop-reentrant-grow: a callee that grows only a local list of its ow
     );
 }
 
-test "slice-loop-reentrant-grow: a callee that grows another list while the walked tree is const does not fire" {
-    try testing.expectNoFire(check,
+test "slice-loop-reentrant-grow: consumer supplies fresh output beside a const tree" {
+    try testing.expectNoFireTyped(check,
         \\const std = @import("std");
         \\const Ast = std.zig.Ast;
         \\const Problem = struct { line: u32 };
-        \\fn report(gpa: std.mem.Allocator, problems: *std.ArrayListUnmanaged(Problem), tree: *const Ast, node: u32) !void {
-        \\    try problems.append(gpa, .{ .line = tree.firstToken(@enumFromInt(node)) });
+        \\fn report(gpa: std.mem.Allocator, problems: *std.ArrayListUnmanaged(Problem), node: u32) !void {
+        \\    try problems.append(gpa, .{ .line = node });
         \\}
-        \\pub fn check(gpa: std.mem.Allocator, tree: *const Ast, problems: *std.ArrayListUnmanaged(Problem)) !void {
+        \\pub fn collect(gpa: std.mem.Allocator, tree: *const Ast) !void {
+        \\    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        \\    defer problems.deinit(gpa);
         \\    for (tree.nodes.items(.tag), 0..) |tag, index| {
         \\        _ = tag;
-        \\        try report(gpa, problems, tree, @intCast(index));
+        \\        try report(gpa, &problems, @intCast(index));
         \\    }
         \\}
-        \\
     );
 }
 
-test "slice-loop-reentrant-grow: the same callee fires when the walked tree is mutable" {
-    try testing.expectFires(check, R,
+test "slice-loop-reentrant-grow: consumer supplies actually shared backing beside a const tree" {
+    try testing.expectFiresTyped(check, R,
         \\const std = @import("std");
-        \\const Ast = std.zig.Ast;
-        \\const Problem = struct { line: u32 };
-        \\fn report(gpa: std.mem.Allocator, problems: *std.ArrayListUnmanaged(Problem), tree: *Ast, node: u32) !void {
-        \\    try problems.append(gpa, .{ .line = tree.firstToken(@enumFromInt(node)) });
+        \\const Problem = u32;
+        \\const Tree = struct { nodes: std.ArrayListUnmanaged(Problem) = .empty };
+        \\fn report(gpa: std.mem.Allocator, problems: *std.ArrayListUnmanaged(Problem), node: u32) !void {
+        \\    try problems.append(gpa, node);
         \\}
-        \\pub fn check(gpa: std.mem.Allocator, tree: *Ast, problems: *std.ArrayListUnmanaged(Problem)) !void {
-        \\    for (tree.nodes.items(.tag), 0..) |tag, index| {
-        \\        _ = tag;
-        \\        try report(gpa, problems, tree, @intCast(index));
+        \\pub fn collect(gpa: std.mem.Allocator, tree: *const Tree) !void {
+        \\    var problems = tree.nodes;
+        \\    for (tree.nodes.items) |node| {
+        \\        try report(gpa, &problems, node);
         \\    }
         \\}
-        \\
     );
 }
 
@@ -1264,4 +1514,415 @@ test "slice-loop-reentrant-grow: a callee summary that exhausts its budget fails
         check(gpa, &tree, &cache, &config_mod.Default, &problems),
     );
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "slice-loop-reentrant-grow: collection identity fresh output aliases stay separate" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\const Owner = struct { list: List = .empty };
+        \\fn copy(gpa: std.mem.Allocator, input: *Owner) !void {
+        \\    var output: Owner = .{};
+        \\    const destination = &output;
+        \\    for (input.list.items) |value| {
+        \\        try destination.list.append(gpa, value);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity fresh constructor output stays separate" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\const Owner = struct {
+        \\    list: List = .empty,
+        \\    fn begin() Owner { return .{}; }
+        \\};
+        \\fn copy(gpa: std.mem.Allocator, input: *Owner) !void {
+        \\    var output = Owner.begin();
+        \\    for (input.list.items) |value| {
+        \\        try output.list.append(gpa, value);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity empty list does not alias owner field" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\const Owner = struct { list: List = .empty };
+        \\fn copy(gpa: std.mem.Allocator, input: *Owner) !void {
+        \\    var list = List.empty;
+        \\    for (input.list.items) |value| {
+        \\        try list.append(gpa, value);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity index queue is not the iterated backing" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\fn walk(gpa: std.mem.Allocator, successors: []const []const u32, queue: *std.ArrayList(u32)) !void {
+        \\    var head: usize = 0;
+        \\    while (head < queue.items.len) : (head += 1) {
+        \\        for (successors[queue.items[head]]) |target| {
+        \\            try queue.append(gpa, target);
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity completed nested borrow does not cover outer append" {
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\fn pins(gpa: std.mem.Allocator, rows: *std.ArrayList(u32), names: []const u32) !void {
+        \\    for (names) |name| {
+        \\        for (rows.items) |row| { _ = row; }
+        \\        try rows.append(gpa, name);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity helper grows fresh output through alias" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\fn add(gpa: std.mem.Allocator, output: *List, input: *List, value: u32) !void {
+        \\    _ = input.items.len;
+        \\    try output.append(gpa, value);
+        \\}
+        \\fn copy(gpa: std.mem.Allocator, input: *List) !void {
+        \\    var output: List = .empty;
+        \\    const destination = &output;
+        \\    for (input.items) |value| {
+        \\        try add(gpa, destination, input, value);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity helper owned allocation does not grow input" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\fn build(gpa: std.mem.Allocator, input: *List) !List {
+        \\    var output: List = .empty;
+        \\    try output.appendSlice(gpa, input.items);
+        \\    return output;
+        \\}
+        \\fn scan(gpa: std.mem.Allocator, input: *List) !void {
+        \\    for (input.items) |_| {
+        \\        var output = try build(gpa, input);
+        \\        output.deinit(gpa);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity copied list header appendSlice remains unsafe" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn grow(gpa: std.mem.Allocator, input: *std.ArrayList(u32)) !void {
+        \\    var output = input.*;
+        \\    for (input.items) |value| {
+        \\        try output.appendSlice(gpa, &.{value});
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity pointer rebind remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn grow(gpa: std.mem.Allocator, input: *std.ArrayList(u32)) !void {
+        \\    var output: std.ArrayList(u32) = .empty;
+        \\    var destination = &output;
+        \\    destination = input;
+        \\    for (input.items) |value| {
+        \\        try destination.appendSlice(gpa, &.{value});
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity two owner pointer parameters remain unsafe" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Owner = struct { list: std.ArrayList(u32) = .empty };
+        \\fn grow(gpa: std.mem.Allocator, input: *const Owner, output: *Owner) !void {
+        \\    for (input.list.items) |value| {
+        \\        try output.list.appendSlice(gpa, &.{value});
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity unknown growth remains unsafe" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\var shared: List = .empty;
+        \\fn unknown(input: *List) void {
+        \\    _ = input;
+        \\    shared.append(std.heap.page_allocator, 1) catch {};
+        \\}
+        \\fn scan(input: *List) void {
+        \\    for (input.items) |_| { unknown(input); }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity actual nested iterated borrow remains unsafe" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn walk(gpa: std.mem.Allocator, names: []const u32, queue: *std.ArrayList(u32)) !void {
+        \\    for (names) |_| {
+        \\        for (queue.items) |target| {
+        \\            try queue.appendSlice(gpa, &.{target});
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity shared sibling header remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Owner = struct {
+        \\    source: std.ArrayList(u32) = .empty,
+        \\    output: std.ArrayList(u32) = .empty,
+        \\};
+        \\fn grow(gpa: std.mem.Allocator, owner: *Owner) !void {
+        \\    owner.output = owner.source;
+        \\    for (owner.source.items) |value| {
+        \\        try owner.output.appendSlice(gpa, &.{value});
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: collection identity helper replacing fresh header remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\fn replaceAndGrow(gpa: std.mem.Allocator, output: *List, input: *List, value: u32) !void {
+        \\    output.* = input.*;
+        \\    try output.appendSlice(gpa, &.{value});
+        \\}
+        \\fn scan(gpa: std.mem.Allocator, input: *List) !void {
+        \\    var output: List = .empty;
+        \\    for (input.items) |value| {
+        \\        try replaceAndGrow(gpa, &output, input, value);
+        \\    }
+        \\}
+    );
+}
+
+const callback_backing_source =
+    \\const std = @import("std");
+    \\const List = std.ArrayList(u32);
+    \\const Error = error{OutOfMemory};
+    \\const ReferenceSink = struct {
+    \\    context: ?*anyopaque,
+    \\    references: *const fn (?*anyopaque, *List) Error!void,
+    \\};
+    \\const Captured = struct {
+    \\    list: List = .empty,
+    \\    allocator: std.mem.Allocator,
+    \\    sink: ReferenceSink = undefined,
+    \\    fn bind(self: *Captured) *const ReferenceSink {
+    \\        self.sink = .{ .context = self, .references = capture };
+    \\        return &self.sink;
+    \\    }
+    \\    fn capture(context: ?*anyopaque, list: *List) Error!void {
+    \\        const self: *Captured = @ptrCast(@alignCast(context.?));
+    \\        for (list.items) |reference| {
+    \\            try self.list.append(self.allocator, reference);
+    \\        }
+    \\    }
+    \\};
+    \\const ViewVerifier = struct {
+    \\    allocator: std.mem.Allocator,
+    \\    references: ?*const ReferenceSink = null,
+    \\    fn verify(self: *ViewVerifier) Error!void {
+    \\        var collected: List = .empty;
+    \\        defer collected.deinit(self.allocator);
+    \\        try collected.append(self.allocator, 1);
+    \\        if (self.references) |sink| try sink.references(sink.context, &collected);
+    \\    }
+    \\};
+    \\
+;
+
+test "slice-loop-reentrant-grow: callback backing census distinct collected output stays quiet" {
+    try testing.expectNoFireTyped(check, callback_backing_source ++
+        \\fn selected(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    var verifier: ViewVerifier = .{ .allocator = allocator, .references = captured.bind() };
+        \\    try verifier.verify();
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing census all distinct callers stay quiet" {
+    try testing.expectNoFireTyped(check, callback_backing_source ++
+        \\fn first(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    var verifier: ViewVerifier = .{ .allocator = allocator, .references = captured.bind() };
+        \\    try verifier.verify();
+        \\}
+        \\fn second(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    var verifier: ViewVerifier = .{ .allocator = allocator, .references = captured.bind() };
+        \\    try verifier.verify();
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing census same object remains unsafe" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\fn selected(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    try captured.list.append(allocator, 1);
+        \\    const sink = captured.bind();
+        \\    try sink.references(sink.context, &captured.list);
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing census copied header remains unsafe" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\fn selected(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    try captured.list.append(allocator, 1);
+        \\    var copied = captured.list;
+        \\    const sink = captured.bind();
+        \\    try sink.references(sink.context, &copied);
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing census escaped dispatcher remains unknown" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\pub fn selected(allocator: std.mem.Allocator) !*const ReferenceSink {
+        \\    const captured = try allocator.create(Captured);
+        \\    captured.* = .{ .allocator = allocator };
+        \\    return captured.bind();
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing census additional aliasing caller remains unsafe" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\fn separate(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    var verifier: ViewVerifier = .{ .allocator = allocator, .references = captured.bind() };
+        \\    try verifier.verify();
+        \\}
+        \\fn aliases(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    try captured.list.append(allocator, 1);
+        \\    const sink = captured.bind();
+        \\    try sink.references(sink.context, &captured.list);
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing census every inline actual remains unsafe" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\fn selected(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    defer captured.list.deinit(allocator);
+        \\    try captured.list.append(allocator, 1);
+        \\    var collected: List = .empty;
+        \\    defer collected.deinit(allocator);
+        \\    try collected.append(allocator, 2);
+        \\    const sink = captured.bind();
+        \\    inline for (.{ false, true }) |shared| {
+        \\        const list = if (shared) &captured.list else &collected;
+        \\        try sink.references(sink.context, list);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: const view alias same-object mutable actual remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\const Owner = struct { list: List = .empty };
+        \\fn append(gpa: std.mem.Allocator, output: *Owner, view: *const Owner, value: u32) !void {
+        \\    _ = view.list.items.len;
+        \\    try output.list.append(gpa, value);
+        \\}
+        \\fn scan(gpa: std.mem.Allocator, view: *const Owner, output: *Owner) !void {
+        \\    for (view.list.items) |value| {
+        \\        try append(gpa, output, view, value);
+        \\    }
+        \\}
+        \\fn sameObject(gpa: std.mem.Allocator) !void {
+        \\    var owner: Owner = .{};
+        \\    defer owner.list.deinit(gpa);
+        \\    try owner.list.append(gpa, 1);
+        \\    try scan(gpa, &owner, &owner);
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: const view alias copied header mutable actual remains unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const List = std.ArrayList(u32);
+        \\const Owner = struct { list: List = .empty };
+        \\fn append(gpa: std.mem.Allocator, output: *List, view: *const Owner, value: u32) !void {
+        \\    _ = view.list.items.len;
+        \\    try output.appendSlice(gpa, &.{value});
+        \\}
+        \\fn scan(gpa: std.mem.Allocator, view: *const Owner) !void {
+        \\    var copied = view.list;
+        \\    for (view.list.items) |value| {
+        \\        try append(gpa, &copied, view, value);
+        \\    }
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing header copied after registration remains unsafe" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\fn selected(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    var input: Captured = .{ .allocator = allocator };
+        \\    defer input.list.deinit(allocator);
+        \\    try input.list.append(allocator, 1);
+        \\    const sink = captured.bind();
+        \\    captured.list = input.list;
+        \\    try sink.references(sink.context, &input.list);
+        \\}
+    );
+}
+
+test "slice-loop-reentrant-grow: callback backing fresh local published after registration remains unsafe" {
+    try testing.expectFiresTyped(check, R, callback_backing_source ++
+        \\fn selected(allocator: std.mem.Allocator) !void {
+        \\    var captured: Captured = .{ .allocator = allocator };
+        \\    var collected: List = .empty;
+        \\    defer collected.deinit(allocator);
+        \\    try collected.append(allocator, 1);
+        \\    const sink = captured.bind();
+        \\    captured.list = collected;
+        \\    try sink.references(sink.context, &collected);
+        \\}
+    );
 }

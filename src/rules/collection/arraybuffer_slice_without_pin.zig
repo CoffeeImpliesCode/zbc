@@ -151,7 +151,7 @@ fn checkFn(
     const tags = tree.tokens.items(.tag);
     const last = tree.lastToken(body);
 
-    const bindings = try cache.localBindings(proto, body);
+    const bindings = (try cache.localBindings(proto, body)).*;
 
     var borrows: std.ArrayListUnmanaged(SliceBorrow) = .empty;
     defer borrows.deinit(gpa);
@@ -168,6 +168,9 @@ fn checkFn(
         const method_token = ca.method_token orelse continue;
         if (method_token < ca.receiver_token + 2) continue;
         const receiver_last = method_token - 2;
+        // A vector of slice descriptors is not a raw code-unit view. Resolve
+        // the call's actual result, never infer this from `toSlice` or `args`.
+        if (try isDescriptorVector(cache, method_token - 1)) continue;
 
         try borrows.append(gpa, .{
             .x_name = b.name,
@@ -195,6 +198,18 @@ fn checkFn(
         ) orelse continue;
         try reportProblem(gpa, problems, tree, b, gc_tok);
     }
+}
+
+fn isDescriptorVector(cache: *file_cache_mod.FileCache, token: Ast.TokenIndex) !bool {
+    const resolver = cache.zls orelse return false;
+    const actual = (try cache.actualCallSummaryAt(token, null)) orelse return false;
+    var result = (try resolver.normalizedType(actual.callee.reference.actual_type.data.function.return_value.*)) orelse return false;
+    if (resolver.typeTag(result) == .error_union) {
+        result = (try resolver.normalizedType(resolver.childType(result) orelse return false)) orelse return false;
+    }
+    if (resolver.pointerSize(result) != .slice and resolver.typeTag(result) != .array) return false;
+    const element = (try resolver.normalizedType(resolver.childType(result) orelse return false)) orelse return false;
+    return resolver.pointerSize(element) == .slice;
 }
 
 /// Scan `[start, last]` at the fn's top scope for a GC-triggering call.
@@ -405,7 +420,7 @@ test "arraybuffer-slice-without-pin: no GC call does not fire" {
     );
 }
 
-test "arraybuffer-slice-without-pin: argv and path spellings remain an unknown advisory" {
+test "arraybuffer-slice-without-pin: arena argv is not a raw code-unit view" {
     var problems = try testing.runRuleTyped(std.testing.allocator, check,
         \\const std = @import("std");
         \\pub fn main(init: std.process.Init) !void {
@@ -416,9 +431,7 @@ test "arraybuffer-slice-without-pin: argv and path spellings remain an unknown a
         \\}
     );
     defer testing.freeProblems(std.testing.allocator, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqual(problem_mod.Severity.warning, problems.items[0].severity);
-    try std.testing.expectEqual(problem_mod.Verdict.unknown, problems.items[0].verdict);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "arraybuffer-slice-without-pin: unknown nested buffer view still fires" {
@@ -446,6 +459,70 @@ test "arraybuffer-slice-without-pin: exact nested receiver pin suppresses" {
         \\    const bytes = holder.buffer.toSlice();
         \\    _ = holder.buffer.pin(globalObject);
         \\    _ = vm.call(bytes);
+        \\}
+    );
+}
+
+test "arraybuffer-slice-without-pin: imported SDK aliases retain argv result type" {
+    try testing.expectNoFireTyped(check,
+        \\const library = @import("std");
+        \\const Startup = library.process.Init;
+        \\const paths = library.fs.path;
+        \\pub fn main(startup: Startup) !void {
+        \\    const arguments = try startup.minimal.args.toSlice(startup.arena.allocator());
+        \\    const destination = try paths.resolve(startup.gpa, &.{ ".", "share" });
+        \\    defer startup.gpa.free(destination);
+        \\    _ = arguments.len;
+        \\}
+    );
+}
+
+test "arraybuffer-slice-without-pin: typed raw buffer lookalike remains unknown" {
+    try testing.expectFiresTyped(check, R,
+        \\const Buffer = struct {
+        \\    contents: []const u8,
+        \\    fn toSlice(self: Buffer) []const u8 { return self.contents; }
+        \\};
+        \\const Runtime = struct {
+        \\    extern fn resolve(self: *Runtime, bytes: []const u8) void;
+        \\};
+        \\pub fn use(buffer: Buffer, runtime: *Runtime) void {
+        \\    const bytes = buffer.toSlice();
+        \\    runtime.resolve(bytes);
+        \\}
+    );
+}
+
+test "arraybuffer-slice-without-pin: typed moving GC code units remain warned" {
+    try testing.expectFiresTyped(check, R,
+        \\const Moving = struct {
+        \\    units: []const u16,
+        \\    fn utf16(self: Moving) []const u16 { return self.units; }
+        \\};
+        \\const Engine = struct {
+        \\    extern fn collectGarbage(self: *Engine) void;
+        \\};
+        \\pub fn use(buffer: Moving, engine: *Engine) u16 {
+        \\    const units = buffer.utf16();
+        \\    engine.collectGarbage();
+        \\    return units[0];
+        \\}
+    );
+}
+
+test "arraybuffer-slice-without-pin: array of slice descriptors is not a raw view" {
+    try testing.expectNoFireTyped(check,
+        \\const Strings = struct {
+        \\    values: [2][]const u8,
+        \\    fn slice(self: Strings) [2][]const u8 { return self.values; }
+        \\};
+        \\const Runtime = struct {
+        \\    extern fn collectGarbage(self: *Runtime) void;
+        \\};
+        \\pub fn use(strings: Strings, runtime: *Runtime) usize {
+        \\    const descriptors = strings.slice();
+        \\    runtime.collectGarbage();
+        \\    return descriptors.len;
         \\}
     );
 }

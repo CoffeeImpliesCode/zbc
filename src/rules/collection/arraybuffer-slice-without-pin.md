@@ -1,10 +1,9 @@
 # arraybuffer-slice-without-pin
 
-A raw byte slice is taken from a JSC-managed buffer via `.slice()`,
-`.utf8()`, `.latin1()`, `.utf16()`, etc., then a function is called
-that may trigger GC (via JSC dispatch).  After the GC call, the
-backing buffer may have been moved or freed — the slice is a dangling
-pointer.
+This rule warns when a possible raw code-unit view crosses a possible
+GC dispatch call. Method names alone do not prove GC ownership or effects.
+Findings remain unknown warnings. Check the actual storage and lifetime
+contracts before you apply a GC protection API.
 
 Real-world: oven-sh/bun#31339, multiple instances.
 
@@ -44,6 +43,11 @@ The rule scans each function body for:
 1. A `const/var NAME = recv.method()` binding where `method` is a
    raw-view method: `slice`, `utf8`, `latin1`, `utf16`, `utf16le`,
    `bytes`, `toSlice`, `toOwnedSlice`, or `constSlice`.
+   The instantiated canonical callee's return type can exclude an array
+   or slice of slice descriptors, such as `[]const [:0]const u8`.
+   This is not a raw code-unit view. Error-union payloads are classified
+   the same way. Import aliases retain the same type identity.
+   Unknown results and raw `[]u8` or `[]u16` views remain candidates.
 
 2. After the binding, any call that may invoke GC:
    - A direct `recv.method(` call where `method` is a known JSC
@@ -54,3 +58,13 @@ The rule scans each function body for:
 3. FP suppression: if a `.pin(` call appears on the same buffer
    receiver between the slice binding and the GC call, the fire is
    suppressed.
+
+## Ordinary argument vectors
+
+`std.process.Args.toSlice` produces a vector of strings, not a raw
+byte view. A later path operation does not make that vector a GC borrow.
+The rule checks the resolved result type, not argument names or method
+spellings.
+
+This exclusion does not prove an arena lifetime contract. It does not
+make arbitrary slices, custom buffers, or unresolved calls safe.

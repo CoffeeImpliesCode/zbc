@@ -1529,6 +1529,8 @@ pub const NamedModuleMap = struct {
     by_root: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
     /// Directories whose `build.zig` chain has already been read.
     scanned_dirs: std.StringArrayHashMapUnmanaged(void) = .empty,
+    /// Exact build files whose bounded read and static scan have finished.
+    scanned_files: std.StringArrayHashMapUnmanaged(void) = .empty,
     /// Declared module instance identity -> the documents its own root
     /// reaches through relative imports.
     ///
@@ -1573,8 +1575,8 @@ pub const NamedModuleMap = struct {
     /// hold — identity strings, roots, names, aliases — are arena bytes that
     /// `arena.deinit` releases in one block below.  Freeing the storage is
     /// therefore this function's job alone; freeing the bytes twice would be
-    /// the bug.  `scanned_dirs` is not listed because it is arena-allocated
-    /// throughout, so the arena covers it.
+    /// the bug.  The scan memos are arena-allocated throughout, so the arena
+    /// covers their storage and keys.
     pub fn deinit(self: *NamedModuleMap) void {
         for (self.entries.values()) |*wiring| {
             wiring.imports.deinit(self.gpa);
@@ -1833,8 +1835,8 @@ pub const NamedModuleMap = struct {
         return owned;
     }
 
-    /// Read every `build.zig` that governs `directory`, walking upwards and
-    /// stopping at the first directory the source policy rejects.
+    /// Read ordinary in-policy governing `build.zig` files, then exact
+    /// authorized metadata files that govern the admitted `directory`.
     ///
     /// Every directory the walk visits is memoized, not just the one it
     /// started from: the whole chain between it and the policy boundary is
@@ -1850,6 +1852,10 @@ pub const NamedModuleMap = struct {
     /// to learn.  Reading the same `build.zig` again for each new
     /// subdirectory is the whole cost this avoids, and nothing about the
     /// answer changes.
+    ///
+    /// Explicit metadata grants do not extend the directory walk or the
+    /// policy used to admit module roots.  An interrupted scan publishes no
+    /// partial wiring or finished-file memo.
     pub fn scanInto(
         self: *NamedModuleMap,
         io: std.Io,
@@ -1857,11 +1863,24 @@ pub const NamedModuleMap = struct {
         directory: []const u8,
     ) (error{OutOfMemory} || std.Io.Cancelable)!void {
         const gpa = self.arena.allocator();
+        if (!policy.allowsAbsolutePath(directory)) return;
+        const entries_before = self.entries.count();
+        const files_before = self.scanned_files.count();
+        const dirs_before = self.scanned_dirs.count();
+        errdefer {
+            self.rollbackDeclarations(entries_before);
+            while (self.scanned_files.count() > files_before) {
+                self.scanned_files.orderedRemoveAt(self.scanned_files.count() - 1);
+            }
+            while (self.scanned_dirs.count() > dirs_before) {
+                self.scanned_dirs.orderedRemoveAt(self.scanned_dirs.count() - 1);
+            }
+        }
 
         // `directory` is a directory, not a file path, so the walk starts at
         // the directory itself and then steps to its parent, and so on.  The
-        // source policy ends the walk: a directory the policy rejects is not
-        // source, and no build file above it describes this source either.
+        // source policy ends the walk.  Outside it, only exact metadata
+        // grants below can describe this source; no ancestors are searched.
         var visited: std.ArrayListUnmanaged([]const u8) = .empty;
         defer visited.deinit(gpa);
         var dir_path: ?[]const u8 = directory;
@@ -1874,13 +1893,53 @@ pub const NamedModuleMap = struct {
             if (!policy.allowsAbsolutePath(build_path)) continue;
             try self.scanBuildZig(io, policy, build_path);
         }
+        for (policy.build_files) |build_path| {
+            if (!policy.allowsBuildFile(build_path)) continue;
+            const build_dir = std.fs.path.dirname(build_path) orelse continue;
+            if (!within(build_dir, directory)) continue;
+            try self.scanBuildZig(io, policy, build_path);
+        }
         for (visited.items) |dir| {
             if (self.scanned_dirs.contains(dir)) continue;
             try self.scanned_dirs.put(gpa, try gpa.dupe(u8, dir), {});
         }
     }
 
+    /// Undo only declarations appended by this scan.  Per-script identities
+    /// keep prior wiring untouched, and reverse order matches each root list.
+    fn rollbackDeclarations(self: *NamedModuleMap, count: usize) void {
+        while (self.entries.count() > count) {
+            const index = self.entries.count() - 1;
+            const identity = self.entries.keys()[index];
+            const wiring = &self.entries.values()[index];
+            const root_index = self.by_root.getIndex(wiring.root).?;
+            const instances = &self.by_root.values()[root_index];
+            const removed = instances.pop().?;
+            std.debug.assert(std.mem.eql(u8, removed, identity));
+            if (instances.items.len == 0) {
+                instances.deinit(self.gpa);
+                self.by_root.orderedRemoveAt(root_index);
+            }
+            wiring.imports.deinit(self.gpa);
+            self.entries.orderedRemoveAt(index);
+        }
+    }
+
     fn scanBuildZig(
+        self: *NamedModuleMap,
+        io: std.Io,
+        policy: SourcePolicy,
+        build_path: []const u8,
+    ) (error{OutOfMemory} || std.Io.Cancelable)!void {
+        const gpa = self.arena.allocator();
+        if (self.scanned_files.contains(build_path)) return;
+        try self.scanBuildZigSource(io, policy, build_path);
+        // Unknown is a finished outcome, but cancellation and OOM never reach
+        // this memo.  scanInto also rolls back if publishing the memo fails.
+        try self.scanned_files.put(gpa, try gpa.dupe(u8, build_path), {});
+    }
+
+    fn scanBuildZigSource(
         self: *NamedModuleMap,
         io: std.Io,
         policy: SourcePolicy,
@@ -1898,6 +1957,7 @@ pub const NamedModuleMap = struct {
             error.Canceled => return error.Canceled,
             else => return,
         };
+        defer gpa.free(source);
         var tree = Ast.parse(gpa, source, .zig) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return,
@@ -1932,16 +1992,10 @@ pub const NamedModuleMap = struct {
         /// naming one root are two declarations, and this is what tells
         /// their instances apart.
         declared: usize = 0,
-        /// Variable name -> the instance its initializer creates, or null
-        /// when the name is bound more than once.  Scoped to this one
-        /// `build.zig`: the same name in another file is a different name.
-        variables: std.StringArrayHashMapUnmanaged(?[]const u8) = .empty,
 
-        /// Call nodes already declared, so the initializer of a binding is
-        /// not declared a second time when the node walk reaches that call
-        /// on its own.  Without this, one `const left = b.createModule(…)`
-        /// would become two modules differing only in identity.
-        declared_calls: std.DynamicBitSetUnmanaged = .{},
+        /// One declaration identity per authored call. Imports are read only
+        /// after every declaration is present, including inline createModule.
+        declared_calls: std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8) = .empty,
 
         /// Two passes, so `module.addImport(...)` is attributed even when it
         /// is written before the `addModule` that creates `module`.
@@ -1949,40 +2003,21 @@ pub const NamedModuleMap = struct {
         /// script would land in one table, and any two of them sharing a name
         /// would collide.
         fn run(scan: *BuildModuleScan) !void {
+            defer scan.declared_calls.deinit(scan.gpa);
             try scan.declareModules();
             try scan.recordModuleImports();
-            scan.variables.deinit(scan.gpa);
         }
 
-        /// Bind declarations before visiting unbound calls.  The parser stores
-        /// an initializer call before the variable declaration that owns it.
         fn declareModules(scan: *BuildModuleScan) !void {
-            defer scan.declared_calls.deinit(scan.gpa);
-            try scan.declared_calls.resize(scan.gpa, scan.tree.nodes.len, false);
             var index: u32 = 1;
             while (index < scan.tree.nodes.len) : (index += 1) {
-                const node: Ast.Node.Index = @enumFromInt(index);
-                if (scan.tree.fullVarDecl(node)) |decl| {
-                    const initializer = decl.ast.init_node.unwrap() orelse continue;
-                    var call_buf: [1]Ast.Node.Index = undefined;
-                    const call = scan.tree.fullCall(&call_buf, initializer) orelse continue;
-                    if (try scan.declareInstance(call)) |identity| {
-                        scan.declared_calls.set(@intFromEnum(initializer));
-                        try scan.bindVariable(decl, identity);
-                    }
-                    continue;
-                }
-            }
-            index = 1;
-            while (index < scan.tree.nodes.len) : (index += 1) {
-                const node: Ast.Node.Index = @enumFromInt(index);
-                _ = try scan.declareInstanceAt(node);
+                _ = try scan.declareInstanceAt(@enumFromInt(index));
             }
         }
 
         /// Declares the module `call` creates and returns its identity, or
         /// null when this call is not a literal module declaration.
-        fn declareInstance(scan: *BuildModuleScan, call: Ast.full.Call) (error{OutOfMemory} || std.Io.Cancelable)!?[]const u8 {
+        fn declareInstance(scan: *BuildModuleScan, node: Ast.Node.Index, call: Ast.full.Call) (error{OutOfMemory} || std.Io.Cancelable)!?[]const u8 {
             const method = callName(scan.tree, call) orelse return null;
             const is_create = std.mem.eql(u8, method, "createModule") and call.ast.params.len == 1;
             const is_add = std.mem.eql(u8, method, "addModule") and call.ast.params.len == 2;
@@ -1993,16 +2028,16 @@ pub const NamedModuleMap = struct {
 
             const identity = try scan.nextIdentity(root);
             try scan.map.declareModule(identity, root, if (is_add) stringLiteral(scan.tree, call.ast.params[0]) else null);
-            if (is_add) try scan.recordImports(identity, options);
+            try scan.declared_calls.put(scan.gpa, node, identity);
             return identity;
         }
 
         /// An inline module expression that no variable binds.
         fn declareInstanceAt(scan: *BuildModuleScan, node: Ast.Node.Index) (error{OutOfMemory} || std.Io.Cancelable)!?[]const u8 {
-            if (scan.declared_calls.isSet(@intFromEnum(node))) return null;
+            if (scan.declared_calls.get(node)) |identity| return identity;
             var call_buf: [1]Ast.Node.Index = undefined;
             const call = scan.tree.fullCall(&call_buf, node) orelse return null;
-            return try scan.declareInstance(call);
+            return try scan.declareInstance(node, call);
         }
 
         /// A fresh identity for one declaration.  The root alone is not an
@@ -2013,38 +2048,25 @@ pub const NamedModuleMap = struct {
             return std.fmt.allocPrint(scan.gpa, "{s}#{d}#{s}", .{ scan.build_script, scan.declared, root });
         }
 
-        /// Binds a module variable to the declaration it was assigned, so
-        /// `left.addImport(…)` can be attributed to it.  A name bound twice
-        /// is shadowed and proves nothing.
-        fn bindVariable(scan: *BuildModuleScan, decl: Ast.full.VarDecl, identity: []const u8) !void {
-            const name = scan.tree.tokenSlice(decl.ast.mut_token + 1);
-            if (scan.variables.get(name) != null) {
-                scan.variables.getPtr(name).?.* = null;
-                return;
-            }
-            try scan.variables.put(scan.gpa, name, identity);
-        }
 
         fn recordModuleImports(scan: *BuildModuleScan) !void {
             var index: u32 = 1;
             while (index < scan.tree.nodes.len) : (index += 1) {
+                const node: Ast.Node.Index = @enumFromInt(index);
                 var call_buf: [1]Ast.Node.Index = undefined;
-                const call = scan.tree.fullCall(&call_buf, @enumFromInt(index)) orelse continue;
+                const call = scan.tree.fullCall(&call_buf, node) orelse continue;
+                if (scan.declared_calls.get(node)) |owner| {
+                    try scan.recordImports(owner, scan.moduleOptions(call) orelse continue);
+                    continue;
+                }
                 const method = callName(scan.tree, call) orelse continue;
                 if (!std.mem.eql(u8, method, "addImport") or call.ast.params.len != 2) continue;
-
-                // `left.addImport("dep", …)` is a field access whose receiver
-                // is the `left` identifier — reading the callee itself as an
-                // identifier skips every ordinary method call, which is the
-                // only shape a build script writes.
                 if (scan.tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
                 const receiver_node = scan.tree.nodeData(call.ast.fn_expr).node_and_token[0];
-                if (scan.tree.nodeTag(receiver_node) != .identifier) continue;
-                const receiver = scan.tree.tokenSlice(scan.tree.nodeMainToken(receiver_node));
-                const owner = scan.variables.get(receiver) orelse continue;
+                const owner = scan.moduleInstanceFromExpr(receiver_node, 0) orelse continue;
                 const alias = stringLiteral(scan.tree, call.ast.params[0]) orelse continue;
                 const target = try scan.moduleTargetFromExpr(call.ast.params[1]) orelse continue;
-                try scan.recordImport(owner orelse continue, alias, target);
+                try scan.recordImport(owner, alias, target);
             }
         }
 
@@ -2071,22 +2093,70 @@ pub const NamedModuleMap = struct {
         };
 
         fn moduleTargetFromExpr(scan: *BuildModuleScan, expr: Ast.Node.Index) error{OutOfMemory}!?Target {
-            if (scan.tree.nodeTag(expr) == .identifier) {
-                const name = scan.tree.tokenSlice(scan.tree.nodeMainToken(expr));
-                if (scan.variables.get(name)) |bound| {
-                    // A shadowed variable proves nothing, and saying so is
-                    // the honest answer rather than picking one binding.
-                    const identity = bound orelse return null;
-                    const root = scan.map.rootOf(identity) orelse return null;
-                    return .{ .identity = identity, .root = root };
-                }
+            const identity = scan.moduleInstanceFromExpr(expr, 0) orelse return null;
+            return .{ .identity = identity, .root = scan.map.rootOf(identity) orelse return null };
+        }
+
+        /// Follow authored immutable aliases, never a same-root guess.
+        /// A conditional null has no second instance; two distinct instances
+        /// or an unsupported branch cannot name one environment.
+        fn moduleInstanceFromExpr(scan: *BuildModuleScan, expr: Ast.Node.Index, depth: u8) ?[]const u8 {
+            if (depth >= 32) return null;
+            if (scan.declared_calls.get(expr)) |identity| return identity;
+            if (scan.tree.fullIf(expr)) |branch| {
+                const alternative = branch.ast.else_expr.unwrap() orelse return null;
+                if (scan.isNull(alternative)) return scan.moduleInstanceFromExpr(branch.ast.then_expr, depth + 1);
+                if (scan.isNull(branch.ast.then_expr)) return scan.moduleInstanceFromExpr(alternative, depth + 1);
+                const left = scan.moduleInstanceFromExpr(branch.ast.then_expr, depth + 1) orelse return null;
+                const right = scan.moduleInstanceFromExpr(alternative, depth + 1) orelse return null;
+                return if (std.mem.eql(u8, left, right)) left else null;
             }
-            const root = try scan.moduleRootFromExpr(expr) orelse return null;
-            // A root exactly one declaration creates can name that
-            // declaration.  A root declared more than once cannot: which
-            // one the build meant is not something the file says.
-            const instances = scan.map.instancesOfRoot(root);
-            return .{ .identity = if (instances.len == 1) instances[0] else null, .root = root };
+            switch (scan.tree.nodeTag(expr)) {
+                .identifier => return scan.moduleInstanceFromExpr(scan.variableInitializer(expr) orelse return null, depth + 1),
+                .unwrap_optional => return scan.moduleInstanceFromExpr(scan.tree.nodeData(expr).node_and_token[0], depth + 1),
+                .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const statements = scan.tree.blockStatements(&buffer, expr) orelse return null;
+                    if (statements.len == 0) return null;
+                    const last = statements[statements.len - 1];
+                    if (scan.tree.nodeTag(last) != .@"break") return null;
+                    const label, const result = scan.tree.nodeData(last).opt_token_and_opt_node;
+                    const label_token = label.unwrap() orelse return null;
+                    const lbrace = scan.tree.nodeMainToken(expr);
+                    if (lbrace < 2 or scan.tree.tokenTag(lbrace - 1) != .colon or
+                        !std.mem.eql(u8, scan.tree.tokenSlice(lbrace - 2), scan.tree.tokenSlice(label_token))) return null;
+                    const value = result.unwrap() orelse return null;
+                    var initializer: ?Ast.Node.Index = null;
+                    for (statements[0 .. statements.len - 1]) |statement| {
+                        if (scan.tree.fullVarDecl(statement)) |decl| {
+                            if (scan.tree.nodeTag(value) == .identifier and
+                                std.mem.eql(u8, scan.tree.tokenSlice(decl.ast.mut_token + 1), scan.tree.tokenSlice(scan.tree.nodeMainToken(value))))
+                            {
+                                if (initializer != null or scan.tree.tokenTag(decl.ast.mut_token) != .keyword_const) return null;
+                                initializer = decl.ast.init_node.unwrap();
+                            }
+                            continue;
+                        }
+                        var call_buf: [1]Ast.Node.Index = undefined;
+                        if (scan.tree.fullCall(&call_buf, statement) != null) continue;
+                        if (scan.tree.nodeTag(statement) == .assign) {
+                            const lhs = scan.tree.nodeData(statement).node_and_node[0];
+                            if (scan.tree.nodeTag(lhs) != .field_access) return null;
+                            const field = scan.tree.nodeData(lhs).node_and_token[1];
+                            if (std.mem.eql(u8, scan.tree.tokenSlice(field), "root_source_file")) return null;
+                            continue;
+                        }
+                        return null;
+                    }
+                    return scan.moduleInstanceFromExpr(initializer orelse value, depth + 1);
+                },
+                else => return null,
+            }
+        }
+
+        fn isNull(scan: *BuildModuleScan, expr: Ast.Node.Index) bool {
+            return scan.tree.nodeTag(expr) == .identifier and
+                std.mem.eql(u8, scan.tree.tokenSlice(scan.tree.nodeMainToken(expr)), "null");
         }
 
         fn recordImport(scan: *BuildModuleScan, owner: []const u8, alias: []const u8, target: Target) !void {
@@ -2129,17 +2199,6 @@ pub const NamedModuleMap = struct {
             return if (is_create) call.ast.params[0] else call.ast.params[1];
         }
 
-        /// The root source file a module expression names, as an absolute path.
-        fn moduleRootFromExpr(scan: *BuildModuleScan, expr: Ast.Node.Index) !?[]const u8 {
-            var resolved = expr;
-            if (scan.tree.nodeTag(expr) == .identifier) {
-                resolved = scan.variableInitializer(expr) orelse return null;
-            }
-            var call_buf: [1]Ast.Node.Index = undefined;
-            const call = scan.tree.fullCall(&call_buf, resolved) orelse return null;
-            const options = scan.moduleOptions(call) orelse return null;
-            return try scan.moduleRootFromOptions(options);
-        }
 
         /// The `root_source_file` of a `createModule` / `addModule` options literal.
         fn moduleRootFromOptions(scan: *BuildModuleScan, options: Ast.Node.Index) !?[]const u8 {
@@ -2195,6 +2254,7 @@ pub const NamedModuleMap = struct {
             while (index < scan.tree.nodes.len) : (index += 1) {
                 const decl = scan.tree.fullVarDecl(@enumFromInt(index)) orelse continue;
                 if (!std.mem.eql(u8, scan.tree.tokenSlice(decl.ast.mut_token + 1), name)) continue;
+                if (scan.tree.tokenTag(decl.ast.mut_token) != .keyword_const) return null;
                 if (found != null) return null;
                 found = decl.ast.init_node.unwrap();
             }

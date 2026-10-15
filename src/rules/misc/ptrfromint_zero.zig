@@ -19,6 +19,7 @@
 //! Detection (Tier 1, token walk):
 //!   4-token pattern: `builtin("@ptrFromInt") l_paren number_literal("0") r_paren`
 //!   Fire at the `@ptrFromInt` builtin token.
+//!   Exempt only an exact destination pointer that permits address zero.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -27,7 +28,6 @@ const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 
-const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
 
 const Problem = problem_mod.Problem;
@@ -42,7 +42,6 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .ptrfromint_zero)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     const last_tok = tree.lastToken(.root);
@@ -56,32 +55,45 @@ pub fn check(
         if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "0")) continue;
         if (tags[t + 3] != .r_paren) continue;
 
-        // Suppress when the target pointer type is `allowzero` (e.g.
-        // `@as(*allowzero u0, @ptrFromInt(0))`, a C-varargs null sentinel).
-        // `allowzero` pointers may legally hold address 0, so the rule's
-        // premise (a non-nullable pointer must never be 0) does not apply.
-        if (targetIsAllowzero(tags, t)) continue;
+        if (try targetAllowsZero(tree, cache, t)) continue;
 
         try report(gpa, problems, tree, t);
     }
 }
 
-/// True iff an `allowzero` qualifier appears in the pointer-type context
-/// enclosing this `@ptrFromInt(0)` — scanning backward to the nearest
-/// statement boundary (`;` / `{` / `}`).  Covers the `@as(*allowzero T, …)`
-/// cast form and the `var p: *allowzero T = …` declaration form.
-fn targetIsAllowzero(tags: []const std.zig.Token.Tag, t: std.zig.Ast.TokenIndex) bool {
-    var k = t;
-    var steps: u32 = 0;
-    while (k > 0 and steps < 24) : (steps += 1) {
-        k -= 1;
-        switch (tags[k]) {
-            .keyword_allowzero => return true,
-            .semicolon, .l_brace, .r_brace => return false,
+/// The contextual type engine owns aliases and aggregate field destinations.
+/// Without it, only a direct literal type annotation can prove `allowzero`.
+fn targetAllowsZero(tree: *const Ast, cache: *file_cache_mod.FileCache, token: Ast.TokenIndex) !bool {
+    const node = cache.nodeForExactSpan(token, token + 3) orelse return false;
+    if (cache.zls) |resolver| {
+        const destination = (try resolver.resolutionFrame().expectedTypeOfNode(node)) orelse return false;
+        return resolver.pointerAllowsZero(destination) orelse false;
+    }
+
+    var buffer: [2]Ast.Node.Index = undefined;
+    for (tree.nodes.items(.tag), 0..) |tag, raw_parent| {
+        const parent: Ast.Node.Index = @enumFromInt(raw_parent);
+        switch (tag) {
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) continue;
+                const args = tree.builtinCallParams(&buffer, parent) orelse continue;
+                if (args.len != 2 or args[1] != node) continue;
+                return literalAllowsZero(tree, args[0]);
+            },
+            .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+                const declaration = tree.fullVarDecl(parent).?;
+                if (declaration.ast.init_node != node.toOptional()) continue;
+                return literalAllowsZero(tree, declaration.ast.type_node.unwrap() orelse return false);
+            },
             else => {},
         }
     }
     return false;
+}
+
+fn literalAllowsZero(tree: *const Ast, node: Ast.Node.Index) bool {
+    const pointer = tree.fullPtrType(node) orelse return false;
+    return pointer.allowzero_token != null;
 }
 
 fn report(
@@ -160,4 +172,171 @@ test "ptrfromint-zero: non-allowzero @as still fires" {
         \\}
         \\
     );
+}
+
+test "ptrfromint-zero: contextual C pointer cast permits zero" {
+    try testing.expectNoFireTyped(check,
+        \\fn sentinel() [*c]const u8 {
+        \\    return @as([*c]const u8, @ptrFromInt(0));
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual C pointer local permits zero" {
+    try testing.expectNoFireTyped(check,
+        \\fn sentinel() void {
+        \\    const p: [*c]const u8 = @ptrFromInt(0);
+        \\    _ = p;
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual C pointer return permits zero" {
+    try testing.expectNoFireTyped(check,
+        \\fn sentinel() [*c]const u8 {
+        \\    return @ptrFromInt(0);
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual returned aggregate field permits zero" {
+    try testing.expectNoFireTyped(check,
+        \\const Value = union(enum) { text: []const u8, none, number: f64 };
+        \\const present_empty_value: [1]u8 = .{0};
+        \\fn valueSliceOf(value: Value) struct { ptr: [*c]const u8, len: usize } {
+        \\    return switch (value) {
+        \\        .text => |text| if (text.len == 0)
+        \\            .{ .ptr = &present_empty_value, .len = 0 }
+        \\        else
+        \\            .{ .ptr = text.ptr, .len = text.len },
+        \\        .none, .number => .{ .ptr = @ptrFromInt(0), .len = 0 },
+        \\    };
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual actual bridge cast shape permits zero" {
+    try testing.expectNoFireTyped(check,
+        \\const Value = union(enum) { text: []const u8, none, number: f64 };
+        \\fn valueSliceOf(value: Value) struct { ptr: [*c]const u8, len: usize } {
+        \\    return switch (value) {
+        \\        .text => |text| .{ .ptr = text.ptr, .len = text.len },
+        \\        .none, .number => .{ .ptr = @as([*c]const u8, @ptrFromInt(0)), .len = 0 },
+        \\    };
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual current file aliases preserve C pointer" {
+    try testing.expectNoFireTyped(check,
+        \\const P = [*c]const u8;
+        \\const Alias = P;
+        \\const Slice = struct { ptr: Alias, len: usize };
+        \\fn sentinel() Slice { return .{ .ptr = @ptrFromInt(0), .len = 0 }; }
+    );
+}
+
+test "ptrfromint-zero: contextual allowzero return permits zero" {
+    try testing.expectNoFireTyped(check,
+        \\fn sentinel() *allowzero u8 { return @ptrFromInt(0); }
+    );
+}
+
+test "ptrfromint-zero: contextual allowzero aliases permit zero" {
+    try testing.expectNoFireTyped(check,
+        \\const P = *allowzero u8;
+        \\const Alias = P;
+        \\fn sentinel() Alias { return @ptrFromInt(0); }
+    );
+}
+
+test "ptrfromint-zero: contextual ordinary pointer return still fires" {
+    try testing.expectFiresTyped(check, R,
+        \\fn invalid() *u8 { return @ptrFromInt(0); }
+    );
+}
+
+test "ptrfromint-zero: contextual ordinary as target still fires" {
+    try testing.expectFiresTyped(check, R,
+        \\fn invalid() *u8 { return @as(*u8, @ptrFromInt(0)); }
+    );
+}
+
+test "ptrfromint-zero: contextual C pointer sibling cannot hide ordinary field" {
+    try testing.expectFiresTyped(check, R,
+        \\fn invalid(p: [*c]u8) struct { nullable: [*c]u8, required: *u8 } {
+        \\    return .{ .nullable = p, .required = @ptrFromInt(0) };
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual previous allowzero operand cannot hide ordinary argument" {
+    try testing.expectFiresTyped(check, R,
+        \\fn consume(nullable: *allowzero u8, required: *u8) void { _ = nullable; _ = required; }
+        \\fn invalid() void {
+        \\    consume(@as(*allowzero u8, undefined), @ptrFromInt(0));
+        \\}
+    );
+}
+
+test "ptrfromint-zero: contextual nested allowzero pointee cannot hide ordinary pointer" {
+    try testing.expectFiresTyped(check, R,
+        \\fn invalid() **allowzero u8 { return @as(**allowzero u8, @ptrFromInt(0)); }
+    );
+}
+
+test "ptrfromint-zero: contextual unresolved target stays conservative" {
+    try testing.expectFiresTyped(check, R,
+        \\fn invalid() Missing { return @ptrFromInt(0); }
+    );
+}
+
+fn expectImportedPointer(source: [:0]const u8, expected: usize) !void {
+    const engine = @import("type_engine");
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "api.zig",
+        .data =
+        \\pub const CPointer = [*c]const u8;
+        \\pub const Alias = CPointer;
+        \\pub const Slice = struct { ptr: Alias, len: usize };
+        \\pub const Required = *u8;
+        ,
+    });
+    const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "main.zig" });
+    defer gpa.free(path);
+    var context: engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{directory} };
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    cache.setZls(&resolver);
+    defer cache.deinit();
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer testing.freeProblems(gpa, &problems);
+    try check(gpa, tree, &cache, &config_mod.Default, &problems);
+    try std.testing.expectEqual(expected, problems.items.len);
+    for (problems.items) |finding| try std.testing.expectEqualStrings(R, finding.rule_id);
+}
+
+test "ptrfromint-zero: contextual imported alias field permits zero" {
+    try expectImportedPointer(
+        \\const api = @import("api.zig");
+        \\fn sentinel() api.Slice { return .{ .ptr = @ptrFromInt(0), .len = 0 }; }
+    , 0);
+}
+
+test "ptrfromint-zero: contextual imported ordinary alias still fires" {
+    try expectImportedPointer(
+        \\const api = @import("api.zig");
+        \\fn invalid() api.Required { return @ptrFromInt(0); }
+    , 1);
 }

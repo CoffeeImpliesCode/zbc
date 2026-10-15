@@ -854,17 +854,31 @@ fn methodKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.In
     return true;
 }
 
-/// Nested calls preserve a selected receiver path only when the existing,
-/// context-keyed effect summary proves it read-only. A const receiver is a
-/// cheap candidate filter, not the proof; unknown rooted or global effects
-/// still invalidate. The summary spends this oracle's remaining allowance.
+/// A selected receiver field survives only a complete, context-keyed effect
+/// proof. Canonical actual-to-formal mapping covers value and pointer receivers;
+/// neither a copied value nor a const spelling proves absence of mutation.
+/// Rooted and unrooted effects spend this oracle's remaining allowance. The
+/// enclosing subtree scan also checks every evaluated actual expression.
 fn methodSummaryKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.Node.Index, path: []const u8) bool {
+    if (o.tree.nodeTag(receiver) != .identifier) return false;
+    return argumentSummaryKeepsField(o, call_node, receiver, path);
+}
+
+/// Discharge one actual's access only through its exact formal-field effect
+/// and the complete unrooted effect. Other actuals are checked independently.
+fn argumentSummaryKeepsField(o: *Oracle, call_node: Ast.Node.Index, argument: Ast.Node.Index, path: []const u8) bool {
+    if (o.summary_error != null) return false;
     const tree = o.tree;
-    if (tree.nodeTag(receiver) != .identifier) return false;
-    const receiver_name = tree.tokenSlice(tree.nodeMainToken(receiver));
-    if (!std.mem.startsWith(u8, path, receiver_name) or path.len <= receiver_name.len + 1 or
-        path[receiver_name.len] != '.') return false;
-    const field = path[receiver_name.len + 1 ..];
+    const operand = value_range.unwrapGrouped(tree, argument);
+    const storage = if (tree.nodeTag(operand) == .address_of)
+        value_range.unwrapGrouped(tree, tree.nodeData(operand).node)
+    else
+        operand;
+    if (!value_range.isPureFieldPath(tree, storage)) return false;
+    const owner = value_range.nodeSrc(tree, storage);
+    if (!std.mem.startsWith(u8, path, owner) or path.len <= owner.len + 1 or
+        path[owner.len] != '.') return false;
+    const field = path[owner.len + 1 ..];
     if (std.mem.indexOfAny(u8, field, "[*(") != null) return false;
     const cache = o.cache orelse return false;
     const resolver = cache.zls orelse return false;
@@ -877,23 +891,21 @@ fn methodSummaryKeepsField(o: *Oracle, call_node: Ast.Node.Index, receiver: Ast.
         o.summary_error = o.summary_error orelse err;
         return false;
     }) orelse return false;
-    var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = tokens.fnProto(actual.callee.tree, &proto_buffer, actual.callee.declaration) orelse return false;
-    var parameters = proto.iterate(actual.callee.tree);
-    const parameter = parameters.next() orelse return false;
-    const pointer = actual.callee.tree.fullPtrType(parameter.type_expr orelse return false) orelse return false;
-    if (pointer.size != .one or pointer.const_token == null) return false;
-    const mapped = (actual.callArgumentFor(cache, &call_buffer, 0) catch |err| {
-        o.summary_error = o.summary_error orelse err;
-        return false;
-    }) orelse return false;
-    if (mapped != receiver) return false;
+    var parameter: u32 = 0;
+    while (true) : (parameter += 1) {
+        if (!o.spend()) return false;
+        const mapped = (actual.callArgumentFor(cache, &call_buffer, parameter) catch |err| {
+            o.summary_error = o.summary_error orelse err;
+            return false;
+        }) orelse return false;
+        if (mapped == argument) break;
+    }
     const context = @import("../cache/call_summary.zig").QueryContext{
         .frame = frame,
         .remaining = &o.budget,
         .declaration = value_range.enclosingFnDecl(o),
     };
-    const effect = (cache.callEffectAt(token, .{ .parameter = .{ .param = 0, .path = field } }, context) catch |err| {
+    const effect = (cache.callEffectAt(token, .{ .parameter = .{ .param = parameter, .path = field } }, context) catch |err| {
         o.summary_error = o.summary_error orelse err;
         return false;
     }) orelse return false;
@@ -992,6 +1004,55 @@ fn containerMethodKeepsSibling(o: *Oracle, call_node: Ast.Node.Index, receiver: 
     return false;
 }
 
+/// Indexed field stores are still element writes, not unknown writes to all
+/// storage. Preserving an INDIRECT header additionally needs the shared
+/// oracle's canonical allocation/all-origins separation fact.
+fn indexedStoreContainer(o: *Oracle, target: Ast.Node.Index) ?Ast.Node.Index {
+    var node = value_range.unwrapGrouped(o.tree, target);
+    var depth: u8 = 0;
+    while (o.tree.nodeTag(node) == .field_access) : (depth += 1) {
+        if (depth == value_range.walk_depth_cap) {
+            o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = value_range.walk_depth_cap });
+            return null;
+        }
+        if (!o.spend()) return null;
+        node = value_range.unwrapGrouped(o.tree, o.tree.nodeData(node).node_and_token[0]);
+    }
+    if (o.tree.nodeTag(node) != .array_access) return null;
+    return value_range.unwrapGrouped(o.tree, o.tree.nodeData(node).node_and_node[0]);
+}
+
+/// Every field after the index must stay inside the element's storage.
+/// A field on a pointer can implicitly dereference it; purity is not a
+/// separation proof. Slice-header fields themselves are by-value storage.
+fn indexedProjectionIsInline(o: *Oracle, target: Ast.Node.Index) bool {
+    const cache = o.cache orelse return false;
+    const resolver = cache.zls orelse return false;
+    const frame = o.resolution_frame orelse resolver.resolutionFrame();
+    var node = value_range.unwrapGrouped(o.tree, target);
+    var depth: u8 = 0;
+    while (o.tree.nodeTag(node) == .field_access) : (depth += 1) {
+        if (depth == value_range.walk_depth_cap) {
+            o.giveUp(.{ .limit = .numeric_oracle_depth, .cap = value_range.walk_depth_cap });
+            return false;
+        }
+        if (!o.spend()) return false;
+        const base = value_range.unwrapGrouped(o.tree, o.tree.nodeData(node).node_and_token[0]);
+        const actual = (frame.typeOfNode(base) catch |err| {
+            o.summary_error = o.summary_error orelse err;
+            return false;
+        }) orelse return false;
+        switch (resolver.typeTag(actual) orelse return false) {
+            .@"struct", .@"union" => {},
+            .pointer => if ((resolver.pointerSize(actual) orelse return false) != .slice) return false,
+            else => return false,
+        }
+        node = base;
+    }
+    return o.tree.nodeTag(node) == .array_access;
+}
+
+
 /// True when a call at `effect` can hand the callee storage that `path` names.
 /// `false` is only returned for effects we can enumerate completely: an
 /// ordinary call (receiver + arguments) or the writing argument of a
@@ -1011,7 +1072,16 @@ pub fn pathEscapedBy(o: *Oracle, effect: Ast.Node.Index, path: []const u8) bool 
         tree.nodeTag(effect) != .assign_destructure)
     {
         const target = tree.nodeData(effect).node_and_node[0];
-        if (tree.nodeTag(target) == .array_access) {
+        if (indexedStoreContainer(o, target)) |container| {
+            if (o.effect_isolated_headers) |headers| {
+                if (value_range.isPureFieldPath(tree, container)) {
+                    const header = value_range.nodeSrc(tree, container);
+                    if (std.mem.eql(u8, header, path) and headers.headerIsolated(header) and
+                        indexedProjectionIsInline(o, target) and
+                        value_range.pureIntegerExpression(o, target, 0) and
+                        value_range.pureIntegerExpression(o, tree.nodeData(effect).node_and_node[1], 0)) return false;
+                }
+            }
             const root = rootText(path);
             return o.indirection_roots.contains(root) or o.addressed.contains(root) or
                 !value_range.isLocalName(o, root);
@@ -1080,7 +1150,8 @@ fn callKeepsUnrootedStorage(o: *Oracle, call_node: Ast.Node.Index) bool {
 /// that access; the argument's AST shape does not determine mutability.
 fn argumentReaches(o: *Oracle, call_node: Ast.Node.Index, argument: Ast.Node.Index, path: []const u8) bool {
     if (!escapeReaches(o, argument, path)) return false;
-    return !calleeKeepsAddress(o, call_node);
+    if (calleeKeepsAddress(o, call_node)) return false;
+    return !argumentSummaryKeepsField(o, call_node, argument, path);
 }
 
 /// A complete effect certificate covers every formal and unrooted storage.
@@ -1177,7 +1248,7 @@ pub fn scanEffects(o: *Oracle, node: Ast.Node.Index, scan: *EffectScan, depth: u
         else => plain: {
             if (!std.mem.startsWith(u8, @tagName(tag), "assign")) break :plain;
             const target = tree.nodeData(node).node_and_node[0];
-            if (tree.nodeTag(target) == .array_access) {
+            if (indexedStoreContainer(o, target) != null) {
                 // Keep this as a non-leaf effect, not a direct field write.
                 // Receiver purity proofs reject it through call_count, while
                 // pathEscapedBy distinguishes independent local indices from
@@ -1678,4 +1749,83 @@ test "successful unresolved escape queries remain no proof without an error" {
     }
     try std.testing.expect(addressed and called);
     try std.testing.expectEqual(@as(?value_range.QueryError, null), oracle.summary_error);
+}
+
+test "receiver field preservation requires canonical rooted unrooted and actual effects" {
+    const resolver_mod = @import("../type_resolver.zig");
+    const gpa = std.testing.allocator;
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: resolver_mod.TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-numeric-receiver-field-effects.zig",
+        \\var escaped: i16 = 0;
+        \\extern fn foreign() void;
+        \\const Box = struct {
+        \\    count: i16,
+        \\    fn read(self: @This()) void { _ = self.count; }
+        \\    fn readConst(self: *const @This()) void { self.read(); }
+        \\    fn write(self: *@This()) void { self.count = -32768; }
+        \\    fn writeGlobal(self: @This()) void { _ = self; escaped = -32768; }
+        \\    fn opaqueCall(self: @This()) void { _ = self; foreign(); }
+        \\    fn readAfter(self: @This(), marker: bool) void { _ = self.count; _ = marker; }
+        \\};
+        \\fn touch(value: *Box) bool { value.count = -32768; return true; }
+        \\fn f(value: Box) void {
+        \\    var holder = value;
+        \\    holder.read();
+        \\    holder.readConst();
+        \\    holder.write();
+        \\    holder.writeGlobal();
+        \\    holder.opaqueCall();
+        \\    holder.readAfter(touch(&holder));
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    const cases = .{
+        .{ "holder.read", true },
+        .{ "holder.readConst", true },
+        .{ "holder.write", false },
+        .{ "holder.writeGlobal", false },
+        .{ "holder.opaqueCall", false },
+        .{ "holder.readAfter", false },
+    };
+    inline for (cases) |case| {
+        var selected: ?Ast.Node.Index = null;
+        for (0..tree.nodes.len) |index| {
+            const node: Ast.Node.Index = @enumFromInt(index);
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, node) orelse continue;
+            if (std.mem.eql(u8, value_range.nodeSrc(tree, call.ast.fn_expr), case[0])) {
+                selected = node;
+                break;
+            }
+        }
+        const node = selected orelse return error.TestUnexpectedResult;
+        const declaration = tokens.enclosingFnDecl(tree, tree.firstToken(node)) orelse
+            return error.TestUnexpectedResult;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse
+            return error.TestUnexpectedResult;
+        const body = tokens.bodyOf(tree, declaration) orelse return error.TestUnexpectedResult;
+        var oracle: Oracle = .{
+            .gpa = gpa,
+            .tree = tree,
+            .body = body,
+            .query = .numeric_range,
+            .target = "",
+            .use_token = tree.firstToken(node),
+            .cache = &cache,
+            .locals = (try cache.localBindings(proto, body)).items,
+        };
+        defer oracle.deinit();
+        try collectEscapeRoots(&oracle);
+        try std.testing.expectEqual(case[1], pathSurvivesCall(&oracle, "holder.count", .{ .subtree = node }));
+        try std.testing.expectEqual(@as(?value_range.QueryError, null), oracle.summary_error);
+    }
 }

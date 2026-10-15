@@ -2032,7 +2032,6 @@ test "shared syntax keeps incoming rebind at its live query horizon" {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const site = probeSite(tree) orelse return error.TestUnexpectedResult;
     var before: ?Ast.Node.Index = null;
     for (tree.nodes.items(.tag), 0..) |_, raw| {
@@ -2080,7 +2079,6 @@ test "shared producer syntax does not borrow the caller release horizon" {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const site = probeSite(tree) orelse return error.TestUnexpectedResult;
     var returning: ?Ast.Node.Index = null;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
@@ -2674,7 +2672,6 @@ fn expectTypedProbePathsBudget(
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var found = false;
     for (tree.nodes.items(.tag), 0..) |_, raw| {
         const node: Ast.Node.Index = @enumFromInt(raw);
@@ -3243,7 +3240,6 @@ fn expectTypedHandoff(source: [:0]const u8, expected: bool) !void {
     var cache = FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var found = false;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .@"return") continue;

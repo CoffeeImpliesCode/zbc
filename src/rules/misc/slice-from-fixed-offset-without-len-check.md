@@ -45,6 +45,19 @@ confirmed matches.
   (`self.buf[N..]`) — the receiver type provides more context that Tier 1
   cannot see; flag only at Tier 4 with ZLS type resolution.
 - Not fired for `buf[0..]` — zero-offset open slices are always safe.
+- The shared value-range oracle also checks the minimum length at the slice
+  expression. It reads guarded allocation counts, fixed array extents, and
+  checked helper return lengths. These facts describe the current slice
+  header; a rebind or a call that can change that header invalidates them.
+- An offset equal to the length is valid: the result is an empty suffix.
+  A nonempty token therefore permits `[1..]`, but an iterator that can return
+  an empty token does not establish that bound.
+- A normal command-line invocation is not a proof that every supported
+  launcher supplies `argv[0]`. Without an explicit nonempty argument contract,
+  `argsAlloc` followed by `args[1..]` remains unproven.
+
+The rule retains legacy token suppressions listed above. A source review of
+one site does not establish that an entire file is safe.
 
 ## Real-world instances
 

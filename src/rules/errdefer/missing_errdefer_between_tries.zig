@@ -10,9 +10,10 @@
 //!   2. For ownership-transfer methods, require `<Type>` to be
 //!      title-cased AND to have a `deinit` (or be unknown — we
 //!      pass through cross-file types conservatively).
-//!   3. From each binding, scan forward for the next `try`.  If a
-//!      `defer`/`errdefer` referencing X appears between, protected.
-//!      Otherwise fire.
+//!   3. At the next failure, require an active cleanup of the exact
+//!      binding/value. Copies retain their capture-time identity.
+//!   4. A field publication can inherit caller cleanup only through a
+//!      complete declaration-bound caller census and actual-argument map.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -37,6 +38,8 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .missing_errdefer_between_tries)) return;
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
 
     const model = try cache.fileModel();
     var proto_buf: [1]Ast.Node.Index = undefined;
@@ -77,7 +80,7 @@ fn checkFn(
     const last = tree.lastToken(body);
     if (!tokens.hasTokenInRange(tags, first, last, .keyword_try)) return;
 
-    const bindings = try cache.localBindings(proto, body);
+    const bindings = (try cache.localBindings(proto, body)).*;
 
     var tracked: std.ArrayListUnmanaged(TrackedBinding) = .empty;
     defer tracked.deinit(gpa);
@@ -97,7 +100,7 @@ fn checkFn(
         //     var arena = ArenaAllocator.init(...);
         //     defer arena.deinit();
         //     const x = try foo(arena.allocator(), ...);
-        if (rhsArenaIsDeferDeinited(tree, b.rhs_first, b.rhs_last, first, last)) continue;
+        if (try rhsArenaIsDeferDeinited(cache, &bindings, body, b)) continue;
 
         // Extract the FIRST call's (type, method) — the OLD walker
         // semantics.  Works for any rhs shape including chains and
@@ -147,11 +150,8 @@ fn checkFn(
             if (rhsTypeViaZlsLacksDeinit(cache, model, tags, b)) continue;
         } else if (isFileHandleOpenerMethod(meth)) {
             is_fd_open = true;
-            // FD wrapped into a helper struct with defer cleanup:
-            // `const fd = try sys.openat(...); const file = sys.File{
-            // .handle = fd }; defer file.close();` — the wrapper
-            // owns the fd's lifetime via its own defer.  Skip.
-            if (fdWrappedAndDeferred(tree, tags, b, last)) continue;
+            // Ownership is checked at the actual later failure, not by
+            // searching for a future wrapper/defer anywhere in the body.
         } else continue;
 
         try tracked.append(gpa, .{
@@ -191,23 +191,16 @@ fn checkFn(
                     if (depth < 0) break; // left binding's scope
                 },
                 .keyword_defer, .keyword_errdefer => {
-                    if (cleanupReferencesLocal(tree, u, b.x_name, last)) {
-                        has_cleanup = true;
-                        break;
+                    // Registration is not execution. In particular a try
+                    // inside the deferred body is not this scope's next try.
+                    if (deferredNodeAt(tree, u)) |deferred| {
+                        u = tree.lastToken(deferred);
                     }
                 },
                 .keyword_try => {
                     found_try = true;
-                    // Consumption-by-call skip: if the next `try`'s
-                    // call passes `<x_name>` (or `&<x_name>`) as an
-                    // arg, the call is the consumer.  The bound
-                    // resource is transferred into the called fn's
-                    // ownership; success or failure of the call is
-                    // the resource's transition point, not a leak
-                    // window the caller must defend.
-                    if (nextCallPassesArg(tree, tags, u, last, b.x_name)) {
-                        has_cleanup = true;
-                    }
+                    const original = bindings.findAt(b.x_name, b.name_token) orelse break;
+                    has_cleanup = try protectedAt(cache, proto, body, original, u);
                     break;
                 },
                 else => {},
@@ -219,97 +212,34 @@ fn checkFn(
     }
 }
 
-/// True iff the `try` at `try_tok` is followed by a CALL whose
-/// argument list mentions `<arg_name>` as a bare identifier
-/// (\`name\` or `&name`).  Walks the source from the next `(`
-/// matching paren-depth to find the call's args, then scans for
-/// the identifier with a word-boundary check.
-fn nextCallPassesArg(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    try_tok: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    arg_name: []const u8,
-) bool {
-    // Find the first `(` after the try (within the next ~50 tokens).
-    var p: Ast.TokenIndex = try_tok + 1;
-    const scan_lim: Ast.TokenIndex = if (try_tok + 50 < last) try_tok + 50 else last;
-    while (p <= scan_lim and tags[p] != .l_paren) : (p += 1) {}
-    if (p > scan_lim or tags[p] != .l_paren) return false;
-    const close = tokens.matchParen(tags, p, last) orelse return false;
-    var k: Ast.TokenIndex = p + 1;
-    while (k < close) : (k += 1) {
-        if (tags[k] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(k), arg_name)) continue;
-        // Word-boundary check: no preceding `.` (field access) and
-        // not part of a longer identifier (already implied by .identifier).
-        if (k > 0 and tags[k - 1] == .period) continue;
-        return true;
-    }
-    return false;
-}
 
 const ParsedCall = struct {
     type_name: []const u8,
     method: []const u8,
 };
 
-/// Walk forward through an `<ident>(.<ident>)*(...)` chain starting
-/// at `start`.  Returns (type_name, method) where `method` is the
-/// LAST identifier before the first `(`, and `type_name` is the
-/// one immediately before it.  Returns null when the chain isn't
-/// at least `<Type>.<method>(`.
-/// Detect `<arena>.allocator()` in the binding's RHS where `<arena>`
-/// has a `defer <arena>.deinit(...)` in the fn body.  Used to skip
-/// the rule on arena-rooted bindings — the arena's defer handles
-/// cleanup on every return (success or error), so an errdefer for
-/// the binding itself is redundant.
+/// Only the SDK arena accessor and the same active owner cleanup can
+/// discharge this obligation. A later or shadowed defer is not proof.
 fn rhsArenaIsDeferDeinited(
-    tree: *const Ast,
-    rhs_first: Ast.TokenIndex,
-    rhs_last: Ast.TokenIndex,
-    body_first: Ast.TokenIndex,
-    body_last: Ast.TokenIndex,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    // Scan the RHS for `<ident> . allocator (` patterns and collect
-    // the receiver names.
-    var t: Ast.TokenIndex = rhs_first;
-    while (t + 3 <= rhs_last) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "allocator")) continue;
-        if (tags[t + 3] != .l_paren) continue;
-        // Walking back to ensure this isn't `something.<ident>.allocator()` —
-        // we want the bare `<arena_name>.allocator()` receiver.  An
-        // immediately-preceding `.` means it's a chained access; the
-        // arena name is whatever the chain root is, but the canonical
-        // pattern uses a plain local, so be conservative.
-        if (t > rhs_first and tags[t - 1] == .period) continue;
-        const arena_name = tree.tokenSlice(t);
-        if (deferDeinitOf(tree, arena_name, body_first, body_last)) return true;
-    }
-    return false;
-}
-
-/// True iff the fn body contains `defer <arena_name>.deinit(` anywhere.
-fn deferDeinitOf(
-    tree: *const Ast,
-    arena_name: []const u8,
-    body_first: Ast.TokenIndex,
-    body_last: Ast.TokenIndex,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    var u: Ast.TokenIndex = body_first;
-    while (u + 4 <= body_last) : (u += 1) {
-        if (tags[u] != .keyword_defer) continue;
-        if (tags[u + 1] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(u + 1), arena_name)) continue;
-        if (tags[u + 2] != .period) continue;
-        if (tags[u + 3] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(u + 3), "deinit")) continue;
-        if (u + 4 <= body_last and tags[u + 4] == .l_paren) return true;
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    body: Ast.Node.Index,
+    binding: local_bindings.Binding,
+) file_cache_mod.SummaryError!bool {
+    const tree = cache.tree;
+    const resolver = cache.zls orelse return false;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (tree.firstToken(node) < binding.rhs_first or tree.lastToken(node) > binding.rhs_last) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+        const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(method), "allocator")) continue;
+        const actual = (try resolver.resolutionFrame().containerOfNode(receiver)) orelse continue;
+        if (!try resolver.declaredInToolchainFile(actual.scope_handle.handle, "/std/heap/ArenaAllocator.zig")) continue;
+        const owner = (try expressionTarget(cache, bindings, receiver, binding.rhs_last)) orelse continue;
+        if (try activeCleanup(cache, bindings, body, owner, binding.rhs_last)) return true;
     }
     return false;
 }
@@ -429,73 +359,6 @@ fn isPrimitiveBaseName(name: []const u8) bool {
     if (lead == 'f' or lead == 'u' or lead == 'i') {
         for (name[1..]) |c| if (c < '0' or c > '9') return false;
         return true;
-    }
-    return false;
-}
-
-/// True iff `Type` has a `deinit` method discoverable in the
-/// FileModel.  Conservative: cross-file / unknown types pass through
-/// (true) so we don't miss real bugs whose types are declared in
-/// another file.  Returns false only when the type IS in the local
-/// file AND demonstrably has no `deinit`.
-/// Detect the FD-wrap-with-defer-cleanup pattern: the fd binding
-/// is immediately consumed into a helper struct's `.handle = <fd>`
-/// field, and that helper has a `defer <helper>.close();` (or
-/// `.deinit()`) within the same scope.  The wrapper takes
-/// ownership of the fd; cleanup flows through the wrapper.
-fn fdWrappedAndDeferred(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    b: anytype,
-    body_last: Ast.TokenIndex,
-) bool {
-    // Scan forward from the binding's terminating `;` for a
-    // `<wrapper> = <SomeType>{ .handle = <name> }` shape — find
-    // the wrapper local name.  Bound to K=30 tokens for cheapness.
-    var t: Ast.TokenIndex = b.rhs_last + 1;
-    var i: u32 = 0;
-    while (t + 6 < body_last and i < 30) : ({
-        t += 1;
-        i += 1;
-    }) {
-        // Pattern: `const <wrapper> = <TypeRef>{ .handle = <name>, ... };`
-        if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
-        if (t + 1 >= body_last or tags[t + 1] != .identifier) continue;
-        const wrapper_name = tree.tokenSlice(t + 1);
-        // Walk forward for `.handle = <b.name>` within the struct
-        // literal.  Bound by `;`.
-        var u: Ast.TokenIndex = t + 2;
-        while (u + 4 <= body_last and tags[u] != .semicolon) : (u += 1) {
-            if (tags[u] != .period) continue;
-            if (tags[u + 1] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(u + 1), "handle")) continue;
-            if (tags[u + 2] != .equal) continue;
-            if (tags[u + 3] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(u + 3), b.name)) continue;
-            // Found the wrap.  Now look for a defer on the wrapper
-            // within the remaining body.
-            if (deferCleanupOn(tree, tags, wrapper_name, u, body_last)) return true;
-        }
-    }
-    return false;
-}
-
-fn deferCleanupOn(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
-    name: []const u8,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) bool {
-    var u: Ast.TokenIndex = start;
-    while (u + 4 <= end) : (u += 1) {
-        if (tags[u] != .keyword_defer and tags[u] != .keyword_errdefer) continue;
-        if (tags[u + 1] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(u + 1), name)) continue;
-        if (tags[u + 2] != .period) continue;
-        if (tags[u + 3] != .identifier) continue;
-        const m = tree.tokenSlice(u + 3);
-        if (std.mem.eql(u8, m, "close") or std.mem.eql(u8, m, "deinit")) return true;
     }
     return false;
 }
@@ -620,51 +483,389 @@ fn typeHasDeinitProject(
     return true;
 }
 
-/// True iff the `defer` / `errdefer` at `kw` mentions `x_name` in
-/// its (inline or block) body.  Any mention is treated as cleanup
-/// — covers receiver form (`X.cleanup()`) AND arg form
-/// (`self.close_socket(X)`, `alloc.free(X)`).
-fn cleanupReferencesLocal(tree: *const Ast, kw: Ast.TokenIndex, x_name: []const u8, last: Ast.TokenIndex) bool {
+
+const CleanupTarget = struct {
+    declaration: Ast.TokenIndex,
+    field: ?[]const u8 = null,
+
+    fn eql(a: CleanupTarget, b: CleanupTarget) bool {
+        if (a.declaration != b.declaration) return false;
+        if (a.field) |field| return std.mem.eql(u8, field, b.field orelse return false);
+        return b.field == null;
+    }
+};
+
+fn deferredNodeAt(tree: *const Ast, token: Ast.TokenIndex) ?Ast.Node.Index {
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .@"defer" and tag != .@"errdefer") continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (tree.firstToken(node) == token) return node;
+    }
+    return null;
+}
+
+fn deferredBody(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    return if (tree.nodeTag(node) == .@"defer")
+        tree.nodeData(node).node
+    else
+        tree.nodeData(node).opt_token_and_node[1];
+}
+
+/// A value copy snapshots its initializer. A deferred expression instead
+/// reads its receiver when the error leaves the block.
+fn valueTarget(
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    evaluated_at: Ast.TokenIndex,
+) file_cache_mod.SummaryError!?CleanupTarget {
+    const tree = cache.tree;
+    const node = cache.nodeForExactSpan(first, last) orelse return null;
+    try cache.enterNormalCleanup(node);
+    defer cache.leaveNormalCleanup();
+    try cache.chargeNormalCleanup(node);
     const tags = tree.tokens.items(.tag);
-    if (kw + 1 > last) return false;
-    // Inline form: scan until the next `;` at depth 0.
-    if (tags[kw + 1] != .l_brace and tags[kw + 1] != .pipe) {
-        var paren: u32 = 0;
-        var t: Ast.TokenIndex = kw + 1;
-        while (t <= last) : (t += 1) {
-            switch (tags[t]) {
-                .l_paren => paren += 1,
-                .r_paren => if (paren > 0) {
-                    paren -= 1;
-                },
-                .semicolon => if (paren == 0) break,
-                .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true,
+    if (tags[first] != .identifier) return null;
+    const binding = bindings.findAt(tree.tokenSlice(first), first) orelse return null;
+    // Reject assignments to THIS declaration, not a same-spelled shadow.
+    var t = binding.rhs_last + 1;
+    while (t + 1 <= evaluated_at and t + 1 < tags.len) : (t += 1) {
+        if (tags[t] != .identifier or tags[t + 1] != .equal) continue;
+        if (t > 0 and tags[t - 1] == .period) continue;
+        const assigned = bindings.findAt(tree.tokenSlice(t), t) orelse continue;
+        if (assigned.name_token == binding.name_token) return null;
+    }
+    if (last == first + 2 and tags[first + 1] == .period and tags[last] == .identifier)
+        return .{ .declaration = binding.name_token, .field = tree.tokenSlice(last) };
+    if (first != last) return null;
+    if (binding.origin == .alias) {
+        return valueTarget(cache, bindings, binding.rhs_first, binding.rhs_last, binding.rhs_last);
+    }
+    if (binding.origin == .loop_capture and binding.rhs_first < binding.name_token) {
+        if (try valueTarget(cache, bindings, binding.rhs_first, binding.rhs_last, binding.rhs_last)) |captured|
+            return captured;
+    }
+    return .{ .declaration = binding.name_token };
+}
+
+fn expressionTarget(
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    node: Ast.Node.Index,
+    evaluated_at: Ast.TokenIndex,
+) file_cache_mod.SummaryError!?CleanupTarget {
+    const tree = cache.tree;
+    if (tree.nodeTag(node) == .address_of)
+        return expressionTarget(cache, bindings, tree.nodeData(node).node, evaluated_at);
+    return valueTarget(cache, bindings, tree.firstToken(node), tree.lastToken(node), evaluated_at);
+}
+
+fn cleanupMethod(name: []const u8) bool {
+    return std.mem.eql(u8, name, "close") or std.mem.eql(u8, name, "deinit") or
+        std.mem.eql(u8, name, "deref") or std.mem.eql(u8, name, "free") or
+        std.mem.eql(u8, name, "destroy");
+}
+
+/// Deliberately small positive witness: direct cleanup, a straight-line
+/// block, or an optional payload of the exact owned field. Arbitrary
+/// conditional cleanup never supplies an all-error-exits certificate.
+fn actionCleans(
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    action: Ast.Node.Index,
+    target: CleanupTarget,
+    risk: Ast.TokenIndex,
+) file_cache_mod.SummaryError!bool {
+    const tree = cache.tree;
+    try cache.enterNormalCleanup(action);
+    defer cache.leaveNormalCleanup();
+    try cache.chargeNormalCleanup(action);
+    var block_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&block_buffer, action)) |statements| {
+        for (statements) |statement| {
+            if (try actionCleans(cache, bindings, statement, target, risk)) return true;
+            switch (tree.nodeTag(statement)) {
+                .@"return", .@"break", .@"continue" => return false,
                 else => {},
             }
+            if (!try preservesOrCleans(cache, bindings, statement, target, risk)) return false;
         }
         return false;
     }
-    // Optional capture (errdefer only): `errdefer |err| { … }`.
-    var scan_start: Ast.TokenIndex = kw + 1;
-    if (tags[scan_start] == .pipe) {
-        scan_start += 1;
-        while (scan_start <= last and tags[scan_start] != .pipe) : (scan_start += 1) {}
-        if (scan_start > last) return false;
-        scan_start += 1;
+    if (tree.fullIf(action)) |branch| {
+        if (branch.error_token != null or branch.payload_token == null) return false;
+        const held = (try expressionTarget(cache, bindings, branch.ast.cond_expr, risk)) orelse return false;
+        if (!CleanupTarget.eql(held, target)) return false;
+        return actionCleans(cache, bindings, branch.ast.then_expr, target, risk);
     }
-    if (scan_start > last or tags[scan_start] != .l_brace) return false;
-    var depth: u32 = 1;
-    var t: Ast.TokenIndex = scan_start + 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => {
-                depth -= 1;
-                if (depth == 0) break;
-            },
-            .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true,
-            else => {},
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, action) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+    const name = tree.tokenSlice(method);
+    if (!cleanupMethod(name)) return false;
+    const argument_cleanup = std.mem.eql(u8, name, "free") or std.mem.eql(u8, name, "destroy");
+    if (argument_cleanup) {
+        for (call.ast.params) |argument| {
+            const held = (try expressionTarget(cache, bindings, argument, risk)) orelse continue;
+            if (CleanupTarget.eql(held, target)) return true;
         }
+    } else if (try expressionTarget(cache, bindings, receiver, risk)) |held| {
+        if (CleanupTarget.eql(held, target)) return true;
+    }
+    // A parent destructor is interpreted in its actual declaration/frame.
+    // Do not attach a same-named method from an unrelated owner.
+    if (target.field == null) return false;
+    const held = (try expressionTarget(cache, bindings, receiver, risk)) orelse return false;
+    if (held.declaration != target.declaration or held.field != null) return false;
+    // Method calls are indexed by the field-access dot, not its member name.
+    const query = tree.nodeMainToken(call.ast.fn_expr);
+    const canonical = (try cache.actualCallSummaryAt(query, null)) orelse return false;
+    if (canonical.callee.tree != tree) return false;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, canonical.callee.declaration) orelse return false;
+    const body = tokens.bodyOf(tree, canonical.callee.declaration) orelse return false;
+    var parameter_iterator = proto.iterate(tree);
+    const self_parameter = parameter_iterator.next() orelse return false;
+    const self_name = self_parameter.name_token orelse return false;
+    var argument_buffer: [2]Ast.Node.Index = undefined;
+    const actual_receiver = (try canonical.callArgumentFor(cache, &argument_buffer, 0)) orelse return false;
+    const mapped = (try expressionTarget(cache, bindings, actual_receiver, risk)) orelse return false;
+    if (!CleanupTarget.eql(mapped, held)) return false;
+    const callee_bindings = (try cache.localBindings(proto, body)).*;
+    return actionCleans(cache, &callee_bindings, body, .{
+        .declaration = self_name,
+        .field = target.field,
+    }, tree.lastToken(body));
+}
+
+/// A later LIFO action must preserve the selected value or release it
+/// before replacing it. Rooted call effects, not unrelated SDK calls,
+/// determine whether a selected field can change.
+fn preservesOrCleans(
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    action: Ast.Node.Index,
+    target: CleanupTarget,
+    risk: Ast.TokenIndex,
+) file_cache_mod.SummaryError!bool {
+    const tree = cache.tree;
+    try cache.enterNormalCleanup(action);
+    defer cache.leaveNormalCleanup();
+    try cache.chargeNormalCleanup(action);
+    if (try actionCleans(cache, bindings, action, target, risk)) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, action)) |statements| {
+        for (statements) |statement| {
+            if (try actionCleans(cache, bindings, statement, target, risk)) return true;
+            if (!try preservesOrCleans(cache, bindings, statement, target, risk)) return false;
+        }
+        return true;
+    }
+    if (tree.fullIf(action)) |branch| {
+        if (!try preservesOrCleans(cache, bindings, branch.ast.cond_expr, target, risk)) return false;
+        if (!try preservesOrCleans(cache, bindings, branch.ast.then_expr, target, risk)) return false;
+        if (branch.ast.else_expr.unwrap()) |other|
+            return preservesOrCleans(cache, bindings, other, target, risk);
+        return true;
+    }
+    switch (tree.nodeTag(action)) {
+        .assign => {
+            const lhs, const rhs = tree.nodeData(action).node_and_node;
+            if (try expressionTarget(cache, bindings, lhs, tree.firstToken(action))) |held| {
+                if (held.declaration == target.declaration and
+                    (held.field == null or CleanupTarget.eql(held, target))) return false;
+            }
+            return preservesOrCleans(cache, bindings, rhs, target, risk);
+        },
+        .@"defer", .@"errdefer" => return true, // registration only
+        .@"try" => return preservesOrCleans(cache, bindings, tree.nodeData(action).node, target, risk),
+        .identifier, .field_access, .number_literal, .string_literal, .enum_literal => return true,
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const declaration = tree.fullVarDecl(action).?;
+            return preservesOrCleans(cache, bindings, declaration.ast.init_node.unwrap() orelse return true, target, risk);
+        },
+        else => {},
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, action) orelse {
+        // All children are inspected; a conditional cleanup is still
+        // not an all-path cleanup certificate.
+        var children = @import("type_engine").AstIterator.init(tree, action);
+        while (children.next(tree)) |child|
+            if (!try preservesOrCleans(cache, bindings, child, target, risk)) return false;
+        return true;
+    };
+    const query = tree.nodeMainToken(call.ast.fn_expr);
+    const canonical = (try cache.actualCallSummaryAt(query, null)) orelse {
+        // Unknown calls are harmless only when none of their actuals
+        // can reach this local owner. Passing it is never safe by default.
+        for (call.ast.params) |argument| {
+            if (try expressionTarget(cache, bindings, argument, tree.firstToken(action))) |held|
+                if (held.declaration == target.declaration) return false;
+        }
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+            const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+            if (try expressionTarget(cache, bindings, receiver, tree.firstToken(action))) |held|
+                if (held.declaration == target.declaration and
+                    (held.field == null or CleanupTarget.eql(held, target))) return false;
+        }
+        return true;
+    };
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(canonical.callee.tree, &proto_buffer, canonical.callee.declaration) orelse return false;
+    var parameters = proto.iterate(canonical.callee.tree);
+    var parameter: u32 = 0;
+    while (parameters.next()) |formal| : (parameter += 1) {
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        const argument = (try canonical.callArgumentFor(cache, &argument_buffer, parameter)) orelse return false;
+        const held = (try expressionTarget(cache, bindings, argument, tree.firstToken(action))) orelse continue;
+        if (held.declaration != target.declaration) continue;
+        if (held.field != null and !CleanupTarget.eql(held, target)) continue;
+        const selected_path = if (held.field == null) target.field orelse "" else "";
+        if (try cache.callEffectAt(query, .{ .parameter = .{
+            .param = parameter,
+            .path = selected_path,
+        } }, .{})) |effect| {
+            if (effect == .read_only) continue;
+        }
+        if (canonical.callee.tree != tree) return false;
+        const callee_body = tokens.bodyOf(tree, canonical.callee.declaration) orelse return false;
+        const callee_bindings = (try cache.localBindings(proto, callee_body)).*;
+        if (!try preservesOrCleans(cache, &callee_bindings, callee_body, .{
+            .declaration = formal.name_token orelse return false,
+            .field = if (held.field == null) target.field else null,
+        }, tree.lastToken(callee_body))) return false;
+    }
+    return true;
+}
+
+fn activeCleanup(
+    cache: *file_cache_mod.FileCache,
+    bindings: *const local_bindings.LocalBindings,
+    body: Ast.Node.Index,
+    target: CleanupTarget,
+    risk: Ast.TokenIndex,
+) file_cache_mod.SummaryError!bool {
+    const tree = cache.tree;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const block: Ast.Node.Index = @enumFromInt(raw);
+        const first = tree.firstToken(block);
+        if (first < tree.firstToken(body) or first > risk or tree.lastToken(block) < risk) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, block) orelse continue;
+        for (statements, 0..) |statement, index| {
+            const registration = tree.firstToken(statement);
+            if (registration >= risk) break;
+            const tag = tree.nodeTag(statement);
+            if (tag != .@"defer" and tag != .@"errdefer") continue;
+            if (!try actionCleans(cache, bindings, deferredBody(tree, statement), target, risk)) continue;
+            var intact = true;
+            for (statements[index + 1 ..]) |later| {
+                if (tree.lastToken(later) >= risk) break;
+                const later_tag = tree.nodeTag(later);
+                const action = if (later_tag == .@"defer" or later_tag == .@"errdefer")
+                    deferredBody(tree, later)
+                else
+                    later;
+                if (!try preservesOrCleans(cache, bindings, action, target, risk)) {
+                    intact = false;
+                    break;
+                }
+            }
+            if (intact) return true;
+        }
+    }
+    return false;
+}
+
+fn protectedAt(
+    cache: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    original: *const local_bindings.Binding,
+    risk: Ast.TokenIndex,
+) file_cache_mod.SummaryError!bool {
+    const tree = cache.tree;
+    const bindings = (try cache.localBindings(proto, body)).*;
+    const target: CleanupTarget = .{ .declaration = original.name_token };
+    if (try activeCleanup(cache, &bindings, body, target, risk)) return true;
+    // Publish only a straight-line store of this precise value before the
+    // failing operation. A conditional store is not ownership transfer.
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .assign) continue;
+        const assignment: Ast.Node.Index = @enumFromInt(raw);
+        const first = tree.firstToken(assignment);
+        if (first <= original.rhs_last or first >= risk) continue;
+        if (!sameDirectBlock(tree, assignment, risk)) continue;
+        const lhs, const rhs = tree.nodeData(assignment).node_and_node;
+        const moved = (try expressionTarget(cache, &bindings, rhs, first)) orelse continue;
+        if (!CleanupTarget.eql(moved, target)) continue;
+        const owner = (try expressionTarget(cache, &bindings, lhs, first)) orelse continue;
+        if (owner.field == null) continue;
+        // The published slot must still hold the captured value at failure.
+        var intact = true;
+        for (tree.nodes.items(.tag), 0..) |_, between_raw| {
+            const between: Ast.Node.Index = @enumFromInt(between_raw);
+            const at = tree.firstToken(between);
+            if (at <= tree.lastToken(assignment) or tree.lastToken(between) >= risk) continue;
+            if (!sameDirectBlock(tree, between, risk)) continue;
+            if (!try preservesOrCleans(cache, &bindings, between, owner, risk)) {
+                intact = false;
+                break;
+            }
+        }
+        if (!intact) continue;
+        if (try activeCleanup(cache, &bindings, body, owner, risk)) return true;
+        const root = bindings.findAt(tree.tokenSlice(tree.firstToken(lhs)), first) orelse continue;
+        if (root.origin != .param) continue;
+        const function = tokens.enclosingFnDecl(tree, first) orelse continue;
+        const calls = (try cache.closedLocalCalls(function)) orelse continue;
+        if (calls.len == 0) continue;
+        var parameters = proto.iterate(tree);
+        var parameter: u32 = 0;
+        while (parameters.next()) |param| : (parameter += 1) {
+            if (param.name_token != root.name_token) continue;
+            var all_owned = true;
+            for (calls) |call_node| {
+                try cache.chargeNormalCleanup(call_node);
+                const call_token = tree.firstToken(call_node);
+                // Only propagation of this invocation enters the parent's
+                // error domain; catch handlers need their own proof.
+                if (call_token == 0 or tree.tokenTag(call_token - 1) != .keyword_try) {
+                    all_owned = false;
+                    break;
+                }
+                var argument_buffer: [2]Ast.Node.Index = undefined;
+                const resolver = cache.zls orelse return false;
+                const argument = (try resolver.resolutionFrame().callArgumentIn(&argument_buffer, call_node, parameter)) orelse return false;
+                const caller = tokens.enclosingFnDecl(tree, call_token) orelse return false;
+                var caller_proto_buffer: [1]Ast.Node.Index = undefined;
+                const caller_proto = tokens.fnProto(tree, &caller_proto_buffer, caller) orelse return false;
+                const caller_body = tokens.bodyOf(tree, caller) orelse return false;
+                const caller_bindings = (try cache.localBindings(caller_proto, caller_body)).*;
+                var actual = (try expressionTarget(cache, &caller_bindings, argument, call_token)) orelse return false;
+                if (actual.field != null) return false;
+                actual.field = owner.field;
+                if (!try activeCleanup(cache, &caller_bindings, caller_body, actual, call_token)) {
+                    all_owned = false;
+                    break;
+                }
+            }
+            if (all_owned) return true;
+        }
+    }
+    return false;
+}
+
+fn sameDirectBlock(tree: *const Ast, statement: Ast.Node.Index, risk: Ast.TokenIndex) bool {
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const block: Ast.Node.Index = @enumFromInt(raw);
+        if (tree.firstToken(block) > risk or tree.lastToken(block) < risk) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, block) orelse continue;
+        for (statements) |child| if (child == statement) return true;
     }
     return false;
 }
@@ -963,4 +1164,354 @@ test "imported type without deinit is not judged by a same-named local type with
         \\    try later();
         \\}
     ));
+}
+
+test "missing-errdefer-between-tries: moved local has active cleanup" {
+    try testing.expectNoFire(check,
+        \\fn f(dir: anytype) !void {
+        \\    const opened = try dir.openFile("x", .{});
+        \\    var handle = opened;
+        \\    defer handle.close();
+        \\    try later();
+        \\}
+        \\fn later() !void {}
+    );
+}
+
+test "missing-errdefer-between-tries: cleanup value binding and error domains" {
+    const prefix =
+        \\const File = struct { fn close(_: File) void {} };
+        \\const Dir = struct { fn openFile(_: Dir, _: []const u8, _: anytype) !File { return .{}; } };
+        \\fn later() !void {}
+    ;
+    const cases = .{
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir, other: File) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    var handle = opened;
+            \\    defer handle.close();
+            \\    handle = other;
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir, yes: bool) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    if (yes) { defer opened.close(); }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir, other: File) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    { const opened = other; defer opened.close(); }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    defer { _ = opened; }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    defer { var copy = opened; copy = .{}; copy.close(); }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    try later();
+            \\    defer opened.close();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir, yes: bool) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    errdefer { if (yes) opened.close(); }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 0),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    errdefer |err| { _ = err; opened.close(); }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 0),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    defer { var copy = opened; copy.close(); }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 0),
+            \\fn f(dir: Dir, other: File) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    var handle = opened;
+            \\    const saved = handle;
+            \\    handle = other;
+            \\    defer saved.close();
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    var handle = opened;
+            \\    defer handle.close();
+            \\    errdefer { handle = .{}; }
+            \\    try later();
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    try inspect(opened);
+            \\}
+            \\fn inspect(_: File) !void {}
+        },
+        .{ @as(usize, 0),
+            \\fn f(dir: Dir) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    const maybe: ?File = opened;
+            \\    if (maybe) |held| { defer held.close(); try later(); }
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\fn f(dir: Dir, other: File) !void {
+            \\    const opened = try dir.openFile("x", .{});
+            \\    const maybe: ?File = other;
+            \\    if (maybe) |held| { defer held.close(); try later(); }
+            \\}
+        },
+    };
+    inline for (cases) |case| {
+        var problems = try testing.runRule(std.testing.allocator, check, prefix ++ "\n" ++ case[1]);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case[0], problems.items.len);
+    }
+}
+
+test "missing-errdefer-between-tries: closed caller owns published optional field" {
+    const prefix =
+        \\const File = struct { fn close(_: File) void {} };
+        \\const Dir = struct { fn openDir(_: Dir, _: []const u8, _: anytype) !File { return .{}; } };
+        \\const Owner = struct {
+        \\    dir: Dir,
+        \\    slot: ?File = null,
+        \\    fn close(self: *Owner) void {
+        \\        if (self.slot) |held| { held.close(); self.slot = null; }
+        \\    }
+        \\};
+        \\fn later() !void {}
+        \\fn fill(owner: *Owner) !void {
+        \\    const opened = try owner.dir.openDir("raw", .{});
+        \\    owner.slot = opened;
+        \\    try later();
+        \\}
+    ;
+    const cases = .{
+        .{ @as(usize, 0),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    defer owner.close();
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 0),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    errdefer owner.close();
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 0),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    defer owner.close();
+            \\    defer if (owner.slot) |held| { held.close(); owner.slot = null; };
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    defer owner.close();
+            \\    errdefer { owner.slot = null; }
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    errdefer owner.close();
+            \\    fill(&owner) catch {};
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    var other: Owner = .{ .dir = .{} };
+            \\    defer other.close();
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\pub fn root(yes: bool) !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    if (yes) { defer owner.close(); }
+            \\    try fill(&owner);
+            \\}
+        },
+        .{ @as(usize, 1),
+            \\pub fn root() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    defer owner.close();
+            \\    try fill(&owner);
+            \\}
+            \\pub fn unowned() !void {
+            \\    var owner: Owner = .{ .dir = .{} };
+            \\    try fill(&owner);
+            \\}
+        },
+    };
+    inline for (cases) |case| {
+        var problems = try testing.runRuleTyped(std.testing.allocator, check, prefix ++ "\n" ++ case[1]);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case[0], problems.items.len);
+    }
+}
+
+test "missing-errdefer-between-tries: published value cannot change slots before failure" {
+    const prefix =
+        \\const File = struct { fn close(_: File) void {} };
+        \\const Dir = struct { fn openDir(_: Dir, _: []const u8, _: anytype) !File { return .{}; } };
+        \\const Owner = struct {
+        \\    dir: Dir,
+        \\    slot: ?File = null,
+        \\    other: ?File = null,
+        \\    fn close(self: *Owner) void { if (self.slot) |held| held.close(); }
+        \\};
+        \\fn later() !void {}
+        \\pub fn root() !void {
+        \\    var owner: Owner = .{ .dir = .{} };
+        \\    defer owner.close();
+        \\    try fill(&owner);
+        \\}
+    ;
+    const cases = .{
+        \\fn fill(owner: *Owner) !void {
+        \\    const opened = try owner.dir.openDir("raw", .{});
+        \\    owner.slot = opened;
+        \\    owner.slot = null;
+        \\    try later();
+        \\}
+        ,
+        \\fn fill(owner: *Owner) !void {
+        \\    const opened = try owner.dir.openDir("raw", .{});
+        \\    owner.other = opened;
+        \\    try later();
+        \\}
+        ,
+    };
+    inline for (cases) |source| {
+        var problems = try testing.runRuleTyped(std.testing.allocator, check, prefix ++ "\n" ++ source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    }
+}
+
+test "missing-errdefer-between-tries: SDK published directory keeps canonical LIFO owner" {
+    // Result.zig:586 publishes rawdir before allocation. Its caller registers
+    // close before conditional discard; discard must release or preserve rawdir.
+    const prefix =
+        \\const std = @import("std");
+        \\const Backing = struct {
+        \\    dir: std.Io.Dir,
+        \\    raw_open: ?std.Io.Dir = null,
+        \\    other: ?std.Io.Dir = null,
+    ;
+    const close =
+        \\    fn close(self: *Backing, io: std.Io) void {
+        \\        if (self.raw_open) |dir| {
+        \\            dir.close(io);
+        \\            self.raw_open = null;
+        \\        }
+        \\        self.dir.close(io);
+        \\    }
+    ;
+    const suffix =
+        \\};
+        \\fn buildBundle(allocator: std.mem.Allocator, io: std.Io, backing: *Backing) !void {
+        \\    const rawdir = try backing.dir.openDir(io, "raw", .{
+        \\        .iterate = true,
+        \\        .follow_symlinks = false,
+        \\    });
+        \\    backing.raw_open = rawdir;
+        \\    const entries = try allocator.alloc(u8, 2);
+        \\    defer allocator.free(entries);
+        \\}
+        \\pub fn publish(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, retain: bool) !void {
+        \\    var backing: Backing = .{ .dir = dir };
+        \\    defer backing.close(io);
+        \\    defer if (!retain) backing.discard(io);
+        \\    try buildBundle(allocator, io, &backing);
+        \\}
+    ;
+    const cases = .{
+        .{ @as(usize, 0), close,
+            \\    fn discard(self: *Backing, io: std.Io) void {
+            \\        if (self.raw_open) |dir| {
+            \\            dir.close(io);
+            \\            self.raw_open = null;
+            \\        }
+            \\    }
+        },
+        .{ @as(usize, 1), close,
+            \\    fn discard(self: *Backing, io: std.Io) void {
+            \\        _ = io;
+            \\        self.raw_open = null;
+            \\    }
+        },
+        .{ @as(usize, 1),
+            \\    fn close(self: *Backing, io: std.Io) void {
+            \\        if (self.other) |dir| dir.close(io);
+            \\        self.dir.close(io);
+            \\    }
+            ,
+            \\    fn discard(_: *Backing, _: std.Io) void {}
+        },
+        .{ @as(usize, 1),
+            \\    fn close(self: *Backing, io: std.Io) void {
+            \\        _ = self.raw_open;
+            \\        self.dir.close(io);
+            \\    }
+            ,
+            \\    fn discard(_: *Backing, _: std.Io) void {}
+        },
+        .{ @as(usize, 0), close,
+            \\    fn discard(self: *Backing, io: std.Io) void {
+            \\        _ = io;
+            \\        self.other = null;
+            \\    }
+        },
+    };
+    inline for (cases) |case| {
+        const source = prefix ++ "\n" ++ case[1] ++ "\n" ++ case[2] ++ "\n" ++ suffix;
+        var problems = try testing.runRuleTyped(std.testing.allocator, check, source);
+        defer freeProblems(std.testing.allocator, &problems);
+        try std.testing.expectEqual(case[0], problems.items.len);
+    }
 }

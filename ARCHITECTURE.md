@@ -28,6 +28,8 @@ Zig allows copying undefined bytes. Transport preserves holes in the destination
 A later selected read of a proved-undefined part reports at that read.
 Selected reads include indexing, field access, arithmetic, comparisons, branches, and passing a selected element by value.
 Transporting an entirely proved-undefined value reports, except for the intentional literal `return undefined;`.
+That whole-transport proof must hold over all settled incoming alternatives at the observation.
+Positive progress on any incoming path defeats it, without repairing a selected byte or granting a value.
 Unknown values alone remain silent and supply no positive initialization certificate.
 Copies from container-level constants carry unknown holes, not undefined holes.
 A direct selected read on the constant still reports proved-undefined bytes.
@@ -35,6 +37,29 @@ Strict initialization certificates are unchanged.
 Prefix joins first record common numeric predicates while each input still has its original bounds.
 They retain path-local predicates until empty-prefix entailment is checked, then remove predicates not proved by both inputs.
 Capacity-clipped push prefixes require a capacity guard at a selected read; copying a count does not remove that requirement.
+A natural-exit `for (0..count)` fill requires a fixed local array and an unsigned,
+immutable, non-aliased count. Its own non-aliased index capture is defined on each executed store.
+A call with an unavailable RHS value recipe can retain only a diagnostic written prefix.
+That prefix keeps the array payload unknown and supplies no strict selected-value certificate.
+Source-backed scalar or whole-result poison supplies no prefix repair; known child holes remain.
+Selected RHS dependencies and the loop-count negative obligation remain in diagnostic replay.
+An aggregate getter's child stays negative across a bounded fill only when every settled
+return alternative proves that exact physical child entirely undefined.
+The current preloop byte snapshot must also prove the same child undefined over the full array.
+An earlier initialized child or unknown seed defeats that full-array witness.
+This is diagnostic-only byte propagation: it grants no initialized value or constructor invariant.
+Adding that authenticated negative snapshot is not another source write.
+It retains the diagnostic physical prefix only when the array payload is already unknown.
+Ordinary stores and strict initialized-value coverage still use normal invalidation.
+Later selected writes repair only their own bytes; an alias escape invalidates retained byte facts.
+Dynamic indexed reads retain the selected physical child separately from the index term.
+Sibling child masks do not poison that read. Whole-element reads still inspect all element bytes.
+This byte selection does not create dynamic resource keys or change strict value certificates.
+An untouched feasible path stays distinct from a possible overwrite that would hide its byte witness.
+Settled replay gathers possible placements in scratch storage, not in the first reached path.
+An opposite evaluated boolean arm makes only its recorded positive-write scope unknown.
+A path that never evaluated that flag keeps its independent negative witness.
+The existing path-state limit remains strict; exhaustion reports incomplete analysis.
 
 `index-type-narrowing-wraparound`, `intfromfloat-without-clamp`, and `f32-narrowing-int-to-float` retain advisory warnings.
 They warn when the required integer range, finite conversion range, or exact float representation is not proved.
@@ -122,7 +147,7 @@ Initialize a `Session` in place with an allocator, `std.Io`, and `SourcePolicy`.
 Do not move or copy it after initialization. Each CLI worker owns a separate session.
 The allocator and I/O backend must outlive the session.
 `initWithToolchain` also borrows its caller-owned `Toolchain` until session teardown.
-Policy roots, exclusions, and their strings remain borrowed and unchanged during that lifetime.
+Policy roots, exclusions, build-file grants, and their strings remain borrowed and unchanged during that lifetime.
 Roots must be canonical absolute paths. Empty roots deny all source access.
 Exclusions override roots, including roots nested within an excluded subtree.
 
@@ -140,16 +165,40 @@ An excluded import cannot authorize a wider scan.
 Relative imports resolve from the importing document's directory.
 Named imports resolve from statically parsed `build.zig` module declarations and import chains.
 The analyzer reads build scripts. It does not execute them.
-Discovered environments must agree on a named module's declared root.
-Conflicting or missing mappings stay unresolved, and source policy still gates a resolved root.
+Discovered environments must agree on the named module's declaration identity, not only its physical root.
+Conflicting or missing mappings stay unresolved, and source policy still gates every resolved root.
 Lookup follows import edges, not a process-global search for matching type names.
 Type and method identity includes the canonical source declaration, not only a leaf name.
+
+`SourcePolicy.build_files` grants exact canonical absolute `build.zig` paths outside source roots for static metadata only.
+The default list is empty. A grant does not admit that script as a source document or grant its directory.
+The CLI grants only the current directory's governing script when a selected root belongs to that directory.
+The scanner does not enumerate excluded ancestors or dependency trees.
+It records inline imports for both `addModule` and `createModule` after it records all module declarations.
+Immutable aliases and optional labeled-block results retain the exact authored instance.
+Mutable bindings, distinct conditional instances, unsupported branches, and alias-depth exhaustion stay unknown.
+Cancellation or allocation failure publishes neither partial declarations nor a completed-file memo.
+
 
 Contextual actual generic bindings can follow references to ancestor declarations.
 They do not change the lexical container that `@This()` names.
 If the actual and lexical containers have the same canonical owner, resolution retains the actual instantiation.
 Otherwise, resolution instantiates the lexical container with the applicable actual generic bindings.
 A nested container therefore cannot replace an ancestor's self-type alias with its own type.
+
+Inline containers and lexical `@This()` reconstruction retain exact, visible
+comptime type and value bindings from the current canonical frame.
+Integer, Boolean, and known optional-null captures stay distinct between
+instantiations. A known null retains its declared optional type and a separate
+null fact; it does not turn that type into the bare-null type.
+Captures are not copied over arbitrary callee-produced types or unrelated
+file-level declarations.
+
+Known integer constants retain their value through range-checked integer
+coercion, including compatible widening. Unknown and undefined values do not
+become known constants. Type factories select returns only through proved
+conditions, ordered Boolean short-circuiting, and supported comptime statements.
+Unknown branches and unsupported early exits remain unresolved.
 
 Completed type-value memoization retains positive results only.
 A null entry reserves an active recursive query, not a completed unknown result.
@@ -279,6 +328,11 @@ Its keys borrow canonical resolver identities. Cache teardown precedes resolver 
 `ExpressionLoanOptions.scratch` and the internal returned-storage `Query.scratch` borrow a `*std.heap.ArenaAllocator`.
 The caller owns this arena. Query snapshots and expression-loan slices remain valid only while the arena remains alive.
 Expression-loan requests retain explicit load horizons and do not cache result snapshots.
+Forward expression queries do not run a normal defer before its scope exits.
+Their source events and receiver-cell effects use the same timing metadata and exact load horizon.
+Completed inner-scope defers and possible prior loop iterations retain their effects.
+The timing metadata borrows query scratch and participates in frame identity.
+Returned-storage exit summaries and strict callee effect proofs keep their existing semantics.
 Copied-payload and written-cell witnesses are immutable snapshots owned by query scratch.
 The internal `ReplayLog` in `src/cache/return_storage.zig` stores their ordered replay histories in immutable, balanced trees.
 Certificates share complete subtrees or selected ranges instead of expanding repeated occurrences.

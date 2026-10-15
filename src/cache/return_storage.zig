@@ -9,6 +9,21 @@
 //! only caller-independent, complete symbolic returns enter the root memo.
 //! A completed lexical-name index shares each immutable binding-table scan;
 //! individual lookups still resolve exact declaration scope and use horizons.
+//! Read-dependent locations bind both immutable write and payload snapshots;
+//! a changed root invalidates them even when the occurrence count is unchanged.
+//! Inline context addresses retain their exact typed payload projections;
+//! replacing those payloads does not move the physical inline cell.
+//! Canonical arena allocation factories retain their resource receiver as well
+//! as backing provenance. Direct child allocation has no arena-owner channel.
+//! An intrinsic null optional has no retained child payload. This does not
+//! discharge the physical cell selected by a location or address query.
+//! A completed no-address proof concerns a local physical header only. It
+//! neither closes its pointee graph nor erases direct stores or RHS origins.
+//! Scalar copies can have a closed value-bit graph without one source cell.
+//! Only pure actual operands use that call-entry proof; unknown encoded and
+//! undefined values never become a completed empty graph through coordinates.
+//! A bound pointer actual supplies its stored address, not its carrier field.
+//! Unknown field-base types never certify distinct physical roots.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -122,20 +137,38 @@ const Memo = struct {
     loop_windows: std.AutoArrayHashMapUnmanaged(NodeKey, []const LoopWindow) = .empty,
     rebinding_indexes: std.AutoArrayHashMapUnmanaged(NodeKey, RebindingIndex) = .empty,
     cell_types: std.AutoArrayHashMapUnmanaged(NodeKey, std.ArrayListUnmanaged(CellTypeAnswer)) = .empty,
+    private_cells: std.AutoArrayHashMapUnmanaged(PrivateCellKey, std.ArrayListUnmanaged(PrivateCellFacts)) = .empty,
 };
 
 /// One finished `sourceCell`: the same node under a structurally equal frame,
 /// the same expected type and the same selected formal gives the same cell.
+/// Read-dependent answers also bind both immutable replay-log roots.
 const CellAnswer = struct {
     frame: Frame,
     expected: ?TypeResolver.ActualType,
     selected_formal: ?u32,
     cell: ?SourceCell,
+    snapshot: ?struct {
+        writes: ?*const WrittenCellLog.Node,
+        copies: ?*const CopiedPayloadLog.Node,
+    } = null,
 };
 
 const CellTypeAnswer = struct { resolution: TypeResolver.ResolutionFrame, path: []const u8, ty: TypeResolver.ActualType };
 const InvalidationAnswer = struct { frame: Frame, invalidated: bool };
 const AddressBitsAnswer = struct { frame: Frame, selected_formal: ?u32, bits: bool };
+
+const PrivateCellKey = struct { tree: *const Ast, body: Ast.Node.Index, binding: Ast.TokenIndex };
+const PrivateCellFacts = struct {
+    frame: Frame,
+    // All syntactic writes to this root, across both cleanup domains.
+    writes: []const Ast.Node.Index,
+};
+const PrivateCellWalk = struct {
+    uses: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty,
+    writes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    valid: bool = true,
+};
 
 const TypeContext = struct {
     pub fn hash(_: TypeContext, value: TypeResolver.ActualType) u64 {
@@ -306,8 +339,28 @@ fn returnedStorageResolved(query: *Query, cache: *FileCache, actual: FileCache.A
                     }
                 }
             }
+            // Pointer coordinates are bound by the expression-loan consumer,
+            // without a duplicate caller-wide graph walk. Wide scalar copies
+            // still need their exact actual origin proof: a numeric field of
+            // a static constant is not an unknown global storage dependency.
+            var scalar_cell: ?SourceCell = null;
+            if (providers != null) {
+                if (alternative.projection == .payload_value and alternative.element_path == null and mapped.path.len != 0) {
+                    if (try query.sourceCell(frame, mapped.node, null, 0)) |located| {
+                        var selected = located;
+                        selected.path = try query.join(selected.path, mapped.path);
+                        if (try query.cellType(selected, 0)) |selected_type| {
+                            if (try query.addressFree(selected_type, 0)) scalar_cell = located;
+                        }
+                    }
+                }
+                if (scalar_cell == null) {
+                    if (kept) |*items| try items.append(query.scratch.allocator(), alternative);
+                    continue;
+                }
+            }
             var source: Output = .{};
-            const cell = try query.sourceCell(frame, mapped.node, null, 0);
+            const cell: ?SourceCell = if (scalar_cell) |known| known else try query.sourceCell(frame, mapped.node, null, 0);
             // An inline-storage pointer designates the actual's own cell at the
             // path, not a pointer value stored there; its content proves nothing.
             if (alternative.element_path == null and alternative.projection != .cell_address and alternative.storage != .inline_storage and cell != null and cell.?.binding.origin != .param and mapped.path.len != 0) {
@@ -392,6 +445,11 @@ pub const ExpressionLoanRequest = struct {
     selection: storage_alias.StorageSelection,
     horizon: Ast.TokenIndex,
     domain: Domain = .normal,
+    /// Also include payload provenance for these exact local declaration tokens.
+    /// Borrows this slice only during the query. Empty preserves physical-loan
+    /// queries. Retained-value origins are not cell addresses or certificates.
+    /// Unknown call dependencies remain unproved; scalar copies add no loan.
+    retained_bindings: []const Ast.TokenIndex = &.{},
 };
 pub const ExpressionLoan = struct {
     pub const Origin = enum { frame_cell, retained_value };
@@ -400,6 +458,10 @@ pub const ExpressionLoan = struct {
     origin: Origin,
     derivation: Derivation,
     scalar_cell: bool = false,
+    /// Exact retained payload projection. Empty denotes the retained value
+    /// itself; frame-cell and opaque dependency coordinates keep it empty.
+    /// Alias provenance alone does not prove this payload's cleanup/lifetime.
+    payload_path: []const u8 = "",
     /// A possible argument/event dependency is not a positive escape witness.
     /// Keep it for conservative storage queries, but do not report it as a bug.
     proved: bool = true,
@@ -414,6 +476,15 @@ const SourceEvent = struct {
     direct: bool,
     loop_start: Ast.TokenIndex = 0,
     loop_end: Ast.TokenIndex = 0,
+    defer_end: Ast.TokenIndex = 0,
+
+    fn activeBefore(self: SourceEvent, horizon: Ast.TokenIndex) bool {
+        if (self.defer_end == 0 or self.defer_end < horizon) return true;
+        // A previous loop iteration may already have crossed this scope.
+        // A defer in an outer scope is still pending.
+        return self.loop_start != 0 and self.defer_end <= self.loop_end and
+            self.loop_start < horizon and horizon <= self.loop_end;
+    }
 };
 const ExpressionFrame = struct { frame: Frame, events: []const SourceEvent, complete: bool };
 
@@ -454,6 +525,7 @@ pub const ExpressionLoanQuery = struct {
             query.source_events = null;
             if (frame.body != self.options.body) return .{};
             frame.domain = request.domain;
+            frame.source_events = events.items;
             self.frames[domain] = .{ .frame = frame, .events = events.items, .complete = frame.mutations_complete };
         }
         const prepared = self.frames[domain].?;
@@ -467,6 +539,8 @@ pub const ExpressionLoanQuery = struct {
             .events = prepared.events,
             .complete = prepared.complete,
             .load_token = request.horizon,
+            .root_horizon = request.horizon,
+            .retained_bindings = request.retained_bindings,
         };
         try walk.borrow(request.selection.node, request.selection.path, false, 0);
         return .{ .complete = walk.complete, .loans = walk.loans.items };
@@ -522,10 +596,14 @@ const ExpressionWalk = struct {
     complete: bool = true,
     loans: std.ArrayListUnmanaged(ExpressionLoan) = .empty,
     retained: bool = false,
+    retained_bindings: []const Ast.TokenIndex = &.{},
     excluded: []const []const u8 = &.{},
     // Referenced payloads are read now; copied aggregates freeze this horizon
     // at the copy expression before following their initializer.
     load_token: Ast.TokenIndex = 0,
+    // Immutable for this walk. A copied context pointer keeps its referenced
+    // object's live payload at the selected output's horizon.
+    root_horizon: Ast.TokenIndex = 0,
     payload_load: bool = false,
     element_unknown: bool = false,
     capture_load: ?CaptureLoad = null,
@@ -611,22 +689,23 @@ const ExpressionWalk = struct {
             return;
         };
         const size = try self.query.pointerSize(ty);
-        if (size != null) {
-            if (path.len != 0 and size == .one) {
-                var cell = (try self.query.sourceCell(self.frame, node, null, depth + 1)) orelse {
-                    self.complete = false;
-                    return;
-                };
-                cell.path = try self.join(cell.path, path);
-                const selected = (try self.query.cellType(cell, depth + 1)) orelse {
-                    self.complete = false;
-                    return;
-                };
-                if (try self.query.pointerSize(selected) == null)
-                    return self.cellBorrow(node, path, depth + 1);
-            }
-            return self.borrow(node, path, false, depth + 1);
+        if (path.len != 0 and (size == null or size == .one)) {
+            var cell = (try self.query.sourceCell(self.frame, node, null, depth + 1)) orelse {
+                self.complete = false;
+                return;
+            };
+            cell.path = try self.join(cell.path, path);
+            const selected = (try self.query.cellType(cell, depth + 1)) orelse {
+                self.complete = false;
+                return;
+            };
+            const selected_size = try self.query.pointerSize(selected);
+            if (size == .one and selected_size == null)
+                return self.cellBorrow(node, path, depth + 1);
+            if (selected_size != null)
+                return self.borrow(node, path, false, depth + 1);
         }
+        if (size != null) return self.borrow(node, path, false, depth + 1);
         return self.borrow(node, path, true, depth + 1);
     }
 
@@ -870,6 +949,7 @@ const ExpressionWalk = struct {
         for (self.events) |event| {
             try self.charge();
             const horizon = if (event.loop_start < use_token and event.loop_end >= use_token) event.loop_end + 1 else use_token;
+            if (!event.activeBefore(use_token)) continue;
             if (tree.lastToken(event.node) <= binding.rhs_last or tree.firstToken(event.node) >= horizon) continue;
             if (tree.nodeTag(event.node) == .address_of) {
                 if ((try self.bindingPath(tree.nodeData(event.node).node, binding)) != null) poisoned.* = true;
@@ -1097,6 +1177,20 @@ const ExpressionWalk = struct {
         }
         if (path.len == 0) {
             if (try self.query.allocatorBacking(self.frame, node)) |backing| {
+                if (backing.retains_owner) {
+                    if (try self.query.sourceCell(self.frame, backing.receiver, null, depth + 1)) |owner| {
+                        if (owner.frame.cache == self.cache and owner.frame.declaration == self.frame.declaration and
+                            sameInvocation(owner.frame.invocation, self.frame.invocation) and
+                            owner.binding.origin != .param and try self.retainsBinding(owner.binding.name_token))
+                        {
+                            // The canonical arena factory retains this exact
+                            // resource receiver, independently of its child's
+                            // allocation provenance. A direct child call has
+                            // no factory receiver and gets no such owner loan.
+                            try self.addAtPath(owner.binding.name_token, .retained_value, false, owner.path);
+                        }
+                    }
+                }
                 return self.allocationProviderBorrow(backing.receiver, backing.path, depth + 1);
             }
         }
@@ -1296,6 +1390,7 @@ const ExpressionWalk = struct {
         for (self.events) |event| {
             try self.charge();
             const horizon = if (event.loop_start < use_token and event.loop_end >= use_token) event.loop_end + 1 else use_token;
+            if (!event.activeBefore(use_token)) continue;
             if (tree.firstToken(event.node) <= start or tree.lastToken(event.node) >= horizon) continue;
             const tag = tree.nodeTag(event.node);
             if (tag == .assign or tag == .address_of) continue;
@@ -1528,7 +1623,12 @@ const ExpressionWalk = struct {
         try self.captureBorrowSource(binding, path, mode, depth);
         // Only an unresolved source needs a synthetic capture coordinate.
         // A known literal/header forwards its actual physical loans instead.
-        if (!self.complete) try self.add(binding.name_token, .retained_value, false);
+        if (!self.complete) {
+            const saved = self.speculative;
+            self.speculative = true;
+            defer self.speculative = saved;
+            try self.add(binding.name_token, .retained_value, false);
+        }
     }
 
     fn captureBorrowSource(self: *ExpressionWalk, binding: *const bindings_mod.Binding, path: []const u8, mode: CaptureMode, depth: u8) Error!void {
@@ -1610,6 +1710,7 @@ const ExpressionWalk = struct {
                     try self.frozenCaptureLoad(initializer, path, mode, tree.firstToken(initializer), read_horizon, depth + 1);
                     for (self.events) |event| {
                         try self.charge();
+                        if (!event.activeBefore(copy_horizon)) continue;
                         if (tree.nodeTag(event.node) != .assign or tree.lastToken(event.node) >= copy_horizon or tree.firstToken(event.node) <= binding.rhs_last) continue;
                         const pair = tree.nodeData(event.node).node_and_node;
                         if (tree.nodeTag(pair[0]) != .identifier) continue;
@@ -1714,6 +1815,7 @@ const ExpressionWalk = struct {
                 try self.frozenCaptureSelection(initializer, selected.path, path, mode, tree.firstToken(initializer), read_horizon, depth + 1);
                 for (self.events) |event| {
                     try self.charge();
+                    if (!event.activeBefore(copy_horizon)) continue;
                     if (tree.nodeTag(event.node) != .assign or tree.lastToken(event.node) >= copy_horizon or tree.firstToken(event.node) <= selected.binding.rhs_last) continue;
                     const pair = tree.nodeData(event.node).node_and_node;
                     var before = self.frame;
@@ -1753,6 +1855,7 @@ const ExpressionWalk = struct {
             index -= 1;
             try self.charge();
             const event = self.events[index];
+            if (!event.activeBefore(self.load_token)) continue;
             if (tree.nodeTag(event.node) != .assign or tree.lastToken(event.node) >= self.load_token) continue;
             const pair = tree.nodeData(event.node).node_and_node;
             const target = (try self.globalSelection(pair[0], depth + 1)) orelse continue;
@@ -1825,6 +1928,7 @@ const ExpressionWalk = struct {
         for (self.events) |event| {
             try self.charge();
             const horizon = if (event.loop_start < self.load_token and event.loop_end >= self.load_token) event.loop_end + 1 else self.load_token;
+            if (!event.activeBefore(self.load_token)) continue;
             if (tree.lastToken(event.node) >= horizon) continue;
             const saved = self.frame;
             const saved_load = self.load_token;
@@ -1865,6 +1969,7 @@ const ExpressionWalk = struct {
         const tree = self.cache.tree;
         for (self.events) |event| {
             try self.charge();
+            if (!event.activeBefore(horizon)) continue;
             if (tree.nodeTag(event.node) != .assign or tree.lastToken(event.node) >= horizon) continue;
             const destination = tree.nodeData(event.node).node_and_node[0];
             const target = (try self.bindingPath(destination, binding)) orelse continue;
@@ -1900,6 +2005,7 @@ const ExpressionWalk = struct {
             const start = if (binding.origin == .param) binding.name_token else binding.rhs_last;
             // This store has not completed while its own RHS is being read.
             const horizon = if (self.load_token != tree.firstToken(pair[1]) and event.loop_start < use_token and event.loop_end >= use_token) event.loop_end + 1 else use_token;
+            if (!event.activeBefore(use_token)) continue;
             if (tree.firstToken(event.node) <= start or tree.lastToken(event.node) >= horizon) continue;
             if (try self.bindingPath(pair[0], binding)) |target| {
                 if (covered(self.excluded, target)) continue;
@@ -1937,6 +2043,7 @@ const ExpressionWalk = struct {
             const start = if (binding.origin == .param) binding.name_token else binding.rhs_last;
             // Keep other loop writes, not the active RHS's own replacement.
             const horizon = if (self.load_token != tree.firstToken(pair[1]) and event.loop_start < use_token and event.loop_end >= use_token) event.loop_end + 1 else use_token;
+            if (!event.activeBefore(use_token)) continue;
             if (tree.firstToken(event.node) <= start or tree.lastToken(event.node) >= horizon) continue;
             const element = try self.elementTarget(pair[0], depth + 1);
             const target_node = if (element) |target| target.base else pair[0];
@@ -1965,17 +2072,60 @@ const ExpressionWalk = struct {
     }
 
     fn add(self: *ExpressionWalk, token: Ast.TokenIndex, origin: ExpressionLoan.Origin, scalar: bool) Error!void {
+        return self.addAtPath(token, origin, scalar, "");
+    }
+
+    fn addAtPath(self: *ExpressionWalk, token: Ast.TokenIndex, origin: ExpressionLoan.Origin, scalar: bool, path: []const u8) Error!void {
         try self.charge();
-        const loan: ExpressionLoan = .{ .binding_token = token, .origin = origin, .derivation = if (self.derived_origin) .propagated else .direct_address, .scalar_cell = scalar, .proved = !self.speculative };
+        const loan: ExpressionLoan = .{ .binding_token = token, .origin = origin, .derivation = if (self.derived_origin) .propagated else .direct_address, .scalar_cell = scalar, .payload_path = path, .proved = !self.speculative };
         if (origin == .retained_value) self.complete = false;
         for (self.loans.items) |*old| {
-            if (old.binding_token != loan.binding_token or old.origin != loan.origin) continue;
+            if (old.binding_token != loan.binding_token or old.origin != loan.origin or !std.mem.eql(u8, old.payload_path, loan.payload_path)) continue;
             if (loan.derivation == .propagated) old.derivation = .propagated;
             old.scalar_cell = old.scalar_cell and loan.scalar_cell;
             old.proved = old.proved or loan.proved;
             return;
         }
         try self.loans.append(self.query.scratch.allocator(), loan);
+    }
+
+    fn retainsBinding(self: *ExpressionWalk, token: Ast.TokenIndex) Error!bool {
+        for (self.retained_bindings) |selected| {
+            try self.charge();
+            if (selected == token) return true;
+        }
+        return false;
+    }
+
+    fn knownPointerPayload(self: *ExpressionWalk, value: TypeResolver.ActualType, depth: u8) Error!bool {
+        try self.charge();
+        if (depth >= depth_limit) return self.query.depthExhausted(depth);
+        const ty = (try self.query.canonicalType(value)) orelse return false;
+        const tag = self.query.resolver.typeTag(ty) orelse return false;
+        switch (tag) {
+            .pointer, .@"fn" => return true,
+            .optional, .error_union, .array, .vector => {
+                const child = self.query.resolver.childType(ty) orelse return false;
+                return self.knownPointerPayload(child, depth + 1);
+            },
+            .@"struct", .@"union" => {
+                if (ty.data != .container) return false;
+                const container = ty.data.container;
+                const frame = self.query.resolver.frameForContainer(container);
+                const tree = &container.scope_handle.handle.document.tree;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const declaration = tree.fullContainerDecl(&buffer, container.scope_handle.toNode()) orelse return false;
+                for (declaration.ast.members) |member| {
+                    try self.charge();
+                    const field = tree.fullContainerField(member) orelse continue;
+                    const node = field.ast.type_expr.unwrap() orelse continue;
+                    const field_type = (try frame.typeOfNode(node)) orelse continue;
+                    if (try self.knownPointerPayload(field_type, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     const BorrowKind = enum { value, location, cell, dereference, element };
@@ -2113,7 +2263,21 @@ const ExpressionWalk = struct {
                     try self.frameCell(binding, node);
                     return;
                 }
-                if (self.retained) try self.add(binding.name_token, .retained_value, false);
+                if (self.retained) {
+                    try self.add(binding.name_token, .retained_value, false);
+                } else if (try self.retainsBinding(binding.name_token)) {
+                    const cell: SourceCell = .{ .frame = self.frame, .binding = binding, .node = node, .path = path };
+                    const ty = try self.query.cellType(cell, 0);
+                    const known_payload = if (ty) |value| try self.knownPointerPayload(value, 0) else false;
+                    if (known_payload) {
+                        try self.addAtPath(binding.name_token, .retained_value, false, path);
+                    } else if (ty == null) {
+                        const saved = self.speculative;
+                        self.speculative = true;
+                        defer self.speculative = saved;
+                        try self.add(binding.name_token, .retained_value, false);
+                    }
+                }
                 self.derived_origin = true;
                 const initializer = self.cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse {
                     self.complete = false;
@@ -2261,6 +2425,28 @@ const ExpressionWalk = struct {
                                 // An implicit address names the actual header,
                                 // not the storage carried by its initializer.
                                 try self.cellBorrow(cell.node, cell.path, depth + 1);
+                                if (try self.query.cellType(cell, depth + 1)) |selected_type| {
+                                    if (try self.knownPointerPayload(selected_type, depth + 1)) {
+                                        const saved_frame = self.frame;
+                                        const saved_load = self.load_token;
+                                        const saved_payload = self.payload_load;
+                                        self.frame = cell.frame;
+                                        self.frame.return_token = self.root_horizon;
+                                        self.load_token = self.root_horizon;
+                                        self.payload_load = true;
+                                        defer {
+                                            self.frame = saved_frame;
+                                            self.load_token = saved_load;
+                                            self.payload_load = saved_payload;
+                                        }
+                                        // The address keeps only this selected
+                                        // object's payload, not sibling fields
+                                        // in the receiver that contains it.
+                                        try self.borrow(cell.node, cell.path, false, depth + 1);
+                                    } else if (!try self.query.addressFree(selected_type, depth + 1)) {
+                                        self.complete = false;
+                                    }
+                                } else self.complete = false;
                                 return;
                             }
                         }
@@ -2281,6 +2467,10 @@ const ExpressionWalk = struct {
                     var selected: Output = .{};
                     try self.query.selectedCallStorage(at_call, node, canonical, path, &selected, depth + 1);
                     if (selected.complete and selected.items.items.len == 0) {
+                        // This projection has no payload or allocation channel.
+                        // Prior unrelated unknowns and loans remain unchanged;
+                        // they do not require replaying sibling providers here.
+                        if (selected.allocations.items.len == 0) return;
                         var independent = true;
                         const before = self.loans.items.len;
                         for (selected.allocations.items) |requirement| {
@@ -2896,6 +3086,9 @@ const ExpressionWalk = struct {
                 .frame = self.frame.resolution,
             })) return;
             self.complete = false;
+            const saved_speculative = self.speculative;
+            self.speculative = true;
+            defer self.speculative = saved_speculative;
             if (node_type) |ty| {
                 // An unknown scalar array child is still unknown, but cannot
                 // carry the physical argument cell as its storage origin.
@@ -2960,6 +3153,7 @@ const Frame = struct {
     bindings: bindings_mod.LocalBindings,
     resolution: TypeResolver.ResolutionFrame,
     mutations: []const Ast.Node.Index = &.{},
+    source_events: []const SourceEvent = &.{},
     mutations_ordered: bool = false,
     caught_errors: []const Ast.Node.Index = &.{},
     return_token: Ast.TokenIndex = 0,
@@ -2996,6 +3190,7 @@ fn sameFrame(a: Frame, b: Frame) bool {
         a.return_token != b.return_token or a.domain != b.domain or a.symbolic != b.symbolic or
         a.source_return != b.source_return or a.mutations_complete != b.mutations_complete or
         a.mutations.ptr != b.mutations.ptr or a.mutations.len != b.mutations.len or
+        a.source_events.ptr != b.source_events.ptr or a.source_events.len != b.source_events.len or
         a.caught_errors.ptr != b.caught_errors.ptr or a.caught_errors.len != b.caught_errors.len or
         !sameResolution(a.resolution, b.resolution)) return false;
     if (a.projected_return) |left| {
@@ -3039,6 +3234,7 @@ const EffectDemand = struct {
     cell: SourceCell,
     horizon: Ast.TokenIndex,
     domain: Domain,
+    private_slot: bool = false,
 };
 // A cycle-free call-effect scan for one demanded cell, reusable verbatim
 // where frame, call, cell, domain and result coordinate agree.
@@ -3245,6 +3441,8 @@ const Query = struct {
     source_direct: bool = true,
     source_loop_start: Ast.TokenIndex = 0,
     source_loop_end: Ast.TokenIndex = 0,
+    source_scope_end: Ast.TokenIndex = 0,
+    source_defer_end: Ast.TokenIndex = 0,
     source_domain: Domain = .normal,
     mutation_errdefer: bool = false,
     mutation_ordered: bool = true,
@@ -3832,14 +4030,25 @@ const Query = struct {
         const saved_direct = self.source_direct;
         const saved_loop_start = self.source_loop_start;
         const saved_loop_end = self.source_loop_end;
+        const saved_scope_end = self.source_scope_end;
+        const saved_defer_end = self.source_defer_end;
         defer {
             self.source_direct = saved_direct;
             self.source_loop_start = saved_loop_start;
             self.source_loop_end = saved_loop_end;
+            self.source_scope_end = saved_scope_end;
+            self.source_defer_end = saved_defer_end;
         }
         if (self.source_events != null and (tree.fullWhile(node) != null or tree.fullFor(node) != null)) {
             self.source_loop_start = tree.firstToken(node);
             self.source_loop_end = tree.lastToken(node);
+        }
+        if (self.source_events != null) {
+            switch (tree.nodeTag(node)) {
+                .block, .block_semicolon, .block_two, .block_two_semicolon => self.source_scope_end = tree.lastToken(node),
+                .@"defer" => self.source_defer_end = @max(self.source_defer_end, self.source_scope_end),
+                else => {},
+            }
         }
         const previous_count = result.items.len;
         var complete = true;
@@ -3891,6 +4100,7 @@ const Query = struct {
                     .direct = self.source_direct,
                     .loop_start = self.source_loop_start,
                     .loop_end = self.source_loop_end,
+                    .defer_end = self.source_defer_end,
                 });
             }
             self.source_direct = self.source_direct and
@@ -4129,6 +4339,63 @@ const Query = struct {
         return try self.addressFree(ty, 0) and !try self.hasAddressBits(frame, node, depth);
     }
 
+    fn scalarValueType(self: *Query, value: TypeResolver.ActualType, depth: u32) Error!bool {
+        try self.charge();
+        if (depth >= 32) {
+            self.cutoffs += 1;
+            return false;
+        }
+        const ty = (try self.canonicalType(value)) orelse return false;
+        return switch (self.resolver.typeTag(ty) orelse return false) {
+            .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" => true,
+            .optional, .error_union => self.scalarValueType(self.resolver.childType(ty) orelse return false, depth + 1),
+            else => false,
+        };
+    }
+
+    /// A scalar actual is copied at call entry. The existing entry horizon
+    /// precedes argument evaluation, so use it only when the complete operand
+    /// list has no runtime effects. Impure actuals keep the source/refusal path.
+    fn valueOperand(self: *Query, tree: *const Ast, node: Ast.Node.Index, depth: u32) Error!bool {
+        try self.charge();
+        if (depth >= 64) {
+            self.cutoffs += 1;
+            return false;
+        }
+        const tag = tree.nodeTag(node);
+        if (hasAssignOperands(tag) or tree.fullFor(node) != null or tree.fullWhile(node) != null) return false;
+        switch (tag) {
+            .call, .call_one, .call_comma, .call_one_comma,
+            .assign_destructure, .@"asm", .asm_simple,
+            .@"return", .@"break", .@"continue", .@"defer", .@"errdefer",
+            => return false,
+            .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => {
+                if (!valueBuiltin(tree.tokenSlice(tree.nodeMainToken(node)))) return false;
+            },
+            else => {},
+        }
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child|
+            if (!try self.valueOperand(tree, child, depth + 1)) return false;
+        return true;
+    }
+
+    fn actualScalarBits(self: *Query, caller: Frame, actual: FileCache.ActualCallSummary, parameter: u32, depth: u32) Error!?bool {
+        try self.charge();
+        const parameters = actual.callee.reference.actual_type.data.function.parameters;
+        if (parameter >= parameters.len or !try self.scalarValueType(parameters[parameter].type, 0)) return null;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const operands = TypeResolver.CallOperands.full(caller.cache.tree, &buffer, actual.callee.call_node) orelse return null;
+        if (!try self.valueOperand(caller.cache.tree, operands.ast.fn_expr, 0)) return null;
+        for (operands.ast.params) |argument| {
+            try self.charge();
+            if (!try self.valueOperand(caller.cache.tree, argument, 0)) return null;
+        }
+        var argument_buffer: [2]Ast.Node.Index = undefined;
+        const argument = (try actual.callArgumentFor(caller.cache, &argument_buffer, parameter)) orelse return null;
+        return try self.hasAddressBits(caller, argument, depth + 1);
+    }
+
     /// Close a local scalar dependency graph by joining its initializer and
     /// every reaching store. A loop edge adds no encoded source of its own.
     /// Unknown effects stay unknown; a result that leaned on an older open
@@ -4159,6 +4426,208 @@ const Query = struct {
         }
         try self.memo.loop_windows.put(self.scratch.allocator(), key, windows.items);
         return windows.items;
+    }
+
+    /// A field path may select bytes of the local header, never bytes reached
+    /// through a pointer, an optional payload, a union, or array backing.
+    fn privateCellSelection(self: *Query, cell: SourceCell) Error!bool {
+        var parent = cell;
+        parent.path = "";
+        _ = (try self.cellType(parent, 0)) orelse return false;
+        var segments = std.mem.tokenizeScalar(u8, cell.path, '.');
+        while (segments.next()) |segment| {
+            try self.charge();
+            const ty = (try self.cellType(parent, 0)) orelse return false;
+            if (self.resolver.typeTag(ty) != .@"struct") return false;
+            parent.path = try self.join(parent.path, segment);
+        }
+        return (try self.cellType(parent, 0)) != null;
+    }
+
+    /// Prove address privacy over the whole lexical body, not the current
+    /// effect prefix. This records direct writes; it does not discharge them.
+    fn privateCellFacts(self: *Query, cell: SourceCell) Error!?PrivateCellFacts {
+        try self.charge();
+        const frame = cell.frame;
+        if (!frame.mutations_complete or frame.source_return != null or
+            cell.binding.origin == .param or cell.binding.origin == .loop_capture or
+            !try self.privateCellSelection(cell)) return null;
+        var invocation = frame.invocation;
+        while (invocation) |bound| {
+            try self.charge();
+            if (bound.caller.source_return != null) return null;
+            invocation = bound.caller.invocation;
+        }
+        const key: PrivateCellKey = .{ .tree = frame.cache.tree, .body = frame.body, .binding = cell.binding.name_token };
+        if (self.memo.private_cells.get(key)) |known_list| {
+            for (known_list.items) |known| {
+                try self.charge();
+                if (known.frame.cache == frame.cache and known.frame.declaration == frame.declaration and
+                    known.frame.invocation == frame.invocation and known.frame.symbolic == frame.symbolic and
+                    sameResolution(known.frame.resolution, frame.resolution)) return known;
+            }
+        }
+        const reads = self.written_reads;
+        const writes = self.written_cells.root;
+        const copies = self.copied_payloads.root;
+        const prunes = self.prunes;
+        const attempt = self.beginAttempt();
+        var walk: PrivateCellWalk = .{};
+        defer walk.uses.deinit(self.scratch.allocator());
+        _ = self.privateCellWalk(frame, frame.body, cell.binding, &walk, 0) catch |err| {
+            _ = self.endAttempt(attempt);
+            return err;
+        };
+        const clean = self.endAttempt(attempt) and self.prunes == prunes and
+            self.written_reads == reads and self.written_cells.root == writes and self.copied_payloads.root == copies;
+        if (!walk.valid or !clean) return null;
+        const result: PrivateCellFacts = .{ .frame = frame, .writes = walk.writes.items };
+        const known = try self.memo.private_cells.getOrPut(self.scratch.allocator(), key);
+        if (!known.found_existing) known.value_ptr.* = .empty;
+        try known.value_ptr.append(self.scratch.allocator(), result);
+        return result;
+    }
+
+    fn privateCellWalk(self: *Query, frame: Frame, node: Ast.Node.Index, binding: *const bindings_mod.Binding, walk: *PrivateCellWalk, depth: u32) Error!bool {
+        try self.charge();
+        if (depth >= 64) {
+            self.cutoffs += 1;
+            walk.valid = false;
+            return false;
+        }
+        const tree = frame.cache.tree;
+        const tag = tree.nodeTag(node);
+        if (tag == .@"asm" or tag == .asm_simple or tag == .assign_destructure) {
+            walk.valid = false;
+            return false;
+        }
+        var used = false;
+        if (tag == .identifier) {
+            const token = tree.nodeMainToken(node);
+            if (std.mem.eql(u8, tree.tokenSlice(token), binding.name)) {
+                if (try self.lookupBinding(frame.bindings, binding.name, token)) |found|
+                    used = found.name_token == binding.name_token;
+            }
+        }
+        var children = Iterator.init(tree, node);
+        while (children.next(tree)) |child| {
+            used = try self.privateCellWalk(frame, child, binding, walk, depth + 1) or used;
+            if (!walk.valid) return false;
+        }
+        if (used) try walk.uses.put(self.scratch.allocator(), node, {});
+        switch (tag) {
+            .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                // Address forging cannot establish local address privacy.
+                if (std.mem.eql(u8, name, "@ptrFromInt") or std.mem.eql(u8, name, "@frameAddress") or
+                    std.mem.eql(u8, name, "@returnAddress") or
+                    (used and (!valueBuiltin(name) or std.mem.eql(u8, name, "@field")))) walk.valid = false;
+            },
+            .address_of, .slice, .slice_open, .slice_sentinel => {
+                if (used) walk.valid = false;
+            },
+            else => {},
+        }
+        if (!walk.valid or !used) return used;
+        if (tree.fullIf(node)) |branch| {
+            if (branch.payload_token) |capture| {
+                if (tree.tokenTag(capture) == .asterisk and walk.uses.contains(branch.ast.cond_expr)) walk.valid = false;
+            }
+        }
+        if (tree.fullWhile(node)) |branch| {
+            if (branch.payload_token) |capture| {
+                if (tree.tokenTag(capture) == .asterisk and walk.uses.contains(branch.ast.cond_expr)) walk.valid = false;
+            }
+        }
+        if (tree.fullFor(node)) |branch| {
+            for (branch.ast.inputs) |input| {
+                try self.charge();
+                if (!walk.uses.contains(input)) continue;
+                var capture = branch.payload_token;
+                while (capture < tree.firstToken(branch.ast.then_expr)) : (capture += 1) {
+                    try self.charge();
+                    if (tree.tokenTag(capture) == .asterisk) walk.valid = false;
+                }
+            }
+        }
+        if (tree.fullSwitch(node)) |selection| {
+            if (walk.uses.contains(selection.ast.condition)) {
+                for (selection.ast.cases) |case| {
+                    try self.charge();
+                    const prong = tree.fullSwitchCase(case) orelse {
+                        walk.valid = false;
+                        continue;
+                    };
+                    if (prong.payload_token) |capture| {
+                        if (tree.tokenTag(capture) == .asterisk) walk.valid = false;
+                    }
+                }
+            }
+        }
+        if (!walk.valid) return used;
+        if (hasAssignOperands(tag) and walk.uses.contains(tree.nodeData(node).node_and_node[0]))
+            try walk.writes.append(self.scratch.allocator(), node);
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (TypeResolver.CallOperands.full(tree, &buffer, node)) |operands| {
+            if (!try self.privateCallValues(frame, node, operands, walk)) walk.valid = false;
+        }
+        return used;
+    }
+
+    fn privateArgumentValue(self: *Query, frame: Frame, argument: Ast.Node.Index, parameter_type: TypeResolver.ActualType) Error!bool {
+        var formal = (try self.canonicalType(parameter_type)) orelse return false;
+        var depth: u32 = 0;
+        while (self.resolver.typeTag(formal) == .optional or self.resolver.typeTag(formal) == .error_union) {
+            try self.charge();
+            if (depth >= 64) {
+                self.cutoffs += 1;
+                return false;
+            }
+            depth += 1;
+            formal = (try self.canonicalType(self.resolver.childType(formal) orelse return false)) orelse return false;
+        }
+        const formal_tag = self.resolver.typeTag(formal) orelse return false;
+        if (formal_tag != .pointer) return true;
+        const argument_type = (try self.nodeType(frame, argument)) orelse return false;
+        const actual = (try self.canonicalType(argument_type)) orelse return false;
+        // An existing pointer is copied. A struct/array implicitly referenced
+        // for a pointer formal would instead expose this local's own bytes.
+        if (self.resolver.typeTag(actual) == .pointer) return true;
+        if (self.resolver.typeTag(actual) != .@"fn") return false;
+        const child = (try self.canonicalType(self.resolver.childType(formal) orelse return false)) orelse return false;
+        return self.resolver.typeTag(child) == .@"fn";
+    }
+
+    fn privateCallValues(self: *Query, frame: Frame, node: Ast.Node.Index, operands: TypeResolver.CallOperands, walk: *const PrivateCellWalk) Error!bool {
+        try self.charge();
+        if (try frame.cache.actualCallSummaryAt(operands.queryToken(frame.cache.tree, node), frame.resolution)) |actual| {
+            const function = actual.callee.reference.actual_type.data.function;
+            if (function.has_varargs) return false;
+            const offset = actual.argument_offset orelse return false;
+            if (function.parameters.len != operands.ast.params.len + offset) return false;
+            for (function.parameters, 0..) |parameter, index| {
+                try self.charge();
+                var buffer: [2]Ast.Node.Index = undefined;
+                const argument = (try actual.callArgumentFor(frame.cache, &buffer, @intCast(index))) orelse return false;
+                if (walk.uses.contains(argument) and !try self.privateArgumentValue(frame, argument, parameter.type)) return false;
+            }
+            return true;
+        }
+        // A stored function pointer has explicit arguments, not an implicit
+        // receiver. Its signature proves only this argument/address map; it
+        // never identifies the callback body or certifies readonly effects.
+        const selected = (try self.nodeType(frame, operands.ast.fn_expr)) orelse return false;
+        const pointer = (try self.canonicalType(selected)) orelse return false;
+        if (self.resolver.pointerSize(pointer) != .one) return false;
+        const callable = (try self.canonicalType(self.resolver.childType(pointer) orelse return false)) orelse return false;
+        if (callable.data != .function) return false;
+        const function = callable.data.function;
+        if (function.has_varargs or function.parameters.len != operands.ast.params.len) return false;
+        for (function.parameters, operands.ast.params) |parameter, argument| {
+            try self.charge();
+            if (walk.uses.contains(argument) and !try self.privateArgumentValue(frame, argument, parameter.type)) return false;
+        }
+        return true;
     }
 
     fn scalarCellBits(self: *Query, frame: Frame, node: Ast.Node.Index, binding: *const bindings_mod.Binding, path: []const u8, reader: ?Frame, depth: u32) Error!bool {
@@ -4218,9 +4687,17 @@ const Query = struct {
         var origins: Output = .{};
         try self.projectExpression(before, initial, path, .value, "", &origins, depth + 1);
         if (!origins.complete or origins.items.items.len != 0 or origins.allocations.items.len != 0) return true;
-        try self.effectsFor(selected, .{ .frame = selected, .node = node, .binding = binding, .path = path }, selected.return_token, selected.domain, "", &origins, depth + 1);
+        const cell: SourceCell = .{ .frame = selected, .node = node, .binding = binding, .path = path };
+        const private = try self.privateCellFacts(cell);
+        if (private) |facts| {
+            // Only deposit events are restricted. Keep the ORIGINAL frame for
+            // every RHS, so another local's earlier stores remain visible.
+            try self.effectsForNodes(selected, cell, selected.return_token, selected.domain, "", &origins, depth + 1, facts.writes);
+        } else {
+            try self.effectsFor(selected, cell, selected.return_token, selected.domain, "", &origins, depth + 1);
+        }
         if (current) |read| {
-            if (!sameFrameBody(read, selected) or !sameInvocation(read.invocation, selected.invocation)) {
+            if (private == null and (!sameFrameBody(read, selected) or !sameInvocation(read.invocation, selected.invocation))) {
                 // The actual pointee can also receive stores in the callee
                 // executing this read. Its caller's pre-call contents alone
                 // are never a proof of the value now being returned.
@@ -4311,14 +4788,18 @@ const Query = struct {
             },
             .identifier => {
                 const token = tree.nodeMainToken(node);
-                // `null`, `true`, `false` and `undefined` are constants, not storage.
-                for ([_][]const u8{ "null", "true", "false", "undefined" }) |constant| {
+                // Undefined bits are not a completed empty value graph.
+                if (std.mem.eql(u8, tree.tokenSlice(token), "undefined")) return true;
+                for ([_][]const u8{ "null", "true", "false" }) |constant| {
                     if (std.mem.eql(u8, tree.tokenSlice(token), constant)) return false;
                 }
                 if (try self.lookupBinding(frame.bindings, tree.tokenSlice(token), token)) |binding| {
                     if (binding.origin == .param and try self.invalidated(frame, node)) return true;
                     if (binding.origin == .param) {
                         if (frame.invocation != null) {
+                            const parameter = (try self.formalIndex(frame, binding)) orelse return true;
+                            const invocation = frame.invocation.?;
+                            if (try self.actualScalarBits(invocation.caller, invocation.actual, parameter, depth + 1)) |bits| return bits;
                             const source = (try self.actualSource(frame, binding, "", depth + 1)) orelse return true;
                             return self.hasAddressBits(source.frame, source.node, depth + 1);
                         }
@@ -5060,6 +5541,38 @@ const Query = struct {
         return .{ .frame = caller, .node = argument };
     }
 
+    /// Implicit pointer coercion addresses an actual inline slot, regardless
+    /// of writes to that slot's payload. Keep only an authenticated formal
+    /// root reached through typed inline fields; a stored intermediate pointer,
+    /// rebound formal, foreign invocation, or unknown type is not this proof.
+    fn inlineActualOwner(self: *Query, frame: Frame, actual: FileCache.ActualCallSummary, parameter: u32, argument: Ast.Node.Index, path: []const u8, depth: u32) Error!?fn_summary.ParamPath {
+        const source = (try self.actualArgumentSource(frame, actual, parameter, argument, null, depth + 1)) orelse return null;
+        const cell = source.cell orelse return null;
+        if (cell.frame.cache != frame.cache or cell.frame.declaration != frame.declaration or
+            !sameInvocation(cell.frame.invocation, frame.invocation) or cell.binding.origin != .param) return null;
+        if (try self.rebound(frame, cell.binding, frame.return_token, &.{})) return null;
+        const owner = (try self.formalIndex(frame, cell.binding)) orelse return null;
+        const selected = try self.join(cell.path, path);
+        var parent = cell;
+        parent.path = "";
+        const root_type = (try self.cellType(parent, depth + 1)) orelse return null;
+        if (try self.pointerSize(root_type) != .one) return null;
+        var segments = std.mem.tokenizeScalar(u8, selected, '.');
+        var first = true;
+        while (segments.next()) |segment| {
+            try self.charge();
+            var ty = (try self.cellType(parent, depth + 1)) orelse return null;
+            if (first)
+                ty = (try self.canonicalType(self.resolver.childType(ty) orelse return null)) orelse return null;
+            first = false;
+            if (self.resolver.typeTag(ty) != .@"struct") return null;
+            parent.path = try self.join(parent.path, segment);
+        }
+        // Resolving the selected field closes the path, not its deep payload.
+        if (try self.cellType(parent, depth + 1) == null) return null;
+        return .{ .param = owner, .path = selected };
+    }
+
     /// Project the actual returned value in its bound invocation frame. This
     /// is a storage proof, not SDK header freshness: allocator dependencies,
     /// mutations, unknown alternatives and errors remain in the same output.
@@ -5256,40 +5769,44 @@ const Query = struct {
                     }
                     const selected: SourceCell = .{ .frame = frame, .binding = binding, .node = node, .path = path };
                     const horizon = if (frame.return_token != 0) frame.return_token else token;
-                    // Authenticate a mutable source only after checking the
-                    // calls before this use as well as its direct writes.
-                    if (!binding.is_const) {
-                        var effects: Output = .{};
-                        try self.effectsFor(frame, selected, horizon, frame.domain, "", &effects, depth + 1);
-                        if (!effects.complete) {
-                            return null;
+                    const private = try self.privateCellFacts(selected);
+                    const unchanged_header = if (private) |facts| facts.writes.len == 0 else false;
+                    if (!unchanged_header) {
+                        // Authenticate a mutable source only after checking the
+                        // calls before this use as well as its direct writes.
+                        if (!binding.is_const) {
+                            var effects: Output = .{};
+                            try self.effectsFor(frame, selected, horizon, frame.domain, "", &effects, depth + 1);
+                            if (!effects.complete) {
+                                return null;
+                            }
                         }
-                    }
-                    self.written_reads += 1;
-                    const writes = self.written_cells;
-                    for (0..writes.len) |index| {
-                        const written = writes.at(index).*;
-                        try self.charge();
-                        if (try self.cellsOverlap(selected, written)) {
-                            return null;
+                        self.written_reads += 1;
+                        const writes = self.written_cells;
+                        for (0..writes.len) |index| {
+                            const written = writes.at(index).*;
+                            try self.charge();
+                            if (try self.cellsOverlap(selected, written)) {
+                                return null;
+                            }
                         }
-                    }
-                    for (frame.mutations) |write| {
-                        try self.charge();
-                        const at = tree.firstToken(write);
-                        if (frame.mutations_ordered and at >= horizon) break;
-                        if (tree.nodeTag(write) != .assign or at <= binding.rhs_last or at >= horizon) continue;
-                        // A discard evaluates its RHS but has no destination.
-                        // Its enclosing assignment starts before this call's
-                        // token and must not invalidate an actual receiver.
-                        const destination = tree.nodeData(write).node_and_node[0];
-                        if (tree.nodeTag(destination) == .identifier and
-                            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(destination)), "_")) continue;
-                        const target = (try self.sourceCell(frame, destination, null, depth + 1)) orelse {
-                            return null;
-                        };
-                        if (try self.cellsOverlap(selected, target)) {
-                            return null;
+                        for (frame.mutations) |write| {
+                            try self.charge();
+                            const at = tree.firstToken(write);
+                            if (frame.mutations_ordered and at >= horizon) break;
+                            if (tree.nodeTag(write) != .assign or at <= binding.rhs_last or at >= horizon) continue;
+                            // A discard evaluates its RHS but has no destination.
+                            // Its enclosing assignment starts before this call's
+                            // token and must not invalidate an actual receiver.
+                            const destination = tree.nodeData(write).node_and_node[0];
+                            if (tree.nodeTag(destination) == .identifier and
+                                std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(destination)), "_")) continue;
+                            const target = (try self.sourceCell(frame, destination, null, depth + 1)) orelse {
+                                return null;
+                            };
+                            if (try self.cellsOverlap(selected, target)) {
+                                return null;
+                            }
                         }
                     }
                     const initial = frame.cache.nodeForExactSpan(binding.rhsFirstAfterTry(tree.tokens.items(.tag)), binding.rhs_last) orelse {
@@ -5370,6 +5887,12 @@ const Query = struct {
             .@"try" => return self.projectExpression(frame, tree.nodeData(node).node, path, mode, result_path, output, depth + 1),
             .grouped_expression, .unwrap_optional => return self.projectExpression(frame, tree.nodeData(node).node_and_token[0], path, mode, result_path, output, depth + 1),
             .error_value => return,
+            .identifier => {
+                // Selecting a child of a proved absent optional is empty, not
+                // an opaque pointee graph. Only its value payload is absent;
+                // physical-cell and address queries keep their normal walk.
+                if (mode == .value and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return;
+            },
             .@"if", .if_simple => {
                 const conditional = tree.fullIf(node).?;
                 try self.charge();
@@ -5389,6 +5912,38 @@ const Query = struct {
             cell.path = try self.join(cell.path, path);
             if (cell.binding.origin != .param and cell.path.len != 0)
                 return self.backingForCell(cell, self.cellHorizon(frame, cell, node), mode, result_path, output, depth + 1);
+            if (cell.binding.origin == .param and cell.path.len != 0 and mode == .value) {
+                const selected_type = (try self.cellType(cell, depth + 1)) orelse {
+                    output.complete = false;
+                    return;
+                };
+                const parameter = (try self.formalIndex(cell.frame, cell.binding)) orelse {
+                    output.complete = false;
+                    return;
+                };
+                // Preserve the incoming channel and every reachable store.
+                // A projected formal field can be initialized by this callee;
+                // forwarding straight to its caller would miss that value.
+                const incoming: Alternative = .{
+                    .owner = .{ .param = parameter, .path = cell.path },
+                    .projection = .payload_value, .storage = .payload_storage,
+                    .result_path = result_path,
+                };
+                const size = try self.pointerSize(selected_type);
+                if (size == .slice or size == .many or size == .c) {
+                    var pointer = incoming;
+                    pointer.projection = .pointer_value;
+                    pointer.storage = .backing_storage;
+                    try self.add(output, pointer);
+                } else if (size == null and try self.addressFree(selected_type, 0) and
+                    !try self.addressNarrow(selected_type, 0))
+                {
+                    try self.add(output, incoming);
+                } else {
+                    try self.payload(selected_type, incoming, true, output, depth + 1);
+                }
+                return self.effectsFor(frame, cell, self.cellHorizon(frame, cell, node), frame.domain, result_path, output, depth + 1);
+            }
         }
         if (try self.sourceAt(frame, node, path, depth + 1)) |source|
             return self.expression(source.frame, source.node, mode, result_path, output, depth + 1);
@@ -5500,21 +6055,70 @@ const Query = struct {
             if (entry.selected_formal == self.selected_formal and entry.frame.invocation == frame.invocation and
                 sameType(entry.expected, expected) and sameFrame(entry.frame, frame))
             {
+                if (entry.snapshot) |snapshot| {
+                    if (snapshot.writes != self.written_cells.root or snapshot.copies != self.copied_payloads.root) continue;
+                }
                 try self.charge();
                 return entry.cell;
             }
         }
-        // Resolving a location reads only the tree, the frame and the type
-        // resolver, unless it falls through to `sourceAt`, which also reads
-        // the cells earlier scans wrote. Those answers are not shared.
+        // Pure locations are independent of replay state. A completed lookup
+        // that reads it can be shared only under the same immutable snapshots,
+        // with no intervening mutation or abandoned dependency.
         const attempt = self.beginAttempt();
         const reads = self.written_reads;
+        const writes = self.written_cells.root;
+        const copies = self.copied_payloads.root;
+        const prunes = self.prunes;
         const answer = try self.sourceCellWalk(frame, node, expected, depth);
-        if (self.endAttempt(attempt) and self.written_reads == reads) {
+        const clean = self.endAttempt(attempt);
+        const independent = self.written_reads == reads;
+        const stable = writes == self.written_cells.root and copies == self.copied_payloads.root and
+            self.prunes == prunes and self.cutoffs == attempt.cutoffs;
+        if (clean and (independent or stable)) {
             const finished = self.memo.source_cells.getPtr(node).?;
-            try finished.append(self.scratch.allocator(), .{ .frame = frame, .expected = expected, .selected_formal = self.selected_formal, .cell = answer });
+            try finished.append(self.scratch.allocator(), .{
+                .frame = frame, .expected = expected, .selected_formal = self.selected_formal, .cell = answer,
+                .snapshot = if (independent) null else .{ .writes = writes, .copies = copies },
+            });
         }
         return answer;
+    }
+
+    /// Qualifier casts preserve a pointer's child type, including when the
+    /// expression resolver cannot infer the cast's result from a field store.
+    /// The bound declaration remains the authority for a formal receiver.
+    fn qualifierPointerType(self: *Query, frame: Frame, node: Ast.Node.Index, depth: u32) Error!?TypeResolver.ActualType {
+        try self.charge();
+        if (depth >= depth_limit) return self.depthExhausted(depth);
+        const tree = frame.cache.tree;
+        if (tree.nodeTag(node) == .grouped_expression)
+            return self.qualifierPointerType(frame, tree.nodeData(node).node_and_token[0], depth + 1);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const arguments = tree.builtinCallParams(&buffer, node) orelse return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        if ((!std.mem.eql(u8, name, "@constCast") and !std.mem.eql(u8, name, "@alignCast")) or arguments.len != 1) return null;
+        const operand = arguments[0];
+        if (tree.nodeTag(operand) == .identifier) {
+            const token = tree.nodeMainToken(operand);
+            if (try self.lookupBinding(frame.bindings, tree.tokenSlice(token), token)) |binding| {
+                if (binding.origin == .param) {
+                    if (frame.invocation) |invocation| {
+                        const parameter = (try self.formalIndex(frame, binding)) orelse return null;
+                        const parameters = invocation.actual.callee.reference.actual_type.data.function.parameters;
+                        if (parameter >= parameters.len) return null;
+                        const formal = (try self.canonicalType(parameters[parameter].type)) orelse return null;
+                        if (self.resolver.pointerSize(formal) == .one) return formal;
+                        return null;
+                    }
+                }
+            }
+        }
+        if (try self.nodeType(frame, operand)) |value| {
+            const ty = (try self.canonicalType(value)) orelse return null;
+            if (self.resolver.pointerSize(ty) == .one) return ty;
+        }
+        return self.qualifierPointerType(frame, operand, depth + 1);
     }
 
     fn sourceCellWalk(self: *Query, frame: Frame, node: Ast.Node.Index, expected: ?TypeResolver.ActualType, depth: u32) Error!?SourceCell {
@@ -5541,25 +6145,25 @@ const Query = struct {
                 // Dereferencing a pointer-valued base follows the stored
                 // address. The final field itself remains a lexical cell:
                 // assigning a pointer field replaces its header, not pointee.
-                if (try self.nodeType(frame, field_node[0])) |ty| {
-                    if (try self.pointerSize(ty) == .one) {
-                        // A receiver formal denotes its actual lexical cell,
-                        // not the aggregate constructor copied into that cell.
-                        // Authenticate the pointee before extending its path;
-                        // pointer-valued fields still need their stored source.
-                        const pointee = (try self.canonicalType(self.resolver.childType(ty) orelse return null)) orelse return null;
-                        var located = try self.sourceCell(frame, field_node[0], ty, depth + 1);
-                        if (located) |cell| {
-                            const actual_type = try self.cellType(cell, depth + 1);
-                            if (actual_type == null or !actual_type.?.eql(pointee)) located = null;
-                        }
-                        var cell = located orelse blk: {
-                            const source = (try self.sourceAt(frame, field_node[0], "", depth + 1)) orelse return null;
-                            break :blk (try self.sourceCell(source.frame, source.node, ty, depth + 1)) orelse return null;
-                        };
-                        cell.path = try self.join(cell.path, tree.tokenSlice(field_node[1]));
-                        return cell;
+                const ty = (try self.nodeType(frame, field_node[0])) orelse
+                    (try self.qualifierPointerType(frame, field_node[0], depth + 1)) orelse return null;
+                if (try self.pointerSize(ty) == .one) {
+                    // A receiver formal denotes its actual lexical cell,
+                    // not the aggregate constructor copied into that cell.
+                    // Authenticate the pointee before extending its path;
+                    // pointer-valued fields still need their stored source.
+                    const pointee = (try self.canonicalType(self.resolver.childType(ty) orelse return null)) orelse return null;
+                    var located = try self.sourceCell(frame, field_node[0], ty, depth + 1);
+                    if (located) |cell| {
+                        const actual_type = try self.cellType(cell, depth + 1);
+                        if (actual_type == null or !actual_type.?.eql(pointee)) located = null;
                     }
+                    var cell = located orelse blk: {
+                        const source = (try self.sourceAt(frame, field_node[0], "", depth + 1)) orelse return null;
+                        break :blk (try self.sourceCell(source.frame, source.node, ty, depth + 1)) orelse return null;
+                    };
+                    cell.path = try self.join(cell.path, tree.tokenSlice(field_node[1]));
+                    return cell;
                 }
                 var cell = (try self.sourceCell(frame, field_node[0], null, depth + 1)) orelse return null;
                 cell.path = try self.join(cell.path, tree.tokenSlice(field_node[1]));
@@ -5576,6 +6180,20 @@ const Query = struct {
                         var buffer: [2]Ast.Node.Index = undefined;
                         try self.charge();
                         const actual = (try invocation.actual.callArgumentFor(invocation.caller.cache, &buffer, parameter)) orelse return null;
+                        const parameters = invocation.actual.callee.reference.actual_type.data.function.parameters;
+                        if (parameter >= parameters.len) return null;
+                        const formal = (try self.canonicalType(parameters[parameter].type)) orelse return null;
+                        if (self.resolver.pointerSize(formal) == .one) {
+                            if (try self.rebound(frame, binding, frame.return_token, &.{})) return null;
+                            const source = (try self.actualArgumentSource(invocation.caller, invocation.actual, parameter, actual, null, depth + 1)) orelse return null;
+                            if (source.cell) |cell| return cell;
+                            // A copied pointer actual names its referent, not
+                            // the inline slot that happened to carry its bits.
+                            // Keep the caller's full history and source horizon.
+                            const stored = (try self.sourceAt(invocation.caller, actual, "", depth + 1)) orelse return null;
+                            if (stored.cell) |cell| return cell;
+                            return self.sourceCell(stored.frame, stored.node, formal, depth + 1);
+                        }
                         return self.sourceCell(invocation.caller, actual, null, depth + 1);
                     }
                     return .{ .frame = frame, .binding = binding, .node = node, .path = "" };
@@ -5733,6 +6351,16 @@ const Query = struct {
             result.complete = false;
             return result;
         };
+        // Index the exact named initializers once. Wide function tables must
+        // not spend the query budget comparing every field with every value.
+        var supplied_fields: std.StringHashMapUnmanaged(void) = .empty;
+        const tags = frame.cache.tree.tokens.items(.tag);
+        for (explicit) |value| {
+            try self.charge();
+            const first = frame.cache.tree.firstToken(value);
+            if (first >= 3 and tags[first - 1] == .equal and tags[first - 2] == .identifier and tags[first - 3] == .period)
+                try supplied_fields.put(self.scratch.allocator(), frame.cache.tree.tokenSlice(first - 2), {});
+        }
         for (declaration.ast.members) |member| {
             try self.charge();
             const container_field = owner_tree.fullContainerField(member) orelse continue;
@@ -5741,19 +6369,7 @@ const Query = struct {
                 continue;
             }
             const name = owner_tree.tokenSlice(container_field.ast.main_token);
-            var supplied = false;
-            for (explicit) |value| {
-                try self.charge();
-                const first = frame.cache.tree.firstToken(value);
-                const tags = frame.cache.tree.tokens.items(.tag);
-                if (first >= 3 and tags[first - 1] == .equal and tags[first - 2] == .identifier and tags[first - 3] == .period and
-                    std.mem.eql(u8, frame.cache.tree.tokenSlice(first - 2), name))
-                {
-                    supplied = true;
-                    break;
-                }
-            }
-            if (supplied) continue;
+            if (supplied_fields.contains(name)) continue;
             const value = container_field.ast.value_expr.unwrap() orelse {
                 result.complete = false;
                 continue;
@@ -5809,6 +6425,8 @@ const Query = struct {
         var segments = std.mem.tokenizeScalar(u8, cell.path, '.');
         while (segments.next()) |segment| {
             try self.charge();
+            if (self.resolver.typeTag(ty) == .optional)
+                ty = (try self.canonicalType(self.resolver.childType(ty) orelse return null)) orelse return null;
             if (ty.data != .container) return null;
             const container = ty.data.container;
             const tree = &container.scope_handle.handle.document.tree;
@@ -5975,6 +6593,12 @@ const Query = struct {
     }
 
     fn effectsForScan(self: *Query, frame: Frame, cell: SourceCell, horizon: Ast.TokenIndex, domain: Domain, result_path: []const u8, output: *Output, depth: u32) Error!void {
+        return self.effectsForNodes(frame, cell, horizon, domain, result_path, output, depth, null);
+    }
+
+    /// `direct_writes` is available only for a proved private physical scalar
+    /// slot. Its frame and all RHS queries retain the full mutation history.
+    fn effectsForNodes(self: *Query, frame: Frame, cell: SourceCell, horizon: Ast.TokenIndex, domain: Domain, result_path: []const u8, output: *Output, depth: u32, direct_writes: ?[]const Ast.Node.Index) Error!void {
         try self.charge();
         if (depth >= 64) {
             self.prunes += 1;
@@ -5993,7 +6617,8 @@ const Query = struct {
         for (self.active_effects.items, 0..) |active, index| {
             try self.charge();
             if (KeyContext.eql(.{}, active.function, key) and sameCellRoot(active.cell, cell) and
-                std.mem.eql(u8, active.cell.path, cell.path) and active.horizon == horizon and active.domain == domain)
+                std.mem.eql(u8, active.cell.path, cell.path) and active.horizon == horizon and active.domain == domain and
+                active.private_slot == (direct_writes != null))
             {
                 self.prunes += 1;
                 self.prune_floor = @min(self.prune_floor, index);
@@ -6001,15 +6626,38 @@ const Query = struct {
                 return;
             }
         }
-        try self.active_effects.append(self.scratch.allocator(), .{ .function = key, .cell = cell, .horizon = horizon, .domain = domain });
+        try self.active_effects.append(self.scratch.allocator(), .{ .function = key, .cell = cell, .horizon = horizon, .domain = domain, .private_slot = direct_writes != null });
         defer self.active_effects.items.len -= 1;
         const tree = frame.cache.tree;
+        var event_index: usize = 0;
         for (frame.mutations) |effect| {
             try self.charge();
+            if (direct_writes) |selected| {
+                var relevant = false;
+                for (selected) |write| {
+                    try self.charge();
+                    if (write == effect) {
+                        relevant = true;
+                        break;
+                    }
+                }
+                if (!relevant) continue;
+            }
             const token = tree.firstToken(effect);
             if (token >= horizon) {
                 if (frame.mutations_ordered) break;
                 continue;
+            }
+            if (frame.source_events.len != 0) {
+                // Both lists came from the same syntax walk. Address events
+                // appear only in source_events; mutation order is unchanged.
+                while (event_index < frame.source_events.len and frame.source_events[event_index].node != effect)
+                    event_index += 1;
+                if (event_index < frame.source_events.len) {
+                    const event = frame.source_events[event_index];
+                    event_index += 1;
+                    if (!event.activeBefore(horizon)) continue;
+                }
             }
             if (frame.cache.tree == cell.frame.cache.tree and frame.declaration == cell.frame.declaration and token <= cell.binding.rhs_last) continue;
             var at_effect = frame;
@@ -6120,12 +6768,11 @@ const Query = struct {
                 } else {
                     // Casts and metadata builtins do not write through their
                     // operands. Other builtins get no mutable-reach credit.
+                    if (valueBuiltin(name)) continue;
                     for (arguments) |argument| {
                         try self.charge();
                         const target = try self.sourceCell(at_effect, argument, null, depth + 1);
-                        if (target != null and try self.cellsOverlap(target.?, cell)) {
-                            if (!valueBuiltin(name)) output.complete = false;
-                        }
+                        if (target != null and try self.cellsOverlap(target.?, cell)) output.complete = false;
                     }
                 }
                 continue;
@@ -6281,6 +6928,19 @@ const Query = struct {
         var at_initial = cell.frame;
         at_initial.return_token = cell.binding.name_token;
         try self.projectExpression(at_initial, initial, cell.path, mode, result_path, output, depth + 1);
+        // A private pointer header can retain its address value while a
+        // callee writes through that address. Keep its initializer origins
+        // and every direct store; do not apply this to backing/pointee reads.
+        if (mode == .value) {
+            if (try self.cellType(cell, depth + 1)) |ty| {
+                if (try self.pointerSize(ty) == .one) {
+                    if (try self.privateCellFacts(cell)) |facts| {
+                        try self.effectsForNodes(cell.frame, cell, horizon, cell.frame.domain, result_path, output, depth + 1, facts.writes);
+                        return;
+                    }
+                }
+            }
+        }
         try self.effectsFor(cell.frame, cell, horizon, cell.frame.domain, result_path, output, depth + 1);
     }
     fn effectCall(self: *Query, frame: Frame, node: Ast.Node.Index, call_node: TypeResolver.CallOperands, depth: u32) Error!?FileCache.ActualCallSummary {
@@ -6340,6 +7000,7 @@ const Query = struct {
         if (a.cache.tree != b.cache.tree or a.cache.module_id != b.cache.module_id or a.declaration != b.declaration or
             a.return_token != b.return_token or a.domain != b.domain or
             a.mutations.ptr != b.mutations.ptr or a.mutations.len != b.mutations.len or
+            a.source_events.ptr != b.source_events.ptr or a.source_events.len != b.source_events.len or
             a.caught_errors.ptr != b.caught_errors.ptr or a.caught_errors.len != b.caught_errors.len) return false;
         const left = a.resolution.actual_type;
         const right = b.resolution.actual_type;
@@ -6964,6 +7625,10 @@ const Query = struct {
                     var address = item;
                     address.projection = .cell_address;
                     try self.add(output, address);
+                    if (mode == .value and address.storage == .inline_storage) {
+                        if (try self.nodeType(frame, value)) |selected_type|
+                            try self.payload(selected_type, item, true, output, depth + 1);
+                    }
                 }
             },
             .identifier => {
@@ -7266,6 +7931,21 @@ const Query = struct {
                     try output.allocations.append(self.scratch.allocator(), requirement);
                 }
                 for (operand_result.items.items) |item| try self.add(output, item);
+                // Erasing a typed context pointer does not erase pointers held
+                // in its inline object. Add exact declared field channels;
+                // their unknown pointees still prevent a complete graph proof.
+                if (mode == .value and std.mem.eql(u8, name, "@ptrCast")) {
+                    if (try self.nodeType(frame, operand)) |pointer| {
+                        if (try self.pointerSize(pointer) == .one) {
+                            if (self.resolver.childType(pointer)) |child| {
+                                for (operand_result.items.items) |item| {
+                                    if (item.storage == .inline_storage and item.projection == .pointer_value)
+                                        try self.payload(child, item, true, output, depth + 1);
+                                }
+                            }
+                        }
+                    }
+                }
             },
             .add, .sub, .mul, .bit_or, .bit_and, .bit_xor, .shl, .shr => {
                 if (mode == .location or mode == .coordinate) {
@@ -7452,7 +8132,7 @@ const Query = struct {
     /// Authenticate the allocator accessor's SDK declaration, then select the
     /// actual backing storage rather than its bookkeeping context pointer.
     /// stackFallback owns inline storage and retains the ordinary frame loan.
-    fn allocatorBacking(self: *Query, frame: Frame, node: Ast.Node.Index) Error!?struct { receiver: Ast.Node.Index, path: []const u8 } {
+    fn allocatorBacking(self: *Query, frame: Frame, node: Ast.Node.Index) Error!?struct { receiver: Ast.Node.Index, path: []const u8, retains_owner: bool } {
         try self.charge();
         const tree = frame.cache.tree;
         var buffer: [2]Ast.Node.Index = undefined;
@@ -7462,7 +8142,8 @@ const Query = struct {
         const name = callee.fn_token + 1;
         if (name >= callee.tree.tokens.len or callee.tree.tokenTag(name) != .identifier or
             !std.mem.eql(u8, callee.tree.tokenSlice(name), "allocator")) return null;
-        const path: []const u8 = if (try self.resolver.declaredInToolchainFile(callee.handle, "/std/heap/ArenaAllocator.zig"))
+        const retains_owner = try self.resolver.declaredInToolchainFile(callee.handle, "/std/heap/ArenaAllocator.zig");
+        const path: []const u8 = if (retains_owner)
             "child_allocator"
         else if (try self.resolver.declaredInToolchainFile(callee.handle, "/std/heap/debug_allocator.zig"))
             "backing_allocator"
@@ -7471,7 +8152,7 @@ const Query = struct {
         else
             return null;
         const receiver = (try canonical.callArgumentFor(frame.cache, &buffer, 0)) orelse return null;
-        return .{ .receiver = receiver, .path = path };
+        return .{ .receiver = receiver, .path = path, .retains_owner = retains_owner };
     }
 
     fn allocationOrigin(self: *Query, frame: Frame, allocator: Ast.Node.Index, output: *Output, depth: u32) Error!void {
@@ -7779,16 +8460,43 @@ const Query = struct {
                 }
                 continue;
             }
-            // Project an actual private source cell before copying formal
-            // coordinates. This binds allocator requirements at the caller.
-            if (alternative.projection != .cell_address and mapped.path.len != 0) {
+            if (alternative.storage == .inline_storage and alternative.projection == .pointer_value) {
                 var at_call = frame;
                 at_call.return_token = frame.cache.tree.firstToken(node);
-                if (try self.sourceCell(at_call, mapped.node, null, depth + 1)) |cell| {
-                    if (cell.binding.origin != .param) {
-                        try self.projectExpression(at_call, mapped.node, mapped.path, .value, try self.join(result_path, alternative.result_path), output, depth + 1);
-                        continue;
+                if (try self.inlineActualOwner(at_call, actual, alternative.owner.param, mapped.node, mapped.path, depth + 1)) |owner| {
+                    var translated = alternative;
+                    translated.owner = owner;
+                    translated.result_path = try self.join(result_path, alternative.result_path);
+                    try self.add(output, translated);
+                    continue;
+                }
+            }
+            // Project an actual private source cell before copying formal
+            // coordinates. This binds allocator requirements at the caller.
+            if (alternative.projection != .cell_address and alternative.storage != .inline_storage and mapped.path.len != 0) {
+                var at_call = frame;
+                at_call.return_token = frame.cache.tree.firstToken(node);
+                if (try self.sourceCell(at_call, mapped.node, null, depth + 1) != null) {
+                    try self.projectExpression(at_call, mapped.node, mapped.path, .value, try self.join(result_path, alternative.result_path), output, depth + 1);
+                    continue;
+                }
+            }
+            if (alternative.projection == .payload_value and alternative.storage == .payload_storage and mapped.path.len == 0) {
+                const parameters = actual.callee.reference.actual_type.data.function.parameters;
+                if (alternative.owner.param < parameters.len and
+                    try self.scalarValueType(parameters[alternative.owner.param].type, 0))
+                {
+                    var at_call = frame;
+                    at_call.return_token = frame.cache.tree.firstToken(node);
+                    if (try self.actualScalarBits(at_call, actual, alternative.owner.param, depth + 1)) |bits| {
+                        if (!bits) continue;
                     }
+                    // Coordinate mapping preserves possible incoming channels,
+                    // but does not prove that unknown scalar bits name a known
+                    // address. Require that separate origin proof as well.
+                    var encoded: Output = .{};
+                    try self.expression(frame, mapped.node, .address_bits, result_path, &encoded, depth + 1);
+                    if (!encoded.complete or encoded.allocations.items.len != 0) output.complete = false;
                 }
             }
             var arguments: Output = .{};
@@ -7934,8 +8642,8 @@ fn actualOf(cache: *FileCache, token: Ast.TokenIndex) !FileCache.ActualCallSumma
 }
 
 /// One alternative named the way a consumer reads it: by owner, projection,
-/// storage and the field of the RESULT that carries it.  The set is searched
-/// by owner, so no answer depends on the order its alternatives came out in.
+/// storage and the field of the RESULT that carries it. Match the whole tuple:
+/// one owner can have both a physical channel and a distinct payload channel.
 fn expectAlternative(
     returned: ReturnedStorage,
     owner: fn_summary.ParamPath,
@@ -7946,9 +8654,8 @@ fn expectAlternative(
     for (returned.alternatives) |alternative| {
         if (alternative.owner.param != owner.param) continue;
         if (!std.mem.eql(u8, alternative.owner.path, owner.path)) continue;
-        try std.testing.expectEqual(projection, alternative.projection);
-        try std.testing.expectEqual(storage, alternative.storage);
-        try std.testing.expectEqualStrings(result_path, alternative.result_path);
+        if (alternative.projection != projection or alternative.storage != storage) continue;
+        if (!std.mem.eql(u8, alternative.result_path, result_path)) continue;
         return alternative;
     }
     return error.TestExpectedAlternative;
@@ -11748,7 +12455,7 @@ test "canonical expression loans retain unresolved loop capture values by exact 
     const answer = try query.expressionLoansAt(.{ .selection = .{ .node = site.node }, .horizon = site.horizon });
     try std.testing.expect(!answer.complete);
     try std.testing.expectEqual(@as(usize, 1), answer.loans.len);
-    try expectExpressionLoan(answer, .{ .binding_token = item, .origin = .retained_value, .derivation = .propagated });
+    try expectExpressionLoan(answer, .{ .binding_token = item, .origin = .retained_value, .derivation = .propagated, .proved = false });
     try expectNoExpressionLoan(answer, input);
 }
 
@@ -13796,4 +14503,1567 @@ test "replay log filters shared repetitions without expanding them" {
     try std.testing.expectEqual(@as(usize, 1 << 24), filtered.len);
     try std.testing.expectEqual(@as(u32, 1), filtered.at(0));
     try std.testing.expectEqual(@as(u32, 1), filtered.at(filtered.len - 1));
+}
+
+test "selected retained binding distinguishes payload loans from physical cells and opaque dependencies" {
+    const source: [:0]const u8 =
+        \\extern fn unknownView(bytes: []u8) []u8;
+        \\fn direct(input: []u8) []u8 {
+        \\    const buffer = input;
+        \\    return buffer;
+        \\}
+        \\fn unknown(input: []u8) []u8 {
+        \\    const buffer = input;
+        \\    return unknownView(buffer);
+        \\}
+        \\fn scalar(input: []u8) usize {
+        \\    const buffer = input;
+        \\    return buffer.len;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const direct = try expressionLoanTestSite(typed.tree(), "direct", "buffer", 0);
+    const token = try expressionLoanTestBinding(typed.cache, direct, "buffer");
+    var query = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = direct.body, .scratch = &arena,
+    });
+    const physical = try query.expressionLoansAt(.{
+        .selection = .{ .node = direct.node }, .horizon = direct.horizon,
+    });
+    try std.testing.expectEqual(@as(usize, 0), physical.loans.len);
+    const retained = try query.expressionLoansAt(.{
+        .selection = .{ .node = direct.node }, .horizon = direct.horizon,
+        .retained_bindings = &.{token},
+    });
+    try std.testing.expectEqual(@as(usize, 1), retained.loans.len);
+    try std.testing.expectEqual(ExpressionLoan.Origin.retained_value, retained.loans[0].origin);
+    try std.testing.expect(retained.loans[0].proved);
+    try std.testing.expectEqual(token, retained.loans[0].binding_token);
+    const after = try query.expressionLoansAt(.{
+        .selection = .{ .node = direct.node }, .horizon = direct.horizon,
+    });
+    try std.testing.expectEqual(@as(usize, 0), after.loans.len);
+    inline for (.{ .{ "unknown", "unknownView(buffer)" }, .{ "scalar", "buffer.len" } }) |case| {
+        const site = try expressionLoanTestSite(typed.tree(), case[0], case[1], 0);
+        const binding = try expressionLoanTestBinding(typed.cache, site, "buffer");
+        var selected = ExpressionLoanQuery.init(.{
+            .cache = typed.cache, .body = site.body, .scratch = &arena,
+        });
+        const answer = try selected.expressionLoansAt(.{
+            .selection = .{ .node = site.node }, .horizon = site.horizon,
+            .retained_bindings = &.{binding},
+        });
+        for (answer.loans) |loan| {
+            try std.testing.expect(!loan.proved);
+            try std.testing.expectEqual(ExpressionLoan.Origin.retained_value, loan.origin);
+        }
+        if (comptime std.mem.eql(u8, case[0], "scalar")) {
+            try std.testing.expectEqual(@as(usize, 0), answer.loans.len);
+        }
+    }
+}
+
+test "map iterator scalar loads retain no iterator frame cell" {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Id = enum(u32) { _ };
+        \\const Map = std.AutoHashMapUnmanaged(u32, Id);
+        \\fn lookup(map: *Map) ?Id {
+        \\    var iterator = map.iterator();
+        \\    while (iterator.next()) |entry| return entry.value_ptr.*;
+        \\    return null;
+        \\}
+        \\fn unsafe(map: *Map) *Map.Iterator {
+        \\    var iterator = map.iterator();
+        \\    return &iterator;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const site = try expressionLoanTestSite(typed.tree(), "lookup", "entry.value_ptr.*", 0);
+    var query = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = site.body, .scratch = &arena,
+    });
+    const answer = try query.expressionLoansAt(.{
+        .selection = .{ .node = site.node }, .horizon = site.horizon,
+    });
+    for (answer.loans) |loan| {
+        try std.testing.expect(!loan.proved or loan.origin != .frame_cell);
+    }
+    const unsafe = try expressionLoanTestSite(typed.tree(), "unsafe", "&iterator", 0);
+    const iterator = try expressionLoanTestBinding(typed.cache, unsafe, "iterator");
+    var control = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = unsafe.body, .scratch = &arena,
+    });
+    const escaped = try control.expressionLoansAt(.{
+        .selection = .{ .node = unsafe.node }, .horizon = unsafe.horizon,
+    });
+    for (escaped.loans) |loan| {
+        if (loan.binding_token == iterator and loan.origin == .frame_cell and loan.proved) return;
+    }
+    return error.TestExpectedIteratorCellLoan;
+}
+
+test "expanded inline values copied into a pending value do not escape their temporary buffer" {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Value = struct { payload: *u8 };
+        \\const Expanded = struct { values: []Value, owned: []Value, allocator: std.mem.Allocator };
+        \\const Pending = struct { inline_values: [32]Value = undefined, owned: []Value, count: usize };
+        \\fn expand(allocator: std.mem.Allocator, input: []const Value, storage: []Value) !Expanded {
+        \\    const owned = if (input.len > storage.len)
+        \\        try allocator.alloc(Value, input.len)
+        \\    else
+        \\        @as([]Value, &.{});
+        \\    const values = if (owned.len != 0) owned else storage[0..input.len];
+        \\    @memcpy(values, input);
+        \\    return .{ .values = values, .owned = owned, .allocator = allocator };
+        \\}
+        \\fn safe(allocator: std.mem.Allocator, input: []const Value) !Pending {
+        \\    var inline_values: [32]Value = undefined;
+        \\    const expanded = try expand(allocator, input, &inline_values);
+        \\    var pending: Pending = .{ .owned = expanded.owned, .count = expanded.values.len };
+        \\    if (expanded.owned.len == 0) {
+        \\        @memcpy(pending.inline_values[0..expanded.values.len], expanded.values);
+        \\    }
+        \\    return pending;
+        \\}
+        \\fn unsafe(allocator: std.mem.Allocator, input: []const Value) ![]Value {
+        \\    var inline_values: [32]Value = undefined;
+        \\    const expanded = try expand(allocator, input, &inline_values);
+        \\    return expanded.values;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const safe = try expressionLoanTestSite(typed.tree(), "safe", "pending", 1);
+    var safe_query = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = safe.body, .scratch = &arena,
+    });
+    const safe_answer = try safe_query.expressionLoansAt(.{
+        .selection = .{ .node = safe.node }, .horizon = safe.horizon,
+    });
+    for (safe_answer.loans) |loan| {
+        try std.testing.expect(!loan.proved or loan.origin != .frame_cell);
+    }
+    const unsafe = try expressionLoanTestSite(typed.tree(), "unsafe", "expanded.values", 0);
+    const storage = try expressionLoanTestBinding(typed.cache, unsafe, "inline_values");
+    var unsafe_query = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = unsafe.body, .scratch = &arena,
+    });
+    const unsafe_answer = try unsafe_query.expressionLoansAt(.{
+        .selection = .{ .node = unsafe.node }, .horizon = unsafe.horizon,
+    });
+    for (unsafe_answer.loans) |loan| {
+        if (loan.binding_token == storage and loan.origin == .frame_cell and loan.proved) return;
+    }
+    return error.TestExpectedInlineStorageLoan;
+}
+
+
+test "copied opaque element results do not prove a frame loan but explicit copied pointers do" {
+    const source: [:0]const u8 =
+        \\const Value = struct { pointer: ?*const u8 = null };
+        \\const Expanded = struct { values: []const Value };
+        \\const Pending = struct { values: [2]Value = .{ .{}, .{} } };
+        \\extern fn expand(storage: *[2]Value) Expanded;
+        \\fn unknown() Pending {
+        \\    var storage: [2]Value = undefined;
+        \\    const expanded = expand(&storage);
+        \\    var pending: Pending = .{};
+        \\    @memcpy(pending.values[0..expanded.values.len], expanded.values);
+        \\    return pending;
+        \\}
+        \\fn known() Pending {
+        \\    const cell: u8 = 1;
+        \\    const storage = [_]Value{ .{ .pointer = &cell }, .{} };
+        \\    const expanded: Expanded = .{ .values = &storage };
+        \\    var pending: Pending = .{};
+        \\    @memcpy(&pending.values, expanded.values);
+        \\    return pending;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const unknown = try expressionLoanTestSite(typed.tree(), "unknown", "pending", 1);
+    var unknown_query = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = unknown.body, .scratch = &arena,
+    });
+    const unknown_answer = try unknown_query.expressionLoansAt(.{
+        .selection = .{ .node = unknown.node }, .horizon = unknown.horizon,
+    });
+    try std.testing.expect(!unknown_answer.complete);
+    for (unknown_answer.loans) |loan| try std.testing.expect(!loan.proved);
+
+    const known = try expressionLoanTestSite(typed.tree(), "known", "pending", 1);
+    const cell = try expressionLoanTestBinding(typed.cache, known, "cell");
+    var known_query = ExpressionLoanQuery.init(.{
+        .cache = typed.cache, .body = known.body, .scratch = &arena,
+    });
+    const known_answer = try known_query.expressionLoansAt(.{
+        .selection = .{ .node = known.node }, .horizon = known.horizon,
+    });
+    try expectExpressionLoan(known_answer, .{
+        .binding_token = cell, .origin = .frame_cell, .derivation = .propagated,
+        .scalar_cell = true, .proved = true,
+    });
+}
+
+test "selected backing pointer fields borrow their pointees while inline fields borrow the frame" {
+    const source: [:0]const u8 =
+        \\const Shelf = struct {
+        \\    external: *[2]u32,
+        \\    inline_values: [2]u32 = .{ 1, 2 },
+        \\    fn externalView(self: *const Shelf) *const u32 { return &self.external[0]; }
+        \\    fn inlineView(self: *const Shelf) *const u32 { return &self.inline_values[0]; }
+        \\};
+        \\fn safe(values: *[2]u32) *const u32 {
+        \\    const shelf: Shelf = .{ .external = values };
+        \\    return shelf.externalView();
+        \\}
+        \\fn unsafe(values: *[2]u32) *const u32 {
+        \\    const shelf: Shelf = .{ .external = values };
+        \\    return shelf.inlineView();
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    inline for (.{ .{ "safe", "shelf.externalView()", false }, .{ "unsafe", "shelf.inlineView()", true } }) |case| {
+        const site = try expressionLoanTestSite(typed.tree(), case[0], case[1], 0);
+        const shelf = try expressionLoanTestBinding(typed.cache, site, "shelf");
+        var query = ExpressionLoanQuery.init(.{
+            .cache = typed.cache, .body = site.body, .scratch = &arena,
+        });
+        const answer = try query.expressionLoansAt(.{
+            .selection = .{ .node = site.node }, .horizon = site.horizon,
+        });
+        if (comptime case[2]) {
+            try expectExpressionLoan(answer, .{
+                .binding_token = shelf, .origin = .frame_cell, .derivation = .propagated,
+            });
+        } else {
+            try expectNoExpressionLoan(answer, shelf);
+        }
+    }
+}
+
+test "canonical expression loans ignore future deferred effects but retain completed scope uncertainty" {
+    const source: [:0]const u8 =
+        \\const Cell = struct { pointer: ?*u8 };
+        \\extern fn externalReset(cell: *Cell) void;
+        \\fn before() Cell {
+        \\    var byte: u8 = 3;
+        \\    var cell: Cell = .{ .pointer = &byte };
+        \\    defer externalReset(&cell);
+        \\    return cell;
+        \\}
+        \\fn after() Cell {
+        \\    var byte: u8 = 3;
+        \\    var cell: Cell = .{ .pointer = &byte };
+        \\    { defer externalReset(&cell); }
+        \\    return cell;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    inline for (.{ "before", "after" }) |name| {
+        const site = try expressionLoanTestSite(typed.tree(), name, "cell", 1);
+        const byte = try expressionLoanTestBinding(typed.cache, site, "byte");
+        var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &arena });
+        const answer = try query.expressionLoansAt(.{ .selection = .{ .node = site.node, .path = "pointer" }, .horizon = site.horizon });
+        if (comptime std.mem.eql(u8, name, "before")) {
+            try std.testing.expect(answer.complete);
+            var proved = false;
+            for (answer.loans) |loan| {
+                if (loan.binding_token == byte and loan.origin == .frame_cell and loan.proved) proved = true;
+            }
+            try std.testing.expect(proved);
+        } else {
+            try std.testing.expect(!answer.complete);
+        }
+    }
+}
+
+test "canonical expression loans through receiver cells ignore pending deferred mutations" {
+    const source: [:0]const u8 =
+        \\const Cell = struct { pointer: ?*u8 };
+        \\const Worker = struct {
+        \\    cell: *Cell,
+        \\    fn view(self: *Worker) Cell { return .{ .pointer = self.cell.pointer }; }
+        \\};
+        \\extern fn externalReset(worker: *Worker) void;
+        \\fn before(out: *Cell) void {
+        \\    var byte: u8 = 3;
+        \\    var cell: Cell = .{ .pointer = &byte };
+        \\    var worker: Worker = .{ .cell = &cell };
+        \\    defer externalReset(&worker);
+        \\    out.* = worker.view();
+        \\}
+        \\fn after(out: *Cell) void {
+        \\    var byte: u8 = 3;
+        \\    var cell: Cell = .{ .pointer = &byte };
+        \\    var worker: Worker = .{ .cell = &cell };
+        \\    { defer externalReset(&worker); }
+        \\    out.* = worker.view();
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    inline for (.{ "before", "after" }) |name| {
+        const site = try expressionLoanTestSite(typed.tree(), name, "worker.view()", 0);
+        const byte = try expressionLoanTestBinding(typed.cache, site, "byte");
+        var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &arena });
+        const answer = try query.expressionLoansAt(.{ .selection = .{ .node = site.node, .path = "pointer" }, .horizon = site.horizon });
+        if (comptime std.mem.eql(u8, name, "before")) {
+            try std.testing.expect(answer.complete);
+            try expectExpressionLoan(answer, .{ .binding_token = byte, .origin = .frame_cell, .derivation = .propagated, .scalar_cell = true, .proved = true });
+        } else {
+            try std.testing.expect(!answer.complete);
+        }
+    }
+}
+
+fn measurerLoanCase(comptime name: []const u8) !void {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const MeasureSource = struct { context: *anyopaque, callback: *const fn (*anyopaque) void };
+        \\const Service = struct { allocator: std.mem.Allocator };
+        \\const Scratch = struct { allocator: std.mem.Allocator };
+        \\const NodeMeasurer = struct {
+        \\    service: *Service, scratch: *Scratch,
+        \\    fn init(self: *NodeMeasurer, service: *Service, scratch: *Scratch) void {
+        \\        self.* = .{ .service = service, .scratch = scratch };
+        \\    }
+        \\    fn invoke(context: *anyopaque) void { _ = context; }
+        \\    fn source(self: *NodeMeasurer) MeasureSource {
+        \\        return .{ .context = @ptrCast(self), .callback = invoke };
+        \\    }
+        \\};
+        \\const TextEngine = struct {
+        \\    service: Service, scratch: Scratch, node_measurer: ?NodeMeasurer = null,
+        \\    fn init(gpa: std.mem.Allocator) TextEngine {
+        \\        return .{ .service = .{ .allocator = gpa }, .scratch = .{ .allocator = gpa } };
+        \\    }
+        \\    fn measurer(self: *TextEngine) MeasureSource {
+        \\        if (self.node_measurer == null) {
+        \\            var bound: NodeMeasurer = undefined;
+        \\            bound.init(&self.service, &self.scratch);
+        \\            self.node_measurer = bound;
+        \\        }
+        \\        return self.node_measurer.?.source();
+        \\    }
+        \\};
+        \\const App = struct { gpa: std.mem.Allocator };
+        \\fn shaderRead(app: *App, io: std.Io) !MeasureSource {
+        \\    const gpa = app.gpa;
+        \\    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "shader.spv", gpa, .unlimited);
+        \\    defer gpa.free(bytes);
+        \\    var engine = TextEngine.init(gpa);
+        \\    return engine.measurer();
+        \\}
+        \\extern fn unknownReset(engine: *TextEngine) void;
+        \\fn inlineCell(gpa: std.mem.Allocator) MeasureSource {
+        \\    var engine = TextEngine.init(gpa);
+        \\    return engine.measurer();
+        \\}
+        \\fn external(engine: *TextEngine) MeasureSource { return engine.measurer(); }
+        \\fn externalUnsafe(engine: *TextEngine) MeasureSource {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    engine.service.allocator = fixed.allocator();
+        \\    return engine.measurer();
+        \\}
+        \\fn installedSource(context: *anyopaque, provider: std.mem.Allocator) MeasureSource {
+        \\    const engine: *TextEngine = @ptrCast(@alignCast(context));
+        \\    engine.service.allocator = provider;
+        \\    return engine.measurer();
+        \\}
+        \\fn rawExternalUnsafe(context: *anyopaque) MeasureSource {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    const engine: *TextEngine = @ptrCast(@alignCast(context));
+        \\    return installedSource(@ptrCast(engine), fixed.allocator());
+        \\}
+        \\fn typedInstalledSource(engine: *TextEngine, provider: std.mem.Allocator) MeasureSource {
+        \\    engine.service.allocator = provider;
+        \\    return engine.measurer();
+        \\}
+        \\fn helperExternalUnsafe(engine: *TextEngine) MeasureSource {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    return typedInstalledSource(engine, fixed.allocator());
+        \\}
+        \\fn failedSetup(engine: *TextEngine, provider: std.mem.Allocator) !void {
+        \\    errdefer engine.service.allocator = provider;
+        \\    return error.SetupFailed;
+        \\}
+        \\fn caughtCleanup(gpa: std.mem.Allocator) MeasureSource {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine = TextEngine.init(gpa);
+        \\    failedSetup(&engine, fixed.allocator()) catch {};
+        \\    return engine.measurer();
+        \\}
+        \\fn providers() MeasureSource {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    const gpa = fixed.allocator();
+        \\    var engine = TextEngine.init(gpa);
+        \\    return engine.measurer();
+        \\}
+        \\fn rebound(gpa: std.mem.Allocator) MeasureSource {
+        \\    var bytes: [128]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        \\    var engine = TextEngine.init(gpa);
+        \\    engine.service.allocator = fixed.allocator();
+        \\    return engine.measurer();
+        \\}
+        \\fn unknownNeighbor(gpa: std.mem.Allocator) MeasureSource {
+        \\    var engine = TextEngine.init(gpa);
+        \\    unknownReset(&engine);
+        \\    return engine.measurer();
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expression = if (comptime std.mem.eql(u8, name, "rawExternalUnsafe"))
+        "installedSource(@ptrCast(engine), fixed.allocator())"
+    else if (comptime std.mem.eql(u8, name, "helperExternalUnsafe"))
+        "typedInstalledSource(engine, fixed.allocator())"
+    else
+        "engine.measurer()";
+    const site = try expressionLoanTestSite(typed.tree(), name, expression, 0);
+    const engine = try expressionLoanTestBinding(typed.cache, site, "engine");
+    var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &arena });
+    const answer = try query.expressionLoansAt(.{
+        .selection = .{ .node = site.node }, .horizon = site.horizon,
+        .retained_bindings = &.{engine},
+    });
+    if (comptime std.mem.eql(u8, name, "external")) {
+        for (answer.loans) |loan| try std.testing.expect(!loan.proved);
+    } else if (comptime std.mem.eql(u8, name, "rawExternalUnsafe")) {
+        // An opaque-to-typed reinterpretation supplies no authenticated field
+        // identity. Do not turn that unknown into a positive provider proof.
+        try std.testing.expect(!answer.complete);
+        for (answer.loans) |loan|
+            try std.testing.expect(!(loan.binding_token == engine and loan.origin == .frame_cell and loan.proved));
+    } else if (comptime std.mem.eql(u8, name, "externalUnsafe") or std.mem.eql(u8, name, "helperExternalUnsafe")) {
+        const bytes = try expressionLoanTestBinding(typed.cache, site, "bytes");
+        var retained = false;
+        for (answer.loans) |loan| {
+            if (loan.binding_token == bytes and loan.proved) retained = true;
+        }
+        try std.testing.expect(retained);
+        if (comptime std.mem.eql(u8, name, "helperExternalUnsafe")) {
+            try std.testing.expect(!answer.complete);
+            for (answer.loans) |loan|
+                try std.testing.expect(!(loan.binding_token == engine and loan.origin == .frame_cell and loan.proved));
+        }
+    } else {
+        var physical = false;
+        for (answer.loans) |loan| {
+            if (loan.binding_token == engine and loan.origin == .frame_cell and loan.proved) physical = true;
+        }
+        try std.testing.expect(physical);
+        if (comptime std.mem.eql(u8, name, "unknownNeighbor")) {
+            try std.testing.expect(!answer.complete);
+        } else if (comptime std.mem.eql(u8, name, "providers") or std.mem.eql(u8, name, "rebound") or std.mem.eql(u8, name, "caughtCleanup")) {
+            const bytes = try expressionLoanTestBinding(typed.cache, site, "bytes");
+            var retained = false;
+            for (answer.loans) |loan| {
+                if (loan.binding_token == bytes and loan.proved) retained = true;
+            }
+            try std.testing.expect(retained);
+        }
+    }
+}
+
+test "canonical measurer loans select inline context" { try measurerLoanCase("inlineCell"); }
+test "canonical measurer loans select external context" { try measurerLoanCase("external"); }
+test "canonical measurer loans retain externally installed local providers" { try measurerLoanCase("externalUnsafe"); }
+test "canonical measurer loans keep reinterpreted external contexts unknown" { try measurerLoanCase("rawExternalUnsafe"); }
+test "canonical measurer loans retain providers installed by typed external helpers" { try measurerLoanCase("helperExternalUnsafe"); }
+test "canonical measurer loans retain local service and scratch providers" { try measurerLoanCase("providers"); }
+test "canonical measurer loans retain rebound service providers" { try measurerLoanCase("rebound"); }
+test "canonical measurer loans keep unknown neighboring effects incomplete" { try measurerLoanCase("unknownNeighbor"); }
+test "canonical measurer loans avoid unrelated shader reader effects" { try measurerLoanCase("shaderRead"); }
+test "canonical measurer loans preserve caught initialization failure cleanup" { try measurerLoanCase("caughtCleanup"); }
+
+test "canonical measurer loans separate arena allocation context from direct child allocation" {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn context(gpa: std.mem.Allocator) std.mem.Allocator {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    return arena.allocator();
+        \\}
+        \\fn owned(gpa: std.mem.Allocator) ![]u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    return try arena.allocator().dupe(u8, "bytes");
+        \\}
+        \\fn child(gpa: std.mem.Allocator) ![]u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    return try arena.child_allocator.dupe(u8, "bytes");
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    inline for (.{
+        .{ "context", "arena.allocator()" },
+        .{ "owned", "arena.allocator().dupe(u8, \"bytes\")" },
+        .{ "child", "arena.child_allocator.dupe(u8, \"bytes\")" },
+    }) |case| {
+        const site = try expressionLoanTestSite(typed.tree(), case[0], case[1], 0);
+        const arena = try expressionLoanTestBinding(typed.cache, site, "arena");
+        var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &scratch });
+        const answer = try query.expressionLoansAt(.{
+            .selection = .{ .node = site.node }, .horizon = site.horizon, .retained_bindings = &.{arena},
+        });
+        if (comptime std.mem.eql(u8, case[0], "context")) {
+            var physical = false;
+            for (answer.loans) |loan| {
+                if (loan.binding_token == arena and loan.origin == .frame_cell and loan.proved) physical = true;
+            }
+            try std.testing.expect(physical);
+        } else if (comptime std.mem.eql(u8, case[0], "owned")) {
+            var owned = false;
+            for (answer.loans) |loan| {
+                if (loan.binding_token == arena and loan.origin == .retained_value and
+                    loan.payload_path.len == 0 and loan.proved) owned = true;
+            }
+            try std.testing.expect(owned);
+        } else {
+            for (answer.loans) |loan| {
+                if (loan.binding_token == arena and loan.proved)
+                    try std.testing.expectEqualStrings("child_allocator", loan.payload_path);
+            }
+        }
+    }
+}
+
+test "canonical measurer projection selects an error-union constructor's omitted optional cell" {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Service = struct { allocator: std.mem.Allocator };
+        \\const Node = struct { service: *Service };
+        \\const Engine = struct { owned: []u8, node: ?Node = null };
+        \\const UnknownEngine = struct { owned: []u8, node: ?Node = undefined };
+        \\fn absent(gpa: std.mem.Allocator, fail: bool) !Engine {
+        \\    if (fail) return error.SetupFailed;
+        \\    const owned = try gpa.dupe(u8, "owned sibling");
+        \\    errdefer gpa.free(owned);
+        \\    return .{ .owned = owned };
+        \\}
+        \\fn uncertain(gpa: std.mem.Allocator, fail: bool) !UnknownEngine {
+        \\    if (fail) return error.SetupFailed;
+        \\    const owned = try gpa.dupe(u8, "owned sibling");
+        \\    errdefer gpa.free(owned);
+        \\    return .{ .owned = owned };
+        \\}
+        \\fn use(gpa: std.mem.Allocator, fail: bool) !void {
+        \\    _ = try absent(gpa, fail);
+        \\    _ = try uncertain(gpa, fail);
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const root = (try grow.growStateAlloc(typed.cache)).owner;
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    var memo: Memo = .{};
+    var query: Query = .{
+        .root = root, .state = &root.return_storage_state,
+        .resolver = &typed.resolver, .remaining = &remaining,
+        .scratch = &scratch, .memo = &memo,
+        .entry_tree = typed.tree(), .entry_token = 0,
+    };
+    inline for (.{ .{ "absent", "absent(gpa, fail)", true }, .{ "uncertain", "uncertain(gpa, fail)", false } }) |case| {
+        const site = try expressionLoanTestSite(typed.tree(), "use", case[1], 0);
+        const actual = try actualOf(typed.cache, callNamed(typed.tree(), case[0]).?);
+        query.entry_token = site.horizon;
+        const caller = (try query.callerFrame(typed.cache, site.horizon, null)) orelse return error.TestExpectedCaller;
+        var selected: Output = .{};
+        try query.selectedCallStorage(caller, site.node, actual, "node.service", &selected, 0);
+        try std.testing.expectEqual(case[2], selected.complete);
+        try std.testing.expectEqual(@as(usize, 0), selected.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), selected.allocations.items.len);
+    }
+}
+
+
+test "canonical expression loans retain mutations nested in pure builtin operands" {
+    const source: [:0]const u8 =
+        \\fn install(target: *?*u8, value: *u8) *?*u8 {
+        \\    target.* = value;
+        \\    return target;
+        \\}
+        \\fn use() ?*u8 {
+        \\    var byte: u8 = 0;
+        \\    var slot: ?*u8 = null;
+        \\    _ = @as(*?*u8, install(&slot, &byte));
+        \\    return slot;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const site = try expressionLoanTestSite(typed.tree(), "use", "slot", 1);
+    const byte = try expressionLoanTestBinding(typed.cache, site, "byte");
+    var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &scratch });
+    const answer = try query.expressionLoansAt(.{ .selection = .{ .node = site.node }, .horizon = site.horizon });
+    try expectExpressionLoan(answer, .{ .binding_token = byte, .origin = .frame_cell, .derivation = .propagated, .scalar_cell = true, .proved = true });
+}
+
+test "canonical source locations reject appended and replaced write snapshots" {
+    const source: [:0]const u8 =
+        \\const Node = struct { value: u8 = 0 };
+        \\const Holder = struct { node: *Node };
+        \\fn use() void {
+        \\    var first: Node = .{};
+        \\    var second: Node = .{};
+        \\    var holder: Holder = .{ .node = &first };
+        \\    const alias: *Holder = &holder;
+        \\    _ = second.value;
+        \\    _ = alias.node.value;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const root = (try grow.growStateAlloc(typed.cache)).owner;
+    const site = try expressionLoanTestSite(typed.tree(), "use", "alias.node.value", 0);
+    const second_site = try expressionLoanTestSite(typed.tree(), "use", "second.value", 0);
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    var memo: Memo = .{};
+    var query: Query = .{
+        .root = root, .state = &root.return_storage_state,
+        .resolver = &typed.resolver, .remaining = &remaining,
+        .scratch = &scratch, .memo = &memo,
+        .entry_tree = typed.tree(), .entry_token = site.horizon,
+    };
+    const caller = (try query.callerFrame(typed.cache, site.horizon, null)) orelse return error.TestExpectedCaller;
+    const first = (try query.lookupBinding(caller.bindings, "first", site.horizon)) orelse return error.TestExpectedBinding;
+    const second = (try query.lookupBinding(caller.bindings, "second", site.horizon)) orelse return error.TestExpectedBinding;
+    const holder = (try query.lookupBinding(caller.bindings, "holder", site.horizon)) orelse return error.TestExpectedBinding;
+    const alias = (try query.lookupBinding(caller.bindings, "alias", site.horizon)) orelse return error.TestExpectedBinding;
+    const address = typed.cache.nodeForExactSpan(alias.rhs_first, alias.rhs_last) orelse return error.TestExpectedAddress;
+    const holder_node = typed.tree().nodeData(address).node;
+    const replacement: SourceCell = .{ .frame = caller, .binding = holder, .node = holder_node, .path = "node" };
+    try query.appendWrittenCell(.{ .frame = caller, .binding = second, .node = typed.tree().nodeData(second_site.node).node_and_token[0], .path = "" });
+    const untouched = query.written_cells;
+    const initial = (try query.sourceCell(caller, site.node, null, 0)) orelse return error.TestExpectedLocation;
+    try std.testing.expectEqual(first.name_token, initial.binding.name_token);
+    try std.testing.expectEqualStrings("value", initial.path);
+    try query.appendWrittenCell(replacement);
+    try std.testing.expect((try query.sourceCell(caller, site.node, null, 0)) == null);
+    query.written_cells = untouched;
+    const restored = (try query.sourceCell(caller, site.node, null, 0)) orelse return error.TestExpectedLocation;
+    try std.testing.expectEqual(first.name_token, restored.binding.name_token);
+    var alternate: WrittenCellLog = .{};
+    const snapshot = try scratch.allocator().create(SourceCell);
+    snapshot.* = replacement;
+    try alternate.appendValue(scratch.allocator(), snapshot);
+    try std.testing.expectEqual(untouched.len, alternate.len);
+    query.written_cells = alternate;
+    try std.testing.expect((try query.sourceCell(caller, site.node, null, 0)) == null);
+}
+
+fn enumTagWidthCase(comptime name: []const u8, comptime expected: bool) !void {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn IntWidth(comptime bits: u16) type { return @Int(.unsigned, bits); }
+        \\fn EnumOf(comptime Tag: type) type { return enum(Tag) { zero = 0, _ }; }
+        \\fn ConditionalWidth(comptime wide: bool) type { if (wide) return usize; return u6; }
+        \\fn SignedWidth(comptime sign: std.builtin.Signedness) type { return @Int(sign, 6); }
+        \\fn MetadataWidth(comptime T: type) type { const bits: u16 = @typeInfo(T).int.bits; return @Int(.unsigned, bits); }
+        \\fn CountWidth(comptime bits: u16) type { const count = @clz(bits - 1); return @Int(.unsigned, count); }
+        \\fn MetaWidth(comptime bits: u16) type { return std.meta.Int(.unsigned, bits); }
+        \\fn WidenWidth(comptime bits: u5) type { return IntWidth(bits); }
+        \\const Mode = enum(u6) { one = 0, _ };
+        \\fn OptionalWidth(comptime width: ?u16) type { if (width) |_| return usize; return u6; }
+        \\fn ForwardOptionalWidth(comptime width: ?u16) type { return OptionalWidth(width); }
+        \\fn OptionalModeWidth(comptime mode: ?Mode) type { if (mode) |_| return usize; return u6; }
+        \\fn opaqueOptional() ?u16 { return null; }
+        \\fn opaqueBool() bool { return true; }
+        \\fn BareNullWidth() type { if (null) |_| return usize; return u6; }
+        \\fn GuardedWidth(comptime percentage: u64) type {
+        \\    if (percentage <= 0 or percentage >= 100) @compileError("outside range");
+        \\    return u6;
+        \\}
+        \\fn ComptimeWidth(comptime percentage: u64) type {
+        \\    comptime { if (percentage <= 0 or percentage >= 100) @compileError("outside range"); }
+        \\    return u6;
+        \\}
+        \\fn ShortAndWidth() type { if (false and opaqueBool()) @compileError("unreachable"); return u6; }
+        \\fn ShortOrWidth() type { if (true or opaqueBool()) return u6; return usize; }
+        \\fn UnknownLeftWidth() type { if (opaqueBool() or true) return u6; return usize; }
+        \\fn UnknownFirstWidth(comptime flag: bool) type { if (flag) return u6; return usize; }
+        \\fn LocalLogWidth(comptime T: type) type {
+        \\    if (T == comptime_int) return comptime_int;
+        \\    const bits: u16 = @typeInfo(T).int.bits;
+        \\    const count = 16 - @clz(bits - 1);
+        \\    return @Int(.unsigned, count);
+        \\}
+        \\const OtherSignedness = enum { signed, unsigned };
+        \\fn WrongSignedWidth(comptime sign: OtherSignedness) type { return @Int(sign, 6); }
+        \\fn fallible() !u6 { return 6; }
+        \\fn opaqueTag() u6 { return 6; }
+        \\fn OpaqueEnum() type { const tag = opaqueTag(); return enum(u6) { item = tag, _ }; }
+        \\fn TryEnum() type { const tag: u6 = try fallible(); return enum(u6) { item = tag, _ }; }
+        \\fn CatchEnum() type { const tag = fallible() catch unreachable; return enum(u6) { item = tag, _ }; }
+        \\fn UnreachableEnum() type { const tag: u6 = unreachable; return enum(u6) { item = tag, _ }; }
+        \\fn PanicEnum() type { const tag: u6 = @panic("unknown constant"); return enum(u6) { item = tag, _ }; }
+        \\fn UnknownEnum(comptime tag: u6) type { const copy = tag; return enum(u6) { item = copy, _ }; }
+        \\const Direct = enum(u6) { zero = 0, _ };
+        \\const Factory = enum(IntWidth(6)) { zero = 0, _ };
+        \\const Math = enum(std.math.Log2Int(usize)) { zero = 0, _ };
+        \\const Wide = enum(usize) { zero = 0, _ };
+        \\const NarrowBranch = enum(ConditionalWidth(false)) { zero = 0, _ };
+        \\const WideBranch = enum(ConditionalWidth(true)) { zero = 0, _ };
+        \\fn direct(value: Direct) void { _ = value; }
+        \\fn factory(value: Factory) void { _ = value; }
+        \\fn math(value: Math) void { _ = value; }
+        \\fn wide(value: Wide) void { _ = value; }
+        \\fn unknown(comptime Tag: type, value: EnumOf(Tag)) void { _ = value; }
+        \\fn narrowBranch(value: NarrowBranch) void { _ = value; }
+        \\fn wideBranch(value: WideBranch) void { _ = value; }
+        \\fn unknownBranch(comptime wide: bool, value: enum(ConditionalWidth(wide)) { zero = 0, _ }) void { _ = value; }
+        \\fn signedWidth(value: enum(SignedWidth(.unsigned)) { zero = 0, _ }) void { _ = value; }
+        \\fn wrongSignedWidth(value: enum(WrongSignedWidth(.unsigned)) { zero = 0, _ }) void { _ = value; }
+        \\fn tryEnum(value: TryEnum()) void { _ = value; }
+        \\fn catchEnum(value: CatchEnum()) void { _ = value; }
+        \\fn unreachableEnum(value: UnreachableEnum()) void { _ = value; }
+        \\fn panicEnum(value: PanicEnum()) void { _ = value; }
+        \\fn unknownEnum(comptime tag: u6, value: UnknownEnum(tag)) void { _ = value; }
+        \\fn opaqueEnum(value: OpaqueEnum()) void { _ = value; }
+        \\fn metadataWidth(value: enum(MetadataWidth(u8)) { zero = 0, _ }) void { _ = value; }
+        \\fn countWidth(value: enum(CountWidth(64)) { zero = 0, _ }) void { _ = value; }
+        \\fn metaWidth(value: enum(MetaWidth(6)) { zero = 0, _ }) void { _ = value; }
+        \\fn localLogWidth(value: enum(LocalLogWidth(usize)) { zero = 0, _ }) void { _ = value; }
+        \\fn widenedWidth(value: enum(WidenWidth(6)) { zero = 0, _ }) void { _ = value; }
+        \\fn widenedMaximum(value: enum(WidenWidth(31)) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownWidened(comptime bits: u5, value: enum(WidenWidth(bits)) { zero = 0, _ }) void { _ = value; }
+        \\fn outOfRangeWidth(value: enum(WidenWidth(@as(u16, 256))) { zero = 0, _ }) void { _ = value; }
+        \\fn nullWidth(value: enum(OptionalWidth(null)) { zero = 0, _ }) void { _ = value; }
+        \\fn typedNullWidth(value: enum(OptionalWidth(@as(?u16, null))) { zero = 0, _ }) void { _ = value; }
+        \\fn forwardedNullWidth(value: enum(ForwardOptionalWidth(null)) { zero = 0, _ }) void { _ = value; }
+        \\fn nominalNullWidth(value: enum(OptionalModeWidth(null)) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownOptionalWidth(comptime width: ?u16, value: enum(OptionalWidth(width)) { zero = 0, _ }) void { _ = value; }
+        \\fn opaqueOptionalWidth(value: enum(OptionalWidth(opaqueOptional())) { zero = 0, _ }) void { _ = value; }
+        \\fn undefinedOptionalWidth(value: enum(OptionalWidth(undefined)) { zero = 0, _ }) void { _ = value; }
+        \\fn nonNullOptionalWidth(value: enum(OptionalWidth(@as(u16, 0))) { zero = 0, _ }) void { _ = value; }
+        \\fn bareNullWidth(value: enum(BareNullWidth()) { zero = 0, _ }) void { _ = value; }
+        \\fn validRangeWidth(value: enum(GuardedWidth(80)) { zero = 0, _ }) void { _ = value; }
+        \\fn lowRangeWidth(value: enum(GuardedWidth(0)) { zero = 0, _ }) void { _ = value; }
+        \\fn highRangeWidth(value: enum(GuardedWidth(100)) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownRangeWidth(comptime percentage: u64, value: enum(GuardedWidth(percentage)) { zero = 0, _ }) void { _ = value; }
+        \\fn comptimeRangeWidth(value: enum(ComptimeWidth(80)) { zero = 0, _ }) void { _ = value; }
+        \\fn shortAndWidth(value: enum(ShortAndWidth()) { zero = 0, _ }) void { _ = value; }
+        \\fn shortOrWidth(value: enum(ShortOrWidth()) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownLeftWidth(value: enum(UnknownLeftWidth()) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownFirstWidth(comptime flag: bool, value: enum(UnknownFirstWidth(flag)) { zero = 0, _ }) void { _ = value; }
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const root = (try grow.growStateAlloc(typed.cache)).owner;
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    var memo: Memo = .{};
+    var query: Query = .{
+        .root = root, .state = &root.return_storage_state,
+        .resolver = &typed.resolver, .remaining = &remaining,
+        .scratch = &scratch, .memo = &memo,
+        .entry_tree = typed.tree(), .entry_token = 0,
+    };
+    const site = try expressionLoanTestSite(typed.tree(), name, "value", 0);
+    query.entry_token = site.horizon;
+    const caller = (try query.callerFrame(typed.cache, site.horizon, null)) orelse return error.TestExpectedCaller;
+    const narrow = if (try query.nodeType(caller, site.node)) |ty| try query.addressNarrow(ty, 0) else false;
+    try std.testing.expectEqual(expected, narrow);
+}
+
+test "canonical enum tag width recognizes explicit narrow nonexhaustive tags" { try enumTagWidthCase("direct", true); }
+test "canonical enum tag width recognizes source-instantiated integer constructors" { try enumTagWidthCase("factory", true); }
+test "canonical enum tag width recognizes canonical math metadata factories" { try enumTagWidthCase("math", true); }
+test "canonical enum tag width preserves nonexhaustive pointer-wide tags" { try enumTagWidthCase("wide", false); }
+test "canonical enum tag width leaves unbound factory tags unknown" { try enumTagWidthCase("unknown", false); }
+test "canonical enum tag width selects a proved narrow conditional return" { try enumTagWidthCase("narrowBranch", true); }
+test "canonical enum tag width selects a proved pointer-wide conditional return" { try enumTagWidthCase("wideBranch", false); }
+test "canonical enum tag width does not select a return across an unknown branch" { try enumTagWidthCase("unknownBranch", false); }
+test "canonical enum tag width validates forwarded builtin signedness identity" { try enumTagWidthCase("signedWidth", true); }
+test "canonical enum tag width rejects an unrelated signedness enum" { try enumTagWidthCase("wrongSignedWidth", false); }
+test "canonical enum tag width does not cross a fallible try initializer" { try enumTagWidthCase("tryEnum", false); }
+test "canonical enum tag width does not cross a fallible catch initializer" { try enumTagWidthCase("catchEnum", false); }
+test "canonical enum tag width does not cross an unreachable initializer" { try enumTagWidthCase("unreachableEnum", false); }
+test "canonical enum tag width does not cross a noreturn initializer" { try enumTagWidthCase("panicEnum", false); }
+test "canonical enum tag width does not infer an unbound initializer value" { try enumTagWidthCase("unknownEnum", false); }
+test "canonical enum tag width does not treat a typed call as a known initializer" { try enumTagWidthCase("opaqueEnum", false); }
+test "canonical enum tag width recognizes reflected integer bit metadata" { try enumTagWidthCase("metadataWidth", true); }
+test "canonical enum tag width recognizes clz of a typed constant expression" { try enumTagWidthCase("countWidth", true); }
+test "canonical enum tag width recognizes canonical meta integer forwarding" { try enumTagWidthCase("metaWidth", true); }
+test "canonical enum tag width recognizes source composed logarithmic factories" { try enumTagWidthCase("localLogWidth", true); }
+test "canonical enum tag width preserves a known widened comptime integer" { try enumTagWidthCase("widenedWidth", true); }
+test "canonical enum tag width preserves the maximum widened source integer" { try enumTagWidthCase("widenedMaximum", true); }
+test "canonical enum tag width does not invent a widened unknown argument" { try enumTagWidthCase("unknownWidened", false); }
+test "canonical enum tag width does not wrap an out of range integer argument" { try enumTagWidthCase("outOfRangeWidth", false); }
+test "canonical enum tag width selects a bound optional null guard" { try enumTagWidthCase("nullWidth", true); }
+test "canonical enum tag width selects a typed optional null guard" { try enumTagWidthCase("typedNullWidth", true); }
+test "canonical enum tag width preserves forwarded optional null actuals" { try enumTagWidthCase("forwardedNullWidth", true); }
+test "canonical enum tag width selects null of a nominal enum optional" { try enumTagWidthCase("nominalNullWidth", true); }
+test "canonical enum tag width leaves unknown optional guards unresolved" { try enumTagWidthCase("unknownOptionalWidth", false); }
+test "canonical enum tag width does not infer null from an opaque optional call" { try enumTagWidthCase("opaqueOptionalWidth", false); }
+test "canonical enum tag width does not infer null from undefined" { try enumTagWidthCase("undefinedOptionalWidth", false); }
+test "canonical enum tag width does not treat an integer zero as optional null" { try enumTagWidthCase("nonNullOptionalWidth", false); }
+test "canonical enum tag width rejects a capture on an untyped null condition" { try enumTagWidthCase("bareNullWidth", false); }
+test "canonical enum tag width evaluates a proved integer range guard" { try enumTagWidthCase("validRangeWidth", true); }
+test "canonical enum tag width rejects the low invalid range boundary" { try enumTagWidthCase("lowRangeWidth", false); }
+test "canonical enum tag width rejects the high invalid range boundary" { try enumTagWidthCase("highRangeWidth", false); }
+test "canonical enum tag width leaves unknown range guards unresolved" { try enumTagWidthCase("unknownRangeWidth", false); }
+test "canonical enum tag width evaluates a proved comptime block guard" { try enumTagWidthCase("comptimeRangeWidth", true); }
+test "canonical enum tag width short circuits a proved false left operand" { try enumTagWidthCase("shortAndWidth", true); }
+test "canonical enum tag width short circuits a proved true left operand" { try enumTagWidthCase("shortOrWidth", true); }
+test "canonical enum tag width does not discard an unknown left boolean operand" { try enumTagWidthCase("unknownLeftWidth", false); }
+test "canonical enum tag width does not choose a narrow first return under an unknown guard" { try enumTagWidthCase("unknownFirstWidth", false); }
+
+test "canonical enum tag width retains explicit pointer encodings" {
+    const source: [:0]const u8 =
+        \\const Narrow = enum(u6) { zero = 0, _ };
+        \\fn encoded(pointer: *u8) Narrow {
+        \\    return @enumFromInt(@as(u6, @truncate(@intFromPtr(pointer))));
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const root = (try grow.growStateAlloc(typed.cache)).owner;
+    const site = try expressionLoanTestSite(typed.tree(), "encoded", "@enumFromInt(@as(u6, @truncate(@intFromPtr(pointer))))", 0);
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    var memo: Memo = .{};
+    var query: Query = .{
+        .root = root, .state = &root.return_storage_state,
+        .resolver = &typed.resolver, .remaining = &remaining,
+        .scratch = &scratch, .memo = &memo,
+        .entry_tree = typed.tree(), .entry_token = site.horizon,
+    };
+    const frame = (try query.callerFrame(typed.cache, site.horizon, null)) orelse return error.TestExpectedCaller;
+    try std.testing.expect(try query.hasAddressBits(frame, site.node, 0));
+}
+
+fn optionalFormalTypeIdentityCase(comptime caller_name: []const u8, comptime expected_equal: bool) !void {
+    const source: [:0]const u8 =
+        \\const Mode = enum(u6) { one = 0, _ };
+        \\fn Preserve(comptime p: ?bool) type { return @TypeOf(p); }
+        \\fn PreserveMode(comptime p: ?Mode) type { return @TypeOf(p); }
+        \\fn Forward(comptime p: ?bool) type { return Preserve(p); }
+        \\fn ForwardMode(comptime p: ?Mode) type { return PreserveMode(p); }
+        \\fn primitive() void {
+        \\    const actual = Preserve(null);
+        \\    const expected = ?bool;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn typedPrimitive() void {
+        \\    const actual = Preserve(@as(?bool, null));
+        \\    const expected = ?bool;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn forwardedPrimitive() void {
+        \\    const actual = Forward(null);
+        \\    const expected = ?bool;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn nominal() void {
+        \\    const actual = PreserveMode(null);
+        \\    const expected = ?Mode;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn typedNominal() void {
+        \\    const actual = PreserveMode(@as(?Mode, null));
+        \\    const expected = ?Mode;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn forwardedNominal() void {
+        \\    const actual = ForwardMode(null);
+        \\    const expected = ?Mode;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn unbound(comptime p: ?bool) void {
+        \\    const actual = Preserve(p);
+        \\    const expected = ?bool;
+        \\    _ = actual; _ = expected;
+        \\}
+        \\fn bareNull() void {
+        \\    const actual = @TypeOf(null);
+        \\    const expected = ?bool;
+        \\    _ = actual; _ = expected;
+        \\}
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const root = (try grow.growStateAlloc(typed.cache)).owner;
+    const actual_site = try expressionLoanTestSite(typed.tree(), caller_name, "actual", 0);
+    const expected_site = try expressionLoanTestSite(typed.tree(), caller_name, "expected", 0);
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    var memo: Memo = .{};
+    var query: Query = .{
+        .root = root, .state = &root.return_storage_state,
+        .resolver = &typed.resolver, .remaining = &remaining,
+        .scratch = &scratch, .memo = &memo,
+        .entry_tree = typed.tree(), .entry_token = actual_site.horizon,
+    };
+    const caller = (try query.callerFrame(typed.cache, actual_site.horizon, null)) orelse return error.TestExpectedCaller;
+    const actual = (try query.nodeType(caller, actual_site.node)) orelse return error.TestExpectedActualType;
+    const expected = (try query.nodeType(caller, expected_site.node)) orelse return error.TestExpectedDeclaredType;
+    try std.testing.expect(actual.is_type_val);
+    try std.testing.expect(expected.is_type_val);
+    try std.testing.expectEqual(expected_equal, actual.eql(expected));
+}
+
+test "canonical optional formal typeof preserves primitive declared type for null" { try optionalFormalTypeIdentityCase("primitive", true); }
+test "canonical optional formal typeof preserves typed primitive null" { try optionalFormalTypeIdentityCase("typedPrimitive", true); }
+test "canonical optional formal typeof preserves forwarded primitive null" { try optionalFormalTypeIdentityCase("forwardedPrimitive", true); }
+test "canonical optional formal typeof preserves nominal declared type for null" { try optionalFormalTypeIdentityCase("nominal", true); }
+test "canonical optional formal typeof preserves typed nominal null" { try optionalFormalTypeIdentityCase("typedNominal", true); }
+test "canonical optional formal typeof preserves forwarded nominal null" { try optionalFormalTypeIdentityCase("forwardedNominal", true); }
+test "canonical optional formal typeof preserves unbound optional type without inventing null" { try optionalFormalTypeIdentityCase("unbound", true); }
+test "canonical optional formal typeof does not change bare literal null into an optional" { try optionalFormalTypeIdentityCase("bareNull", false); }
+
+const CapturedFactoryValueCase = struct { caller: []const u8, narrow: bool };
+
+fn capturedFactoryValueCases(comptime cases: []const CapturedFactoryValueCase) !void {
+    const source: [:0]const u8 =
+        \\const Mode = enum(u6) { one = 0, _ };
+        \\fn IntegerTag(comptime _: type, comptime n: u16) type { if (n == 6) return u6; return usize; }
+        \\fn BooleanTag(comptime _: type, comptime wide: bool) type { if (wide) return usize; return u6; }
+        \\fn OptionalTag(comptime _: type, comptime p: ?u16) type { if (p) |_| return usize; return u6; }
+        \\fn NominalTag(comptime _: type, comptime p: ?Mode) type { if (p) |_| return usize; return u6; }
+        \\fn Factory(comptime T: type, comptime n: u16, comptime wide: bool, comptime p: ?u16, comptime mode: ?Mode) type {
+        \\    return struct {
+        \\        payload: T,
+        \\        const Self = @This();
+        \\        pub const Child = struct {
+        \\            pub const Parent = Self;
+        \\            pub const Integer = IntegerTag(T, n);
+        \\            pub const Boolean = BooleanTag(T, wide);
+        \\            pub const Optional = OptionalTag(T, p);
+        \\            pub const Nominal = NominalTag(T, mode);
+        \\        };
+        \\    };
+        \\}
+        \\fn directInteger(value: enum(IntegerTag(u8, 6)) { zero = 0, _ }) void { _ = value; }
+        \\fn directBoolean(value: enum(BooleanTag(u8, false)) { zero = 0, _ }) void { _ = value; }
+        \\fn directOptional(value: enum(OptionalTag(u8, null)) { zero = 0, _ }) void { _ = value; }
+        \\fn directNominal(value: enum(NominalTag(u8, null)) { zero = 0, _ }) void { _ = value; }
+        \\fn integerNarrow(value: enum(Factory(u8, 6, false, null, null).Child.Integer) { zero = 0, _ }) void { _ = value; }
+        \\fn integerWide(value: enum(Factory(u8, 64, false, null, null).Child.Integer) { zero = 0, _ }) void { _ = value; }
+        \\fn booleanNarrow(value: enum(Factory(u8, 6, false, null, null).Child.Boolean) { zero = 0, _ }) void { _ = value; }
+        \\fn booleanWide(value: enum(Factory(u8, 6, true, null, null).Child.Boolean) { zero = 0, _ }) void { _ = value; }
+        \\fn optionalNarrow(value: enum(Factory(u8, 6, false, null, null).Child.Optional) { zero = 0, _ }) void { _ = value; }
+        \\fn optionalNonNull(value: enum(Factory(u8, 6, false, @as(u16, 0), null).Child.Optional) { zero = 0, _ }) void { _ = value; }
+        \\fn nominalNarrow(value: enum(Factory(u8, 6, false, null, null).Child.Nominal) { zero = 0, _ }) void { _ = value; }
+        \\fn nominalNonNull(value: enum(Factory(u8, 6, false, null, Mode.one).Child.Nominal) { zero = 0, _ }) void { _ = value; }
+        \\fn integerAncestor(value: enum(Factory(u8, 6, false, null, null).Child.Parent.Child.Integer) { zero = 0, _ }) void { _ = value; }
+        \\fn integerAncestorWide(value: enum(Factory(u8, 64, false, null, null).Child.Parent.Child.Integer) { zero = 0, _ }) void { _ = value; }
+        \\fn booleanAncestor(value: enum(Factory(u8, 6, false, null, null).Child.Parent.Child.Boolean) { zero = 0, _ }) void { _ = value; }
+        \\fn booleanAncestorWide(value: enum(Factory(u8, 6, true, null, null).Child.Parent.Child.Boolean) { zero = 0, _ }) void { _ = value; }
+        \\fn optionalAncestor(value: enum(Factory(u8, 6, false, null, null).Child.Parent.Child.Optional) { zero = 0, _ }) void { _ = value; }
+        \\fn nominalAncestor(value: enum(Factory(u8, 6, false, null, null).Child.Parent.Child.Nominal) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownInteger(comptime n: u16, value: enum(Factory(u8, n, false, null, null).Child.Integer) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownBoolean(comptime wide: bool, value: enum(Factory(u8, 6, wide, null, null).Child.Boolean) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownOptional(comptime p: ?u16, value: enum(Factory(u8, 6, false, p, null).Child.Optional) { zero = 0, _ }) void { _ = value; }
+        \\fn unknownNominal(comptime mode: ?Mode, value: enum(Factory(u8, 6, false, null, mode).Child.Nominal) { zero = 0, _ }) void { _ = value; }
+        \\fn undefinedOptional(value: enum(Factory(u8, 6, false, undefined, null).Child.Optional) { zero = 0, _ }) void { _ = value; }
+        \\fn undefinedNominal(value: enum(Factory(u8, 6, false, null, undefined).Child.Nominal) { zero = 0, _ }) void { _ = value; }
+    ;
+    const typed = try Typed.init(std.testing.allocator, source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const root = (try grow.growStateAlloc(typed.cache)).owner;
+    var remaining: u32 = call_summary.actual_query_work_limit;
+    var memo: Memo = .{};
+    var query: Query = .{
+        .root = root, .state = &root.return_storage_state,
+        .resolver = &typed.resolver, .remaining = &remaining,
+        .scratch = &scratch, .memo = &memo,
+        .entry_tree = typed.tree(), .entry_token = 0,
+    };
+    for (cases) |case| {
+        const site = try expressionLoanTestSite(typed.tree(), case.caller, "value", 0);
+        query.entry_token = site.horizon;
+        const caller = (try query.callerFrame(typed.cache, site.horizon, null)) orelse return error.TestExpectedCaller;
+        const narrow = if (try query.nodeType(caller, site.node)) |ty| try query.addressNarrow(ty, 0) else false;
+        try std.testing.expectEqual(case.narrow, narrow);
+    }
+}
+
+test "captured factory values retain integers across nested aliases and distinct environments" {
+    try capturedFactoryValueCases(&.{
+        .{ .caller = "directInteger", .narrow = true },
+        .{ .caller = "integerNarrow", .narrow = true },
+        .{ .caller = "integerWide", .narrow = false },
+        .{ .caller = "integerNarrow", .narrow = true },
+    });
+}
+test "captured factory values retain booleans across nested aliases and distinct environments" {
+    try capturedFactoryValueCases(&.{
+        .{ .caller = "directBoolean", .narrow = true },
+        .{ .caller = "booleanNarrow", .narrow = true },
+        .{ .caller = "booleanWide", .narrow = false },
+        .{ .caller = "booleanNarrow", .narrow = true },
+    });
+}
+test "captured factory values retain primitive optional nulls without treating nonnull zero as null" {
+    try capturedFactoryValueCases(&.{
+        .{ .caller = "directOptional", .narrow = true },
+        .{ .caller = "optionalNarrow", .narrow = true },
+        .{ .caller = "optionalNonNull", .narrow = false },
+        .{ .caller = "optionalNarrow", .narrow = true },
+    });
+}
+test "captured factory values retain nominal optional null facts with their declared types" {
+    try capturedFactoryValueCases(&.{
+        .{ .caller = "directNominal", .narrow = true },
+        .{ .caller = "nominalNarrow", .narrow = true },
+        .{ .caller = "nominalNonNull", .narrow = false },
+        .{ .caller = "nominalNarrow", .narrow = true },
+    });
+}
+test "captured factory values survive lexical ancestor this aliases without changing environment" {
+    try capturedFactoryValueCases(&.{
+        .{ .caller = "integerAncestor", .narrow = true },
+        .{ .caller = "integerAncestorWide", .narrow = false },
+        .{ .caller = "integerAncestor", .narrow = true },
+        .{ .caller = "booleanAncestor", .narrow = true },
+        .{ .caller = "booleanAncestorWide", .narrow = false },
+        .{ .caller = "optionalAncestor", .narrow = true },
+        .{ .caller = "nominalAncestor", .narrow = true },
+    });
+}
+test "captured factory values do not turn unbound or undefined inputs into known constants" {
+    try capturedFactoryValueCases(&.{
+        .{ .caller = "unknownInteger", .narrow = false },
+        .{ .caller = "unknownBoolean", .narrow = false },
+        .{ .caller = "unknownOptional", .narrow = false },
+        .{ .caller = "unknownNominal", .narrow = false },
+        .{ .caller = "undefinedOptional", .narrow = false },
+        .{ .caller = "undefinedNominal", .narrow = false },
+    });
+}
+
+const stable_projection_source: [:0]const u8 =
+    \\const Header = struct {
+    \\    ptr: *u8,
+    \\    fn touchCopy(self: Header, fail: bool) !void {
+    \\        errdefer unknownStore(self.ptr);
+    \\        if (fail) return error.Failed;
+    \\        unknownStore(self.ptr);
+    \\    }
+    \\    fn replace(self: *const Header, pointer: *u8) void {
+    \\        @constCast(self).ptr = pointer;
+    \\    }
+    \\};
+    \\const Carrier = struct { value: *Header };
+    \\const Inline = struct { values: [1]*u8 };
+    \\const Slice = struct { values: []*u8 };
+    \\const Bits = struct { bits: usize };
+    \\extern fn unknownStore(pointer: *u8) void;
+    \\extern fn opaqueHeader(header: *const Header, pointer: *u8) void;
+    \\fn replace(header: *Header, pointer: *u8) void { header.ptr = pointer; }
+    \\fn replaceFirst(values: []*u8, pointer: *u8) void { values[0] = pointer; }
+    \\fn failAfterStore(header: *Header, pointer: *u8) !void {
+    \\    errdefer header.ptr = pointer;
+    \\    return error.Failed;
+    \\}
+    \\fn beforeHeader(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = replacement; _ = neighbor;
+    \\    const header: Header = .{ .ptr = input };
+    \\    return header.ptr;
+    \\}
+    \\fn copiedHeader(input: *u8, replacement: *u8, neighbor: *u8, fail: bool) *u8 {
+    \\    _ = replacement;
+    \\    const header: Header = .{ .ptr = input };
+    \\    header.touchCopy(fail) catch {};
+    \\    unknownStore(neighbor);
+    \\    return header.ptr;
+    \\}
+    \\fn beforeScalar(neighbor: *u8) usize {
+    \\    _ = neighbor;
+    \\    const header: Bits = .{ .bits = 42 };
+    \\    return header.bits;
+    \\}
+    \\fn scalarValue(neighbor: *u8) usize {
+    \\    const header: Bits = .{ .bits = 42 };
+    \\    unknownStore(neighbor);
+    \\    return header.bits;
+    \\}
+    \\fn beforeBits(input: *u8, replacement: *u8, neighbor: *u8) usize {
+    \\    _ = replacement; _ = neighbor;
+    \\    const header: Bits = .{ .bits = @intFromPtr(input) };
+    \\    return header.bits;
+    \\}
+    \\fn encodedValue(input: *u8, replacement: *u8, neighbor: *u8) usize {
+    \\    _ = replacement;
+    \\    const header: Bits = .{ .bits = @intFromPtr(input) };
+    \\    unknownStore(neighbor);
+    \\    return header.bits;
+    \\}
+    \\fn explicitAddress(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    var header: Header = .{ .ptr = input };
+    \\    const alias: *const Header = &header;
+    \\    replace(@constCast(alias), replacement);
+    \\    return header.ptr;
+    \\}
+    \\fn implicitReceiver(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    var header: Header = .{ .ptr = input };
+    \\    header.replace(replacement);
+    \\    return header.ptr;
+    \\}
+    \\fn opaqueAddress(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    var header: Header = .{ .ptr = input };
+    \\    const alias: *const Header = &header;
+    \\    opaqueHeader(alias, replacement);
+    \\    return header.ptr;
+    \\}
+    \\fn caughtFailure(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    var header: Header = .{ .ptr = input };
+    \\    failAfterStore(&header, replacement) catch {};
+    \\    return header.ptr;
+    \\}
+    \\fn beforePointee(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = replacement; _ = neighbor;
+    \\    var target: Header = .{ .ptr = input };
+    \\    const header: Carrier = .{ .value = &target };
+    \\    return header.value.ptr;
+    \\}
+    \\fn pointeeWrite(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    var target: Header = .{ .ptr = input };
+    \\    const header: Carrier = .{ .value = &target };
+    \\    header.value.replace(replacement);
+    \\    return header.value.ptr;
+    \\}
+    \\extern fn unknownHeader() *Header;
+    \\fn externalReceiver() *u8 {
+    \\    const header: Carrier = .{ .value = unknownHeader() };
+    \\    return header.value.ptr;
+    \\}
+    \\fn reboundReceiver(input: *u8) *u8 {
+    \\    var target: Header = .{ .ptr = input };
+    \\    var header: Carrier = .{ .value = &target };
+    \\    header.value = unknownHeader();
+    \\    return header.value.ptr;
+    \\}
+    \\fn beforeInline(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = replacement; _ = neighbor;
+    \\    var header: Inline = .{ .values = .{input} };
+    \\    const alias = &header;
+    \\    return alias.values[0];
+    \\}
+    \\fn inlineSlice(input: *u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    var header: Inline = .{ .values = .{input} };
+    \\    const alias = &header;
+    \\    replaceFirst(alias.values[0..], replacement);
+    \\    return alias.values[0];
+    \\}
+    \\fn beforeSlice(values: []*u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = replacement; _ = neighbor;
+    \\    const header: Slice = .{ .values = values };
+    \\    return header.values[0];
+    \\}
+    \\fn sliceBacking(values: []*u8, replacement: *u8, neighbor: *u8) *u8 {
+    \\    _ = neighbor;
+    \\    const header: Slice = .{ .values = values };
+    \\    replaceFirst(header.values, replacement);
+    \\    return header.values[0];
+    \\}
+    \\fn use(input: *u8, replacement: *u8, neighbor: *u8, fail: bool) void {
+    \\    _ = beforeHeader(input, replacement, neighbor);
+    \\    _ = copiedHeader(input, replacement, neighbor, fail);
+    \\    _ = beforeScalar(neighbor);
+    \\    _ = scalarValue(neighbor);
+    \\    _ = beforeBits(input, replacement, neighbor);
+    \\    _ = encodedValue(input, replacement, neighbor);
+    \\    _ = explicitAddress(input, replacement, neighbor);
+    \\    _ = implicitReceiver(input, replacement, neighbor);
+    \\    _ = opaqueAddress(input, replacement, neighbor);
+    \\    _ = caughtFailure(input, replacement, neighbor);
+    \\    _ = beforePointee(input, replacement, neighbor);
+    \\    _ = pointeeWrite(input, replacement, neighbor);
+    \\    _ = beforeInline(input, replacement, neighbor);
+    \\    _ = inlineSlice(input, replacement, neighbor);
+    \\    _ = externalReceiver();
+    \\    _ = reboundReceiver(input);
+    \\}
+    \\fn useSlice(values: []*u8, replacement: *u8, neighbor: *u8) void {
+    \\    _ = beforeSlice(values, replacement, neighbor);
+    \\    _ = sliceBacking(values, replacement, neighbor);
+    \\}
+;
+
+fn stableProjectionCase(before_name: []const u8, after_name: []const u8, complete: ?bool, replacement: ?bool, kind: enum { pointer, payload }) !void {
+    const typed = try Typed.init(std.testing.allocator, stable_projection_source);
+    defer typed.deinit(std.testing.allocator);
+    const before = try returnedStorageOf(typed.cache, callNamed(typed.tree(), before_name).?);
+    const projection: Projection = if (kind == .pointer) .pointer_value else .payload_value;
+    const storage: Storage = if (kind == .pointer) .inline_storage else .payload_storage;
+    // An indexed pointer carrier is not a closed-pointee certificate.
+    if (kind == .pointer) try std.testing.expect(before.complete);
+    _ = try expectAlternative(before, .{ .param = 0, .path = "" }, projection, storage, "");
+    for (before.alternatives) |alternative|
+        try std.testing.expect(alternative.owner.param != 1);
+    const after = try returnedStorageOf(typed.cache, callNamed(typed.tree(), after_name).?);
+    if (complete) |expected| try std.testing.expectEqual(expected, after.complete);
+    if (replacement) |expected| {
+        if (expected) {
+            _ = try expectAlternative(after, .{ .param = 1, .path = "" }, projection, storage, "");
+        } else {
+            _ = try expectAlternative(after, .{ .param = 0, .path = "" }, projection, storage, "");
+            for (after.alternatives) |alternative|
+                try std.testing.expect(alternative.owner.param != 1);
+        }
+    } else {
+        _ = try expectAlternative(after, .{ .param = 0, .path = "" }, projection, storage, "");
+    }
+}
+
+test "stable header projection keeps copied pointer origins complete across caught and unrelated effects" {
+    try stableProjectionCase("beforeHeader", "copiedHeader", true, false, .pointer);
+}
+test "stable header projection keeps scalar value copies complete and empty" {
+    const typed = try Typed.init(std.testing.allocator, stable_projection_source);
+    defer typed.deinit(std.testing.allocator);
+    try expectNoBorrow(try returnedStorageOf(typed.cache, callNamed(typed.tree(), "beforeScalar").?));
+    try expectNoBorrow(try returnedStorageOf(typed.cache, callNamed(typed.tree(), "scalarValue").?));
+}
+test "stable header projection preserves encoded incoming pointer bits" {
+    try stableProjectionCase("beforeBits", "encodedValue", null, false, .pointer);
+}
+test "stable header projection retains stores through an explicit const alias of mutable backing" {
+    try stableProjectionCase("beforeHeader", "explicitAddress", null, true, .pointer);
+}
+test "stable header projection retains stores through an implicit const receiver of mutable backing" {
+    try stableProjectionCase("beforeHeader", "implicitReceiver", null, true, .pointer);
+}
+test "stable header projection keeps opaque address escapes incomplete" {
+    try stableProjectionCase("beforeHeader", "opaqueAddress", false, null, .pointer);
+}
+test "stable header projection retains caught initialization failure cleanup stores" {
+    try stableProjectionCase("beforeHeader", "caughtFailure", null, true, .pointer);
+}
+test "stable header projection does not freeze a const carriers mutable pointee" {
+    try stableProjectionCase("beforePointee", "pointeeWrite", null, true, .pointer);
+}
+test "stable header projection does not freeze inline array slices through const aliases" {
+    try stableProjectionCase("beforeInline", "inlineSlice", null, true, .payload);
+}
+test "stable header projection does not freeze copied slice backing elements" {
+    try stableProjectionCase("beforeSlice", "sliceBacking", null, true, .payload);
+}
+test "stable header projection keeps unresolved receiver factories incomplete" {
+    const typed = try Typed.init(std.testing.allocator, stable_projection_source);
+    defer typed.deinit(std.testing.allocator);
+    const result = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "externalReceiver").?);
+    try std.testing.expect(!result.complete);
+}
+test "stable header projection keeps receivers rebound to unknown factories incomplete" {
+    const typed = try Typed.init(std.testing.allocator, stable_projection_source);
+    defer typed.deinit(std.testing.allocator);
+    const result = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "reboundReceiver").?);
+    try std.testing.expect(!result.complete);
+}
+
+const stable_callable_source: [:0]const u8 =
+    \\const Box = struct { bytes: []const u8 };
+    \\const Table = struct { inspect: *const fn (*Box) void };
+    \\extern fn unknownDestination() *u8;
+    \\fn inspectOnly(box: *Box) void { _ = box; }
+    \\fn before(input: []const u8) []const u8 {
+    \\    var box: Box = .{ .bytes = input };
+    \\    _ = &box;
+    \\    return box.bytes;
+    \\}
+    \\fn after(input: []const u8) []const u8 {
+    \\    const table: Table = .{ .inspect = inspectOnly };
+    \\    unknownDestination().* = 0;
+    \\    var box: Box = .{ .bytes = input };
+    \\    table.inspect(&box);
+    \\    return box.bytes;
+    \\}
+    \\fn unknown(input: []const u8, action: *const fn (*Box) void) []const u8 {
+    \\    const table: Table = .{ .inspect = action };
+    \\    var box: Box = .{ .bytes = input };
+    \\    table.inspect(&box);
+    \\    return box.bytes;
+    \\}
+    \\fn use(input: []const u8, action: *const fn (*Box) void) void {
+    \\    _ = before(input);
+    \\    _ = after(input);
+    \\    _ = unknown(input, action);
+    \\}
+;
+
+test "stable header source values keep an exact readonly callback across unrelated unknown destinations" {
+    const typed = try Typed.init(std.testing.allocator, stable_callable_source);
+    defer typed.deinit(std.testing.allocator);
+    const before = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "before").?);
+    try std.testing.expect(before.complete);
+    _ = try expectAlternative(before, .{ .param = 0, .path = "" }, .pointer_value, .backing_storage, "");
+    const after = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "after").?);
+    try std.testing.expect(after.complete);
+    _ = try expectAlternative(after, .{ .param = 0, .path = "" }, .pointer_value, .backing_storage, "");
+}
+
+test "stable header source values do not turn an unknown callback slot into a readonly callback" {
+    const typed = try Typed.init(std.testing.allocator, stable_callable_source);
+    defer typed.deinit(std.testing.allocator);
+    const after = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "unknown").?);
+    try std.testing.expect(!after.complete);
+    _ = try expectAlternative(after, .{ .param = 0, .path = "" }, .pointer_value, .backing_storage, "");
+}
+
+const private_scalar_source: [:0]const u8 =
+    \\const Limit = enum(usize) {
+    \\    nothing = 0,
+    \\    _,
+    \\    fn subtract(self: Limit, n: usize) ?Limit {
+    \\        const value = @intFromEnum(self);
+    \\        if (n > value) return null;
+    \\        return @enumFromInt(value - n);
+    \\    }
+    \\};
+    \\extern fn unknownStore(pointer: *u8) void;
+    \\fn count(neighbor: *u8) usize {
+    \\    var remaining: Limit = @enumFromInt(4);
+    \\    while (remaining != .nothing) {
+    \\        unknownStore(neighbor);
+    \\        const n: usize = 1;
+    \\        remaining = remaining.subtract(n).?;
+    \\    }
+    \\    return @intFromEnum(remaining);
+    \\}
+    \\fn compound(neighbor: *u8) usize {
+    \\    var bits: usize = 42;
+    \\    unknownStore(neighbor);
+    \\    bits += 1;
+    \\    return bits;
+    \\}
+    \\fn introduced(neighbor: *u8) usize {
+    \\    var local: u8 = 0;
+    \\    var bits: usize = 0;
+    \\    unknownStore(neighbor);
+    \\    bits = @intFromPtr(&local);
+    \\    return bits;
+    \\}
+    \\fn storeEncoded(bits: *usize, pointer: *u8) void {
+    \\    bits.* = @intFromPtr(pointer);
+    \\}
+    \\fn escaped(neighbor: *u8) usize {
+    \\    var local: u8 = 0;
+    \\    var bits: usize = 0;
+    \\    const alias = &bits;
+    \\    unknownStore(neighbor);
+    \\    storeEncoded(alias, &local);
+    \\    return bits;
+    \\}
+    \\fn loopIntroduced(neighbor: *u8, again: bool) usize {
+    \\    var local: u8 = 0;
+    \\    var bits: usize = 0;
+    \\    while (again) {
+    \\        unknownStore(neighbor);
+    \\        bits = @intFromPtr(&local);
+    \\    }
+    \\    return bits;
+    \\}
+    \\fn changedRhs(neighbor: *u8) usize {
+    \\    var local: u8 = 0;
+    \\    var other: usize = 0;
+    \\    other = @intFromPtr(&local);
+    \\    var bits: usize = 0;
+    \\    unknownStore(neighbor);
+    \\    bits = other;
+    \\    return bits;
+    \\}
+    \\fn use(neighbor: *u8, again: bool) void {
+    \\    _ = count(neighbor);
+    \\    _ = compound(neighbor);
+    \\    _ = introduced(neighbor);
+    \\    _ = escaped(neighbor);
+    \\    _ = loopIntroduced(neighbor, again);
+    \\}
+;
+
+test "private scalar slots keep a variable limit subtract loop free of storage loans" {
+    const typed = try Typed.init(std.testing.allocator, private_scalar_source);
+    defer typed.deinit(std.testing.allocator);
+    try expectNoBorrow(try returnedStorageOf(typed.cache, callNamed(typed.tree(), "count").?));
+}
+
+test "private scalar slots keep a compound numeric update free of storage loans" {
+    const typed = try Typed.init(std.testing.allocator, private_scalar_source);
+    defer typed.deinit(std.testing.allocator);
+    try expectNoBorrow(try returnedStorageOf(typed.cache, callNamed(typed.tree(), "compound").?));
+}
+
+fn privateScalarEncodedCase(function_name: []const u8) !void {
+    const typed = try Typed.init(std.testing.allocator, private_scalar_source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const tree = typed.tree();
+    var site = try expressionLoanTestSite(tree, function_name, "bits", 0);
+    var found_return = false;
+    // Choose the actual return load, not an address/assignment operand.
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (tree.firstToken(node) < tree.firstToken(site.body) or tree.lastToken(node) > tree.lastToken(site.body)) continue;
+        const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
+        if (!std.mem.eql(u8, tree.getNodeSource(value), "bits")) continue;
+        site.node = value;
+        site.horizon = tree.firstToken(value);
+        found_return = true;
+    }
+    if (!found_return) return error.TestExpectedScalarReturn;
+    const local = try expressionLoanTestBinding(typed.cache, site, "local");
+    var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &scratch });
+    const answer = try query.expressionLoansAt(.{ .selection = .{ .node = site.node }, .horizon = site.horizon });
+    for (answer.loans) |loan|
+        if (loan.binding_token == local and loan.proved) return;
+    return error.TestExpectedEncodedLocalLoan;
+}
+
+test "private scalar slots retain an encoded pointer introduced by direct assignment" {
+    try privateScalarEncodedCase("introduced");
+}
+test "private scalar slots retain an encoded pointer introduced through an escaped address" {
+    try privateScalarEncodedCase("escaped");
+}
+test "private scalar slots retain encoded pointer assignments from loop bodies" {
+    try privateScalarEncodedCase("loopIntroduced");
+}
+
+test "private scalar slots retain a changed neighbor local used by an assignment RHS" {
+    try privateScalarEncodedCase("changedRhs");
+}
+
+const scalar_value_forwarding_source: [:0]const u8 =
+    \\extern fn unknownStore(pointer: *u8) void;
+    \\extern fn unknownBits() usize;
+    \\fn subtract(word: usize) usize { return word - 1; }
+    \\fn install(slot: *usize, pointer: *u8) void { slot.* = @intFromPtr(pointer); }
+    \\fn actualArgumentRhs(neighbor: *u8) usize {
+    \\    var local: u8 = 0;
+    \\    var bits: usize = 0;
+    \\    unknownStore(neighbor);
+    \\    const result = subtract(blk: {
+    \\        install(&bits, &local);
+    \\        break :blk bits;
+    \\    });
+    \\    return result;
+    \\}
+    \\fn opaqueActual() usize { return subtract(unknownBits()); }
+    \\fn incomingActual(word: usize) usize { return subtract(word); }
+    \\fn use(neighbor: *u8, word: usize) void {
+    \\    _ = actualArgumentRhs(neighbor);
+    \\    _ = opaqueActual();
+    \\    _ = incomingActual(word);
+    \\}
+;
+
+test "bound scalar value forwarding retains encoded mutations performed by an actual argument RHS" {
+    const typed = try Typed.init(std.testing.allocator, scalar_value_forwarding_source);
+    defer typed.deinit(std.testing.allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const site = try expressionLoanTestSite(typed.tree(), "actualArgumentRhs", "result", 0);
+    const local = try expressionLoanTestBinding(typed.cache, site, "local");
+    var query = ExpressionLoanQuery.init(.{ .cache = typed.cache, .body = site.body, .scratch = &scratch });
+    const answer = try query.expressionLoansAt(.{ .selection = .{ .node = site.node }, .horizon = site.horizon });
+    for (answer.loans) |loan|
+        if (loan.binding_token == local and loan.proved) return;
+    return error.TestExpectedEncodedArgumentRhsLoan;
+}
+
+test "bound scalar value forwarding keeps an opaque scalar actual incomplete" {
+    const typed = try Typed.init(std.testing.allocator, scalar_value_forwarding_source);
+    defer typed.deinit(std.testing.allocator);
+    const answer = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "opaqueActual").?);
+    try std.testing.expect(!answer.complete);
+}
+
+test "bound scalar value forwarding keeps symbolic incoming scalar bits incomplete" {
+    const typed = try Typed.init(std.testing.allocator, scalar_value_forwarding_source);
+    defer typed.deinit(std.testing.allocator);
+    const answer = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "incomingActual").?);
+    try std.testing.expect(!answer.complete);
+}
+
+const scalar_undefined_forwarding_source: [:0]const u8 =
+    \\fn identity(word: usize) usize { return word; }
+    \\fn subtract(word: usize) usize { return word - 1; }
+    \\fn literalActual() usize { return identity(@as(usize, undefined)); }
+    \\fn aliasActual() usize {
+    \\    const missing: usize = undefined;
+    \\    return identity(missing);
+    \\}
+    \\fn arithmeticActual() usize {
+    \\    const missing: usize = undefined;
+    \\    return subtract(missing);
+    \\}
+    \\fn use() void {
+    \\    _ = literalActual();
+    \\    _ = aliasActual();
+    \\    _ = arithmeticActual();
+    \\}
+;
+
+test "bound scalar undefined values do not close a typed undefined literal actual" {
+    const typed = try Typed.init(std.testing.allocator, scalar_undefined_forwarding_source);
+    defer typed.deinit(std.testing.allocator);
+    const answer = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "literalActual").?);
+    try std.testing.expect(!answer.complete);
+}
+
+test "bound scalar undefined values do not close a typed undefined alias actual" {
+    const typed = try Typed.init(std.testing.allocator, scalar_undefined_forwarding_source);
+    defer typed.deinit(std.testing.allocator);
+    const answer = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "aliasActual").?);
+    try std.testing.expect(!answer.complete);
+}
+
+test "bound scalar undefined values do not close arithmetic over a typed undefined alias" {
+    const typed = try Typed.init(std.testing.allocator, scalar_undefined_forwarding_source);
+    defer typed.deinit(std.testing.allocator);
+    const answer = try returnedStorageOf(typed.cache, callNamed(typed.tree(), "arithmeticActual").?);
+    try std.testing.expect(!answer.complete);
 }

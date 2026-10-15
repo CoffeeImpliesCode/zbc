@@ -113,6 +113,10 @@ pub const CanonicalPaths = struct {
 pub const SourcePolicy = struct {
     roots: []const []const u8 = &.{},
     excludes: []const []const u8 = &.{},
+    /// Borrowed exact canonical absolute build.zig paths, immutable for the
+    /// Session lifetime. Empty by default: libraries get no metadata-only
+    /// permission. These grants never admit sources or module targets.
+    build_files: []const []const u8 = &.{},
     /// The exclusive width bound on a source this policy reads off the
     /// filesystem, in bytes.  A file whose length is *at or past* this
     /// number is refused as `error.SourceTooWide`, and it is refused from
@@ -219,6 +223,42 @@ pub const SourcePolicy = struct {
         var parts = std.mem.tokenizeAny(u8, path[root.len..], "/\\");
         while (parts.next()) |part| {
             if (self.excludesName(part)) return false;
+        }
+        return true;
+    }
+
+    /// Allows an ordinary in-root build.zig or an exact metadata-only grant.
+    /// Explicit grants cannot override excluded ancestors. Rejects noncanonical
+    /// path spellings without I/O; callers must resolve filesystem identities.
+    pub fn allowsBuildFile(self: SourcePolicy, path: []const u8) bool {
+        if (!isCanonicalBuildPath(path)) return false;
+        if (self.allowsAbsolutePath(path)) return true;
+        if (self.excludesPath(path)) return false;
+        var parts = std.mem.tokenizeAny(u8, path, "/\\");
+        while (parts.next()) |part| {
+            if (self.excludesName(part)) return false;
+        }
+        for (self.build_files) |build_file| {
+            if (std.mem.eql(u8, build_file, path)) return true;
+        }
+        return false;
+    }
+
+    fn isCanonicalBuildPath(path: []const u8) bool {
+        if (!std.fs.path.isAbsolute(path)) return false;
+        if (!std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) return false;
+        // Skip only the filesystem prefix, not empty interior components.
+        const start: usize = if (builtin.os.tag == .windows and
+            (std.mem.startsWith(u8, path, "\\\\") or std.mem.startsWith(u8, path, "//")))
+            2
+        else if (path[0] == '/' or path[0] == '\\')
+            1
+        else
+            0;
+        var parts = std.mem.splitAny(u8, path[start..], "/\\");
+        while (parts.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or
+                std.mem.eql(u8, part, "..")) return false;
         }
         return true;
     }
@@ -386,4 +426,91 @@ test "source streaming admits the last valid length and refuses growth to the bo
     defer gpa.free(source);
     try std.testing.expectEqualStrings(bytes, source);
     try std.testing.expectEqual(@as(u8, 0), source[source.len]);
+}
+
+test "build metadata exact grants do not widen source admission" {
+    const policy: SourcePolicy = .{
+        .roots = &.{"/project/src"},
+        .build_files = &.{"/project/build.zig"},
+    };
+    try std.testing.expect(policy.allowsBuildFile("/project/build.zig"));
+    try std.testing.expect(policy.allowsBuildFile("/project/src/build.zig"));
+    try std.testing.expect(!policy.allowsAbsolutePath("/project/build.zig"));
+    try std.testing.expect(policy.rootFor("/project/build.zig") == null);
+    try std.testing.expect(!policy.allowsAbsolutePath("/project/secret.zig"));
+    try std.testing.expect(!policy.allowsBuildFile("/project-other/build.zig"));
+    try std.testing.expect(!policy.allowsBuildFile("/project/build.zig/child/build.zig"));
+    try std.testing.expect(!policy.allowsBuildFile("/project/src/main.zig"));
+    const default: SourcePolicy = .{ .roots = policy.roots };
+    try std.testing.expectEqual(@as(usize, 0), default.build_files.len);
+    try std.testing.expect(!default.allowsBuildFile("/project/build.zig"));
+    const metadata_only: SourcePolicy = .{ .build_files = policy.build_files };
+    try std.testing.expect(metadata_only.allowsBuildFile("/project/build.zig"));
+    try std.testing.expect(!metadata_only.allowsAbsolutePath("/project/build.zig"));
+}
+
+test "build metadata rejects malformed exact grants" {
+    const paths = [_][]const u8{
+        "build.zig",
+        "project/build.zig",
+        "/project/src/../build.zig",
+        "/project/./build.zig",
+        "/project//build.zig",
+        "/project/main.zig",
+        "/project/build.zig.zon",
+        "/project/build.zig/",
+    };
+    for (paths) |path| {
+        const policy: SourcePolicy = .{ .roots = &.{"/project"}, .build_files = &.{path} };
+        try std.testing.expect(!policy.allowsBuildFile(path));
+    }
+}
+
+test "build metadata exclusions precede ordinary and exact admission" {
+    const cases = [_]struct { path: []const u8, excluded: []const u8 }{
+        .{ .path = "/project/build.zig", .excluded = "build.zig" },
+        .{ .path = "/project/build.zig", .excluded = "/project/build.zig" },
+        .{ .path = "/project/build.zig", .excluded = "/project" },
+        .{ .path = "/project/generated/deep/build.zig", .excluded = "generated" },
+        .{ .path = "/project/generated/deep/build.zig", .excluded = "/project/generated" },
+    };
+    for (cases) |case| {
+        const policy: SourcePolicy = .{
+            .roots = &.{"/project"},
+            .build_files = &.{case.path},
+            .excludes = &.{case.excluded},
+        };
+        try std.testing.expect(!policy.allowsBuildFile(case.path));
+    }
+    const sibling: SourcePolicy = .{
+        .build_files = &.{"/project/generated-other/build.zig"},
+        .excludes = &.{"/project/generated"},
+    };
+    try std.testing.expect(sibling.allowsBuildFile("/project/generated-other/build.zig"));
+}
+
+test "build metadata rejects implicit excluded ancestors" {
+    for ([_][]const u8{ ".hidden", "vendor", "zig-pkg", "build", "deps", "target" }) |name| {
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "/project/{s}/nested/build.zig",
+            .{name},
+        );
+        defer std.testing.allocator.free(path);
+        const policy: SourcePolicy = .{
+            .roots = &.{"/project"},
+            .build_files = &.{path},
+        };
+        try std.testing.expect(!policy.allowsBuildFile(path));
+    }
+}
+
+test "ordinary build metadata preserves the existing source root boundary" {
+    const policy: SourcePolicy = .{ .roots = &.{"/tmp/.fixtures/project"} };
+    try std.testing.expect(policy.allowsBuildFile("/tmp/.fixtures/project/build.zig"));
+    const explicit: SourcePolicy = .{
+        .roots = &.{"/tmp/.fixtures/project/src"},
+        .build_files = &.{"/tmp/.fixtures/project/build.zig"},
+    };
+    try std.testing.expect(!explicit.allowsBuildFile("/tmp/.fixtures/project/build.zig"));
 }

@@ -203,6 +203,10 @@ pub const Ctx = struct {
     /// consult the config to honor Config.enabled.
     config: *const config_mod.Config = &config_mod.Default,
     report_enabled: bool = true,
+    /// Solver-owned, read-only ALL-incoming whole-transport inhibitor.
+    /// Borrowed only for this settled block replay. Never a scalar-read,
+    /// byte-mask, tag, resource, or positive-value certificate.
+    incoming_partial_transport: ?*const std.AutoArrayHashMapUnmanaged(LocalId, void) = null,
 };
 
 /// Mutate `state` to reflect the effect of `stmt`.  Emit any problems
@@ -212,10 +216,19 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
     switch (stmt.kind) {
         .decl => |d| try transferDecl(ctx, state, d, stmt.pos),
         .assign => |a| try transferAssign(ctx, state, a, stmt.pos),
-        .assume => |condition| state.feasible = switch (condition) {
-            .constant => |value| value,
-            .local => |local| try state.facts.assumeBoolean(ctx.gpa, local, true, !ctx.locals[@intFromEnum(local)].address_taken),
-            .not_local => |local| try state.facts.assumeBoolean(ctx.gpa, local, false, !ctx.locals[@intFromEnum(local)].address_taken),
+        .assume => |condition| {
+            state.feasible = switch (condition) {
+                .constant => |value| value,
+                .local => |local| try state.facts.assumeBoolean(ctx.gpa, local, true, !ctx.locals[@intFromEnum(local)].address_taken),
+                .not_local => |local| try state.facts.assumeBoolean(ctx.gpa, local, false, !ctx.locals[@intFromEnum(local)].address_taken),
+                .optional_present => booleanValue(state, condition) orelse true,
+            };
+            if (state.feasible) switch (condition) {
+                .optional_present => |place| if (!place.expected) {
+                    if (place.physical_selection) |channel| state.retireOutputChannel(channel);
+                },
+                else => {},
+            };
         },
         .indexed_read => |r| try transferIndexedRead(ctx, state, r, stmt.pos, stmt.end_pos),
         .indexed_write => |w| {
@@ -224,6 +237,11 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         },
         .counter_step => |s| try transferCounterStep(ctx, state, s),
         .field_counter_step => |s| {
+            if (ctx.locals[@intFromEnum(s.parent)].is_slice) {
+                invalidateSliceHeader(state, .{ .local = s.parent });
+            }
+            if (s.slice_header_owner) |owner| invalidateSliceHeader(state, owner);
+            invalidateStoredMutation(ctx, state);
             state.facts.forgetLocal(s.parent);
             try state.stepFieldCounter(ctx.gpa, .{ .parent = s.parent, .name = s.name }, s.step);
         },
@@ -251,6 +269,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
             _ = try @import("bounded_prefix.zig").recordScaledIndex(ctx.gpa, state, certificate);
         },
         .array_complete => |complete| {
+            invalidateStoredMutation(ctx, state);
             const write: @TypeOf(@as(StmtKind, undefined).indexed_write) = .{
                 .array = complete.array,
                 .index = .{ .constant = 0 },
@@ -299,6 +318,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                 try copyArrayDiagnosticBytes(ctx, state, value);
                 return;
             }
+            invalidateStoredMutation(ctx, state);
             var may_undefined = exprMayBeUndefined(ctx, state, value.source) or
                 valueInputsMayBeUndefined(ctx, state, &value.selected_inputs);
             for (value.inputs) |input| {
@@ -536,6 +556,12 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .pointer_write => |p| {
+            // This statement carries mutation effects only. Operand reads
+            // are independent IR and remain mandatory even for a no-op.
+            if (p.sdk_empty_noop_release) |source| {
+                if (storedValueFacts(state, source).empty_slice) return;
+            }
+            invalidateStoredCallMutation(ctx, state, p.preserves_private_inline_fields);
             const writes_undefined = p.value_has_undefined_origin or
                 valueInputsMayBeUndefined(ctx, state, &p.preserve_inputs) or
                 valueInputsMayBeUndefined(ctx, state, &p.diagnostic_inputs);
@@ -691,11 +717,16 @@ fn storageInputsMayBeUndefined(ctx: Ctx, state: *const AbstractState, inputs: []
     return false;
 }
 
-fn booleanValue(state: *const AbstractState, value: cfg.BooleanValue) ?bool {
+/// Evaluate only MUST value facts. MAY origins and allocation liveness never
+/// prove optional presence. There is no known-null channel in this IR.
+pub fn booleanValue(state: *const AbstractState, value: cfg.BooleanValue) ?bool {
     return switch (value) {
         .constant => |v| v,
         .local => |local| state.facts.boolean(local),
         .not_local => |local| if (state.facts.boolean(local)) |v| !v else null,
+        .optional_present => |place| if (storedValueFacts(state, .{ .field = .{
+            .parent = place.parent, .name = place.name,
+        } }).nonnull_pointer) place.expected else null,
     };
 }
 
@@ -706,6 +737,107 @@ fn bindBoolean(ctx: Ctx, state: *AbstractState, local: LocalId, kind: ExprKind) 
         else => null,
     };
     try state.facts.bindBoolean(ctx.gpa, local, value);
+}
+
+/// One evaluated physical-value packet, independent of lifetime provenance.
+fn storedValueFacts(state: *const AbstractState, place: cfg.StoredValuePlace) state_mod.StoredValueFacts {
+    return switch (place) {
+        .local => |local| state.stored_values.get(local) orelse .{},
+        .field => |field| state.stored_places.getContext(.{
+            .parent = field.parent, .name = field.name,
+        }, .{}) orelse .{},
+    };
+}
+
+fn valueFacts(state: *const AbstractState, proof: cfg.StoredValueProof) state_mod.StoredValueFacts {
+    return switch (proof) {
+        .unknown => .{},
+        .nonnull_pointer => .{ .nonnull_pointer = true },
+        .empty_slice => .{ .empty_slice = true },
+        .copy => |place| storedValueFacts(state, place),
+    };
+}
+
+fn storedValueOrigin(state: *const AbstractState, place: cfg.StoredValuePlace) Origin {
+    return switch (place) {
+        .local => |local| state.locals.get(local) orelse .plain,
+        .field => |field| state.fields.getContext(.{
+            .parent = field.parent, .name = field.name,
+        }, .{}) orelse .plain,
+    };
+}
+
+/// Without an alias-disjointness proof, any selected pointee may alias the
+/// written storage. Unescaped local pointer headers cannot be rebound through
+/// an alias; addressed headers have no such protection.
+fn invalidateStoredMutation(ctx: Ctx, state: *AbstractState) void {
+    state.stored_places.clearRetainingCapacity();
+    invalidateAliasedStoredLocals(ctx, state);
+}
+
+fn exactApprovedPath(paths: []const []const u8, wanted: []const u8) bool {
+    for (paths) |path| if (std.mem.eql(u8, path, wanted)) return true;
+    return false;
+}
+
+fn invalidateStoredFieldMutation(ctx: Ctx, state: *AbstractState, parent: LocalId, approved: []const []const u8) void {
+    if (approved.len == 0) return invalidateStoredMutation(ctx, state);
+    var index: usize = 0;
+    while (index < state.stored_places.count()) {
+        const key = state.stored_places.keys()[index];
+        if (key.parent == parent and exactApprovedPath(approved, key.name)) {
+            index += 1;
+        } else _ = state.stored_places.swapRemoveAt(index);
+    }
+    invalidateAliasedStoredLocals(ctx, state);
+}
+
+fn invalidateStoredCallMutation(ctx: Ctx, state: *AbstractState, preserve_private: bool) void {
+    if (!preserve_private) return invalidateStoredMutation(ctx, state);
+    var index: usize = 0;
+    while (index < state.stored_places.count()) {
+        const key = state.stored_places.keys()[index];
+        const info = ctx.locals[@intFromEnum(key.parent)];
+        if (!info.is_pointer and !info.is_slice and !info.is_array and !info.address_taken and
+            exactApprovedPath(info.private_inline_fields, key.name))
+        {
+            index += 1;
+        } else _ = state.stored_places.swapRemoveAt(index);
+    }
+    invalidateAliasedStoredLocals(ctx, state);
+}
+
+/// Component mutation revokes only emptiness. In particular a pointer local
+/// keeps its nonnull value when this operation changes its pointee's header.
+fn invalidateSliceHeader(state: *AbstractState, owner: cfg.StoredValuePlace) void {
+    switch (owner) {
+        .local => |local| if (state.stored_values.getIndex(local)) |index| {
+            state.stored_values.values()[index].empty_slice = false;
+            if (!state.stored_values.values()[index].any()) _ = state.stored_values.swapRemoveAt(index);
+        },
+        .field => |field| if (state.stored_places.getIndexContext(.{ .parent = field.parent, .name = field.name }, .{})) |index| {
+            state.stored_places.values()[index].empty_slice = false;
+            if (!state.stored_places.values()[index].any()) _ = state.stored_places.swapRemoveAt(index);
+        },
+    }
+}
+
+fn invalidateAliasedStoredLocals(ctx: Ctx, state: *AbstractState) void {
+    if (state.stored_values.count() == 0) return;
+    // Runtime aliases are additional revocation evidence, never certificates.
+    for (state.locals.values()) |origin| {
+        if (origin == .stack) _ = state.stored_values.swapRemove(origin.stack);
+    }
+    for (state.fields.values()) |origin| {
+        if (origin == .stack) _ = state.stored_values.swapRemove(origin.stack);
+    }
+    var index: usize = 0;
+    while (index < state.stored_values.count()) {
+        const local = state.stored_values.keys()[index];
+        if (ctx.locals[@intFromEnum(local)].address_taken) {
+            _ = state.stored_values.swapRemoveAt(index);
+        } else index += 1;
+    }
 }
 
 fn transferLeakWarning(
@@ -749,6 +881,7 @@ fn transferDecl(
     pos: cfg.SrcPos,
 ) !void {
     const origin = try originOfInit(ctx, state, d.init_kind, pos);
+    const stored = valueFacts(state, d.value_proof);
     const payload_defined = if (tracksScalarValue(ctx, state, d.local))
         scalarValueIsDefined(ctx, state, d.init_kind, d.value_defined, &d.value_inputs)
     else if (state.integer_domains.len != 0 and ctx.locals[@intFromEnum(d.local)].tracks_array_payload)
@@ -779,6 +912,7 @@ fn transferDecl(
     // is a back-edge artifact that would spuriously fire double-free
     // / UAF on the new instance.
     state.forgetFields(d.local);
+    if (stored.any() and !may_undefined) try state.stored_values.put(ctx.gpa, d.local, stored);
     if (may_undefined and !array_complete) try state.may_undefined_values.put(ctx.gpa, d.local, {});
     if ((ctx.locals[@intFromEnum(d.local)].tracks_array_payload or tracksScalarValue(ctx, state, d.local)) and !payload_defined) {
         try state.unknown_values.put(ctx.gpa, d.local, {});
@@ -861,6 +995,7 @@ fn invalidateAliasedArrayPayload(ctx: Ctx, state: *AbstractState, parent: LocalI
     if (!localIsArray(ctx, array) and !ctx.locals[@intFromEnum(array)].is_slice and
         !ctx.locals[@intFromEnum(array)].is_pointer) return;
     const may_undefined = state.fieldValueMayBeUndefined(parent, member);
+    invalidateStoredMutation(ctx, state);
     try forgetAliasedValueFacts(ctx, state, array, false);
     if (may_undefined) {
         if (member.len != 0 and ctx.locals[@intFromEnum(array)].array_extent != null) {
@@ -905,6 +1040,8 @@ fn localIsArray(ctx: Ctx, local: LocalId) bool {
 }
 
 fn forgetLocalValueFacts(ctx: Ctx, state: *AbstractState, local: LocalId) void {
+    if (ctx.locals[@intFromEnum(local)].address_taken) invalidateStoredMutation(ctx, state);
+    state.forgetStoredLocal(local);
     state.facts.forgetLocal(local);
     state.forgetInitializationLocal(local);
     if (localIsArray(ctx, local)) state.forgetInitializationArray(local);
@@ -1001,18 +1138,23 @@ fn arrayHasWrittenCoverage(ctx: Ctx, state: *const AbstractState, array: LocalId
 /// pointer-typed result and wrong for one the declared type cannot
 /// carry; the DECLARED TYPE is what settles it here.
 ///
-/// Every other answer keeps the origin.  A binding with no declared
-/// type, a pointer, a slice, an array, a struct, a generic or an
-/// opaque one can hold any of them, and downgrading there would lose
-/// a real use-after-free.  Only a positively-proven address-free type
-/// downgrades, which is exactly what [type_query.
-/// isReservedScalarTypeName] claims and no more.
+/// The receiver's base type name is unwrapped: `*u32` can be recorded as
+/// `u32`. That primitive leaf alone does not prove the whole value address-free.
+/// Require positive whole-value scalar metadata, and let known pointer or
+/// aggregate shapes veto it before discarding a lifetime hint.
 fn scalarBindingOrigin(ctx: Ctx, local: LocalId, origin: Origin) Origin {
     switch (origin) {
         .heap, .arena, .arena_borrow => {},
         else => return origin,
     }
-    const type_name = ctx.locals[@intFromEnum(local)].type_name orelse return origin;
+    const info = ctx.locals[@intFromEnum(local)];
+    if (info.is_pointer or info.is_slice or localIsArray(ctx, local) or
+        info.tracks_optional_tag or info.tracks_array_payload or info.runtime_fields != null)
+    {
+        return origin;
+    }
+    if (!info.tracks_scalar_value) return origin;
+    const type_name = info.type_name orelse return origin;
     if (!type_query.isReservedScalarTypeName(type_name)) return origin;
     return .plain;
 }
@@ -1023,8 +1165,21 @@ fn transferAssign(
     a: @TypeOf(@as(StmtKind, undefined).assign),
     pos: cfg.SrcPos,
 ) !void {
-    if (a.rhs_kind == .copy_of and a.rhs_kind.copy_of == a.target) return;
+    if (a.rhs_kind == .copy_of and a.rhs_kind.copy_of == a.target) {
+        const exact_copy = a.value_proof == .copy and
+            a.value_proof.copy == .local and a.value_proof.copy.local == a.target;
+        const poisoned = a.value_has_undefined_origin or a.value_entirely_undefined or
+            bindingMayBeUndefined(ctx, state, a.rhs_kind, &a.value_inputs);
+        if (exact_copy and !poisoned) return;
+        // Preserve the legacy lifetime fast path, not a stale VALUE proof.
+        const stored: state_mod.StoredValueFacts = if (poisoned) .{} else valueFacts(state, a.value_proof);
+        if (ctx.locals[@intFromEnum(a.target)].address_taken) invalidateStoredMutation(ctx, state);
+        state.forgetStoredLocal(a.target);
+        if (stored.any()) try state.stored_values.put(ctx.gpa, a.target, stored);
+        return;
+    }
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
+    const stored = valueFacts(state, a.value_proof);
     const payload_defined = if (tracksScalarValue(ctx, state, a.target))
         scalarValueIsDefined(ctx, state, a.rhs_kind, a.value_defined, &a.value_inputs)
     else if (state.integer_domains.len != 0 and ctx.locals[@intFromEnum(a.target)].tracks_array_payload)
@@ -1057,6 +1212,7 @@ fn transferAssign(
     // x.  Stale field state would surface as use-undefined / leak
     // FPs on the new value's fields.
     state.forgetFields(a.target);
+    if (stored.any() and !may_undefined) try state.stored_values.put(ctx.gpa, a.target, stored);
     if (may_undefined and !array_complete) try state.may_undefined_values.put(ctx.gpa, a.target, {});
     if ((ctx.locals[@intFromEnum(a.target)].tracks_array_payload or tracksScalarValue(ctx, state, a.target)) and !payload_defined) {
         try state.unknown_values.put(ctx.gpa, a.target, {});
@@ -1132,7 +1288,13 @@ fn transferHeapFree(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    if (state.locals.get(f.freed_local)) |origin| {
+    if (f.sdk_empty_slice_noop and storedValueFacts(state, .{ .local = f.freed_local }).empty_slice) return;
+    // A real release may invoke a callback. An authenticated empty SDK
+    // release returned above without calling one. Only independently private
+    // inline headers can retain their MUST properties across this effect.
+    const entry_origin = state.locals.get(f.freed_local);
+    invalidateStoredCallMutation(ctx, state, true);
+    if (entry_origin) |origin| {
         switch (origin) {
             .heap => |hid| {
                 const st = state.heaps.get(hid) orelse return;
@@ -1219,10 +1381,10 @@ fn transferRetOutParamDanglingHeaps(
     end_pos: cfg.SrcPos,
 ) !void {
     if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
-    for (state.out_param_writes.keys(), state.out_param_writes.values()) |out_local, hid| {
-        const st = state.heaps.get(hid) orelse continue;
+    for (state.out_param_writes.keys()) |pending| {
+        const st = state.heaps.get(pending.heap) orelse continue;
         if (st.state != .dead) continue;
-        const out_name = ctx.locals[@intFromEnum(out_local)].name;
+        const out_name = ctx.locals[@intFromEnum(pending.channel.out)].name;
         try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "value written through `{s}` was freed before return — caller's pointee dangles", .{out_name}, if (st.killed_at) |ks|
             .{ .site = ks, .label = "value freed here" }
         else
@@ -1247,7 +1409,7 @@ fn transferRetValueChecks(
     };
     if (array_source) |source| {
         // A retained strict origin is not an entirely undefined byte witness.
-        const entirely_undefined = localIsEntirelyUndefined(ctx, state, source);
+        const entirely_undefined = wholeTransportIsEntirelyUndefined(ctx, state, source);
         if (origin == .undef and !entirely_undefined) origin = .plain;
         if (localIsArray(ctx, source) and state.locals.contains(source) and entirely_undefined)
             try reportUncoveredArrayUse(ctx, state, source, false, true, pos, end_pos);
@@ -1267,10 +1429,10 @@ fn transferRetValueChecks(
     // because that path produces .undef via an identifier expr, which
     // doesn't set is_literal_undef.
     const diagnostic_undefined = if (r.diagnostic_source) |source|
-        localIsEntirelyUndefined(ctx, state, source)
+        wholeTransportIsEntirelyUndefined(ctx, state, source)
     else
         switch (r.value_kind) {
-            .copy_of => |source| localIsEntirelyUndefined(ctx, state, source),
+            .copy_of => |source| wholeTransportIsEntirelyUndefined(ctx, state, source),
             .field_copy_of => |field| fieldIsEntirelyUndefined(ctx, state, field.parent, field.name),
             else => r.value_has_undefined_origin,
         };
@@ -2086,9 +2248,9 @@ fn localDiagnosticIsAggregate(ctx: Ctx, state: *const AbstractState, local: Loca
         fieldHasDiagnosticChildren(state, local, ""));
 }
 
-/// Exact ALL proof for whole-value transport and strict result summaries.
-/// Selected reads instead use the retained per-byte undefined mask.
-fn localIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+/// Path-local negative ALL-byte proof. Never a positive value certificate.
+/// Exact copied optional/field facts can be stronger than intrinsic partial metadata.
+pub fn localIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
     if (state.entire_undefined_values.contains(local)) return true;
     const info = ctx.locals[@intFromEnum(local)];
     if (!info.is_pointer and
@@ -2112,6 +2274,7 @@ fn localIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, local: LocalI
     if (state.partial_undefined_values.contains(local)) return false;
     if (!localIsProvedUndefined(ctx, state, local)) return false;
     for (state.written_fields.keys()) |key| if (key.parent == local) return false;
+    for (state.uncertain_byte_writes.keys()) |key| if (key.parent == local) return false;
     if (localIsArray(ctx, local)) {
         if (state.baseComplete(local) or state.fixedPrefix(local) != 0) return false;
         for (state.exact_elements.keys()) |key| if (key.array == local) return false;
@@ -2120,7 +2283,14 @@ fn localIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, local: LocalI
     return true;
 }
 
-fn fieldIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, parent: LocalId, path: []const u8) bool {
+fn wholeTransportIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, local: LocalId) bool {
+    if (ctx.incoming_partial_transport) |incoming|
+        if (incoming.contains(local) and localDiagnosticIsAggregate(ctx, state, local)) return false;
+    return localIsEntirelyUndefined(ctx, state, local);
+}
+
+/// Negative-only ALL proof for a selected byte scope. This is not a safe-value certificate.
+pub fn fieldIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, parent: LocalId, path: []const u8) bool {
     if (fixedArrayLength(ctx, parent, path) != null) return false;
     if (state.entire_undefined_values.contains(parent)) return true;
     if (!fieldValueMayBeUndefined(ctx, state, parent, path)) return false;
@@ -2133,7 +2303,7 @@ fn fieldIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, parent: Local
         } else if (state_mod.diagnosticFieldPrefix(path, key.name) != null) return false;
     }
     for ([_][]const state_mod.FieldKey{
-        state.undefined_field_values.keys(), state.unknown_field_values.keys(),
+        state.undefined_field_values.keys(), state.unknown_field_values.keys(), state.uncertain_byte_writes.keys(),
     }) |keys| {
         for (keys) |key| {
             if (key.parent != parent) continue;
@@ -2153,7 +2323,11 @@ fn fieldIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, parent: Local
 pub fn returnValueIsEntirelyUndefined(ctx: Ctx, state: *const AbstractState, kind: StmtKind) bool {
     if (kind != .ret) return false;
     const ret = kind.ret;
-    if (ret.diagnostic_source) |source| return localIsEntirelyUndefined(ctx, state, source);
+    if (ret.diagnostic_source) |source| return wholeTransportIsEntirelyUndefined(ctx, state, source);
+    if (ret.value_kind == .copy_of) if (ctx.incoming_partial_transport) |incoming| {
+        const source = ret.value_kind.copy_of;
+        if (incoming.contains(source) and localDiagnosticIsAggregate(ctx, state, source)) return false;
+    };
     return ret.is_literal_undef or bindingIsEntirelyUndefined(ctx, state, ret.value_kind,
         ret.entire_source_undefined, ret.value_entirely_undefined,
         ret.result_is_computation, &ret.value_inputs);
@@ -2272,7 +2446,17 @@ fn fieldIndexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array:
 }
 
 fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: LocalId, index: cfg.IndexTerm) bool {
+    return indexedSelectionMayBeUndefined(ctx, state, array, index, null);
+}
+
+/// Selected-member filtering changes negative byte reads, not value certificates.
+fn indexedSelectionMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: LocalId, index: cfg.IndexTerm, member: ?[]const u8) bool {
     const info = ctx.locals[@intFromEnum(array)];
+    if (member) |selected| if (resolveIndex(state, index)) |known| {
+        var buffer: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&buffer, "[{d}].{s}", .{ known, selected }) catch return false;
+        return fieldValueMayBeUndefined(ctx, state, array, path);
+    };
     if (info.is_slice) {
         if (state.fieldValueMayBeUndefined(array, "ptr") or state.fieldValueMayBeUndefined(array, "len")) return true;
         if (!state.hasInitializedElement(array, index)) {
@@ -2288,7 +2472,7 @@ fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: Loca
             .stack => |backing| if (state.unknown_field_values.containsContext(.{ .parent = array, .name = "ptr" }, .{}))
                 localIsProvedUndefined(ctx, state, backing)
             else
-                indexedValueMayBeUndefined(ctx, state, backing, index),
+                indexedSelectionMayBeUndefined(ctx, state, backing, index, member),
             .undef => true,
             else => false,
         };
@@ -2304,7 +2488,7 @@ fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: Loca
         if (state.fieldValueMayBeUndefined(array, "")) return true;
         if (state.locals.get(array)) |origin| {
             if (origin == .stack and origin.stack != array and localIsArray(ctx, origin.stack))
-                return indexedValueMayBeUndefined(ctx, state, origin.stack, index);
+                return indexedSelectionMayBeUndefined(ctx, state, origin.stack, index, member);
         }
         return false;
     }
@@ -2317,6 +2501,7 @@ fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: Loca
     if (state.fieldRangeBytesAreWritten(array, "", index)) return false;
     for (state.undefined_field_values.keys()) |key| {
         if (key.parent != array or !state.fieldValueMayBeUndefined(array, key.name)) continue;
+        if (member) |selected| if (!indexedScopeTouchesMember(key.name, selected)) continue;
         if (state_mod.diagnosticArrayPrefixEnd(key.name)) |bound| {
             if (state.provesComparison(.{
                 .lhs = index, .rhs = .{ .constant = bound }, .op = .ge,
@@ -2330,6 +2515,7 @@ fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: Loca
     }
     for (state.written_fields.keys()) |key| {
         if (key.parent != array) continue;
+        if (member) |selected| if (!indexedScopeTouchesMember(key.name, selected)) continue;
         if (state_mod.diagnosticArrayPrefixEnd(key.name)) |bound| {
             if (state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = 0 }, .op = .ge }) and
                 state.provesComparison(.{ .lhs = index, .rhs = .{ .constant = bound }, .op = .lt })) return false;
@@ -2350,21 +2536,52 @@ fn indexedValueMayBeUndefined(ctx: Ctx, state: *const AbstractState, array: Loca
     return if (state.locals.get(array)) |origin| origin == .undef else false;
 }
 
+fn indexedScopeTouchesMember(path: []const u8, member: []const u8) bool {
+    const slot = state_mod.diagnosticArrayRange(path) orelse return true;
+    const suffix = path[slot.length..];
+    if (suffix.len == 0) return true;
+    if (suffix[0] != '.') return true;
+    return state_mod.diagnosticFieldPrefix(suffix[1..], member) != null or
+        state_mod.diagnosticFieldPrefix(member, suffix[1..]) != null;
+}
+
 fn transferFieldAssign(
     ctx: Ctx,
     state: *AbstractState,
     a: @TypeOf(@as(StmtKind, undefined).field_assign),
     pos: cfg.SrcPos,
 ) !void {
+    if (a.slice_header_owner) |owner| invalidateSliceHeader(state, owner);
+    const physical_write = a.whole_value_companion == null or a.slice_header_owner != null;
+    // The canonical slice root already identifies a potentially changed
+    // header. Missing producer metadata cannot preserve a positive bit.
+    if (physical_write and ctx.locals[@intFromEnum(a.parent)].is_slice) {
+        invalidateSliceHeader(state, .{ .local = a.parent });
+    }
+    if (a.requires_entire_negative_source) {
+        const source = switch (a.rhs_kind) {
+            .field_copy_of => |source| source,
+            else => return,
+        };
+        if (!a.diagnostic_only or
+            !fieldIsEntirelyUndefined(ctx, state, source.parent, source.name)) return;
+    }
     if (a.diagnostic_only and a.rhs_kind == .unknown) if (a.prefix_entry) |entry| {
         const count: cfg.IndexTerm = .{ .local = .{ .local = entry.count } };
         const offset = state.termSymbolicPrefixOffset(.{ .parent = entry.array, .name = entry.path }, count);
         if ((offset != null and offset.? >= 0) or
             state.provesComparison(.{ .lhs = count, .rhs = .{ .constant = 0 }, .op = .eq })) return;
     };
-    if (!a.may_write_only)
+    // This authenticated negative snapshot adds a byte fact, not a store.
+    // Keep only physical coverage of an already UNKNOWN array payload;
+    // strict initialized-value coverage still follows ordinary invalidation.
+    const preserves_physical_prefix = a.requires_entire_negative_source and
+        a.diagnostic_only and a.preserve_undefined_descendants and
+        localIsArray(ctx, a.parent) and state.unknown_values.contains(a.parent);
+    if (!a.may_write_only and !preserves_physical_prefix)
         state.forgetFieldInitialization(.{ .parent = a.parent, .name = a.name });
     if (a.may_write_only) {
+        if (physical_write) invalidateStoredFieldMutation(ctx, state, a.parent, a.disjoint_fields);
         if (!fieldAssignmentReadsUndefined(ctx, state, a)) return;
         const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
         // This is a unioned negative alternative, not an overwrite. In
@@ -2484,13 +2701,36 @@ fn transferFieldAssign(
     }
     if (!a.reads_old_value and a.rhs_kind == .field_copy_of and
         a.rhs_kind.field_copy_of.parent == a.parent and
-        std.mem.eql(u8, a.rhs_kind.field_copy_of.name, a.name)) return;
+        std.mem.eql(u8, a.rhs_kind.field_copy_of.name, a.name))
+    {
+        const exact_copy = a.value_proof == .copy and
+            a.value_proof.copy == .field and
+            a.value_proof.copy.field.parent == a.parent and
+            std.mem.eql(u8, a.value_proof.copy.field.name, a.name);
+        const poisoned = a.entire_value_undefined or a.value_has_undefined_origin;
+        if (exact_copy and !poisoned) return;
+        const stored: state_mod.StoredValueFacts = if (poisoned or a.interior_view) .{} else valueFacts(state, a.value_proof);
+        if (physical_write) invalidateStoredFieldMutation(ctx, state, a.parent, a.disjoint_fields);
+        if (stored.any()) try state.stored_places.putContext(ctx.gpa, .{
+            .parent = a.parent, .name = a.name,
+        }, stored, .{});
+        return;
+    }
     const entirely_undefined = bindingIsEntirelyUndefined(
         ctx, state, a.rhs_kind, a.entire_source_undefined,
         a.entire_value_undefined, a.result_is_computation, &a.selected_inputs,
     ) or (a.reads_old_value and
         fieldIsEntirelyUndefined(ctx, state, a.parent, a.name));
     var origin = try originOfInit(ctx, state, a.rhs_kind, pos);
+    const stored: state_mod.StoredValueFacts = if (a.reads_old_value or a.interior_view or
+        a.entire_value_undefined or a.value_has_undefined_origin)
+        .{}
+    else
+        valueFacts(state, a.value_proof);
+    if (physical_write) invalidateStoredFieldMutation(ctx, state, a.parent, a.disjoint_fields);
+    if (stored.any()) try state.stored_places.putContext(ctx.gpa, .{
+        .parent = a.parent, .name = a.name,
+    }, stored, .{});
     // Retain the selected descriptor scalar at value time. A later source
     // clobber must revoke the relation, not the already copied scalar value.
     var copied_constant: ?u64 = null;
@@ -2520,7 +2760,7 @@ fn transferFieldAssign(
     try state.fields.putContext(ctx.gpa, key, origin, .{});
     try state.bindWrittenField(ctx.gpa, key, reads_undefined);
     if (reads_undefined) try state.undefined_field_values.putContext(ctx.gpa, key, {}, .{});
-    if (!defined) try invalidateAliasedArrayPayload(ctx, state, a.parent, a.name);
+    if (!defined and physical_write) try invalidateAliasedArrayPayload(ctx, state, a.parent, a.name);
     // An aggregate field rebind revokes every descendant descriptor proof.
     var fields = state.fields.iterator();
     while (fields.next()) |entry| {
@@ -2636,7 +2876,12 @@ fn transferFieldHeapFree(
     end_pos: cfg.SrcPos,
 ) !void {
     const key: state_mod.FieldKey = .{ .parent = f.parent, .name = f.name };
-    if (state.fields.getContext(key, .{})) |origin| {
+    if (f.sdk_empty_slice_noop and storedValueFacts(state, .{ .field = .{
+        .parent = f.parent, .name = f.name,
+    } }).empty_slice) return;
+    const entry_origin = state.fields.getContext(key, .{});
+    invalidateStoredCallMutation(ctx, state, true);
+    if (entry_origin) |origin| {
         switch (origin) {
             .heap => |hid| {
                 const st = state.heaps.get(hid) orelse return;
@@ -2758,7 +3003,7 @@ fn transferFieldUse(
     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
     switch (origin) {
         .arena, .arena_borrow => |aid| {
-            if (config_mod.isEnabled(ctx.config, .arena_use_after_kill)) {
+            if (!u.descriptor_only and config_mod.isEnabled(ctx.config, .arena_use_after_kill)) {
                 if (state.arenas.get(aid)) |st| if (st.state == .dead) {
                     try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error", "`{s}{s}{s}` borrows from an arena that was deinit'd", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
                         .{ .site = ks, .label = "arena deinit'd here" }
@@ -2769,7 +3014,7 @@ fn transferFieldUse(
             }
         },
         .heap => |hid| {
-            if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
+            if (!u.descriptor_only and config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
                 if (state.heaps.get(hid)) |st| if (st.state == .dead) {
                     try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error", "use of `{s}{s}{s}` after free", .{ parent_name, pathSep(u.name), u.name }, if (st.killed_at) |ks|
                         .{ .site = ks, .label = "value freed here" }
@@ -2791,7 +3036,7 @@ fn transferFieldUse(
             // field route, or via struct-literal unpack of a
             // borrowed-field read), a kill of the owner invalidates
             // this read.
-            if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
+            if (!u.descriptor_only and config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
                 if (state.locals.get(owner_id)) |owner_origin| switch (owner_origin) {
                     .heap => |hid| {
                         if (state.heaps.get(hid)) |st| if (st.state == .dead) {
@@ -2856,13 +3101,11 @@ fn transferCompositeEscape(
 /// ends with this frame — surface the same arena-escape /
 /// stack-escape diagnostics that fire at `return`.
 ///
-/// Heap origins are left alone here: heap allocations are
-/// owned-and-transferable, so writing one to caller-storage is
-/// legitimate (the canonical out-param return-allocator pattern).
-/// The case where a heap allocation is freed via `defer` BEFORE
-/// the function returns — and the write therefore leaves a
-/// dangling caller pointer — needs a deferred check at fn exit
-/// that this pass doesn't do yet.
+/// Heap values can transfer ownership without an immediate error. Each MAY
+/// heap is recorded against its selected output channel for the exit check.
+/// A stable physical-place certificate does not prove a complete RHS origin
+/// set: later unknown writes retain these loans. Only an actual typed null
+/// branch for the same certified current channel can retire its records.
 fn transferOutParamWrite(
     ctx: Ctx,
     state: *AbstractState,
@@ -2870,10 +3113,25 @@ fn transferOutParamWrite(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    const origin = try originOfInit(ctx, state, w.value_kind, pos);
+    const origin = if (w.written_value) |place|
+        storedValueOrigin(state, place)
+    else
+        try originOfInit(ctx, state, w.value_kind, pos);
+    const stored = if (w.written_value) |place|
+        storedValueFacts(state, place)
+    else
+        valueFacts(state, w.value_proof);
+    if (w.written_value == null) invalidateStoredMutation(ctx, state);
+    if (w.name) |name| {
+        const key: state_mod.FieldKey = .{ .parent = w.out, .name = name };
+        if (stored.any()) {
+            try state.stored_places.putContext(ctx.gpa, key, stored, .{});
+        } else _ = state.stored_places.swapRemoveContext(key, .{});
+    }
     const out_name = ctx.locals[@intFromEnum(w.out)].name;
     switch (origin) {
         .stack => |src_local| {
+            if (w.heap_custody_only) return;
             // `out.field = &local` / `out.* = &local` — unambiguous
             // stack-frame escape regardless of out's pointee type.
             if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
@@ -2903,24 +3161,18 @@ fn transferOutParamWrite(
             try report(ctx, "stack-escape", pos, end_pos, .@"error", "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)", .{ src_name, out_name });
         },
         .heap => |hid| {
-            // Record the write for the deferred check at fn exit
-            // (transferRet).  At write time the heap is live, so
-            // it's not yet an escape — but if a defer subsequently
-            // frees it, the caller's pointee dangles on return.
-            // Last-write-wins per out-param.
-            try state.out_param_writes.put(ctx.gpa, w.out, hid);
+            // Preserve every MAY heap. A place certificate is not a complete
+            // RHS-origin certificate and never authorizes an implicit overwrite.
+            const channel = w.physical_selection orelse cfg.OutputChannel{ .out = w.out, .name = w.name };
+            const certified = w.physical_selection != null and channel.name != null;
+            const entry = try state.out_param_writes.getOrPutContext(ctx.gpa, .{ .channel = channel, .heap = hid }, .{});
+            if (entry.found_existing) {
+                entry.value_ptr.* = entry.value_ptr.* and certified;
+            } else entry.value_ptr.* = certified;
         },
-        .plain, .undef => {
-            // Last-write-wins: a primitive / null / undefined
-            // sentinel write through `this.<field>` REPLACES any
-            // prior heap-owning value we'd tracked for this
-            // out-param.  Without removing it, an err-path
-            // `this.statement = null; destroy(stmt); deref(this);
-            // return err;` keeps the stale entry and the
-            // deferred check fires "heap freed before return" on
-            // a slot that's already been nulled out.
-            _ = state.out_param_writes.swapRemove(w.out);
-        },
+        // Unknown/plain/undefined values do not prove old loan absence.
+        // Only a typed current-null assumption may retire certified records.
+        .plain, .undef => {},
         .arena, .arena_borrow => |aid| {
             // Arena-shaped value written to caller storage.  Only a
             // stack-allocated arena (`var a = ArenaAllocator.init(...)`)
@@ -2964,10 +3216,11 @@ fn transferUse(
         return;
     }
     if (localIsArray(ctx, u.local)) {
-        const reads_undefined = localIsEntirelyUndefined(ctx, state, u.local);
+        const reads_undefined = wholeTransportIsEntirelyUndefined(ctx, state, u.local);
         if (reads_undefined) try reportUncoveredArrayUse(ctx, state, u.local, false, false, pos, end_pos);
         const read_origin = if (!reads_undefined and origin == .undef) Origin.plain else origin;
-        try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
+        if (!u.descriptor_only or read_origin == .undef)
+            try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
         return;
     }
     const may_undefined = if (u.tag_only)
@@ -2975,13 +3228,14 @@ fn transferUse(
     else if (u.optional_payload)
         localIsProvedUndefined(ctx, state, u.local)
     else if (localDiagnosticIsAggregate(ctx, state, u.local))
-        localIsEntirelyUndefined(ctx, state, u.local)
+        wholeTransportIsEntirelyUndefined(ctx, state, u.local)
     else
         localIsProvedUndefined(ctx, state, u.local);
     if (origin != .undef and may_undefined)
         try checkOriginAlive(ctx, state, .undef, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
     const read_origin = if (origin == .undef and !may_undefined) Origin.plain else origin;
-    try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
+    if (!u.descriptor_only or read_origin == .undef)
+        try checkOriginAlive(ctx, state, read_origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
 }
 
 fn transferGap(
@@ -2989,6 +3243,8 @@ fn transferGap(
     state: *AbstractState,
     g: @TypeOf(@as(StmtKind, undefined).lowering_gap),
 ) !void {
+    // A no-local-rebind gap can still mutate pointees or escaped headers.
+    invalidateStoredMutation(ctx, state);
     // A gap the builder marked `may_assign_locals = false` is a
     // statement that provably CANNOT write a local: `call-untracked`
     // carries no pointer argument, and `assign-target`'s `arr[i] = X`
@@ -2997,6 +3253,8 @@ fn transferGap(
     // only thing that distinguishes the two claims — reading past it
     // made every gap a claim about locals no gap can support.
     if (!g.may_assign_locals) return;
+    // This gap can replace even unaddressed local pointer headers.
+    state.stored_values.clearRetainingCapacity();
     for (0..ctx.locals.len) |index| {
         const local: LocalId = @enumFromInt(index);
         if (localIsArray(ctx, local)) {
@@ -3086,7 +3344,7 @@ fn transferIndexedRead(
         const initialized = (if (selected_field)
             !fieldValueMayBeUndefined(ctx, state, read.array, read.name.?)
         else
-            !indexedValueMayBeUndefined(ctx, state, read.array, read.index)) or
+            !indexedSelectionMayBeUndefined(ctx, state, read.array, read.index, read.selected_member)) or
             (scaled_initialized and !undefinedFieldBytesRemain(state, read.array));
         try reportUncoveredArrayUse(ctx, state, read.array, initialized, false, pos, end_pos);
         if (origin) |root| {
@@ -3110,6 +3368,7 @@ fn transferIndexedWrite(
     write: @TypeOf(@as(StmtKind, undefined).indexed_write),
     pos: cfg.SrcPos,
 ) !void {
+    invalidateStoredMutation(ctx, state);
     // An indexed store initializes bytes, not the descriptor used to reach
     // them. Undefined slice headers cannot be repaired by writing a slot.
     if (ctx.locals[@intFromEnum(write.array)].is_slice) {
@@ -3398,6 +3657,7 @@ fn transferArrayRangeComplete(
     state: *AbstractState,
     range: @TypeOf(@as(StmtKind, undefined).array_range_complete),
 ) !void {
+    invalidateStoredMutation(ctx, state);
     const info = ctx.locals[@intFromEnum(range.array)];
     const extent = info.array_extent orelse {
         state.forgetInitializationArray(range.array);
@@ -3440,6 +3700,7 @@ fn transferArrayMemsetPrefix(
     prefix: @TypeOf(@as(StmtKind, undefined).array_memset_prefix),
     pos: cfg.SrcPos,
 ) !void {
+    invalidateStoredMutation(ctx, state);
     const info = ctx.locals[@intFromEnum(prefix.array)];
     const extent = info.array_extent orelse {
         state.forgetInitializationArray(prefix.array);
@@ -3614,6 +3875,8 @@ fn transferCounterStep(
     state: *AbstractState,
     step: @TypeOf(@as(StmtKind, undefined).counter_step),
 ) !void {
+    if (ctx.locals[@intFromEnum(step.local)].address_taken) invalidateStoredMutation(ctx, state);
+    state.forgetStoredLocal(step.local);
     if (!ctx.locals[@intFromEnum(step.local)].is_unsigned or (step.step != 1 and step.step != -1)) {
         forgetLocalValueFacts(ctx, state, step.local);
         return;
@@ -4164,6 +4427,788 @@ const enabled_without_use_undefined: [config_mod.all_invariants.len - 1]config_m
     }
     break :blk buf;
 };
+
+test "stored header contract: actual components revoke empty values but whole-value companions do not" {
+    const gpa = testing.allocator;
+    for (0..3) |mode| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{.{ .name = "bytes", .decl_pos = pos0(), .is_slice = true, .address_taken = mode == 2 }};
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        const bytes: LId = @enumFromInt(0);
+        try transferDecl(ctx, &state, .{ .local = bytes, .init_kind = .plain, .value_proof = .empty_slice }, pos0());
+        if (mode == 1) {
+            try transfer(ctx, &state, .{ .kind = .{ .field_counter_step = .{
+                .parent = bytes, .name = "len", .step = 1, .slice_header_owner = .{ .local = bytes },
+            } }, .pos = pos0(), .end_pos = pos1() });
+        } else {
+            try transferFieldAssign(ctx, &state, .{
+                .parent = bytes, .name = "len", .rhs_kind = .plain,
+                .slice_header_owner = if (mode == 0) .{ .local = bytes } else null,
+                .whole_value_companion = if (mode == 2) .{ .local = bytes } else null,
+            }, pos0());
+        }
+        for ([_]cfg.SrcPos{ pos0(), pos1() }) |pos| try transferHeapFree(ctx, &state, .{
+            .freed_local = bytes, .fallback_hid = @enumFromInt(0), .sdk_empty_slice_noop = true,
+        }, pos, pos);
+        try testing.expectEqual(if (mode == 2) @as(usize, 0) else 1, problems.items.len);
+    }
+}
+
+test "stored header defaults: unannotated physical components revoke emptiness without rebinding pointers" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |counter| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{
+            .{ .name = "bytes", .decl_pos = pos0(), .is_slice = true },
+            .{ .name = "owner", .decl_pos = pos0(), .is_pointer = true },
+        };
+        const ctx: Ctx = .{
+            .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test",
+        };
+        const bytes: LId = @enumFromInt(0);
+        const owner: LId = @enumFromInt(1);
+        const heap: HId = @enumFromInt(0);
+        try transferDecl(ctx, &state, .{
+            .local = owner, .init_kind = .plain, .value_proof = .nonnull_pointer,
+        }, pos0());
+        try transferFieldAssign(ctx, &state, .{
+            .parent = owner, .name = "nested", .rhs_kind = .plain, .value_proof = .empty_slice,
+        }, pos0());
+        // A zero-length view retains the real allocation's pointer. Restoring
+        // its allocated length makes the first release valid, the second not.
+        try transferDecl(ctx, &state, .{
+            .local = bytes, .init_kind = .{ .heap_alloc = .{ .id = heap } },
+            .value_proof = .empty_slice,
+        }, pos0());
+        if (counter) {
+            try transfer(ctx, &state, .{ .kind = .{ .field_counter_step = .{
+                .parent = bytes, .name = "len", .step = 1,
+            } }, .pos = pos0(), .end_pos = pos1() });
+        } else {
+            try transferFieldAssign(ctx, &state, .{
+                .parent = bytes, .name = "len", .rhs_kind = .plain,
+            }, pos0());
+        }
+        try testing.expect(!storedValueFacts(&state, .{ .local = bytes }).empty_slice);
+        try testing.expect(!storedValueFacts(&state, .{ .field = .{
+            .parent = owner, .name = "nested",
+        } }).empty_slice);
+        try testing.expect(storedValueFacts(&state, .{ .local = owner }).nonnull_pointer);
+        for ([_]cfg.SrcPos{ pos0(), pos1() }) |pos| try transferHeapFree(ctx, &state, .{
+            .freed_local = bytes, .fallback_hid = heap, .sdk_empty_slice_noop = true,
+        }, pos, pos);
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+    }
+}
+
+test "stored header contract: selected header mutation preserves the pointer local's nonnull value" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "owner", .decl_pos = pos0(), .is_pointer = true },
+        .{ .name = "out", .decl_pos = pos0(), .is_pointer = true },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const owner: LId = @enumFromInt(0);
+    const out: LId = @enumFromInt(1);
+    try transferDecl(ctx, &state, .{ .local = owner, .init_kind = .plain, .value_proof = .nonnull_pointer }, pos0());
+    try transferFieldAssign(ctx, &state, .{ .parent = owner, .name = "bytes", .rhs_kind = .plain, .value_proof = .empty_slice }, pos0());
+    try transferFieldAssign(ctx, &state, .{
+        .parent = owner, .name = "bytes.len", .rhs_kind = .plain,
+        .slice_header_owner = .{ .field = .{ .parent = owner, .name = "bytes" } },
+    }, pos0());
+    try transferOutParamWrite(ctx, &state, .{
+        .out = out, .name = "", .value_kind = .plain, .value_proof = .{ .copy = .{ .local = owner } },
+    }, pos0(), pos1());
+    try testing.expectEqual(@as(?bool, true), booleanValue(&state, .{ .optional_present = .{ .parent = out, .name = "" } }));
+}
+
+test "stored header contract: only exact approved same-root sibling paths survive a physical store" {
+    const gpa = testing.allocator;
+    for (0..4) |mode| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "root", "other" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const root: LId = @enumFromInt(0);
+        const old_path = if (mode == 3) "a.child" else "a";
+        try transferFieldAssign(ctx, &state, .{ .parent = root, .name = old_path, .rhs_kind = .plain, .value_proof = .nonnull_pointer }, pos0());
+        try transferFieldAssign(ctx, &state, .{
+            .parent = if (mode == 2) @enumFromInt(1) else root, .name = "b",
+            .rhs_kind = .plain, .value_proof = .empty_slice,
+            .disjoint_fields = if (mode == 1) &.{} else &.{"a"},
+        }, pos0());
+        try testing.expectEqual(if (mode == 0) @as(?bool, true) else null, booleanValue(&state, .{ .optional_present = .{ .parent = root, .name = old_path } }));
+    }
+}
+
+test "stored header contract: call footprints preserve only certified private inline fields" {
+    const gpa = testing.allocator;
+    for (0..5) |mode| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{
+            .{ .name = "argument", .decl_pos = pos0(), .is_pointer = true },
+            .{
+                .name = "holder", .decl_pos = pos0(), .is_pointer = mode == 3, .address_taken = mode == 4,
+                .private_inline_fields = if (mode == 0) &.{} else &.{"p"},
+            },
+        };
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        const holder: LId = @enumFromInt(1);
+        try transferFieldAssign(ctx, &state, .{ .parent = holder, .name = "p", .rhs_kind = .plain, .value_proof = .nonnull_pointer }, pos0());
+        try transfer(ctx, &state, .{ .kind = .{ .pointer_write = .{
+            .target = @enumFromInt(0), .preserves_private_inline_fields = mode != 1,
+        } }, .pos = pos0(), .end_pos = pos1() });
+        try testing.expectEqual(if (mode == 2) @as(?bool, true) else null, booleanValue(&state, .{ .optional_present = .{ .parent = holder, .name = "p" } }));
+    }
+}
+
+fn publishDeadOutput(ctx: Ctx, state: *AbstractState, out: LId, name: ?[]const u8, heap: HId, selected: ?cfg.OutputChannel) !void {
+    const value: LId = @enumFromInt(1);
+    try transferDecl(ctx, state, .{ .local = value, .init_kind = .{ .heap_alloc = .{ .id = heap } } }, pos0());
+    try transferOutParamWrite(ctx, state, .{ .out = out, .name = name, .value_kind = .{ .copy_of = value }, .physical_selection = selected }, pos0(), pos1());
+    try transferHeapFree(ctx, state, .{ .freed_local = value, .fallback_hid = heap }, pos0(), pos1());
+}
+
+test "output channels: null guards retire only exact certified current physical loans" {
+    const gpa = testing.allocator;
+    for (0..7) |mode| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "out", "value", "other" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const out: LId = @enumFromInt(0);
+        const name: ?[]const u8 = switch (mode) { 1 => "a", 2 => null, 4 => "nested.p", else => "" };
+        const selected: ?cfg.OutputChannel = if (mode == 2 or mode == 3 or mode == 4 or mode == 5)
+            null
+        else
+            .{ .out = out, .name = name };
+        try publishDeadOutput(ctx, &state, out, name, @enumFromInt(0), selected);
+        if (mode == 6) try transferOutParamWrite(ctx, &state, .{
+            .out = @enumFromInt(2), .name = "", .value_kind = .{ .copy_of = @enumFromInt(1) },
+            .physical_selection = .{ .out = @enumFromInt(2), .name = "" },
+        }, pos0(), pos1());
+        const guard_path = if (mode == 1) "b" else name orelse "";
+        try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+            .parent = out, .name = guard_path, .expected = false,
+            .physical_selection = if (mode == 3 or mode == 4) null else .{ .out = out, .name = guard_path },
+        } } }, .pos = pos0(), .end_pos = pos1() });
+        try transferRetOutParamDanglingHeaps(ctx, &state, pos0(), pos1());
+        try testing.expectEqual(if (mode == 0) @as(usize, 0) else 1, problems.items.len);
+    }
+}
+
+test "output channels: retiring one output field never erases a dangling sibling" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "out", "value" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const out: LId = @enumFromInt(0);
+    try publishDeadOutput(ctx, &state, out, "a", @enumFromInt(0), .{ .out = out, .name = "a" });
+    try publishDeadOutput(ctx, &state, out, "b", @enumFromInt(1), .{ .out = out, .name = "b" });
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+        .parent = out, .name = "a", .expected = false, .physical_selection = .{ .out = out, .name = "a" },
+    } } }, .pos = pos0(), .end_pos = pos1() });
+    try transferRetOutParamDanglingHeaps(ctx, &state, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "output channels: joins preserve every MAY heap and never gain a physical certificate from absence" {
+    const gpa = testing.allocator;
+    var lhs: AbstractState = .{};
+    defer lhs.deinit(gpa);
+    var rhs: AbstractState = .{};
+    defer rhs.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "out", "value" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const out: LId = @enumFromInt(0);
+    try transferOutParamWrite(ctx, &lhs, .{
+        .out = out, .name = "", .value_kind = .{ .heap_alloc = .{ .id = @enumFromInt(1) } },
+        .physical_selection = .{ .out = out, .name = "" },
+    }, pos0(), pos1());
+    try publishDeadOutput(ctx, &rhs, out, "", @enumFromInt(0), .{ .out = out, .name = "" });
+    _ = try state_mod.join(&lhs, &rhs, gpa);
+    try transfer(ctx, &lhs, .{ .kind = .{ .assume = .{ .optional_present = .{
+        .parent = out, .name = "", .expected = false, .physical_selection = .{ .out = out, .name = "" },
+    } } }, .pos = pos0(), .end_pos = pos1() });
+    try transferRetOutParamDanglingHeaps(ctx, &lhs, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "output channels: unknown plain and value-property writes never erase MAY heap loans" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { kind: ExprKind, proof: cfg.StoredValueProof }{
+        .{ .kind = .plain, .proof = .unknown },
+        .{ .kind = .unknown, .proof = .unknown },
+        .{ .kind = .undef, .proof = .unknown },
+        .{ .kind = .{ .heap_alloc = .{ .id = @enumFromInt(1) } }, .proof = .unknown },
+        .{ .kind = .plain, .proof = .nonnull_pointer },
+        .{ .kind = .plain, .proof = .empty_slice },
+    };
+    for (cases) |case| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "out", "value" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const out: LId = @enumFromInt(0);
+        try publishDeadOutput(ctx, &state, out, "", @enumFromInt(0), .{ .out = out, .name = "" });
+        try transferOutParamWrite(ctx, &state, .{
+            .out = out, .name = "", .value_kind = case.kind, .value_proof = case.proof,
+            .physical_selection = .{ .out = out, .name = "" }, .heap_custody_only = true,
+        }, pos0(), pos1());
+        try transferRetOutParamDanglingHeaps(ctx, &state, pos0(), pos1());
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+    }
+}
+
+test "output channels: heap-custody-only mode records heaps without widening the stack exemption" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |heap_case| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "out", "value" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const out: LId = @enumFromInt(0);
+        const value: LId = @enumFromInt(1);
+        if (heap_case) {
+            try transferDecl(ctx, &state, .{ .local = value, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } } }, pos0());
+            try transferOutParamWrite(ctx, &state, .{
+                .out = out, .name = "", .value_kind = .{ .copy_of = value },
+                .physical_selection = .{ .out = out, .name = "" }, .heap_custody_only = true,
+            }, pos0(), pos1());
+            try transferHeapFree(ctx, &state, .{ .freed_local = value, .fallback_hid = @enumFromInt(0) }, pos0(), pos1());
+            try transferRetOutParamDanglingHeaps(ctx, &state, pos0(), pos1());
+            try testing.expectEqual(@as(usize, 1), problems.items.len);
+            try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+        } else {
+            try transferOutParamWrite(ctx, &state, .{
+                .out = out, .name = "", .value_kind = .{ .stack_ref = value }, .heap_custody_only = true,
+            }, pos0(), pos1());
+            try testing.expectEqual(@as(usize, 0), problems.items.len);
+            try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "", .value_kind = .{ .stack_ref = value } }, pos0(), pos1());
+            try testing.expectEqual(@as(usize, 1), problems.items.len);
+            try testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+        }
+    }
+}
+
+test "stored values: only authorized SDK cleanup treats a proved empty slice as a no-op" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |field_storage| {
+        for ([_]bool{ false, true }) |sdk_authority| {
+            var state: AbstractState = .{};
+            defer state.deinit(gpa);
+            var problems: std.ArrayListUnmanaged(Problem) = .empty;
+            defer freeProblems(gpa, &problems);
+            var seen = Seen.init();
+            defer seen.deinit(gpa);
+            const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"slice"}), .problems = &problems, .seen = &seen, .path = "test" };
+            const slice: LId = @enumFromInt(0);
+            if (field_storage) {
+                try transferFieldAssign(ctx, &state, .{ .parent = slice, .name = "bytes", .rhs_kind = .plain, .value_proof = .empty_slice }, pos0());
+            } else {
+                try transferDecl(ctx, &state, .{ .local = slice, .init_kind = .plain, .value_proof = .empty_slice }, pos0());
+            }
+            for ([_]cfg.SrcPos{ pos0(), pos1() }) |pos| {
+                if (field_storage) {
+                    try transferFieldHeapFree(ctx, &state, .{
+                        .parent = slice, .name = "bytes", .fallback_hid = @enumFromInt(0), .sdk_empty_slice_noop = sdk_authority,
+                    }, pos, pos);
+                } else {
+                    try transferHeapFree(ctx, &state, .{
+                        .freed_local = slice, .fallback_hid = @enumFromInt(0), .sdk_empty_slice_noop = sdk_authority,
+                    }, pos, pos);
+                }
+            }
+            try testing.expectEqual(if (sdk_authority) @as(usize, 0) else 1, problems.items.len);
+            if (!sdk_authority) try testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+            if (field_storage) try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{ .optional_present = .{ .parent = slice, .name = "bytes" } }));
+        }
+    }
+}
+
+test "stored values: a copied empty slice survives its custody companion but not an unknown overwrite" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |overwrite| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "source", "out" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const source: LId = @enumFromInt(0);
+        const out: LId = @enumFromInt(1);
+        try transferFieldAssign(ctx, &state, .{ .parent = source, .name = "bytes", .rhs_kind = .plain, .value_proof = .empty_slice }, pos0());
+        try transferFieldAssign(ctx, &state, .{
+            .parent = out, .name = "bytes", .rhs_kind = .plain,
+            .value_proof = .{ .copy = .{ .field = .{ .parent = source, .name = "bytes" } } },
+        }, pos0());
+        try transferOutParamWrite(ctx, &state, .{
+            .out = out, .name = "bytes", .value_kind = .plain, .written_value = .{ .field = .{ .parent = out, .name = "bytes" } },
+        }, pos0(), pos1());
+        if (overwrite) try transferFieldAssign(ctx, &state, .{ .parent = out, .name = "bytes", .rhs_kind = .unknown }, pos0());
+        var copied = try state.clone(gpa);
+        defer copied.deinit(gpa);
+        for ([_]cfg.SrcPos{ pos0(), pos1() }) |pos| {
+            try transferFieldHeapFree(ctx, &copied, .{
+                .parent = out, .name = "bytes", .fallback_hid = @enumFromInt(0), .sdk_empty_slice_noop = true,
+            }, pos, pos);
+        }
+        try testing.expectEqual(if (overwrite) @as(usize, 1) else 0, problems.items.len);
+    }
+}
+
+test "stored values: one-sided joins alias writes gaps and wrong places cannot authorize empty cleanup" {
+    const gpa = testing.allocator;
+    for (0..4) |mutation| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "owner", "alias" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const owner: LId = @enumFromInt(0);
+        try transferFieldAssign(ctx, &state, .{ .parent = owner, .name = "bytes", .rhs_kind = .plain, .value_proof = .empty_slice }, pos0());
+        switch (mutation) {
+            0 => {
+                var other: AbstractState = .{};
+                defer other.deinit(gpa);
+                _ = try state_mod.join(&state, &other, gpa);
+            },
+            1 => try transfer(ctx, &state, .{ .kind = .{ .pointer_write = .{ .target = @enumFromInt(1) } }, .pos = pos0(), .end_pos = pos1() }),
+            2 => try transferGap(ctx, &state, .{ .note = "unrooted empty-header mutation", .may_assign_locals = false }),
+            3 => {},
+            else => unreachable,
+        }
+        for ([_]cfg.SrcPos{ pos0(), pos1() }) |pos| {
+            try transferFieldHeapFree(ctx, &state, .{
+                .parent = owner, .name = if (mutation == 3) "different" else "bytes",
+                .fallback_hid = @enumFromInt(0), .sdk_empty_slice_noop = true,
+            }, pos, pos);
+        }
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+    }
+}
+
+test "stored values: empty cleanup never revives or erases a MAY heap lifetime" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"owner"}), .problems = &problems, .seen = &seen, .path = "test" };
+    const owner: LId = @enumFromInt(0);
+    const heap: HId = @enumFromInt(0);
+    try transferFieldAssign(ctx, &state, .{ .parent = owner, .name = "bytes", .rhs_kind = .plain, .value_proof = .empty_slice }, pos0());
+    // A MAY origin is independent of the actual stored-value packet.
+    try state.fields.putContext(gpa, .{ .parent = owner, .name = "bytes" }, .{ .heap = heap }, .{});
+    try state.heaps.put(gpa, heap, .{ .state = .dead });
+    try transferFieldHeapFree(ctx, &state, .{
+        .parent = owner, .name = "bytes", .fallback_hid = heap, .sdk_empty_slice_noop = true,
+    }, pos0(), pos1());
+    try transferFieldUse(ctx, &state, .{ .parent = owner, .name = "bytes" }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "optional review: nullable allocation and borrowed-call lifetime hints never prove presence" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |nullable_borrow| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "argument", "nullable", "out", "victim" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const argument: LId = @enumFromInt(0);
+        const nullable: LId = @enumFromInt(1);
+        const out: LId = @enumFromInt(2);
+        const victim: LId = @enumFromInt(3);
+        try transferDecl(ctx, &state, .{ .local = argument, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0());
+        try transferDecl(ctx, &state, .{ .local = victim, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(1) } } }, pos0());
+        if (nullable_borrow) {
+            // A nullable callee's borrowed lifetime summary is not an actual
+            // value copy. That call can return null instead of its argument.
+            try transferDecl(ctx, &state, .{ .local = nullable, .init_kind = .{ .copy_of = argument } }, pos0());
+            try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "", .value_kind = .{ .copy_of = nullable }, .value_proof = .{ .copy = .{ .local = nullable } } }, pos0(), pos1());
+        } else {
+            // Existing allocation-shaped lifetime IR also describes a create
+            // wrapper or `create(T) catch null`; it supplies no MUST value.
+            try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "", .value_kind = .{ .heap_alloc = .{ .id = @enumFromInt(2) } } }, pos0(), pos1());
+        }
+        try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+            .parent = out, .name = "", .expected = false,
+        } } }, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = .{ .heap_free = .{ .freed_local = victim, .fallback_hid = @enumFromInt(1) } }, .pos = pos0(), .end_pos = pos1() });
+        try transfer(ctx, &state, .{ .kind = .{ .heap_free = .{ .freed_local = victim, .fallback_hid = @enumFromInt(1) } }, .pos = pos1(), .end_pos = pos1() });
+        try testing.expect(state.feasible);
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+    }
+}
+
+test "optional review: a local-rebinding gap keeps the real null output arm reachable" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "value", "out" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const value: LId = @enumFromInt(0);
+    const out: LId = @enumFromInt(1);
+    // An inline-assembly output can replace this unaddressed optional local
+    // with null. The gap must revoke the old pointer-value certificate.
+    try transferDecl(ctx, &state, .{ .local = value, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0());
+    try transferGap(ctx, &state, .{ .note = "assembly output rebinds optional local", .may_assign_locals = true });
+    try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "", .value_kind = .{ .copy_of = value }, .value_proof = .{ .copy = .{ .local = value } } }, pos0(), pos1());
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+        .parent = out, .name = "", .expected = false,
+    } } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(state.feasible);
+}
+
+test "optional review: one physical field copy does not become two value evaluations" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "holder", "out" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const holder: LId = @enumFromInt(0);
+    const out: LId = @enumFromInt(1);
+    try transferFieldAssign(ctx, &state, .{
+        .parent = holder, .name = "p", .rhs_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } },
+        .value_proof = .nonnull_pointer,
+    }, pos0());
+    // This is the two-statement source IR for the ONE store out.p = holder.p.
+    const copy: ExprKind = .{ .field_copy_of = .{ .parent = holder, .name = "p" } };
+    try transferFieldAssign(ctx, &state, .{ .parent = out, .name = "p", .rhs_kind = copy, .value_proof = .{ .copy = .{ .field = .{ .parent = holder, .name = "p" } } } }, pos0());
+    try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "p", .value_kind = copy, .written_value = .{ .field = .{ .parent = out, .name = "p" } } }, pos0(), pos1());
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+        .parent = out, .name = "p", .expected = false,
+    } } }, .pos = pos0(), .end_pos = pos1() });
+    // A null-guarded errdefer must not free this transferred nonnull value.
+    try transfer(ctx, &state, .{ .kind = .{ .field_heap_free = .{
+        .parent = out, .name = "p", .fallback_hid = @enumFromInt(0),
+    } }, .pos = pos0(), .end_pos = pos1() });
+    try transfer(ctx, &state, .{ .kind = .{ .field_use = .{ .parent = out, .name = "p" } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(!state.feasible);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "optional review: dead pointer facts fit a fixed clone resource allowance" {
+    // The clone consumer gets a fixed allowance, not a map-length assertion.
+    // Each predecessor's pointer header is dead before the next scope.
+    var buffer: [16 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const gpa = fixed.allocator();
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var keep = [_]u8{0} ** 128;
+    var heaps: std.ArrayListUnmanaged(u32) = .empty;
+    defer heaps.deinit(gpa);
+    var arenas: std.ArrayListUnmanaged(u32) = .empty;
+    defer arenas.deinit(gpa);
+    for (0..128) |index| {
+        try state.stored_values.put(gpa, @enumFromInt(index), .{ .nonnull_pointer = true });
+        try state.project(gpa, &keep, &keep, &heaps, &arenas);
+        const next = try state.clone(gpa);
+        state.deinit(gpa);
+        state = next;
+    }
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "survivor", "out" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const survivor: LId = @enumFromInt(0);
+    const out: LId = @enumFromInt(1);
+    try transferDecl(ctx, &state, .{ .local = survivor, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0());
+    try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "", .value_kind = .{ .copy_of = survivor }, .value_proof = .{ .copy = .{ .local = survivor } } }, pos0(), pos1());
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+        .parent = out, .name = "", .expected = false,
+    } } }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(!state.feasible);
+}
+
+test "optional review: self-copy lifetime hints do not preserve a nullable replacement" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |actual_copy| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "value", "holder" }), .problems = &problems, .seen = &seen, .path = "test" };
+        const value: LId = @enumFromInt(0);
+        const holder: LId = @enumFromInt(1);
+        try transferDecl(ctx, &state, .{
+            .local = value, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer,
+        }, pos0());
+        const local_presence: cfg.StoredValueProof = if (actual_copy)
+            .{ .copy = .{ .local = value } }
+        else
+            .unknown;
+        try transferAssign(ctx, &state, .{ .target = value, .rhs_kind = .{ .copy_of = value }, .value_proof = local_presence }, pos0());
+        try transferOutParamWrite(ctx, &state, .{
+            .out = holder, .name = "", .value_kind = .{ .copy_of = value },
+            .value_proof = .{ .copy = .{ .local = value } },
+        }, pos0(), pos1());
+        try testing.expectEqual(if (actual_copy) @as(?bool, true) else null, booleanValue(&state, .{ .optional_present = .{ .parent = holder, .name = "" } }));
+        try transferFieldAssign(ctx, &state, .{
+            .parent = holder, .name = "p", .rhs_kind = .{ .heap_alloc = .{ .id = @enumFromInt(1) } }, .value_proof = .nonnull_pointer,
+        }, pos0());
+        const field_presence: cfg.StoredValueProof = if (actual_copy)
+            .{ .copy = .{ .field = .{ .parent = holder, .name = "p" } } }
+        else
+            .unknown;
+        try transferFieldAssign(ctx, &state, .{
+            .parent = holder, .name = "p", .rhs_kind = .{ .field_copy_of = .{ .parent = holder, .name = "p" } },
+            .value_proof = field_presence,
+        }, pos0());
+        try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{
+            .parent = holder, .name = "p", .expected = false,
+        } } }, .pos = pos0(), .end_pos = pos1() });
+        try testing.expectEqual(!actual_copy, state.feasible);
+    }
+}
+
+test "optional place: a physical nonnull pointee store prunes only its null arm" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const locals = [_]LocalInfo{
+        .{ .name = "instance", .decl_pos = pos0(), .is_pointer = true },
+        .{ .name = "other", .decl_pos = pos0(), .is_pointer = true },
+        .{ .name = "value", .decl_pos = pos0(), .is_pointer = true },
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    const instance: LId = @enumFromInt(0);
+    const value: LId = @enumFromInt(2);
+    // Source IR: const value = try create(T); value.* = ...; instance.* = value.
+    const statements = [_]Stmt{
+        .{ .kind = .{ .decl = .{ .local = value, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .pointer_write = .{ .target = value } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .field_assign = .{ .parent = instance, .name = "", .rhs_kind = .{ .copy_of = value }, .value_proof = .{ .copy = .{ .local = value } } } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .out_param_write = .{ .out = instance, .name = "", .value_kind = .{ .copy_of = value }, .written_value = .{ .field = .{ .parent = instance, .name = "" } } } }, .pos = pos0(), .end_pos = pos1() },
+    };
+    for (statements) |statement| try transfer(ctx, &state, statement);
+    const present: cfg.BooleanValue = .{ .optional_present = .{ .parent = instance, .name = "" } };
+    try testing.expectEqual(@as(?bool, true), booleanValue(&state, present));
+    try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{ .optional_present = .{ .parent = @enumFromInt(1), .name = "" } }));
+    try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{ .optional_present = .{ .parent = instance, .name = "different" } }));
+    var null_arm = try state.clone(gpa);
+    defer null_arm.deinit(gpa);
+    try transfer(ctx, &null_arm, .{ .kind = .{ .assume = present.negate() }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(!null_arm.feasible);
+    try transfer(ctx, &state, .{ .kind = .{ .assume = present }, .pos = pos0(), .end_pos = pos1() });
+    try testing.expect(state.feasible);
+}
+
+test "optional place: null unknown alias and opaque overwrites keep the null arm feasible" {
+    const gpa = testing.allocator;
+    const instance: LId = @enumFromInt(0);
+    const overwrites = [_]StmtKind{
+        // Null has no positive-null channel: .plain must forget, not assert.
+        .{ .out_param_write = .{ .out = instance, .name = "", .value_kind = .plain } },
+        .{ .out_param_write = .{ .out = instance, .name = "", .value_kind = .unknown } },
+        .{ .out_param_write = .{ .out = instance, .name = "", .value_kind = .undef } },
+        .{ .pointer_write = .{ .target = @enumFromInt(1) } },
+        .{ .field_assign = .{ .parent = @enumFromInt(1), .name = "value", .rhs_kind = .unknown } },
+        .{ .lowering_gap = .{ .note = "unrooted mutation", .may_assign_locals = false } },
+    };
+    for (overwrites) |overwrite| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{
+            .{ .name = "instance", .decl_pos = pos0(), .is_pointer = true },
+            .{ .name = "alias", .decl_pos = pos0(), .is_pointer = true },
+        };
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        try transferOutParamWrite(ctx, &state, .{ .out = instance, .name = "", .value_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0(), pos1());
+        try transfer(ctx, &state, .{ .kind = overwrite, .pos = pos0(), .end_pos = pos1() });
+        const present: cfg.BooleanValue = .{ .optional_present = .{ .parent = instance, .name = "" } };
+        try testing.expectEqual(@as(?bool, null), booleanValue(&state, present));
+        try transfer(ctx, &state, .{ .kind = .{ .assume = present.negate() }, .pos = pos0(), .end_pos = pos1() });
+        try testing.expect(state.feasible);
+    }
+}
+
+test "optional place: one-sided joins and MAY origins cannot prove nonnull" {
+    const gpa = testing.allocator;
+    var lhs: AbstractState = .{};
+    defer lhs.deinit(gpa);
+    var rhs: AbstractState = .{};
+    defer rhs.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"instance"}), .problems = &problems, .seen = &seen, .path = "test" };
+    const instance: LId = @enumFromInt(0);
+    try transferOutParamWrite(ctx, &lhs, .{ .out = instance, .name = "", .value_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0(), pos1());
+    _ = try state_mod.join(&lhs, &rhs, gpa);
+    const present: cfg.BooleanValue = .{ .optional_present = .{ .parent = instance, .name = "" } };
+    try testing.expect(lhs.out_param_writes.containsContext(.{
+        .channel = .{ .out = instance, .name = "" }, .heap = @enumFromInt(0),
+    }, .{}));
+    try testing.expectEqual(@as(?bool, null), booleanValue(&lhs, present));
+    try transferOutParamWrite(ctx, &lhs, .{ .out = instance, .name = "", .value_kind = .{ .field_copy_of = .{ .parent = instance, .name = "may" } }, .value_proof = .{ .copy = .{ .field = .{ .parent = instance, .name = "may" } } } }, pos0(), pos1());
+    try lhs.fields.putContext(gpa, .{ .parent = instance, .name = "may" }, .{ .heap = @enumFromInt(0) }, .{});
+    try transferOutParamWrite(ctx, &lhs, .{ .out = instance, .name = "", .value_kind = .{ .field_copy_of = .{ .parent = instance, .name = "may" } }, .value_proof = .{ .copy = .{ .field = .{ .parent = instance, .name = "may" } } } }, pos0(), pos1());
+    try testing.expectEqual(@as(?bool, null), booleanValue(&lhs, present));
+}
+
+test "optional place: a dead nonnull pointer still has its lifetime hazard" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "instance", "value" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const instance: LId = @enumFromInt(0);
+    const value: LId = @enumFromInt(1);
+    try transferDecl(ctx, &state, .{ .local = value, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0());
+    try transferOutParamWrite(ctx, &state, .{ .out = instance, .name = "", .value_kind = .{ .copy_of = value }, .value_proof = .{ .copy = .{ .local = value } } }, pos0(), pos1());
+    try transferHeapFree(ctx, &state, .{ .freed_local = value, .fallback_hid = @enumFromInt(0) }, pos0(), pos1());
+    // A callback can replace the published slot, but cannot rebind this
+    // unescaped local pointer header. Republishing its dead value proves
+    // presence again, never lifetime.
+    try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{
+        .optional_present = .{ .parent = instance, .name = "" },
+    }));
+    try testing.expect(storedValueFacts(&state, .{ .local = value }).nonnull_pointer);
+    try transferOutParamWrite(ctx, &state, .{
+        .out = instance, .name = "", .value_kind = .{ .copy_of = value },
+        .value_proof = .{ .copy = .{ .local = value } },
+    }, pos0(), pos1());
+    try testing.expectEqual(@as(?bool, true), booleanValue(&state, .{ .optional_present = .{ .parent = instance, .name = "" } }));
+    try transfer(ctx, &state, .{ .kind = .{ .assume = .{ .optional_present = .{ .parent = instance, .name = "" } } }, .pos = pos0(), .end_pos = pos1() });
+    try transferUse(ctx, &state, .{ .local = value }, pos0(), pos1());
+    try testing.expect(state.feasible);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "optional place: exact address field stores and copied MUST values are independent of origins" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "holder", "storage", "out" }), .problems = &problems, .seen = &seen, .path = "test" };
+    const holder: LId = @enumFromInt(0);
+    const storage: LId = @enumFromInt(1);
+    const out: LId = @enumFromInt(2);
+    try state.locals.put(gpa, storage, .undef);
+    try transferFieldAssign(ctx, &state, .{
+        .parent = holder, .name = "selected", .rhs_kind = .{ .stack_ref = storage },
+        .value_proof = .nonnull_pointer,
+    }, pos0());
+    try testing.expectEqual(@as(?bool, true), booleanValue(&state, .{ .optional_present = .{ .parent = holder, .name = "selected" } }));
+    try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{ .optional_present = .{ .parent = holder, .name = "" } }));
+    try transferOutParamWrite(ctx, &state, .{
+        .out = out, .name = "", .value_kind = .{ .field_copy_of = .{ .parent = holder, .name = "selected" } },
+        .value_proof = .{ .copy = .{ .field = .{ .parent = holder, .name = "selected" } } },
+    }, pos0(), pos1());
+    try testing.expectEqual(@as(?bool, true), booleanValue(&state, .{ .optional_present = .{ .parent = out, .name = "" } }));
+    // A legacy unselected store cannot identify a pointee, even with a heap RHS.
+    try transferOutParamWrite(ctx, &state, .{
+        .out = out, .value_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } },
+        .value_proof = .nonnull_pointer,
+    }, pos0(), pos1());
+    try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{ .optional_present = .{ .parent = out, .name = "" } }));
+}
+
+test "optional place: escaped header mutation and local rebind cannot reuse a stale MUST value" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |opaque_mutation| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{
+            .{ .name = "value", .decl_pos = pos0(), .is_pointer = true, .address_taken = true },
+            .{ .name = "out", .decl_pos = pos0(), .is_pointer = true },
+        };
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        const value: LId = @enumFromInt(0);
+        const out: LId = @enumFromInt(1);
+        try transferDecl(ctx, &state, .{ .local = value, .init_kind = .{ .heap_alloc = .{ .id = @enumFromInt(0) } }, .value_proof = .nonnull_pointer }, pos0());
+        if (opaque_mutation) {
+            try transferGap(ctx, &state, .{ .note = "escaped pointer", .may_assign_locals = false });
+        } else {
+            try transferAssign(ctx, &state, .{ .target = value, .rhs_kind = .unknown }, pos0());
+        }
+        try transferOutParamWrite(ctx, &state, .{ .out = out, .name = "", .value_kind = .{ .copy_of = value }, .value_proof = .{ .copy = .{ .local = value } } }, pos0(), pos1());
+        try testing.expectEqual(@as(?bool, null), booleanValue(&state, .{ .optional_present = .{ .parent = out, .name = "" } }));
+    }
+}
 
 test "transfer: a cloned guard still prunes a contradictory use" {
     const gpa = testing.allocator;
@@ -7305,6 +8350,8 @@ test "diagnostic scalar transport: joins retain UNKNOWN repairs and actual poiso
         _ = try state_mod.join(&left, &right, gpa);
         _ = try state_mod.join(&left, &right, gpa);
         try testing.expect(left.locals.get(target).? == .undef);
+        if (scenario != .undefined_pointer_header)
+            try testing.expectEqual(scenario == .one_unwritten, left.may_undefined_values.contains(target));
         try testing.expect(left.unknown_values.contains(target));
         try testing.expect(!localInputIsDefined(ctx, &left, target, false));
         try testing.expectEqual(scenario != .repaired_both, localIsProvedUndefined(ctx, &left, target));
@@ -7312,5 +8359,327 @@ test "diagnostic scalar transport: joins retain UNKNOWN repairs and actual poiso
             .kind = .{ .use = .{ .local = target } }, .pos = pos1(), .end_pos = pos1(),
         });
         try testing.expectEqual(@as(usize, if (scenario == .repaired_both) 0 else 1), problems.items.len);
+    }
+}
+
+test "counter placement replay: scoped uncertainty defeats ALL but preserves tail and child negatives" {
+    const gpa = testing.allocator;
+    const array: LocalId = @enumFromInt(0);
+    const locals = [_]cfg.LocalInfo{.{ .name = "array", .decl_pos = pos0(), .is_array = true, .array_extent = 4 }};
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    try state.locals.put(gpa, array, .undef);
+    try state.undefined_field_values.putContext(gpa, .{ .parent = array, .name = "" }, {}, .{});
+    try state.entire_undefined_fields.putContext(gpa, .{ .parent = array, .name = "" }, {}, .{});
+    try state.uncertain_byte_writes.putContext(gpa, .{ .parent = array, .name = "[0..3]" }, {}, .{});
+    try state.undefined_field_values.putContext(gpa, .{ .parent = array, .name = "[0].hole" }, {}, .{});
+    try state.entire_undefined_fields.putContext(gpa, .{ .parent = array, .name = "[0].hole" }, {}, .{});
+    try testing.expect(!localIsEntirelyUndefined(ctx, &state, array));
+    try testing.expect(!fieldIsEntirelyUndefined(ctx, &state, array, ""));
+    try testing.expect(!fieldValueMayBeUndefined(ctx, &state, array, "[1]"));
+    try testing.expect(fieldIsEntirelyUndefined(ctx, &state, array, "[3]"));
+    try testing.expect(fieldIsEntirelyUndefined(ctx, &state, array, "[0].hole"));
+    try testing.expect(!returnValueIsDefined(ctx, &state, .{ .ret = .{
+        .value_kind = .{ .copy_of = array }, .is_borrowed_return_type = false, .value_defined = true,
+        .value_inputs = .{cfg.ValueInput{ .local = array }} ++ .{null} ** 7,
+    } }));
+}
+
+test "descriptor transfer: selected backing is not read but ordinary uses retain liveness" {
+    const gpa = testing.allocator;
+    for ([_]Origin{
+        .{ .heap = @enumFromInt(0) },
+        .{ .arena = @enumFromInt(0) },
+        .{ .arena_borrow = @enumFromInt(0) },
+        .{ .stack = @enumFromInt(1) },
+    }) |origin| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]cfg.LocalInfo{
+            .{ .name = "descriptor", .decl_pos = pos0(), .is_pointer = true, .is_slice = true },
+            .{ .name = "owner", .decl_pos = pos0(), .is_pointer = true },
+            .{ .name = "record", .decl_pos = pos0() },
+        };
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        const descriptor: LId = @enumFromInt(0);
+        const record: LId = @enumFromInt(2);
+        try state.heaps.put(gpa, @enumFromInt(0), .{ .state = .dead });
+        try state.arenas.put(gpa, @enumFromInt(0), .{ .state = .dead });
+        try state.locals.put(gpa, @enumFromInt(1), .{ .heap = @enumFromInt(0) });
+        try state.locals.put(gpa, descriptor, origin);
+        try state.locals.put(gpa, record, .plain);
+        try state.fields.putContext(gpa, .{ .parent = record, .name = "bytes" }, origin, .{});
+        try transferUse(ctx, &state, .{ .local = descriptor, .descriptor_only = true }, pos0(), pos1());
+        try transferFieldUse(ctx, &state, .{ .parent = record, .name = "bytes", .descriptor_only = true }, pos0(), pos1());
+        try testing.expectEqual(@as(usize, 0), problems.items.len);
+        try transferUse(ctx, &state, .{ .local = descriptor }, pos0(), pos1());
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try transferFieldUse(ctx, &state, .{ .parent = record, .name = "bytes" }, pos1(), pos1());
+        try testing.expectEqual(@as(usize, 2), problems.items.len);
+    }
+}
+
+test "descriptor transfer: undefined headers and dead containing objects remain reads" {
+    const gpa = testing.allocator;
+    const locals = [_]cfg.LocalInfo{
+        .{ .name = "descriptor", .decl_pos = pos0(), .is_pointer = true, .is_slice = true },
+        .{ .name = "record", .decl_pos = pos0(), .is_pointer = true },
+    };
+    for ([_]bool{ false, true }) |dead_owner| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+        const record: LId = @enumFromInt(1);
+        try state.locals.put(gpa, record, if (dead_owner) .{ .heap = @enumFromInt(0) } else .plain);
+        try state.heaps.put(gpa, @enumFromInt(0), .{ .state = .dead });
+        try state.fields.putContext(gpa, .{ .parent = record, .name = "bytes" }, if (dead_owner) .plain else .undef, .{});
+        if (!dead_owner) try state.undefined_field_values.putContext(gpa, .{ .parent = record, .name = "bytes" }, {}, .{});
+        try transferFieldUse(ctx, &state, .{ .parent = record, .name = "bytes", .descriptor_only = true }, pos0(), pos1());
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings(if (dead_owner) "heap-use-after-free" else "use-undefined", problems.items[0].rule_id);
+    }
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test" };
+    try state.locals.put(gpa, @enumFromInt(0), .undef);
+    try transferUse(ctx, &state, .{ .local = @enumFromInt(0), .descriptor_only = true }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+}
+
+test "release callbacks: only an authorized empty no-op preserves exposed stored properties" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |field_storage| {
+        for (0..3) |mode| {
+            var state: AbstractState = .{};
+            defer state.deinit(gpa);
+            var problems: std.ArrayListUnmanaged(Problem) = .empty;
+            defer freeProblems(gpa, &problems);
+            var seen = Seen.init();
+            defer seen.deinit(gpa);
+            const locals = [_]LocalInfo{
+                .{ .name = "victim", .decl_pos = pos0(), .is_slice = true },
+                .{ .name = "owner", .decl_pos = pos0(), .is_pointer = true },
+                .{ .name = "private", .decl_pos = pos0(), .private_inline_fields = &.{"bytes"} },
+                .{ .name = "exposed", .decl_pos = pos0(), .is_slice = true, .address_taken = true },
+            };
+            const ctx: Ctx = .{
+                .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test",
+            };
+            const victim: LId = @enumFromInt(0);
+            const owner: LId = @enumFromInt(1);
+            const private: LId = @enumFromInt(2);
+            const exposed: LId = @enumFromInt(3);
+            const heap: HId = @enumFromInt(0);
+            const no_op = mode == 1;
+            try state.heaps.put(gpa, heap, .{ .state = .live });
+            try state.locals.put(gpa, victim, .{ .heap = heap });
+            try state.fields.putContext(gpa, .{ .parent = owner, .name = "victim" }, .{ .heap = heap }, .{});
+            try state.stored_values.put(gpa, owner, .{ .nonnull_pointer = true });
+            try state.stored_values.put(gpa, exposed, .{ .empty_slice = true });
+            try state.stored_places.putContext(gpa, .{
+                .parent = owner, .name = "other",
+            }, .{ .nonnull_pointer = true }, .{});
+            try state.stored_places.putContext(gpa, .{
+                .parent = private, .name = "bytes",
+            }, .{ .empty_slice = true }, .{});
+            if (mode != 0) {
+                if (field_storage) {
+                    try state.stored_places.putContext(gpa, .{
+                        .parent = owner, .name = "victim",
+                    }, .{ .empty_slice = true }, .{});
+                } else try state.stored_values.put(gpa, victim, .{ .empty_slice = true });
+            }
+
+            // A real release may invoke an allocator/custom callback. The
+            // selected empty SDK no-op invokes none; its siblings stay valid.
+            if (field_storage) {
+                try transferFieldHeapFree(ctx, &state, .{
+                    .parent = owner, .name = "victim", .fallback_hid = heap,
+                    .sdk_empty_slice_noop = mode != 2,
+                }, pos0(), pos1());
+            } else try transferHeapFree(ctx, &state, .{
+                .freed_local = victim, .fallback_hid = heap, .sdk_empty_slice_noop = mode != 2,
+            }, pos0(), pos1());
+            try testing.expectEqual(if (no_op) @as(?bool, true) else null, booleanValue(&state, .{
+                .optional_present = .{ .parent = owner, .name = "other" },
+            }));
+            try testing.expectEqual(no_op, storedValueFacts(&state, .{ .local = exposed }).empty_slice);
+            try testing.expect(storedValueFacts(&state, .{ .field = .{
+                .parent = private, .name = "bytes",
+            } }).empty_slice);
+            try testing.expect(storedValueFacts(&state, .{ .local = owner }).nonnull_pointer);
+            try testing.expect((state.heaps.get(heap).?.state == .live) == no_op);
+            try testing.expectEqual(@as(usize, 0), problems.items.len);
+        }
+    }
+}
+
+test "release effect guard: exact SDK emptiness suppresses mutation but never operand reads" {
+    const gpa = testing.allocator;
+    for (0..5) |mode| {
+        var state: AbstractState = .{};
+        defer state.deinit(gpa);
+        var problems: std.ArrayListUnmanaged(Problem) = .empty;
+        defer freeProblems(gpa, &problems);
+        var seen = Seen.init();
+        defer seen.deinit(gpa);
+        const locals = [_]LocalInfo{
+            .{ .name = "owner", .decl_pos = pos0(), .is_pointer = true },
+            .{ .name = "argument", .decl_pos = pos0(), .is_slice = true },
+        };
+        const ctx: Ctx = .{
+            .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test",
+        };
+        const owner: LId = @enumFromInt(0);
+        const argument: LId = @enumFromInt(1);
+        const allocation: HId = @enumFromInt(0);
+        const containing: HId = @enumFromInt(1);
+        const no_op = mode == 0 or mode == 4;
+        try state.heaps.put(gpa, allocation, .{ .state = .live });
+        try state.heaps.put(gpa, containing, .{ .state = .dead });
+        try state.locals.put(gpa, owner, .{ .heap = containing });
+        try state.locals.put(gpa, argument, .{ .heap = allocation });
+        try state.fields.putContext(gpa, .{
+            .parent = owner, .name = "bytes",
+        }, .{ .heap = allocation }, .{});
+        if (mode != 3) try state.stored_places.putContext(gpa, .{
+            .parent = owner, .name = "bytes",
+        }, .{ .empty_slice = true }, .{});
+        if (mode == 4) try state.stored_values.put(gpa, argument, .{ .empty_slice = true });
+
+        // Even a known empty value must be read from its containing object.
+        // The mutation guard cannot suppress this independent lifetime read.
+        try transferFieldUse(ctx, &state, .{
+            .parent = owner, .name = "bytes", .descriptor_only = true,
+        }, pos0(), pos1());
+        try transfer(ctx, &state, .{ .kind = .{ .pointer_write = .{
+            .target = owner, .initializes = false,
+            .sdk_empty_noop_release = if (mode == 1) null else if (mode == 4)
+                .{ .local = argument }
+            else
+                .{ .field = .{ .parent = owner, .name = if (mode == 2) "other" else "bytes" } },
+        } }, .pos = pos0(), .end_pos = pos1() });
+        try testing.expectEqual(!no_op, state.unknown_field_values.containsContext(.{
+            .parent = owner, .name = "",
+        }, .{}));
+        if (mode != 3) try testing.expectEqual(no_op, storedValueFacts(&state, .{
+            .field = .{ .parent = owner, .name = "bytes" },
+        }).empty_slice);
+        try testing.expectEqual(@as(usize, 1), problems.items.len);
+        try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+
+        // An unrelated wrapper/global tail effect has no direct-SDK guard.
+        try transfer(ctx, &state, .{ .kind = .{ .pointer_write = .{
+            .target = owner, .initializes = false,
+        } }, .pos = pos0(), .end_pos = pos1() });
+        try testing.expect(!storedValueFacts(&state, .{ .field = .{
+            .parent = owner, .name = "bytes",
+        } }).empty_slice);
+    }
+}
+
+test "scalar binding origin: primitive leaf names do not erase wrapped resource identities" {
+    const gpa = testing.allocator;
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    var seen = Seen.init();
+    defer seen.deinit(gpa);
+    const shapes = [_]LocalInfo{
+        .{ .name = "pointer", .decl_pos = pos0(), .is_pointer = true },
+        .{ .name = "slice", .decl_pos = pos0(), .is_slice = true },
+        .{ .name = "array", .decl_pos = pos0(), .is_array = true },
+        .{ .name = "extent", .decl_pos = pos0(), .array_extent = 1 },
+        .{ .name = "optional", .decl_pos = pos0(), .tracks_optional_tag = true },
+        .{ .name = "aggregate", .decl_pos = pos0(), .tracks_array_payload = true },
+        .{ .name = "record", .decl_pos = pos0(), .runtime_fields = &.{"pointer"} },
+    };
+    const resources = [_]Origin{
+        .{ .heap = @enumFromInt(0) },
+        .{ .arena = @enumFromInt(0) },
+        .{ .arena_borrow = @enumFromInt(0) },
+    };
+    for (shapes) |shape| {
+        var local = shape;
+        local.type_name = "u32";
+        // Pointer-valued locals can also carry scalar runtime metadata.
+        // A known whole-value shape must take precedence over that hint.
+        local.tracks_scalar_value = true;
+        const locals = [_]LocalInfo{local};
+        const ctx: Ctx = .{
+            .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test",
+        };
+        for (resources) |origin|
+            try testing.expect(Origin.eql(origin, scalarBindingOrigin(ctx, @enumFromInt(0), origin)));
+    }
+}
+
+test "scalar binding origin: declaration and assignment preserve pointer hazards but not scalar hints" {
+    const gpa = testing.allocator;
+    const domains = [_]state_mod.IntegerDomain{ .{}, .{} };
+    for (0..3) |kind| {
+        for ([_]bool{ false, true }) |assignment| {
+            for ([_]bool{ true, false }) |released| {
+                var state: AbstractState = .{ .integer_domains = &domains };
+                defer state.deinit(gpa);
+                var problems: std.ArrayListUnmanaged(Problem) = .empty;
+                defer freeProblems(gpa, &problems);
+                var seen = Seen.init();
+                defer seen.deinit(gpa);
+                const locals = [_]LocalInfo{
+                    .{ .name = "raw", .decl_pos = pos0(), .is_slice = true },
+                    .{
+                        .name = "value", .decl_pos = pos0(), .type_name = "u32",
+                        .is_pointer = kind == 0, .tracks_scalar_value = kind != 2,
+                    },
+                };
+                const ctx: Ctx = .{
+                    .gpa = gpa, .locals = &locals, .problems = &problems, .seen = &seen, .path = "test",
+                };
+                const raw: LId = @enumFromInt(0);
+                const value: LId = @enumFromInt(1);
+                const heap: HId = @enumFromInt(0);
+                try transferDecl(ctx, &state, .{
+                    .local = raw, .init_kind = .{ .heap_alloc = .{ .id = heap } },
+                }, pos0());
+                if (assignment) {
+                    try transferDecl(ctx, &state, .{ .local = value, .init_kind = .plain }, pos0());
+                    try transferAssign(ctx, &state, .{
+                        .target = value, .rhs_kind = .{ .copy_of = raw },
+                    }, pos0());
+                } else try transferDecl(ctx, &state, .{
+                    .local = value, .init_kind = .{ .copy_of = raw },
+                }, pos0());
+                if (released) try transferHeapFree(ctx, &state, .{
+                    .freed_local = raw, .fallback_hid = heap,
+                }, pos0(), pos1());
+                try transferUse(ctx, &state, .{ .local = value }, pos1(), pos1());
+                const carries_address = kind != 1;
+                try testing.expectEqual(@as(usize, if (released and carries_address) 1 else 0), problems.items.len);
+                if (released and carries_address)
+                    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+                try testing.expect(Origin.eql(
+                    if (carries_address) .{ .heap = heap } else .plain,
+                    state.locals.get(value).?,
+                ));
+            }
+        }
     }
 }

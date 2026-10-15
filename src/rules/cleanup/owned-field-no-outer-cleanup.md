@@ -17,6 +17,24 @@ This is the complement to
 Same family of bugs (resource leak via composition); different
 source signal.
 
+## Source-backed cleanup entry points
+
+With typed source, the cleanup entry point need not be named `deinit`.
+The detector recognizes an exact field destructor called by an owner method
+or a function that receives that owner. Both the receiver container and the
+callee declaration must match. A same-named field on another type is unrelated.
+
+A local temporary needs an active `defer`, or paired error and normal cleanup.
+An error-arm call alone does not prove cleanup after a successful handoff.
+Inline cleanup counts only when it matches the entire small inner destructor,
+including each actual argument's field path. Partial cleanup remains diagnostic.
+
+Static allocator callbacks, reset-only interfaces, and scalar accounting closes
+do not establish a resource destructor. A private, unreferenced declaration can
+be excluded only when the source contains no reflective namespace exposure.
+Unknown calls and unresolved custody do not establish these proofs.
+
+
 ## Bad
 
 ```zig

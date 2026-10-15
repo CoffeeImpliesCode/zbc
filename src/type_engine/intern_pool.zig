@@ -1701,7 +1701,17 @@ pub fn coerce(
     const inst_tag = ip.zigTypeTag(inst_ty) orelse return try ip.getUnknown(dest_ty);
 
     var in_memory_result = try ip.coerceInMemoryAllowed(arena, dest_ty, inst_ty, false, builtin.target);
-    if (in_memory_result == .ok) return try ip.getUnknown(dest_ty);
+    if (in_memory_result == .ok) {
+        // Memory compatibility does not erase a known integer value. Let the
+        // numeric coercion below check its range and retain its exact value.
+        const known_integer = (dest_tag == .int or dest_tag == .comptime_int) and
+            (inst_tag == .int or inst_tag == .comptime_int) and
+            switch (ip.indexToKey(inst)) {
+                .int_u64_value, .int_i64_value, .int_big_value => true,
+                else => false,
+            };
+        if (!known_integer) return try ip.getUnknown(dest_ty);
+    }
 
     switch (dest_tag) {
         .optional => optional: {
@@ -5359,6 +5369,42 @@ test "coerce int" {
     try ip.testCoerce(.u1_type, @"as(comptime_int, 1)", @"as(u1, 1)");
     try ip.testCoerce(.u1_type, @"as(comptime_int, -1)", .none);
     try ip.testCoerce(.i8_type, @"as(i64, 32000)", .none);
+}
+
+test "coerce int preserves known typed constants across widening" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = try .init(std.testing.io, gpa);
+    defer ip.deinit(gpa);
+
+    const u5_type = try ip.get(.{ .int_type = .{ .signedness = .unsigned, .bits = 5 } });
+    const narrow_six = try ip.get(.{ .int_u64_value = .{ .ty = u5_type, .int = 6 } });
+    const wide_six = try ip.get(.{ .int_u64_value = .{ .ty = .u16_type, .int = 6 } });
+    try ip.testCoerce(.u16_type, narrow_six, wide_six);
+    const narrow_max = try ip.get(.{ .int_u64_value = .{ .ty = u5_type, .int = 31 } });
+    const wide_max = try ip.get(.{ .int_u64_value = .{ .ty = .u16_type, .int = 31 } });
+    try ip.testCoerce(.u16_type, narrow_max, wide_max);
+    const narrow_negative = try ip.get(.{ .int_i64_value = .{ .ty = .i8_type, .int = -1 } });
+    const wide_negative = try ip.get(.{ .int_i64_value = .{ .ty = .i16_type, .int = -1 } });
+    try ip.testCoerce(.i16_type, narrow_negative, wide_negative);
+
+    const too_large = try ip.get(.{ .int_u64_value = .{ .ty = .u16_type, .int = 256 } });
+    try ip.testCoerce(.u8_type, too_large, .none);
+    const wide_unknown = try ip.getUnknown(.u16_type);
+    try ip.testCoerce(.u16_type, try ip.getUnknown(u5_type), wide_unknown);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var err_msg: ErrorMsg = undefined;
+    const coerced_undefined = try ip.coerce(arena.allocator(), .u16_type, try ip.getUndefined(u5_type), builtin.target, &err_msg);
+    try std.testing.expect(coerced_undefined != .none);
+    try std.testing.expectEqual(Index.u16_type, ip.typeOf(coerced_undefined));
+    try std.testing.expect(switch (ip.indexToKey(coerced_undefined)) {
+        .undefined_value, .unknown_value => true,
+        else => false,
+    });
+    try ip.testCoerce(.u16_type, .undefined_value, try ip.getUndefined(.u16_type));
+    const mutable_pointer = try ip.get(.{ .pointer_type = .{ .elem_type = .u8_type, .flags = .{ .size = .one } } });
+    const const_pointer = try ip.get(.{ .pointer_type = .{ .elem_type = .u8_type, .flags = .{ .size = .one, .is_const = true } } });
+    try ip.testCoerce(const_pointer, try ip.getUnknown(mutable_pointer), try ip.getUnknown(const_pointer));
 }
 
 fn testCoerce(ip: *InternPool, dest_ty: Index, inst: Index, expected: Index) !void {

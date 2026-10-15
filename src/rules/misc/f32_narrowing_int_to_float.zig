@@ -503,6 +503,34 @@ test "f32-narrowing-int-to-float: quoted caller aliases cannot be skipped" {
     );
 }
 
+test "f32-narrowing-int-to-float: unicode escape callers cannot be skipped" {
+    try testing.expectFiresTyped(check, R,
+        \\fn convert(value: u32) f32 { return @floatFromInt(value); }
+        \\pub fn small() f32 { return convert(42); }
+        \\pub fn large() f32 { return @"\u{63}onvert"(16777217); }
+    );
+}
+
+test "f32-narrowing-int-to-float: unresolved quoted callers cannot close exact bounds" {
+    try testing.expectFiresTyped(check, R,
+        \\fn convert(value: u32) f32 { return @floatFromInt(value); }
+        \\pub fn small() f32 { return @"convert"(42); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\fn convert(value: u32) f32 { return @floatFromInt(value); }
+        \\pub fn small() f32 { return convert(42); }
+        \\pub fn large() f32 { return @"convert"(16777217); }
+    );
+}
+
+test "f32-narrowing-int-to-float: escaped function values keep caller bounds open" {
+    try testing.expectFiresTyped(check, R,
+        \\fn convert(value: u32) f32 { return @floatFromInt(value); }
+        \\pub const exported = @"\x63onvert";
+        \\pub fn small() f32 { return convert(42); }
+    );
+}
+
 test "f32-narrowing-int-to-float: impure caller arguments invalidate guarded globals" {
     try testing.expectFiresTyped(check, R,
         \\var value: u32 = 0;
@@ -897,7 +925,6 @@ test "f32-narrowing-int-to-float: named imported image reexports preserve elemen
         defer cache.deinit();
         cache.setZls(&resolver);
         cache.file_path = source_path;
-        cache.module_id = resolver.handle.module;
         var accesses: usize = 0;
         for (tree.nodes.items(.tag), 0..) |tag, index| {
             if (tag != .array_access) continue;

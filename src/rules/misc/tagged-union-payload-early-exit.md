@@ -51,8 +51,8 @@ resolve.value = .{ .err = msg };
 A half-retagged union is only a bug when something can still read it after
 the tag has flipped.  On the error path a `try` unwinds straight out of the
 function, so a **by-value local whose storage never leaves the frame** is
-harmless: the frame dies with the corrupt bytes still sealed inside it, and
-no handler runs that would interpret them.
+harmless. The frame ends without a handler that reads the partial value.
+The actual type can prove this boundary for an inferred call or `orelse` initializer.
 
 Observability is bounded by the frame's own lifetime.  The reader that
 matters is one running while the frame is still unwinding — a callee entered
@@ -63,7 +63,7 @@ callee was given while the frame was still alive.
 The question is never "was `&root` written down" — `_ = &result;` writes it
 down and reaches nobody — but **where it went**.  The rule reports a local's
 assignment when the address reaches a destination outside this frame
-**before** the `try` runs.  These report:
+before the initializer completes. This includes publication from its fallible payload. These report:
 
 - the storage belongs to a **parameter** (`resolve.value = .{ .err = try … }`)
   — the caller owns it and inspects it on the error path;
@@ -87,8 +87,8 @@ the address:
 - an alias or aggregate that is bound and then **discarded**
   (`const alias = &result; _ = alias;` with or without a type annotation;
   `const holder = Holder{ .spec = &result }; _ = holder;`);
-- publication **after** the assignment (`observe(&result)` following the
-  write) — control never reaches it, the `try` leaves the function first;
+- publication **after** the complete initializer (`observe(&result)` following
+  the write). The failing `try` leaves the function before that publication.
 - the address of an **unrelated local** (`observe(&scratch)`);
 - **private heap storage** whose only failing-path cleanup releases the raw
   allocation without reading the element — a `defer gpa.free(fields);` whose
@@ -123,26 +123,29 @@ that produced it (`allocator.alloc(Field, n)`), or an alias of one of those.
 
 Such a capture stays quiet only when **every** step of the proof holds:
 
-- the iterable is a plain name bound to storage this frame owns — never a
-  **parameter**, whose slice the caller owns and reads on the error path;
-- its element type resolves, so the write is known to land in a slice rather
-  than in something the rule cannot place;
+- the iterable names storage this frame owns. A slice range such as
+  `sources[0..pinned]` keeps the exact declaration of `sources`;
+- the storage comes from a resolved allocator call, not a copied caller header;
+- its element type resolves, so the rule can place the union field;
 - a `defer` / `errdefer` **dominates** the write: the block it is registered
   in is the write's own block or an **ancestor** of it, and it is registered
   unconditionally;
-- that cleanup releases the storage **raw** — a `free` whose receiver's
-  declared type resolves to `std.mem.Allocator`.  `deinit` / `destroy` can run
-  destructors that read the corrupted element, and a `free` this rule cannot
-  resolve is not a release at all;
-- no other cleanup registered before the write reaches the storage, or the
-  captured element, by any route.  A cleanup that **both** releases raw and
-  reads is an observer: the release hands the bytes back, and a read that
-  follows it still interprets them;
+- that cleanup releases the exact allocation through the allocator that created
+  it. The receiver must resolve to `std.mem.Allocator`;
+- alternatively, the allocation comes from a private standard `ArenaAllocator`.
+  A dominating arena cleanup must release it without publishing the arena;
+- no other active cleanup reads the retagged field. A cleanup can read a
+  different declared field through its exact loop capture;
+  The capture's binder token is not a payload read, even though binding lookup
+  already resolves it. The binder takes the whole-loop proof, not the individual
+  field-read proof. Every actual use must still read a disjoint field, even when
+  sibling loops reuse the same capture spelling.
+- a cleanup that releases raw and also reads the union remains an observer;
 - the **capture itself** reaches no callee before the write, and the storage
   neither takes its address nor is published — the same escape and
   publication proofs a plain root gets;
-- every other mention of that storage before the assignment is its own
-  declaration, a reassignment, or a loop header.
+- every other storage use before the assignment is a declaration, a proved
+  allocation assignment, an element write, or a loop header.
 
 These still report, and each is one fact away from the quiet shape above:
 
@@ -162,15 +165,13 @@ These still report, and each is one fact away from the quiet shape above:
 - a **cleanup registered before** the write reads the storage or the captured
   element (`errdefer trace(fields[0].kind);`), or does both in one statement
   (`errdefer { gpa.free(fields); trace(fields[0].kind); }`);
-- **nothing releases** the allocation — the release is part of the proof, so
-  an unreleased capture is reported rather than assumed private;
+- **nothing releases** the allocation. The rule requires a raw release or the
+  exact private arena lifetime proof;
 - the **capture is handed out** (`observe(field);` inside the loop body) — it
   is a pointer to the element the retag corrupts, so a callee holding it can
   still read the union;
-- the iterable is **not a plain name** (`for (self.fields) |*field|`), or the
-  span belongs to a `while` / `if` capture rather than a `for` header: the
-  storage cannot be placed, and what cannot be placed is not evidence of
-  privacy.
+- the iterable is **not a name or a slice range over a name** (`self.fields`),
+  or the span belongs to a `while` / `if` capture. The storage remains unresolved.
 
 ## Who proved the release
 
@@ -201,6 +202,18 @@ encloses the write's — which is what rules out a sibling block and a
 mutually exclusive arm, the two shapes a brace DEPTH cannot separate from a
 real enclosing block.
 
+The allocation and release must refer to the same storage declaration and
+allocator. `other.free(fields)` does not prove cleanup of `gpa.alloc(Field, n)`.
+Neither does `gpa.free(unrelated[fields.len])`.
+A local annotation does not make a borrowed slice private.
+
+The arena proof follows `ArenaAllocator.init` through the actual standard import.
+It follows the arena's allocator binding to the allocation.
+The arena cannot escape before the write.
+An unknown owner, a custom allocator factory, or a cleanup that reads the
+retagged field supplies no privacy certificate.
+
+
 ## Which binding a use names
 
 One spelling can be two declarations, and the one a use names is the
@@ -226,9 +239,12 @@ to make the two equivalent.
   (`resolve`, `self.value`).  `fields[0] = …` and `first.* = …` end in `]` and
   `*`, resolve to no root location, and are not reported by this rule.
 - The literal must have exactly one top-level field.
-- The target's type must resolve to a `union(enum)`.  A target that resolves
-  to an ordinary struct or an untagged union is not reported; a target whose
-  type cannot be resolved is treated as a tagged union and reported.
+- The rule resolves the complete target type and unwraps optionals.
+  A known struct, including `?Reader`, is not a tagged union.
+  An unresolved target remains conservative and can report.
+- A private root does not prove ownership of intermediate pointees.
+  Each intermediate field must remain inline aggregate storage.
+  Pointer aliases and unresolved target paths remain conservative findings.
 
 - When the target's root is a loop capture, the type checked is the ELEMENT
   type of the storage the capture iterates.  An element type the rule cannot
@@ -270,3 +286,20 @@ to make the two equivalent.
   both are at depth 1 relative to the write in some readings; the former is a
   true negative for the rule (the scope really has ended) and the latter is
   the quiet half.
+
+## Selected corpus boundary
+
+The private-construction proofs cover the six local assembler request writes
+and the local parameter-value construction.
+The reader projection resolves to an optional struct.
+The arena construction reads only the separate lease field during cleanup.
+
+The six `MappedEncoder.Frozen.copy` writes remain unsafe.
+Their active `errdefer result.release(ctx)` dispatches on the union being retagged.
+
+The two `Session` iterator writes remain conservative findings.
+They write a real optional union through parameter-reachable storage.
+The release path does not read that iterator, but this fact does not prove storage privacy.
+Quieting them requires exact admission custody and actual caller-to-owner mapping.
+A nonowning payload type alone cannot prove that published partial mutation is safe.
+

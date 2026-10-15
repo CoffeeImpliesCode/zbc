@@ -30,6 +30,8 @@ const file_cache_mod = @import("../../cache/file_cache.zig");
 
 const tokens = @import("../../ast/tokens.zig");
 const method_names = @import("../../model/method_names.zig");
+const type_query = @import("../../model/type_query.zig");
+const std_type_query = @import("../../model/std_type_query.zig");
 const testing = @import("../../testing.zig");
 const matchBrace = tokens.matchBrace;
 
@@ -45,7 +47,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .reset_skips_pooled_resource_release)) return;
-    _ = cache;
+    const model = try cache.fileModel();
 
     if (tree.source.len >= std.math.maxInt(u32)) return error.SourceTooWide;
     const tok_count = std.math.cast(u32, tree.tokens.len) orelse return error.SourceTooWide;
@@ -59,7 +61,7 @@ pub fn check(
         if (tags[t + 1] != .l_brace) continue;
         const body_start = t + 1;
         const body_end = matchBrace(tags, body_start, last) orelse continue;
-        try checkStruct(gpa, tree, body_start + 1, body_end - 1, problems);
+        try checkStruct(gpa, tree, cache, model, body_start + 1, body_end - 1, problems);
         t = body_end;
     }
 }
@@ -73,6 +75,8 @@ const FnInfo = struct {
 fn checkStruct(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    model: *const @import("../../model/file_model.zig").FileModel,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -152,6 +156,7 @@ fn checkStruct(
     //      not â†’ pool-lifetime (suppress).
     const reset_has_any_cleanup = reset_cleanups.items.len > 0;
     for (deinit_cleanups.items) |dc| {
+        if (try cleanupOnlyReleasesBackingStorage(tree, cache, model, dc)) continue;
         var matched_in_reset = false;
         for (reset_cleanups.items) |rc| {
             if (std.mem.eql(u8, dc.recv, rc.recv)) {
@@ -223,6 +228,9 @@ fn isAcquireMethodName(name: []const u8) bool {
 const Cleanup = struct {
     recv: []const u8,
     method: []const u8,
+    receiver_first: Ast.TokenIndex,
+    receiver_last: Ast.TokenIndex,
+    call_token: Ast.TokenIndex,
 };
 
 fn collectCleanups(
@@ -259,9 +267,169 @@ fn collectCleanups(
             }
         }
         if (!already) {
-            try out.append(gpa, .{ .recv = recv, .method = method });
+            var receiver_first = t;
+            while (receiver_first >= 2 and tags[receiver_first - 1] == .period and tags[receiver_first - 2] == .identifier)
+                receiver_first -= 2;
+            try out.append(gpa, .{
+                .recv = recv,
+                .method = method,
+                .receiver_first = receiver_first,
+                .receiver_last = t,
+                .call_token = t + 2,
+            });
         }
     }
+}
+
+/// An address-free standard list owns only its backing allocation. Appending
+/// observations does not acquire a pool slot that a logical reset must release.
+/// Both the declaration and its element are proved; an opaque element or a
+/// look-alike container is not an exemption.
+fn cleanupOnlyReleasesBackingStorage(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    model: *const @import("../../model/file_model.zig").FileModel,
+    cleanup: Cleanup,
+) !bool {
+    if (!std.mem.eql(u8, cleanup.method, "deinit")) return false;
+    if (cleanup.receiver_first + 2 != cleanup.receiver_last) return false;
+    const owner = blk: {
+        for (model.types) |*candidate| {
+            if (candidate.body_first < cleanup.call_token and candidate.body_last > cleanup.call_token)
+                if (candidate.findField(cleanup.recv) != null) break :blk candidate;
+        }
+        return false;
+    };
+    const field = owner.findField(cleanup.recv) orelse return false;
+    if (!std_type_query.isType(cache, tree, field.type_first, field.type_last, "", "ArrayList", .{ .allow_type_call = true }) and
+        !std_type_query.isType(cache, tree, field.type_first, field.type_last, "", "ArrayListUnmanaged", .{ .allow_type_call = true }))
+        return false;
+    const element = type_query.elementTypeRef(cache, .{
+        .tree = tree,
+        .first = field.type_first,
+        .last = field.type_last,
+    }, 0) orelse return false;
+    const resolver = cache.zls orelse return false;
+    const element_node = cache.nodeForExactSpan(element.first, element.last) orelse return false;
+    const frame = resolver.resolutionFrame();
+    const element_type = (try frame.typeOfNode(element_node)) orelse return false;
+    if (!try @import("../../cache/fresh_storage.zig").actualTypeAddressFree(frame, element_type, 0, null))
+        return false;
+    const callee = cache.nodeForExactSpan(cleanup.receiver_first, cleanup.call_token) orelse return false;
+    const actual = (try cache.actualCallSummaryAt(tree.nodeMainToken(callee), null)) orelse return false;
+    var argument_buffer: [2]Ast.Node.Index = undefined;
+    const receiver = (try actual.callArgumentFor(cache, &argument_buffer, 0)) orelse return false;
+    if (tree.firstToken(receiver) != cleanup.receiver_first or tree.lastToken(receiver) != cleanup.receiver_last)
+        return false;
+    if (!try standardListReleasesOnlyBacking(cache, actual)) return false;
+    // The call must actually dispatch on that field, not on a same-spelled
+    // parameter of some other object inside the method.
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    var functions = tokens.iterFnDecls(tree);
+    while (functions.next(&fn_buffer)) |entry| {
+        if (tree.firstToken(entry.body) >= cleanup.call_token or tree.lastToken(entry.body) <= cleanup.call_token) continue;
+        const bindings = try cache.localBindings(entry.proto, entry.body);
+        const root = bindings.findAt(tree.tokenSlice(cleanup.receiver_first), cleanup.call_token) orelse return false;
+        if (root.origin != .param) return false;
+        const name = tokens.typeNameFromTokens(tree, root.rhs_first, root.rhs_last) orelse return false;
+        if (model.resolveTypeNameInScope(name, owner) != owner) return false;
+        return true;
+    }
+    return false;
+}
+
+/// A selected-storage certificate, not a claim that allocator callbacks have
+/// no global effects. Read every statement of the actual SDK destructor and
+/// its actual slice projection in their instantiated source frames.
+fn standardListReleasesOnlyBacking(
+    cache: *file_cache_mod.FileCache,
+    actual: file_cache_mod.FileCache.ActualCallSummary,
+) !bool {
+    const resolver = cache.zls orelse return false;
+    if (!try resolver.declaredInToolchainFile(actual.callee.handle, "/std/array_list.zig")) return false;
+    const declaring = (try actual.declaringCache(cache)) orelse return false;
+    const tree = actual.callee.tree;
+    const frame = resolver.frameForFunction(actual.callee.reference);
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, actual.callee.declaration) orelse return false;
+    const self_name = declaring.paramNameFor(proto, 0) orelse return false;
+    const allocator_name = declaring.paramNameFor(proto, 1) orelse return false;
+    if (declaring.paramNameFor(proto, 2) != null) return false;
+    const body = tokens.bodyOf(tree, actual.callee.declaration) orelse return false;
+    var statement_buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&statement_buffer, body) orelse return false;
+    if (statements.len != 2) return false;
+
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    try cache.chargeNormalCleanupAt(tree, body);
+    try cache.chargeNormalCleanupAt(tree, statements[0]);
+    try cache.chargeNormalCleanupAt(tree, statements[1]);
+    // The only operation after release clears the same list header.
+    if (tree.nodeTag(statements[1]) != .assign) return false;
+    const clear = tree.nodeData(statements[1]).node_and_node;
+    if (tree.nodeTag(clear[0]) != .deref or
+        !identifierIs(tree, tree.nodeData(clear[0]).node, self_name) or
+        !identifierIs(tree, clear[1], "undefined")) return false;
+
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const release = tree.fullCall(&call_buffer, statements[0]) orelse return false;
+    if (release.ast.params.len != 1 or tree.nodeTag(release.ast.fn_expr) != .field_access) return false;
+    const release_access = tree.nodeData(release.ast.fn_expr).node_and_token;
+    if (!identifierIs(tree, release_access[0], allocator_name)) return false;
+    const release_actual = (try declaring.actualCallSummaryAt(tree.nodeMainToken(release.ast.fn_expr), frame)) orelse return false;
+    if (!try resolver.declaredInToolchainFile(release_actual.callee.handle, "/std/mem/Allocator.zig")) return false;
+    var release_proto_buffer: [1]Ast.Node.Index = undefined;
+    const release_proto = tokens.fnProto(release_actual.callee.tree, &release_proto_buffer, release_actual.callee.declaration) orelse return false;
+    if (!std.mem.eql(u8, release_actual.callee.tree.tokenSlice(release_proto.name_token orelse return false), "free")) return false;
+    if ((try frame.isStdAllocator(release_access[0])) != true) return false;
+
+    // The release argument must be the exact list's canonical projection.
+    const projection_node = release.ast.params[0];
+    try cache.chargeNormalCleanupAt(tree, projection_node);
+    var projection_buffer: [1]Ast.Node.Index = undefined;
+    const projection = tree.fullCall(&projection_buffer, projection_node) orelse return false;
+    if (projection.ast.params.len != 0 or tree.nodeTag(projection.ast.fn_expr) != .field_access) return false;
+    if (!identifierIs(tree, tree.nodeData(projection.ast.fn_expr).node_and_token[0], self_name)) return false;
+    const projected = (try declaring.actualCallSummaryAt(tree.nodeMainToken(projection.ast.fn_expr), frame)) orelse return false;
+    if (projected.callee.tree != tree) return false;
+    const projection_cache = (try projected.declaringCache(cache)) orelse return false;
+    const projection_tree = projected.callee.tree;
+    var projection_proto_buffer: [1]Ast.Node.Index = undefined;
+    const projection_proto = tokens.fnProto(projection_tree, &projection_proto_buffer, projected.callee.declaration) orelse return false;
+    const projection_self = projection_cache.paramNameFor(projection_proto, 0) orelse return false;
+    if (projection_cache.paramNameFor(projection_proto, 1) != null) return false;
+    const projection_body = tokens.bodyOf(projection_tree, projected.callee.declaration) orelse return false;
+    var returns_buffer: [2]Ast.Node.Index = undefined;
+    const returns = projection_tree.blockStatements(&returns_buffer, projection_body) orelse return false;
+    if (returns.len != 1 or projection_tree.nodeTag(returns[0]) != .@"return") return false;
+    try cache.chargeNormalCleanupAt(projection_tree, projection_body);
+    try cache.chargeNormalCleanupAt(projection_tree, returns[0]);
+    const value = projection_tree.nodeData(returns[0]).opt_node.unwrap() orelse return false;
+    const slice = projection_tree.fullSlice(value) orelse return false;
+    if (slice.ast.sentinel != .none) return false;
+    if (projection_tree.nodeTag(slice.ast.start) != .number_literal or
+        !std.mem.eql(u8, projection_tree.tokenSlice(projection_tree.nodeMainToken(slice.ast.start)), "0")) return false;
+    const end = slice.ast.end.unwrap() orelse return false;
+    if (!fieldOfIdentifier(projection_tree, end, projection_self, "capacity")) return false;
+    if (projection_tree.nodeTag(slice.ast.sliced) != .field_access) return false;
+    const pointer = projection_tree.nodeData(slice.ast.sliced).node_and_token;
+    if (!std.mem.eql(u8, projection_tree.tokenSlice(pointer[1]), "ptr") or
+        !fieldOfIdentifier(projection_tree, pointer[0], projection_self, "items")) return false;
+    const projection_frame = resolver.frameForFunction(projected.callee.reference);
+    const slice_type = (try projection_frame.typeOfNode(value)) orelse return false;
+    if (resolver.pointerSize(slice_type) != .slice) return false;
+    return true;
+}
+
+fn identifierIs(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name);
+}
+
+fn fieldOfIdentifier(tree: *const Ast, node: Ast.Node.Index, root: []const u8, field: []const u8) bool {
+    if (tree.nodeTag(node) != .field_access) return false;
+    const access = tree.nodeData(node).node_and_token;
+    return identifierIs(tree, access[0], root) and std.mem.eql(u8, tree.tokenSlice(access[1]), field);
 }
 
 const isAllocatorishName = method_names.isAllocatorishName;
@@ -505,4 +673,74 @@ test "reset-skips: pool-release in deinit with per-cycle reference() elsewhere â
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expect(problems.items.len >= 1);
+}
+
+test "reset-skips: address-free event storage is not a per-cycle resource" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Observation = struct { kind: enum { read, write }, id: u64, committed: bool };
+        \\const Port = struct {
+        \\    memory: std.mem.Allocator,
+        \\    events: std.ArrayList(Observation) = .empty,
+        \\    reset_next: bool = false,
+        \\    fn deinit(self: *Port) void { self.events.deinit(self.memory); }
+        \\    fn reset(self: *Port) void { self.reset_next = true; }
+        \\    fn record(self: *Port, row: Observation) !void { try self.events.append(self.memory, row); }
+        \\};
+    );
+}
+
+test "reset-skips: pooled elements are not an event-storage exemption" {
+    try testing.expectFiresTyped(check, "reset-skips-pooled-resource-release",
+        \\const std = @import("std");
+        \\const Lease = struct { bytes: []u8 };
+        \\const Pool = struct {
+        \\    memory: std.mem.Allocator,
+        \\    fn acquire(self: *Pool) !Lease { return .{ .bytes = try self.memory.alloc(u8, 1) }; }
+        \\    fn release(self: *Pool, lease: Lease) void { self.memory.free(lease.bytes); }
+        \\};
+        \\const Port = struct {
+        \\    leases: [4]Lease,
+        \\    used: usize = 0,
+        \\    fn deinit(self: *Port, pool: *Pool) void {
+        \\        for (self.leases[0..self.used]) |lease| pool.release(lease);
+        \\    }
+        \\    fn reset(self: *Port) void { self.used = 0; }
+        \\    fn record(self: *Port, pool: *Pool) !void {
+        \\        self.leases[self.used] = try pool.acquire();
+        \\        self.used += 1;
+        \\    }
+        \\};
+    );
+}
+
+test "reset-skips: address-carrying list elements do not prove a nonpool lifetime" {
+    try testing.expectFiresTyped(check, "reset-skips-pooled-resource-release",
+        \\const std = @import("std");
+        \\const Port = struct {
+        \\    memory: std.mem.Allocator,
+        \\    leases: std.ArrayList([]u8) = .empty,
+        \\    fn deinit(self: *Port) void { self.leases.deinit(self.memory); }
+        \\    fn reset(self: *Port) void { _ = self; }
+        \\    fn record(self: *Port, bytes: []u8) !void { try self.leases.append(self.memory, bytes); }
+        \\};
+    );
+}
+
+test "reset-skips: standard-looking user container does not prove backing-only release" {
+    try testing.expectFiresTyped(check, "reset-skips-pooled-resource-release",
+        \\const std = @import("std");
+        \\const ArrayList = struct {
+        \\    memory: std.mem.Allocator,
+        \\    bytes: []u8,
+        \\    fn deinit(self: *ArrayList) void { self.memory.free(self.bytes); }
+        \\    fn append(self: *ArrayList) !void { self.bytes = try self.memory.alloc(u8, 1); }
+        \\};
+        \\const Port = struct {
+        \\    events: ArrayList,
+        \\    fn deinit(self: *Port) void { self.events.deinit(); }
+        \\    fn reset(self: *Port) void { _ = self; }
+        \\    fn record(self: *Port) !void { try self.events.append(); }
+        \\};
+    );
 }

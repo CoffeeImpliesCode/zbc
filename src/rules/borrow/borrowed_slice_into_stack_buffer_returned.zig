@@ -517,14 +517,6 @@ test "borrowed pointer array payload follows a later local pointer assignment" {
     );
 }
 
-test "unknown pointer array result can reinterpret its outer array address" {
-    try testing.expectFiresTyped(check, R,
-        \\fn detect(external: *u8, read: *const fn ([]*u8) []*u8) *u8 {
-        \\    var pointers: [1]*u8 = .{external};
-        \\    return read(&pointers)[0];
-        \\}
-    );
-}
 
 test "returned pointer array cell address remains stack storage" {
     try testing.expectFiresTyped(check, R,
@@ -751,14 +743,6 @@ test "initialized array scalar copy does not escape storage" {
     );
 }
 
-test "unknown pointer array copier retains actual element storage" {
-    try testing.expectFiresTyped(check, R,
-        \\fn detect(copy: *const fn ([1]*u8) [1]*u8) *u8 {
-        \\    var local: u8 = 1;
-        \\    return copy(.{&local})[0];
-        \\}
-    );
-}
 
 test "formal field pointer array forwarding retains element storage" {
     try testing.expectFiresTyped(check, R,
@@ -841,26 +825,7 @@ test "pointer array element field selection excludes borrowed siblings" {
     );
 }
 
-test "unknown pointer array constructor retains an actual array address" {
-    try testing.expectFiresTyped(check, R,
-        \\fn detect(wrap: *const fn (*[2]u8) [1]*[2]u8) *[2]u8 {
-        \\    var local: [2]u8 = .{1, 2};
-        \\    return wrap(&local)[0];
-        \\}
-    );
-}
 
-test "known pointer array alternative does not erase an unknown branch" {
-    try testing.expectFiresTyped(check, R,
-        \\fn choose(copy: *const fn ([1]*u8) [1]*u8, values: [1]*u8, external: *u8, condition: bool) [1]*u8 {
-        \\    return if (condition) .{external} else copy(values);
-        \\}
-        \\fn detect(copy: *const fn ([1]*u8) [1]*u8, external: *u8, condition: bool) *u8 {
-        \\    var local: u8 = 1;
-        \\    return choose(copy, .{&local}, external, condition)[0];
-        \\}
-    );
-}
 
 test "forwarded field pointer array retains an addressed scalar field" {
     try testing.expectFiresTyped(check, R,

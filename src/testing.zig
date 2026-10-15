@@ -96,10 +96,9 @@ pub fn runRuleWithConfig(
     return runParsed(gpa, check_fn, &tree, null, config);
 }
 
-/// Exercise rules whose contract depends on actual declaration and type
-/// identity.  The document is synthetic: it carries a native absolute
-/// identity under the working directory, is never written to disk, and
-/// dies with the resolver that owns it.
+/// Exercise rules whose contract depends on declaration and type identity.
+/// Owns a default context with no project target or builtin configuration;
+/// discovering the SDK does not prove the target of the fixture.
 pub fn runRuleTyped(
     gpa: std.mem.Allocator,
     check_fn: CheckFn,
@@ -108,6 +107,22 @@ pub fn runRuleTyped(
     var context: type_engine.TypeContext = undefined;
     try context.init(gpa, std.testing.io);
     defer context.deinit();
+    return runRuleTypedWithContext(gpa, check_fn, src, &context);
+}
+
+/// Run a typed fixture with a caller-configured context and the default rule
+/// config. Borrows `context` in place; the caller owns its configuration and
+/// teardown. The context retains the synthetic document at the native absolute
+/// path `zbc-typed-rule.zig` under the working directory, without writing it.
+/// Reusing that identity with different source returns SourceSnapshotChanged.
+/// The returned problems own their text independently of the context; release
+/// them with `freeProblems(gpa, ...)`. All allocation and query errors propagate.
+pub fn runRuleTypedWithContext(
+    gpa: std.mem.Allocator,
+    check_fn: CheckFn,
+    src: []const u8,
+    context: *type_engine.TypeContext,
+) !std.ArrayListUnmanaged(Problem) {
     const source = try dupeSource(gpa, src);
     defer gpa.free(source);
     // Give the virtual document a native absolute identity. No file is written.
@@ -116,7 +131,7 @@ pub fn runRuleTyped(
     const separator = if (std.mem.endsWith(u8, document_path[0..directory_len], std.fs.path.sep_str)) "" else std.fs.path.sep_str;
     const document_name = try std.fmt.bufPrint(document_path[directory_len..], "{s}zbc-typed-rule.zig", .{separator});
     var resolver: type_engine.TypeResolver = undefined;
-    try resolver.init(&context, gpa, document_path[0 .. directory_len + document_name.len], source);
+    try resolver.init(context, gpa, document_path[0 .. directory_len + document_name.len], source);
     defer resolver.deinit();
     return runParsed(gpa, check_fn, &resolver.handle.document.tree, &resolver, &config_mod.Default);
 }
@@ -259,5 +274,65 @@ test "invalid rule fixtures cannot pass silently" {
         truncate_rule.check,
         malformed,
         &config_mod.Default,
+    ));
+}
+
+test "typed context runner propagates source allocation failure" {
+    const truncate_rule = @import("rules/misc/truncate_len_to_narrow_int.zig");
+    const gpa = std.testing.allocator;
+    var context: type_engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, runRuleTypedWithContext(
+        failing.allocator(),
+        truncate_rule.check,
+        "fn run() void {}",
+        &context,
+    ));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "typed context runner findings outlive the borrowed context" {
+    const iterator_rule = @import("rules/misc/forced_unwrap_iterator_next.zig");
+    const gpa = std.testing.allocator;
+    var problems = blk: {
+        var context: type_engine.TypeContext = undefined;
+        try context.init(gpa, std.testing.io);
+        defer context.deinit();
+        break :blk try runRuleTypedWithContext(
+            gpa,
+            iterator_rule.check,
+            "fn run(it: *Cursor) u8 { return it.next().?; }",
+            &context,
+        );
+    };
+    defer freeProblems(gpa, &problems);
+    try assertProblems(.{
+        .caller = "runRuleTypedWithContext",
+        .count = 1,
+        .rule_id = "forced-unwrap-iterator-next",
+    }, problems.items);
+    try std.testing.expect(problems.items[0].message.len != 0);
+}
+
+test "typed context runner refuses replacing a retained source snapshot" {
+    const iterator_rule = @import("rules/misc/forced_unwrap_iterator_next.zig");
+    const gpa = std.testing.allocator;
+    var context: type_engine.TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var problems = try runRuleTypedWithContext(
+        gpa,
+        iterator_rule.check,
+        "fn run(it: *Cursor) u8 { return it.next().?; }",
+        &context,
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectError(error.SourceSnapshotChanged, runRuleTypedWithContext(
+        gpa,
+        iterator_rule.check,
+        "fn run() void {}",
+        &context,
     ));
 }

@@ -55,6 +55,21 @@ The rule is quiet when the cast is provably safe:
   block": a guard whose scope cannot be determined is refused, so deep nesting
   reports rather than silently suppressing.
 
+A fixed allocation alignment does not prove an imported ABI target's alignment.
+For example, a 64-aligned slot still needs authority that its target requires no
+more than 64-byte alignment. Unknown C layouts remain findings.
+
+Packed runs retain their byte offsets. An aligned buffer base does not align
+32-bit values at offsets 13, 17, or 29; a length check or reference-value check
+does not repair the address.
+This applies equally to scalar runs and enum-backed reference runs; retaining
+the element type does not change the slice's byte offset.
+
+A public erased pointer/marker record is not a closed typed allocation proof.
+One constructor can correctly pair `allocator.create(T)` with a type marker
+without proving every caller-created record has that pairing. A marker comparison
+alone therefore does not discharge the finding.
+
 ## Why it matters
 
 In Zig, `.ptr` on a `[]const u8` slice returns a raw `[*]const u8` pointer whose alignment depends on where the data came from — the allocator, memory-mapping offset, or network socket buffer position. There is no guarantee it is aligned to anything other than `align(1)`.

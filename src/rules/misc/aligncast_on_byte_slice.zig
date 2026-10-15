@@ -2170,3 +2170,59 @@ test "page mapping: a lookalike mmap method is not an alignment contract" {
         \\}
     );
 }
+
+test "packed event: scalar and reference runs retain offsets thirteen seventeen and twenty nine" {
+    try testing.expectFiresTyped(check, R,
+        \\fn readScalarField(payload: []u8, resumed: bool) []u32 {
+        \\    const offset: usize = if (resumed) 17 else 13;
+        \\    const span = payload[offset..];
+        \\    const count = span.len / 4;
+        \\    return @as([*]u32, @ptrCast(@alignCast(span.ptr)))[0..count];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const TypeId = enum(u32) { _ };
+        \\fn readTypes(payload: []u8) []TypeId {
+        \\    const span = payload[29..];
+        \\    const count = span.len / 4;
+        \\    return @as([*]TypeId, @ptrCast(@alignCast(span.ptr)))[0..count];
+        \\}
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const NodeId = enum(u32) { _ };
+        \\fn readNodes(payload: []u8, resumed: bool) []NodeId {
+        \\    const offset: usize = if (resumed) 17 else 13;
+        \\    const span = payload[offset..];
+        \\    const count = span.len / 4;
+        \\    return @as([*]NodeId, @ptrCast(@alignCast(span.ptr)))[0..count];
+        \\}
+    );
+}
+
+test "placement storage: fixed alignment cannot certify an unresolved imported ABI target" {
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Engine = @import("native_engine");
+        \\fn open(allocator: std.mem.Allocator, size: usize) !*Engine.Context {
+        \\    const slot = try allocator.alignedAlloc(u8, .@"64", size);
+        \\    const context: *Engine.Context = @ptrCast(@alignCast(slot.ptr));
+        \\    return context;
+        \\}
+    );
+}
+
+test "erased payload: a public marker pair is not a closed typed address census" {
+    try testing.expectFiresTyped(check, R,
+        \\pub const Payload = struct {
+        \\    ptr: *const anyopaque,
+        \\    marker: *const u8,
+        \\    pub fn get(self: Payload, comptime T: type, expected: *const u8) ?*const T {
+        \\        if (self.marker != expected) return null;
+        \\        return @ptrCast(@alignCast(self.ptr));
+        \\    }
+        \\};
+        \\pub fn construct(ptr: *const anyopaque, marker: *const u8) Payload {
+        \\    return .{ .ptr = ptr, .marker = marker };
+        \\}
+    );
+}

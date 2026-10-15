@@ -397,6 +397,7 @@ const SourceSelection = struct {
     files: std.StringArrayHashMapUnmanaged(void) = .empty,
     failures: std.ArrayListUnmanaged(Failure) = .empty,
     excludes: []const []const u8,
+    build_files: []const []const u8 = &.{},
 
     const Failure = struct {
         path: []const u8,
@@ -417,7 +418,11 @@ const SourceSelection = struct {
     }
 
     fn policy(self: *const SourceSelection) lib.SourcePolicy {
-        return .{ .roots = self.roots.keys(), .excludes = self.excludes };
+        return .{
+            .roots = self.roots.keys(),
+            .excludes = self.excludes,
+            .build_files = self.build_files,
+        };
     }
     fn containsParentTraversal(path: []const u8) bool {
         var components = std.mem.tokenizeAny(u8, path, "/\\\\");
@@ -588,6 +593,50 @@ const SourceSelection = struct {
                 _ = try self.files.put(self.gpa, input.path, {});
             }
         }
+        try self.collectBuildFiles(cwd);
+    }
+
+    fn collectBuildFiles(self: *SourceSelection, cwd: []const u8) !void {
+        self.build_files = &.{};
+        const cwd_scope: lib.SourcePolicy = .{ .roots = &.{cwd} };
+        var has_project_root = false;
+        for (self.roots.keys()) |root| {
+            if (cwd_scope.rootFor(root) != null) {
+                has_project_root = true;
+                break;
+            }
+        }
+        if (!has_project_root) return;
+
+        // Form and check the exact metadata grant before resolving or opening
+        // it. A stack buffer keeps rejected metadata allocation-free.
+        var lexical_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var lexical_allocator = std.heap.FixedBufferAllocator.init(&lexical_buffer);
+        const lexical = try std.fs.path.join(
+            lexical_allocator.allocator(),
+            &.{ cwd, "build.zig" },
+        );
+        const metadata_policy: lib.SourcePolicy = .{
+            .build_files = &.{lexical},
+            .excludes = self.excludes,
+        };
+        if (!metadata_policy.allowsBuildFile(lexical)) return;
+
+        var canonical_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const length = std.Io.Dir.cwd().realPathFile(self.io, lexical, &canonical_buffer) catch |err| {
+            if (err == error.Canceled) return err;
+            // Missing or inaccessible metadata cannot establish a binding.
+            return;
+        };
+        const canonical_path = canonical_buffer[0..length];
+        const parent = std.fs.path.dirname(canonical_path) orelse return;
+        if (!std.mem.eql(u8, parent, cwd)) return;
+        if (!metadata_policy.allowsBuildFile(canonical_path)) return;
+        const arena = self.arena.allocator();
+        const saved_path = try arena.dupe(u8, canonical_path);
+        const build_files = try arena.alloc([]const u8, 1);
+        build_files[0] = saved_path;
+        self.build_files = build_files;
     }
 
     fn walk(self: *SourceSelection, root: []const u8) !void {
@@ -1420,6 +1469,150 @@ test "jsonEscapeToBuf: low control bytes become \\uXXXX" {
     const s = try jsonEscapeToBuf(gpa, &[_]u8{ 'x', 0x01, 'y', 0x1f, 'z' });
     defer gpa.free(s);
     try std.testing.expectEqualStrings("x\\u0001y\\u001fz", s);
+}
+
+// These fixtures live outside hidden cache ancestors because metadata-only
+// grants must not turn an excluded ancestor into an allowed directory.
+const MetadataSelectionFixture = struct {
+    path: [:0]const u8,
+    dir: std.Io.Dir,
+
+    fn init() !MetadataSelectionFixture {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const gpa = std.testing.allocator;
+        const io = std.testing.io;
+        var random: [16]u8 = undefined;
+        try std.Io.randomSecure(io, &random);
+        const name = std.fmt.bytesToHex(random, .lower);
+        const path = try std.fmt.allocPrint(gpa, "/tmp/zbc-metadata-{s}", .{name});
+        errdefer gpa.free(path);
+        try std.Io.Dir.cwd().createDir(io, path, .default_dir);
+        errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+        const dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+        errdefer dir.close(io);
+        const canonical = try dir.realPathFileAlloc(io, ".", gpa);
+        gpa.free(path);
+        return .{ .path = canonical, .dir = dir };
+    }
+
+    fn deinit(self: MetadataSelectionFixture) void {
+        self.dir.close(std.testing.io);
+        std.Io.Dir.cwd().deleteTree(std.testing.io, self.path) catch @panic("fixture cleanup failed");
+        std.testing.allocator.free(self.path);
+    }
+};
+
+test "SourceSelection metadata passes cwd build only without widening selected sources" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try MetadataSelectionFixture.init();
+    defer fixture.deinit();
+    try fixture.dir.createDir(io, "src", .default_dir);
+    try fixture.dir.writeFile(io, .{ .sub_path = "build.zig", .data = "pub fn build() void {}\n" });
+    try fixture.dir.writeFile(io, .{ .sub_path = "src/main.zig", .data = "pub const value = 1;\n" });
+    const root = try std.fs.path.join(gpa, &.{ fixture.path, "src" });
+    defer gpa.free(root);
+    const source = try std.fs.path.join(gpa, &.{ root, "main.zig" });
+    defer gpa.free(source);
+    const build_file = try std.fs.path.join(gpa, &.{ fixture.path, "build.zig" });
+    defer gpa.free(build_file);
+    var selection = SourceSelection.init(gpa, io, &.{});
+    defer selection.deinit();
+    try selection.collect(&.{source});
+    try selection.collectBuildFiles(fixture.path);
+    const policy = selection.policy();
+    try std.testing.expectEqual(@as(usize, 1), policy.build_files.len);
+    try std.testing.expectEqualStrings(build_file, policy.build_files[0]);
+    try std.testing.expectEqual(@as(usize, 1), selection.files.count());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.count());
+    try std.testing.expectEqualStrings(root, policy.roots[0]);
+    try std.testing.expect(policy.allowsBuildFile(build_file));
+    try std.testing.expect(!policy.allowsAbsolutePath(build_file));
+    try std.testing.expect(!selection.files.contains(build_file));
+}
+
+test "SourceSelection metadata skips missing build files and sibling source roots" {
+    const gpa = std.testing.allocator;
+    const fixture = try MetadataSelectionFixture.init();
+    defer fixture.deinit();
+    var selection = SourceSelection.init(gpa, std.testing.io, &.{});
+    defer selection.deinit();
+    const root = try std.fs.path.join(gpa, &.{ fixture.path, "src" });
+    defer gpa.free(root);
+    try selection.roots.put(gpa, root, {});
+    try selection.collectBuildFiles(fixture.path);
+    try std.testing.expectEqual(@as(usize, 0), selection.policy().build_files.len);
+    try std.testing.expectEqual(@as(usize, 0), selection.failures.items.len);
+    try fixture.dir.writeFile(
+        std.testing.io,
+        .{ .sub_path = "build.zig", .data = "pub fn build() void {}\n" },
+    );
+    selection.roots.clearRetainingCapacity();
+    const sibling = try std.fmt.allocPrint(gpa, "{s}-other/src", .{fixture.path});
+    defer gpa.free(sibling);
+    try selection.roots.put(gpa, sibling, {});
+    try selection.collectBuildFiles(fixture.path);
+    try std.testing.expectEqual(@as(usize, 0), selection.policy().build_files.len);
+}
+
+test "SourceSelection metadata checks exclusions before resolving the build file" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { cwd: []const u8, excluded: []const u8 }{
+        .{ .cwd = "/project", .excluded = "build.zig" },
+        .{ .cwd = "/project", .excluded = "/project/build.zig" },
+        .{ .cwd = "/project", .excluded = "project" },
+        .{ .cwd = "/project", .excluded = "/project" },
+        .{ .cwd = "/project/vendor/nested", .excluded = "unused" },
+        .{ .cwd = "/project/.hidden/nested", .excluded = "unused" },
+    };
+    for (cases) |case| {
+        var selection = SourceSelection.init(gpa, std.testing.io, &.{case.excluded});
+        defer selection.deinit();
+        try selection.roots.put(gpa, case.cwd, {});
+        var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+        selection.arena.child_allocator = failing.allocator();
+        try selection.collectBuildFiles(case.cwd);
+        try std.testing.expectEqual(@as(usize, 0), selection.policy().build_files.len);
+        try std.testing.expectEqual(@as(usize, 0), selection.failures.items.len);
+    }
+}
+
+test "SourceSelection metadata refuses symlink escapes and renamed build targets" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try MetadataSelectionFixture.init();
+    defer fixture.deinit();
+    try fixture.dir.createDirPath(io, "project/src");
+    try fixture.dir.createDirPath(io, "outside");
+    try fixture.dir.writeFile(io, .{ .sub_path = "outside/build.zig", .data = "" });
+    try fixture.dir.writeFile(io, .{ .sub_path = "project/alternate.zig", .data = "" });
+    const cwd = try std.fs.path.join(gpa, &.{ fixture.path, "project" });
+    defer gpa.free(cwd);
+    const root = try std.fs.path.join(gpa, &.{ cwd, "src" });
+    defer gpa.free(root);
+    for ([_][]const u8{ "../outside/build.zig", "alternate.zig" }) |target| {
+        try fixture.dir.symLink(io, target, "project/build.zig", .{});
+        defer fixture.dir.deleteFile(io, "project/build.zig") catch @panic("link cleanup failed");
+        var selection = SourceSelection.init(gpa, io, &.{});
+        defer selection.deinit();
+        try selection.roots.put(gpa, root, {});
+        try selection.collectBuildFiles(cwd);
+        try std.testing.expectEqual(@as(usize, 0), selection.policy().build_files.len);
+        try std.testing.expectEqual(@as(usize, 0), selection.failures.items.len);
+    }
+}
+
+test "SourceSelection metadata propagates allocation failure" {
+    const gpa = std.testing.allocator;
+    const fixture = try MetadataSelectionFixture.init();
+    defer fixture.deinit();
+    try fixture.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "" });
+    var selection = SourceSelection.init(gpa, std.testing.io, &.{});
+    defer selection.deinit();
+    try selection.roots.put(gpa, fixture.path, {});
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    selection.arena.child_allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, selection.collectBuildFiles(fixture.path));
 }
 
 test {

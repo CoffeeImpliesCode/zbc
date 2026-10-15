@@ -19,13 +19,14 @@ const Ast = std.zig.Ast;
 
 const file_model = @import("../../model/file_model.zig");
 const mq = @import("../../model/model_query.zig");
-const query = @import("../../ast/token_query.zig");
 const tokens = @import("../../ast/tokens.zig");
 const problem = @import("../../problem.zig");
 const testing = @import("../../testing.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const method_names = @import("../../model/method_names.zig");
+const fn_summary = @import("../../model/fn_summary.zig");
+const TypeResolver = @import("../../type_resolver.zig").TypeResolver;
 
 const R = "missing-deinit-on-composed-owner";
 
@@ -93,43 +94,13 @@ pub fn check(
             // wrong for refcounted innerss; skip.
             if (innerIsRefCounted(tree, inner_ti)) continue;
 
-            // Direct: `<X>.<field>.<cleanup>(`.  X is wildcarded
-            // (typically self/this).  The body pattern is built
-            // per-field since `.text` needs the field's name.
-            const cleanup_call = &[_]query.Atom{
-                .{ .tok = .identifier },
-                .{ .tok = .period },
-                .{ .text = field.name },
-                .{ .tok = .period },
-                .{ .pred = isCleanupName },
-                .paren_args,
-            };
-            if (mq.methodBodyContains(tree, deinit, cleanup_call)) continue;
+            if (try bodyCallsFieldDestructor(cache, model, outer, inner_ti, deinit.fn_decl, 0, field.name, null, null)) continue;
 
             // Optional-unwrap: `if (X.field) |*?cap| { ... cap.<cleanup>(...); ... }`.
             // The user explicitly handled the optional and called
             // cleanup on the unwrapped capture — no leak.
-            if (bodyHandlesFieldViaUnwrap(tree, deinit, field.name)) continue;
+            if (bodyHandlesFieldViaUnwrap(tree, deinit, field.name, inner_ti)) continue;
 
-            // Helper-delegation: outer's deinit calls `<self>.<helper>()`
-            // on the same type, and that helper's body cleans up the
-            // field.  Common Bun shape:
-            //     pub fn deinit(this: *Subprocess) void {
-            //         this.finalizeSync();   ← helper does the cleanup
-            //         alloc.destroy(this);
-            //     }
-            // One level of delegation only (no transitive chains).
-            if (bodyHandlesFieldViaHelper(tree, model, deinit, outer, field.name, cleanup_call)) continue;
-
-            // Partial sub-field cleanup: the deinit body mentions
-            // `<self>.<field>.<subfield>...` somewhere.  Even without
-            // a direct `<self>.<field>.deinit()`, partial cleanup
-            // of inner resources is evidence the field is being
-            // handled intentionally (rather than forgotten) — common
-            // when the composed type's deinit signature requires
-            // arguments the outer doesn't have, so the outer reaches
-            // into specific owned sub-fields.
-            if (methodBodyMentionsField(tree, deinit, field.name)) continue;
 
             // Circular-ownership skip: when the inner's `deinit`
             // body navigates back to the outer via
@@ -157,18 +128,6 @@ pub fn check(
             // own lifetime; the nested struct is a view/slice of it.
             if (model.fileIsTypeNamed(inner_ti.name)) continue;
 
-            // Externally-cleaned-up skip: when `<this>.<field>.<cleanup>(...)`
-            // is invoked in OTHER methods of the same outer type
-            // (multiple lifecycle stages — request setup, async
-            // completion, ref drop), the field's cleanup is
-            // routinely run before the outer's deinit ever fires.
-            // The rule's prescription (call the inner's deinit from
-            // the outer's deinit) would either double-deinit or
-            // require the inner's deinit to be idempotent.  When the
-            // inner's deinit IS idempotent (canonical bun shape:
-            // \`this.* = .{}\` first, then frees), the call is safe
-            // either way — but firing on this shape is noisy.
-            if (siblingMethodsCleanField(tree, outer, deinit, field.name)) continue;
 
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
@@ -186,41 +145,131 @@ fn anyNonTrivialReceiverCleanup(tree: *const Ast, ti: *const file_model.TypeInfo
     return false;
 }
 
-/// True iff some method of `outer` OTHER than `deinit_method`
-/// contains a call `<X>.<field_name>.<cleanup>(...)` — evidence
-/// that the field's cleanup is invoked routinely at a different
-/// lifecycle stage (request setup / async completion / ref drop /
-/// etc.), so the outer's destructor doesn't need to re-do it.
-/// The inner's deinit is conventionally idempotent in these shapes
-/// (canonical bun: `this.* = .{}` then frees, so double-calls are
-/// no-ops).
-fn siblingMethodsCleanField(
-    tree: *const Ast,
+const CleanupFrame = struct {
+    declaration: Ast.Node.Index,
+    parent: ?*const CleanupFrame,
+};
+
+/// Follow the exact receiver/formal mapping through teardown wrappers. A field
+/// mention, an unrelated receiver, or a cleanup elsewhere in the lifecycle is
+/// not evidence that this destructor invokes the field's destructor.
+fn bodyCallsFieldDestructor(
+    cache: *file_cache_mod.FileCache,
+    model: *const file_model.FileModel,
     outer: *const file_model.TypeInfo,
-    deinit_method: *const file_model.MethodInfo,
+    inner: *const file_model.TypeInfo,
+    declaration: Ast.Node.Index,
+    parameter: u32,
     field_name: []const u8,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    for (outer.methods) |*m| {
-        if (m == deinit_method) continue;
-        // Walk the body for `<X> . <field_name> . <cleanup-name> (`.
-        var t: Ast.TokenIndex = m.body_first;
-        while (t + 5 <= m.body_last) : (t += 1) {
-            if (tags[t] != .identifier) continue;
-            // Word boundary at start.
-            if (t > 0 and tags[t - 1] == .period) continue;
-            if (tags[t + 1] != .period) continue;
-            if (tags[t + 2] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field_name)) continue;
-            if (tags[t + 3] != .period) continue;
-            if (tags[t + 4] != .identifier) continue;
-            if (tags[t + 5] != .l_paren) continue;
-            const cleanup = tree.tokenSlice(t + 4);
-            if (isCleanupName(cleanup)) return true;
+    frame: ?TypeResolver.ResolutionFrame,
+    parent: ?*const CleanupFrame,
+) file_cache_mod.SummaryError!bool {
+    var ancestor = parent;
+    while (ancestor) |visited| : (ancestor = visited.parent) {
+        if (visited.declaration == declaration) return false;
+    }
+    const visit = CleanupFrame{ .declaration = declaration, .parent = parent };
+    const tree = model.tree;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return false;
+    const body = tokens.bodyOf(tree, declaration) orelse return false;
+    const bindings = (try cache.localBindings(proto, body)).*;
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    try cache.enterNormalCleanup(declaration);
+    defer cache.leaveNormalCleanup();
+    var arena = std.heap.ArenaAllocator.init(cache.gpa);
+    defer arena.deinit();
+    const index = try cache.getCallIndex();
+    // Calls are indexed once. No token spelling can create a call that is not
+    // present in the AST, and nested declarations cannot supply a wrapper edge.
+    var calls = index.by_callee_token.iterator();
+    while (calls.next()) |entry| {
+        const node = entry.value_ptr.*;
+        const token = entry.key_ptr.*;
+        if (token <= tree.firstToken(body) or token >= tree.lastToken(body)) continue;
+        if (!callIsUnconditional(tree, body, node, proto, parameter)) continue;
+        try cache.chargeNormalCleanup(node);
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node) orelse continue;
+        const canonical = if (cache.zls != null)
+            try cache.actualCallSummaryAt(token, frame)
+        else
+            null;
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+            const access = tree.nodeData(call.ast.fn_expr).node_and_token;
+            const method = inner.findMethod(tree.tokenSlice(access[1]));
+            if (method) |cleanup| {
+                if (cleanup.receiver != null and isCleanupName(cleanup.name)) {
+                    const receiver = access[0];
+                    const owner = try fn_summary.ownerOfExpr(arena.allocator(), tree, proto, &bindings,
+                        tree.firstToken(receiver), tree.lastToken(receiver), 0);
+                    if (owner == .param and owner.param.param == parameter and
+                        std.mem.eql(u8, owner.param.path, field_name))
+                    {
+                        if (canonical) |actual| {
+                            if (actual.callee.tree == tree and actual.callee.declaration == cleanup.fn_decl) return true;
+                        } else if (cache.zls == null and declaration == outer.findMethod("deinit").?.fn_decl) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        const actual = canonical orelse continue;
+        if (actual.callee.tree != tree or actual.callee.declaration == declaration) continue;
+        var callee_buffer: [1]Ast.Node.Index = undefined;
+        const callee_proto = tokens.fnProto(tree, &callee_buffer, actual.callee.declaration) orelse continue;
+        var parameters = callee_proto.iterate(tree);
+        var position: u32 = 0;
+        while (parameters.next()) |_| : (position += 1) {
+            var arguments: [2]Ast.Node.Index = undefined;
+            const argument = (try actual.callArgumentFor(cache, &arguments, position)) orelse continue;
+            const owner = try fn_summary.ownerOfExpr(arena.allocator(), tree, proto, &bindings,
+                tree.firstToken(argument), tree.lastToken(argument), 0);
+            if (owner != .param or owner.param.param != parameter or owner.param.path.len != 0) continue;
+            const resolver = cache.zls orelse continue;
+            if (try bodyCallsFieldDestructor(cache, model, outer, inner, actual.callee.declaration,
+                position, field_name, resolver.frameForFunction(actual.callee.reference), &visit)) return true;
         }
     }
     return false;
 }
+
+/// Only top-level sequencing can prove the wrapper obligation here. Conditional
+/// cleanup, early successful returns and reset-before-cleanup remain unknown.
+fn callIsUnconditional(tree: *const Ast, body: Ast.Node.Index, call: Ast.Node.Index, proto: Ast.full.FnProto, parameter: u32) bool {
+    const tags = tree.tokens.items(.tag);
+    const target = tree.firstToken(call);
+    var parameters = proto.iterate(tree);
+    var position: u32 = 0;
+    var receiver: ?[]const u8 = null;
+    while (parameters.next()) |p| : (position += 1) {
+        if (position == parameter) receiver = tree.tokenSlice(p.name_token orelse return false);
+    }
+    const name = receiver orelse return false;
+    var depth: usize = 0;
+    var t = tree.firstToken(body);
+    while (t < target) : (t += 1) {
+        if (tags[t] == .l_brace) depth += 1;
+        if (tags[t] == .r_brace) depth -= 1;
+        if (tags[t] == .keyword_return and tags[t + 1] != .keyword_error) {
+            const end = tokens.findStmtSemicolon(tags, t + 1, tree.lastToken(body)) orelse return false;
+            if (end < target) return false;
+        }
+        if (tags[t] == .identifier and std.mem.eql(u8, tree.tokenSlice(t), name) and
+            t + 2 < target and tags[t + 1] == .period_asterisk and tags[t + 2] == .equal) return false;
+    }
+    if (depth != 1) return false;
+    var previous = target;
+    while (previous > tree.firstToken(body)) {
+        previous -= 1;
+        if (tags[previous] == .keyword_try or tags[previous] == .keyword_return) continue;
+        return tags[previous] == .semicolon or tags[previous] == .l_brace or tags[previous] == .r_brace;
+    }
+    return false;
+}
+
 
 /// True iff `inner_ti` is a refcounted type — its `deinit` is meant
 /// to be invoked only by the refcount machinery on the last
@@ -327,60 +376,6 @@ fn fieldTypeTrailingNameEndsWith(tree: *const Ast, field: *const file_model.Fiel
     return std.mem.endsWith(u8, name, suffix);
 }
 
-/// True iff `deinit`'s body calls `<self>.<helper>(...)` for a
-/// helper method on the same outer type whose body mentions
-/// `<self>.<field>` in any cleanup-shaped context.  Catches both:
-///   1. helper does `<self>.<field>.<cleanup>(...)` directly
-///   2. helper does `<self>.<field> = ...` reset followed by cleanup
-///      elsewhere, or dispatches via tag-enum (`closeIO(.stdin)`).
-/// One level of delegation only — chains of helpers aren't followed.
-fn bodyHandlesFieldViaHelper(
-    tree: *const Ast,
-    model: *const file_model.FileModel,
-    deinit: *const file_model.MethodInfo,
-    outer: *const file_model.TypeInfo,
-    field_name: []const u8,
-    cleanup_call: []const query.Atom,
-) bool {
-    _ = model;
-    const tags = tree.tokens.items(.tag);
-    const first = deinit.body_first;
-    const last = deinit.body_last;
-    var t: Ast.TokenIndex = first;
-    while (t + 3 <= last) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .l_paren) continue;
-        const helper_name = tree.tokenSlice(t + 2);
-        if (std.mem.eql(u8, helper_name, "deinit")) continue;
-        const helper = outer.findMethod(helper_name) orelse continue;
-        // Tight check: helper does the canonical cleanup pattern.
-        if (mq.methodBodyContains(tree, helper, cleanup_call)) return true;
-        // Loose check: helper's body MENTIONS `<self>.<field>` at all
-        // (covers tag-dispatch wrappers like `closeIO(.stdin)` whose
-        // body inspects `<self>.stdin` and does the cleanup there).
-        if (methodBodyMentionsField(tree, helper, field_name)) return true;
-    }
-    return false;
-}
-
-/// True iff the method's body contains either:
-///   - `<id>.<field>` token-pair (object-field reference), OR
-///   - `.<field>` tag-style reference (e.g. `closeIO(.stdin)` where
-///     the field name matches a tag enum's variant).
-/// Looser than a cleanup pattern match — used as a fall-through
-/// signal that the helper at least references the field in some way.
-fn methodBodyMentionsField(tree: *const Ast, method: *const file_model.MethodInfo, field_name: []const u8) bool {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = method.body_first;
-    while (t + 1 <= method.body_last) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (std.mem.eql(u8, tree.tokenSlice(t + 1), field_name)) return true;
-    }
-    return false;
-}
 
 /// True iff the method's body contains an `if (X.<field>) |...cap...| { ... }`
 /// shape where the if-body calls a cleanup-named method on `cap`.
@@ -395,7 +390,8 @@ fn methodBodyMentionsField(tree: *const Ast, method: *const file_model.MethodInf
 /// bare identifier (`|cap|` or `|*cap|`).  Doesn't try to match
 /// `while (X.field) |cap|` (loops on an optional field are rare for
 /// cleanup) or nested patterns.
-fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const file_model.MethodInfo, field_name: []const u8) bool {
+fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const file_model.MethodInfo, field_name: []const u8, inner: *const file_model.TypeInfo) bool {
+    const receiver = method.receiver orelse return false;
     const tags = tree.tokens.items(.tag);
     const first = method.body_first;
     const last = method.body_last;
@@ -404,8 +400,9 @@ fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const file_model.MethodI
         if (tags[t] != .keyword_if) continue;
         if (tags[t + 1] != .l_paren) continue;
         const rparen = tokens.matchParen(tags, t + 1, last) orelse continue;
-        // The condition's last two tokens must be `.<field_name>`.
-        if (rparen < t + 4) continue;
+        // The optional must be this receiver's exact field, not another owner.
+        if (rparen != t + 5 or tags[t + 2] != .identifier or
+            !std.mem.eql(u8, tree.tokenSlice(t + 2), receiver.name)) continue;
         if (tags[rparen - 2] != .period) continue;
         if (tags[rparen - 1] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(rparen - 1), field_name)) continue;
@@ -436,7 +433,8 @@ fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const file_model.MethodI
             if (tags[k + 1] != .period) continue;
             if (tags[k + 2] != .identifier) continue;
             if (tags[k + 3] != .l_paren) continue;
-            if (isCleanupName(tree.tokenSlice(k + 2))) return true;
+            const cleanup = inner.findMethod(tree.tokenSlice(k + 2)) orelse continue;
+            if (cleanup.receiver != null and isCleanupName(cleanup.name)) return true;
         }
     }
     return false;
@@ -619,6 +617,82 @@ test "skript regression: receiver cleanup still requires outer deinit" {
         \\    inner: Resource,
         \\    pub fn deinit(self: *Outer) void {
         \\        _ = self;
+        \\    }
+        \\};
+    );
+}
+
+// ocean#653: OwnedScene.deinit -> destroyScene(self) -> owned.scene.deinit.
+// nogui#295,#296: Harness.deinit releases fake/threaded, not counter/stream.
+test "composed owner follows exact free-function teardown argument" {
+    try testing.expectNoFireTyped(check,
+        \\const Scene = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Scene) void { self.fd = -1; }
+        \\};
+        \\const Owned = struct {
+        \\    scene: Scene,
+        \\    fn deinit(self: *Owned) !void { return destroyScene(self); }
+        \\};
+        \\fn destroyScene(owned: *Owned) !void { owned.scene.deinit(); }
+        \\pub fn run(owned: *Owned) !void { try owned.deinit(); }
+    );
+    try testing.expectFiresTyped(check, R,
+        \\const Scene = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Scene) void { self.fd = -1; }
+        \\};
+        \\const Owned = struct {
+        \\    scene: Scene,
+        \\    fn deinit(self: *Owned, other: *Owned) void { destroyScene(other); _ = self; }
+        \\};
+        \\fn destroyScene(owned: *Owned) void { owned.scene.deinit(); }
+        \\pub fn run(owned: *Owned, other: *Owned) void { owned.deinit(other); }
+    );
+}
+
+test "composed owner does not treat field inspection or partial cleanup as destruction" {
+    try testing.expectFiresTyped(check, R,
+        \\const Scene = struct {
+        \\    first: i32, second: i32,
+        \\    fn deinit(self: *Scene) void { self.first = -1; self.second = -1; }
+        \\};
+        \\const Owned = struct {
+        \\    scene: Scene,
+        \\    fn deinit(self: *Owned) void { self.scene.first = -1; }
+        \\};
+        \\pub fn run(owned: *Owned) void { owned.deinit(); }
+    );
+}
+
+test "composed owner preserves both outstanding PipeWire resources" {
+    try testing.expectCount(check, R, 2,
+        \\const Counter = struct {
+        \\    live: usize,
+        \\    fn release(self: *Counter) void { self.live -= 1; }
+        \\};
+        \\const Stream = struct {
+        \\    live: usize,
+        \\    fn stop(self: *Stream) void { self.live -= 1; }
+        \\};
+        \\const Harness = struct {
+        \\    counter: Counter, stream: Stream, other: Counter,
+        \\    fn deinit(self: *Harness) void { self.other.release(); self.* = undefined; }
+        \\};
+    );
+}
+
+test "composed owner optional cleanup must unwrap the same receiver" {
+    try testing.expectFires(check, R,
+        \\const Scene = struct {
+        \\    fd: i32,
+        \\    fn deinit(self: *Scene) void { self.fd = -1; }
+        \\};
+        \\const Owned = struct {
+        \\    scene: ?Scene,
+        \\    fn deinit(self: *Owned, other: *Owned) void {
+        \\        _ = self;
+        \\        if (other.scene) |*scene| scene.deinit();
         \\    }
         \\};
     );

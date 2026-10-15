@@ -12,10 +12,9 @@
 //! Detection (syntactic dep edges, AST deferred scopes):
 //!   1. Skip comptime type-builder fns.
 //!   2. Collect "dep" edges: `<A> = <T>.init(&<B>, ...)` or
-//!      `<A>.init(&<B>, ...)` — meaning A depends on B.  Both
-//!      LHS receiver chains (`a`, `env.grid_verify`) are
-//!      flattened to the last identifier for comparison.
-//!   3. Collect `<X>.deinit(...)` calls and their enclosing defer.
+//!      `<A>.init(&<B>, ...)` — meaning A depends on B. Owners are
+//!      compared by their complete paths, not their leaf members.
+//!   3. Collect `<X>.deinit(...)` calls and their enclosing defer/errdefer.
 //!      Compare execution order: separate defers in one scope run
 //!      LIFO, while calls within one deferred body keep source order.
 //!      Report the dependent's deinit when its dependency runs first.
@@ -56,9 +55,28 @@ pub fn check(
     }
 }
 
+const Owner = struct {
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+
+    fn eql(self: Owner, tree: *const Ast, other: Owner) bool {
+        if (self.last - self.first != other.last - other.first) return false;
+        for (0..self.last - self.first + 1) |offset| {
+            const n: Ast.TokenIndex = @intCast(offset);
+            if (!std.mem.eql(u8, tree.tokenSlice(self.first + n), tree.tokenSlice(other.first + n))) return false;
+        }
+        return true;
+    }
+
+    fn text(self: Owner, tree: *const Ast) []const u8 {
+        const starts = tree.tokens.items(.start);
+        return tree.source[starts[self.first] .. starts[self.last] + tree.tokenSlice(self.last).len];
+    }
+};
+
 const Dep = struct {
-    a_name: []const u8, // last identifier of the LHS receiver chain
-    b_name: []const u8, // last identifier of the &b argument
+    a_name: Owner,
+    b_name: Owner,
 };
 
 const Deferred = struct {
@@ -68,7 +86,7 @@ const Deferred = struct {
 };
 
 const Deinit = struct {
-    recv_name: []const u8, // Last identifier of `<chain>.deinit(`.
+    recv_name: Owner,
     tok: Ast.TokenIndex,
     deferred: ?Deferred,
 
@@ -161,7 +179,7 @@ fn checkBody(
         const scope_last = tree.lastToken(node);
         if (scope_first < first or scope_last > last) continue;
         for (statements) |statement| {
-            if (tree.nodeTag(statement) != .@"defer") continue;
+            if (tree.nodeTag(statement) != .@"defer" and tree.nodeTag(statement) != .@"errdefer") continue;
             try defers.append(gpa, .{
                 .first = tree.firstToken(statement),
                 .last = tree.lastToken(statement),
@@ -196,10 +214,10 @@ fn checkBody(
             const earlier = if (di_first) di else dj;
             const later = if (di_first) dj else di;
             for (deps.items) |d| {
-                if (std.mem.eql(u8, d.a_name, later.recv_name) and
-                    std.mem.eql(u8, d.b_name, earlier.recv_name))
+                if (d.a_name.eql(tree, later.recv_name) and
+                    d.b_name.eql(tree, earlier.recv_name))
                 {
-                    try report(gpa, problems, tree, later.tok, d.a_name, d.b_name);
+                    try report(gpa, problems, tree, later.tok, d.a_name.text(tree), d.b_name.text(tree));
                     break;
                 }
             }
@@ -207,64 +225,43 @@ fn checkBody(
     }
 }
 
-/// Walk forward through the receiver chain starting at `start`
-/// and return the LAST identifier segment.
-fn lastIdentSegment(tree: *const Ast, tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) []const u8 {
-    var t: Ast.TokenIndex = start;
-    var last_ident = start;
-    while (t <= last) : (t += 1) {
-        if (tags[t] == .identifier) last_ident = t;
-        if (tags[t] == .period and t + 1 <= last and tags[t + 1] == .identifier) continue;
-        if (t > start and tags[t] != .identifier and tags[t] != .period) break;
-    }
-    return tree.tokenSlice(last_ident);
+/// Keep the complete source owner path. Equal member names in different
+/// objects do not identify the same cleanup target.
+fn lastIdentSegment(_: *const Ast, tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) Owner {
+    var end = start;
+    while (end + 2 <= last and tags[end + 1] == .period and tags[end + 2] == .identifier) end += 2;
+    return .{ .first = start, .last = end };
 }
 
-/// Walk backward from `period_tok` (the `.` before `init` /
-/// `deinit`) through the receiver chain and return the LAST
-/// identifier segment (the closest one to the method).
-fn lastIdentSegmentBack(tree: *const Ast, tags: []const std.zig.Token.Tag, period_tok: Ast.TokenIndex) []const u8 {
-    if (period_tok == 0) return &.{};
-    if (tags[period_tok - 1] != .identifier) return &.{};
-    return tree.tokenSlice(period_tok - 1);
+fn lastIdentSegmentBack(_: *const Ast, tags: []const std.zig.Token.Tag, period_tok: Ast.TokenIndex) Owner {
+    const end = period_tok - 1;
+    var start = end;
+    while (start >= 2 and tags[start - 1] == .period and tags[start - 2] == .identifier) start -= 2;
+    return .{ .first = start, .last = end };
 }
 
-/// Find the assignee identifier name for an init call.  Walks
-/// back from the `init` token to find either `<lhs> = <T>.init(`
-/// or `<lhs-chain>.init(` shapes.  Returns the LAST identifier
-/// of the LHS (e.g. `grid_verify` for `env.grid_verify = ...`).
-fn findInitAssignee(tree: *const Ast, tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, init_tok: Ast.TokenIndex) ?[]const u8 {
-    // Walk back across the receiver chain that ends at `.init`.
-    var t: Ast.TokenIndex = init_tok;
-    if (t < 2) return null;
-    t -= 2; // skip `.` and method
-    // Walk back across the type-name chain: `<T1>.<T2>...<Tn>`.
-    while (t >= 2 and tags[t] == .identifier and tags[t - 1] == .period and tags[t - 2] == .identifier) {
-        t -= 2;
+/// The constructor receiver is a type path; an assignment's owner is
+/// its LHS. `try` changes neither that owner nor the actual dependency.
+fn findInitAssignee(tree: *const Ast, tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, init_tok: Ast.TokenIndex) ?Owner {
+    // A declared type annotation sits before `=` too. The declaration's
+    // binding token, not that type token, owns the constructor result.
+    var index: u32 = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const declaration = tree.fullVarDecl(node) orelse continue;
+        if (tree.firstToken(node) < first) continue;
+        const initializer = declaration.ast.init_node.unwrap() orelse continue;
+        if (tree.firstToken(initializer) > init_tok or tree.lastToken(initializer) < init_tok) continue;
+        const name = declaration.ast.mut_token + 1;
+        return .{ .first = name, .last = name };
     }
-    if (tags[t] != .identifier) return null;
-    // At this point `t` is the leftmost identifier before the
-    // type/method chain.  Two cases:
-    //   A) `<a> = <T>.init(...)` — the token before `t` is `=`.
-    //      Walk back over `=` and over the LHS receiver chain.
-    //   B) `<chain>.init(...)` — `t` IS the assignee's leftmost
-    //      receiver (no `=` involved).
-    if (t == 0 or tags[t - 1] != .equal) {
-        // Case B: assignee is the chain ending here.  Return the
-        // chain's LAST identifier (the rightmost).
-        return tree.tokenSlice(t);
-    }
-    // Case A: walk back over `=` then back through `<lhs-chain>`.
-    var u: Ast.TokenIndex = t - 2; // skip space + `=`... well, no space tokens; just `=`.
-    if (u < first) return null;
-    if (tags[u] != .identifier) return null;
-    const last_ident = u;
-    // (Walk back to find the leftmost segment, even though we
-    // return the rightmost — purely to validate the chain shape.)
-    while (u >= 2 and tags[u - 1] == .period and tags[u - 2] == .identifier) {
-        u -= 2;
-    }
-    return tree.tokenSlice(last_ident);
+    if (init_tok < 2 or tags[init_tok - 2] != .identifier) return null;
+    const receiver = lastIdentSegmentBack(tree, tags, init_tok - 1);
+    var before = receiver.first;
+    if (before > first and tags[before - 1] == .keyword_try) before -= 1;
+    if (before == 0 or tags[before - 1] != .equal) return receiver;
+    if (before < 2 or tags[before - 2] != .identifier) return null;
+    return lastIdentSegmentBack(tree, tags, before - 1);
 }
 
 fn report(
@@ -602,5 +599,146 @@ test "deinit-order-violates-construction-dep: nested dependent defer runs too la
         \\}
     );
     defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: typed errdefer construction order" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const Root = struct {
+        \\    fn init() Root { return .{}; }
+        \\    fn deinit(_: *Root) void {}
+        \\};
+        \\const Dependent = struct {
+        \\    fn init(_: *Root) Dependent { return .{}; }
+        \\    fn deinit(_: *Dependent) void {}
+        \\};
+        \\const Alias = Dependent;
+        \\fn run() !void {
+        \\    var root = Root.init();
+        \\    errdefer root.deinit();
+        \\    var dependent = Alias.init(&root);
+        \\    errdefer dependent.deinit();
+        \\    return error.Stop;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: typed reversed errdefer reports" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const Root = struct { fn deinit(_: *Root) void {} };
+        \\const Dependent = struct {
+        \\    fn init(_: *Root) Dependent { return .{}; }
+        \\    fn deinit(_: *Dependent) void {}
+        \\};
+        \\fn run() !void {
+        \\    var root: Root = .{};
+        \\    var dependent = Dependent.init(&root);
+        \\    errdefer dependent.deinit();
+        \\    errdefer root.deinit();
+        \\    return error.Stop;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: distinct owners and missing cleanup do not match" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const Root = struct { fn deinit(_: *Root) void {} };
+        \\const Dependent = struct {
+        \\    fn init(_: *Root) Dependent { return .{}; }
+        \\    fn deinit(_: *Dependent) void {}
+        \\};
+        \\const Env = struct { root: Root = .{}, child: Dependent = .{} };
+        \\fn run() void {
+        \\    var left: Env = .{};
+        \\    var right: Env = .{};
+        \\    left.child = Dependent.init(&left.root);
+        \\    right.root.deinit();
+        \\    left.child.deinit();
+        \\}
+        \\fn missing() void {
+        \\    var root: Root = .{};
+        \\    var dependent = Dependent.init(&root);
+        \\    root.deinit();
+        \\    _ = dependent;
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: typed constructor assignee is not its annotation" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const Root = struct { fn deinit(_: *Root) void {} };
+        \\const Child = struct {
+        \\    fn init(_: *Root) Child { return .{}; }
+        \\    fn deinit(_: *Child) void {}
+        \\};
+        \\fn run() void {
+        \\    var root: Root = .{};
+        \\    var dependent: Child = Child.init(&root);
+        \\    root.deinit();
+        \\    dependent.deinit();
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: imported constructor alias preserves actual owners" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "owners.zig", .data =
+        \\pub const Root = struct { pub fn deinit(_: *Root) void {} };
+        \\pub const Child = struct {
+        \\    pub fn init(_: *Root) Child { return .{}; }
+        \\    pub fn deinit(_: *Child) void {}
+        \\};
+    });
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "use.zig" });
+    defer gpa.free(path);
+    const source =
+        \\const lib = @import("owners.zig");
+        \\const Constructor = lib.Child;
+        \\const Env = struct { child: lib.Child = .{}, root: lib.Root = .{} };
+        \\fn unsafeOrder() void {
+        \\    var env: Env = .{};
+        \\    env.child = Constructor.init(&env.root);
+        \\    env.root.deinit();
+        \\    env.child.deinit();
+        \\}
+        \\fn safeOrder() !void {
+        \\    var env: Env = .{};
+        \\    errdefer env.root.deinit();
+        \\    env.child = Constructor.init(&env.root);
+        \\    errdefer env.child.deinit();
+        \\    return error.Stop;
+        \\}
+    ;
+    var context: @import("../../type_resolver.zig").TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    var resolver: @import("../../type_resolver.zig").TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    cache.setZls(&resolver);
+    defer cache.deinit();
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    try check(gpa, tree, &cache, &config_mod.Default, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }

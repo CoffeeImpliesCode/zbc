@@ -123,10 +123,12 @@ pub const ParamPath = struct {
 pub const StorageOperation = struct {
     path: ParamPath,
     /// Entry releases name the payload present on call entry, even after a
-    /// replace. Current releases name the latest published payload. Replace
-    /// is emitted only for a certified independent, live heap allocation.
+    /// replace. Current releases name the latest published payload.
     kind: enum { release_entry, replace, release_current },
-    /// Formal allocator provenance for replace; null removes exact replay.
+    /// A static empty descriptor advances the selected place's generation
+    /// without allocating. Missing heap provenance never implies static storage.
+    replacement: enum { fresh_heap, static_empty } = .fresh_heap,
+    /// Formal allocator provenance is required only for fresh-heap replace.
     allocator: ?ParamPath = null,
     /// Exact relative payload generation for a release. Zero is entry;
     /// each replacement advances the generation of this path by one.
@@ -135,11 +137,53 @@ pub const StorageOperation = struct {
     /// Positive identity evidence survives an opaque tail even when the
     /// whole trace is incomplete. Ambiguous projections cannot supply it.
     identity_proved: bool = true,
+    /// Only an authenticated SDK slice free can ignore a proved empty
+    /// nonsentinel descriptor. Raw/custom releases retain their effects.
+    sdk_empty_slice_noop: bool = false,
 };
 
 pub const StorageOutcome = struct {
     operations: []const StorageOperation = &.{},
 };
+
+/// Every selected exit releases this exact entry payload only through the
+/// authenticated SDK empty-slice protocol. Incomplete tails do not erase an
+/// earlier proved release; unknown identity or any other release defeats it.
+/// This grants no authority over another path or a replacement generation.
+pub fn entrySdkEmptyNoop(
+    cache: anytype,
+    at: Ast.Node.Index,
+    outcomes: []const StorageOutcome,
+    path: ParamPath,
+) CleanupError!bool {
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    if (outcomes.len == 0) return false;
+    for (outcomes) |outcome| {
+        try cache.normalCleanupStorageWork(at, 1);
+        var found = false;
+        for (outcome.operations) |operation| {
+            try cache.normalCleanupStorageWork(at, 1);
+            if (!cleanupEqual(ParamPath, operation.path, path)) continue;
+            switch (operation.kind) {
+                .replace => {},
+                .release_entry, .release_current => {
+                    // A partial trace cannot reconstruct an unspecified
+                    // current generation. Only explicit zero equals entry.
+                    const released = if (operation.kind == .release_entry)
+                        operation.version orelse 0
+                    else
+                        operation.version orelse return false;
+                    if (released != 0 or !operation.identity_proved or !operation.sdk_empty_slice_noop)
+                        return false;
+                    found = true;
+                },
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
 
 /// Where a value came from, as far as this file can prove.  Anything
 /// the file cannot read — a call result, an index, a `@constCast` of a
@@ -1720,7 +1764,7 @@ const CleanupState = struct {
                     const entry_version = try prefix.version(operation.path);
                     switch (operation.kind) {
                         .replace => {
-                            if (operation.allocator == null) self.storage_complete = false;
+                            if (operation.replacement == .fresh_heap and operation.allocator == null) self.storage_complete = false;
                         },
                         .release_entry => {
                             mapped.kind = if (entry_version == 0) .release_entry else .release_current;
@@ -1981,9 +2025,10 @@ fn CleanupWalker(comptime Cache: type) type {
             switch (owner) {
                 .param => |borrowed| {
                     const stored = try cleanupOwnedPath(self.arena, state.work, borrowed);
-                    const certified = try self.cache.normalCleanupFresh(rhs);
-                    const allocator = if (certified) try self.cache.normalCleanupAllocator(rhs) else null;
-                    if (certified and allocator == null) state.storage_complete = false;
+                    const static_empty = try self.cache.normalCleanupStaticEmpty(lhs, rhs);
+                    const certified = static_empty or try self.cache.normalCleanupFresh(rhs);
+                    const allocator = if (certified and !static_empty) try self.cache.normalCleanupAllocator(rhs) else null;
+                    if (certified and !static_empty and allocator == null) state.storage_complete = false;
                     const owned_allocator = if (allocator) |path| try cleanupOwnedPath(self.arena, state.work, path) else null;
                     try cleanupCharge(state.work, state.alternatives.len * 2);
                     const alternatives = try self.arena.dupe(CleanupAlternative, state.alternatives);
@@ -1991,12 +2036,17 @@ fn CleanupWalker(comptime Cache: type) type {
                     var released_store = false;
                     for (alternatives) |*alternative| {
                         const identity = try self.storageIdentity(rhs, alternative.*);
+                        // Freshness authenticates the allocation's origin,
+                        // not its lifetime. A private fresh snapshot can have
+                        // been released before this first publication.
+                        const dead_fresh = certified and !static_empty and owned_allocator != null and
+                            identity.fresh_token != null and identity.path == null and identity.released;
                         if (identity.released) {
                             released_store = true;
                             live_replacement = false;
                         }
                         if (identity.path != null) live_replacement = false;
-                        if (!certified or identity.released or identity.path != null) {
+                        if (!certified or (identity.released and !dead_fresh) or identity.path != null) {
                             alternative.uncertain_stores = try cleanupAddStorageValue(ParamPath, self.arena, state.work, alternative.uncertain_stores, stored);
                             try cleanupCharge(state.work, alternative.operations.len + alternative.snapshots.len);
                             for (alternative.operations) |operation| {
@@ -2015,7 +2065,22 @@ fn CleanupWalker(comptime Cache: type) type {
                             continue;
                         }
                         if (try alternative.uncertain(stored)) state.storage_complete = false;
-                        try alternative.append(self.arena, .{ .path = stored, .kind = .replace, .allocator = owned_allocator });
+                        try alternative.append(self.arena, .{
+                            .path = stored,
+                            .kind = .replace,
+                            .replacement = if (static_empty) .static_empty else .fresh_heap,
+                            .allocator = owned_allocator,
+                        });
+                        if (dead_fresh) {
+                            // Replay the published generation as dead. Dropping
+                            // this release would fabricate a live replacement.
+                            try alternative.append(self.arena, .{
+                                .path = stored,
+                                .kind = .release_current,
+                                .version = try alternative.version(stored),
+                                .identity_proved = identity.identity_proved and !identity.projection_ambiguous,
+                            });
+                        }
                         if (identity.fresh_token) |fresh_token| {
                             const previous = alternative.snapshots;
                             try cleanupCharge(state.work, previous.len);
@@ -2039,7 +2104,7 @@ fn CleanupWalker(comptime Cache: type) type {
             }
         }
 
-        fn releaseStorage(self: *Self, state: *CleanupState, argument: Ast.Node.Index) CleanupError!void {
+        fn releaseStorage(self: *Self, state: *CleanupState, argument: Ast.Node.Index, sdk_empty_slice_noop: bool) CleanupError!void {
             try cleanupCharge(state.work, state.alternatives.len * 2);
             const alternatives = try self.arena.dupe(CleanupAlternative, state.alternatives);
             var current_paths: []const ParamPath = &.{};
@@ -2062,6 +2127,7 @@ fn CleanupWalker(comptime Cache: type) type {
                         .path = path,
                         .kind = if (identity.version == 0) .release_entry else .release_current,
                         .version = identity.version,
+                        .sdk_empty_slice_noop = sdk_empty_slice_noop,
                         .identity_proved = !identity.projection_ambiguous and
                             if (identity.from_snapshot) identity.identity_proved else
                             state.storage_complete and !try alternative.uncertain(path),
@@ -2203,7 +2269,7 @@ fn CleanupWalker(comptime Cache: type) type {
             if (call.can_normal and call.returns_error != true) {
                 out.next = prefix;
                 if (call.release_argument) |argument| {
-                    try self.releaseStorage(&out.next, argument);
+                    try self.releaseStorage(&out.next, argument, call.sdk_empty_slice_noop);
                     out.next.storage_complete = out.next.storage_complete and call.storage_complete;
                 } else {
                     try out.next.addEffects(self.arena, call.definite_paths, call.definite_fields, call.may_paths, call.may_fields, call.complete);
@@ -2457,6 +2523,226 @@ pub fn inferNormalSuccessCleanup(
     };
 }
 
+/// The containing allocation released by one exact callback declaration.
+pub const AllocationRelease = struct {
+    parameter: u32,
+    owner: @import("type_engine").TypeResolver.ActualType.Data.Container,
+    relation: union(enum) {
+        same_address,
+        parent_container: struct { field_tree: *const Ast, field_declaration: Ast.Node.Index },
+    },
+};
+
+const AllocationProjection = struct {
+    source: ParamPath,
+    parent: ?struct { field: []const u8, child: Ast.Node.Index } = null,
+};
+
+fn callbackProjection(
+    cache: anytype,
+    arena: std.mem.Allocator,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    node: Ast.Node.Index,
+) CleanupError!?AllocationProjection {
+    try cache.enterNormalCleanup(node);
+    defer cache.leaveNormalCleanup();
+    try cache.chargeNormalCleanup(node);
+    const tree = cache.tree;
+    if (tree.nodeTag(node) == .identifier) {
+        const token = tree.nodeMainToken(node);
+        const name = tree.tokenSlice(token);
+        if (bindings.findAt(name, token)) |binding| {
+            if (binding.origin != .param) {
+                if (!binding.is_const or binding.origin == .loop_capture) return null;
+                const value = cache.nodeForExactSpan(binding.rhs_first, binding.rhs_last) orelse return null;
+                if (value == node) return null;
+                return callbackProjection(cache, arena, proto, bindings, value);
+            }
+        }
+        const parameter = paramIndex(tree, proto, name) orelse return null;
+        const resolver = cache.zls orelse return null;
+        const frame = cache.cleanup_frame orelse resolver.resolutionFrame();
+        // Authenticate the incoming address at its declared source. Cast
+        // result types need not resolve, and confer no payload/write authority.
+        var parameters = proto.iterate(tree);
+        var index: u32 = 0;
+        while (parameters.next()) |formal| : (index += 1) {
+            if (index != parameter) continue;
+            const type_node = formal.type_expr orelse return null;
+            const source_type = (try frame.typeOfNode(type_node)) orelse return null;
+            if (resolver.pointerSize(source_type) != .one) return null;
+            return .{ .source = .{ .param = parameter, .path = "" } };
+        }
+        return null;
+    }
+    if (tree.nodeTag(node) == .grouped_expression)
+        return callbackProjection(cache, arena, proto, bindings, tree.nodeData(node).node_and_token[0]);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const arguments = tree.builtinCallParams(&buffer, node) orelse return null;
+    const builtin = tree.tokenSlice(tree.nodeMainToken(node));
+    if (std.mem.eql(u8, builtin, "@fieldParentPtr")) {
+        if (arguments.len != 2 or tree.nodeTag(arguments[0]) != .string_literal) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(arguments[0]));
+        if (name.len < 2 or std.mem.indexOfScalar(u8, name, '\\') != null) return null;
+        const child = (try callbackProjection(cache, arena, proto, bindings, arguments[1])) orelse return null;
+        if (child.parent != null or child.source.path.len != 0) return null;
+        return .{ .source = child.source, .parent = .{ .field = name[1 .. name.len - 1], .child = arguments[1] } };
+    }
+    const is_as = std.mem.eql(u8, builtin, "@as");
+    if (is_as and arguments.len != 2) return null;
+    if (!is_as and (arguments.len != 1 or
+        (!std.mem.eql(u8, builtin, "@ptrCast") and !std.mem.eql(u8, builtin, "@alignCast") and
+            !std.mem.eql(u8, builtin, "@constCast")))) return null;
+    return callbackProjection(cache, arena, proto, bindings, arguments[arguments.len - 1]);
+}
+
+fn callbackInitializerPreserves(cache: anytype, frame: anytype, node: Ast.Node.Index) CleanupError!bool {
+    try cache.enterNormalCleanup(node);
+    defer cache.leaveNormalCleanup();
+    try cache.chargeNormalCleanup(node);
+    const tree = cache.tree;
+    switch (tree.nodeTag(node)) {
+        .@"return", .@"break", .@"continue", .assign,
+        .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and,
+        .assign_bit_or, .assign_bit_xor, .assign_div, .assign_sub,
+        .assign_sub_wrap, .assign_sub_sat, .assign_mod, .assign_add,
+        .assign_add_wrap, .assign_add_sat, .assign_mul, .assign_mul_wrap,
+        .assign_mul_sat => return false,
+        .fn_decl => return true,
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (!std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@ptrCast") and
+                !std.mem.eql(u8, name, "@alignCast") and !std.mem.eql(u8, name, "@constCast") and
+                !std.mem.eql(u8, name, "@fieldParentPtr")) return false;
+        },
+        else => {},
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, node)) |call| {
+        const token = @import("../cache/fresh_storage.zig").calleeQueryToken(tree, call);
+        const actual = (try cache.actualCallSummaryAt(token, frame)) orelse return false;
+        return (try cache.callEffectAt(token, .{ .whole = actual.callee }, .{ .frame = frame })) == .read_only;
+    }
+    var children = CleanupIterator.init(tree, node);
+    while (children.next(tree)) |child|
+        if (!try callbackInitializerPreserves(cache, frame, child)) return false;
+    return true;
+}
+
+/// A declaration is not a callable expression. Keep its complete canonical
+/// function value, and authenticate its source before constructing the frame.
+fn cleanupDeclarationFrame(cache: anytype, declaration: Ast.Node.Index) CleanupError!?@import("type_engine").TypeResolver.ResolutionFrame {
+    const resolver = cache.zls orelse return null;
+    const initial = cache.cleanup_frame orelse resolver.resolutionFrame();
+    if (&initial.handle.document.tree != cache.tree) return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(cache.tree, &buffer, declaration) orelse return null;
+    const callable = (try initial.resolveValueOfNode(declaration)) orelse return null;
+    if (callable.is_type_val or callable.data != .function) return null;
+    const function = callable.data.function;
+    if (!function.handle.eql(initial.handle) or function.fn_token != proto.ast.fn_token) return null;
+    return resolver.frameForFunction(.{
+        .tree = cache.tree,
+        .handle = function.handle,
+        .fn_token = function.fn_token,
+        .actual_type = callable,
+    });
+}
+
+/// Source-declaration-bound SDK release. A parent projection is never ordinary
+/// parameter/address equality. Conditional subsets and child-only release
+/// cannot certify the containing allocation's release.
+/// This certifies the callback body, not any creator or callback installation.
+/// Consumers must independently match the created canonical owner and exact
+/// embedding field; equal field types or one matching initializer do not suffice.
+pub fn callbackAllocationRelease(
+    cache: anytype,
+    arena: std.mem.Allocator,
+    declaration: Ast.Node.Index,
+) CleanupError!?AllocationRelease {
+    cache.beginNormalCleanup();
+    defer cache.endNormalCleanup();
+    const tree = cache.tree;
+    if (tree.errors.len != 0) return error.InvalidSyntax;
+    _ = try checkedTokenCount(tree.source.len, tree.tokens.len);
+    const resolver = cache.zls orelse return null;
+    const frame = (try cleanupDeclarationFrame(cache, declaration)) orelse return null;
+    const saved = cache.cleanup_frame;
+    cache.cleanup_frame = frame;
+    defer cache.cleanup_frame = saved;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &proto_buffer, declaration) orelse return null;
+    const body = tokens.bodyOf(tree, declaration) orelse return null;
+    const bindings = (try cache.localBindings(proto, body)).*;
+    var block_buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&block_buffer, body) orelse return null;
+    for (statements) |statement| {
+        try cache.chargeNormalCleanup(statement);
+        if (tree.fullVarDecl(statement)) |binding| {
+            const initializer = binding.ast.init_node.unwrap() orelse return null;
+            if (!try callbackInitializerPreserves(cache, frame, initializer)) return null;
+            continue;
+        }
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const syntax = tree.fullCall(&call_buffer, statement) orelse return null;
+        const call = try cache.normalCleanupCall(arena, proto, &bindings, statement);
+        if (!call.can_normal) return null;
+        const argument = call.release_argument orelse {
+            const token = @import("../cache/fresh_storage.zig").calleeQueryToken(tree, syntax);
+            const actual = (try cache.actualCallSummaryAt(token, frame)) orelse return null;
+            if ((try cache.callEffectAt(token, .{ .whole = actual.callee }, .{})) != .read_only) return null;
+            continue;
+        };
+        // SDK authentication supplies release_argument even when ordinary
+        // parameter projection cannot express the inverse parent relation.
+        if (!call.storage_complete or call.can_error) return null;
+        const projection = (try callbackProjection(cache, arena, proto, &bindings, argument)) orelse continue;
+        if (projection.source.path.len != 0) continue;
+        const pointer = (try frame.typeOfNode(argument)) orelse continue;
+        if (resolver.pointerSize(pointer) != .one) continue;
+        var pointee = (try resolver.normalizedType(resolver.childType(pointer) orelse continue)) orelse continue;
+        pointee.is_type_val = true;
+        if (pointee.data != .container) continue;
+        const owner = pointee.data.container;
+        var result: AllocationRelease = .{
+            .parameter = projection.source.param,
+            .owner = owner,
+            .relation = .same_address,
+        };
+        if (projection.parent) |parent| {
+            const owner_frame = resolver.frameForContainer(owner);
+            const owner_tree = &owner.scope_handle.handle.document.tree;
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            const container = owner_tree.fullContainerDecl(&container_buffer, owner.scope_handle.toNode()) orelse return null;
+            var child_type = (try frame.typeOfNode(parent.child)) orelse return null;
+            child_type = (try resolver.normalizedType(child_type)) orelse return null;
+            child_type.is_type_val = true;
+            if (resolver.pointerSize(child_type) != .one) return null;
+            var child_pointee = resolver.childType(child_type) orelse return null;
+            child_pointee = (try resolver.normalizedType(child_pointee)) orelse return null;
+            child_pointee.is_type_val = true;
+            var found = false;
+            for (container.ast.members) |member| {
+                try cache.normalCleanupStorageWork(statement, 1);
+                const field = owner_tree.fullContainerField(member) orelse continue;
+                if (!std.mem.eql(u8, owner_tree.tokenSlice(field.ast.main_token), parent.field)) continue;
+                const type_node = field.ast.type_expr.unwrap() orelse return null;
+                var field_type = (try owner_frame.typeOfNode(type_node)) orelse return null;
+                field_type = (try resolver.normalizedType(field_type)) orelse return null;
+                field_type.is_type_val = true;
+                if (!child_pointee.eql(field_type)) return null;
+                result.relation = .{ .parent_container = .{ .field_tree = owner_tree, .field_declaration = member } };
+                found = true;
+                break;
+            }
+            if (!found) return null;
+        }
+        return result;
+    }
+    return null;
+}
+
 /// Derive the release and write paths this declaration's OWN body
 /// spells out.  `arena` owns the two result slices; their `path` texts
 /// borrow `tree`, so a consumer reading a FOREIGN declaration's answer
@@ -2692,6 +2978,21 @@ fn isStoreOp(tag: std.zig.Token.Tag) bool {
     };
 }
 
+/// Exact source shape for an anonymous zero-element address literal.
+/// Names, globals, nonempty literals, and unknown calls are not evidence.
+/// The caller must separately authenticate its descriptor type and release
+/// protocol; this source shape alone never makes a custom release a no-op.
+pub fn isStaticEmptyDescriptor(tree: *const Ast, node: Ast.Node.Index) bool {
+    var value = node;
+    if (tree.nodeTag(value) == .grouped_expression)
+        value = tree.nodeData(value).node_and_token[0];
+    if (tree.nodeTag(value) != .address_of) return false;
+    value = tree.nodeData(value).node;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const literal = tree.fullStructInit(&buffer, value) orelse return false;
+    return literal.ast.fields.len == 0 and literal.ast.type_expr == .none;
+}
+
 /// Deepest `<param> . <local> . …` chain followed before the answer is
 /// declared unknown.  Chains longer than this are vanishingly rare and
 /// the alternative (following them) risks not terminating on a
@@ -2772,9 +3073,9 @@ fn pathChainEnd(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) ?
 /// parameter, or as an alias declared above the switch would all be
 /// answers this file cannot give.
 ///
-/// Everything else — a call result, an index, a cast, a local this
-/// file cannot read — is `.unknown` too.  Unknown means "may carry
-/// any storage", never "carries none".
+/// Pointer casts preserve the selected address; integer reconstruction and
+/// arbitrary calls do not. An inverse parent projection is a different relation
+/// and is exposed only by `callbackAllocationRelease`, never as value identity.
 pub fn ownerOfExpr(
     arena: std.mem.Allocator,
     tree: *const Ast,
@@ -2798,12 +3099,26 @@ fn ownerOfExprWithTokenCount(
     depth: u8,
     token_count: TokenIndex,
 ) WalkError!StorageOwner {
+    return ownerOfExprProjection(arena, tree, proto, bindings, first, last, depth, token_count, true);
+}
+
+fn ownerOfExprProjection(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    bindings: *const local_bindings.LocalBindings,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    depth: u8,
+    token_count: TokenIndex,
+    allow_address_cast: bool,
+) WalkError!StorageOwner {
     const tags = tree.tokens.items(.tag);
     if (first > last) return .unknown;
     // `&x` and `try x` wrap an expression without changing the storage
     // it names.
     switch (tags[first]) {
-        .ampersand, .keyword_try => return ownerOfExprWithTokenCount(
+        .ampersand, .keyword_try => return ownerOfExprProjection(
             arena,
             tree,
             proto,
@@ -2812,8 +3127,34 @@ fn ownerOfExprWithTokenCount(
             last,
             depth,
             token_count,
+            allow_address_cast,
         ),
         else => {},
+    }
+    if (tags[first] == .builtin and first + 2 <= last and tags[first + 1] == .l_paren) {
+        if (!allow_address_cast) return .unknown;
+        if (depth >= max_owner_depth) return .unknown;
+        const name = tree.tokenSlice(first);
+        const is_as = std.mem.eql(u8, name, "@as");
+        if (!is_as and !std.mem.eql(u8, name, "@ptrCast") and
+            !std.mem.eql(u8, name, "@alignCast") and !std.mem.eql(u8, name, "@constCast")) return .unknown;
+        if (tokens.matchParen(tags, first + 1, last) != last) return .unknown;
+        const initial = firstArgument(tags, first + 2, last) orelse return .unknown;
+        if (is_as) {
+            // An aggregate coercion can build a different value. Without a
+            // type frame, only an explicit pointer/slice target proves that
+            // this builtin preserves the allocation's address.
+            const target = tags[initial.start];
+            const bracket_pointer = target == .l_bracket and initial.start < initial.end and
+                (tags[initial.start + 1] == .r_bracket or tags[initial.start + 1] == .colon or tags[initial.start + 1] == .asterisk);
+            if (target != .asterisk and target != .asterisk_asterisk and !bracket_pointer) return .unknown;
+        }
+        const argument = if (is_as)
+            nextArgument(tags, initial.end, last) orelse return .unknown
+        else
+            initial;
+        if (nextArgument(tags, argument.end, last) != null) return .unknown;
+        return ownerOfExprProjection(arena, tree, proto, bindings, argument.start, argument.end, depth + 1, token_count, allow_address_cast);
     }
     const chain_end = pathChainEnd(tree, first, last) orelse return .unknown;
     var end = chain_end;
@@ -2831,7 +3172,7 @@ fn ownerOfExprWithTokenCount(
     // an `else |e|` payload, which `bindings` never recorded and
     // which the parameter table must not answer for either.
     if (nameAtUse(bindings, tree, proto, root, first, token_count)) |decl| {
-        return ownerOfBinding(arena, tree, proto, bindings, decl, fields, depth, token_count);
+        return ownerOfBinding(arena, tree, proto, bindings, decl, fields, depth, token_count, allow_address_cast);
     }
     if (paramIndex(tree, proto, root)) |idx| {
         return .{ .param = .{ .param = idx, .path = fields } };
@@ -2919,6 +3260,7 @@ fn ownerOfBinding(
     fields: []const u8,
     depth: u8,
     token_count: TokenIndex,
+    allow_address_cast: bool,
 ) WalkError!StorageOwner {
     // Forwarding is what the alias rule exists for, and a chain this
     // long is charged rather than followed forever.
@@ -2955,7 +3297,9 @@ fn ownerOfBinding(
         },
     }
     if (rhs_first > rhs_last) return .unknown;
-    const inner = try ownerOfExprWithTokenCount(
+    // Address-preserving casts say nothing about the destination layout.
+    // A later field selection needs value identity, including through aliases.
+    const inner = try ownerOfExprProjection(
         arena,
         tree,
         proto,
@@ -2964,6 +3308,7 @@ fn ownerOfBinding(
         rhs_last,
         depth + 1,
         token_count,
+        allow_address_cast and fields.len == 0,
     );
     return switch (inner) {
         .unknown => .unknown,
@@ -4457,6 +4802,9 @@ fn inferGrowEffectsWithTokenCount(
 /// resolves the allocator and follows aliases/accessor returns. Known
 /// arena/buffer backing belongs to that backing owner. The instance's own
 /// pointer or slice fields do not decide who must free the instance.
+/// This is MAY ownership evidence, not an all-creators or callback-installation
+/// certificate. The created type must equal the canonical containing container;
+/// a type argument named Self can denote a different owner.
 pub fn inferHeapAllocatesSelf(
     cache: *@import("../cache/file_cache.zig").FileCache,
     body: Ast.Node.Index,
@@ -4465,6 +4813,17 @@ pub fn inferHeapAllocatesSelf(
     const freshness = @import("../cache/fresh_storage.zig");
     const tn = type_name orelse return false;
     const tree = cache.tree;
+    const resolver = cache.zls orelse return false;
+    const initial = cache.cleanup_frame orelse resolver.resolutionFrame();
+    const declaration = (try initial.enclosingFunctionAt(tree.firstToken(body))) orelse return false;
+    const model = try cache.fileModel();
+    const containing = model.containingTypeOf(declaration) orelse return false;
+    if (!std.mem.eql(u8, containing.name, tn)) return false;
+    const frame = (try cleanupDeclarationFrame(cache, declaration)) orelse return false;
+    var expected = frame.container_type orelse return false;
+    expected = (try resolver.normalizedType(expected)) orelse return false;
+    if (expected.data != .container) return false;
+    expected.is_type_val = true;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -4483,16 +4842,17 @@ pub fn inferHeapAllocatesSelf(
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&call_buffer, node) orelse continue;
         if (call.ast.params.len != 1) continue;
-        const allocated_type = call.ast.params[0];
-        const type_token = tree.lastToken(allocated_type);
-        if (tree.tokenTag(type_token) != .identifier) continue;
-        const text = tree.tokenSlice(type_token);
-        if (!std.mem.eql(u8, text, tn) and !std.mem.eql(u8, text, "Self")) continue;
-        const canonical = (try cache.actualCallSummaryAt(freshness.calleeQueryToken(tree, call), cache.cleanup_frame)) orelse continue;
-        if (try freshness.sdkCreateMayOwnHeap(cache, canonical, freshness.FreshWalk.root(.{
+        var allocated = (try frame.typeOfNode(call.ast.params[0])) orelse continue;
+        allocated = (try resolver.normalizedType(allocated)) orelse continue;
+        if (!allocated.is_type_val or allocated.data != .container) continue;
+        if (!allocated.eql(expected)) continue;
+        const canonical = (try cache.actualCallSummaryAt(freshness.calleeQueryToken(tree, call), frame)) orelse continue;
+        var walk = freshness.FreshWalk.root(.{
             .first = tree.firstToken(node),
             .last = tree.lastToken(node),
-        }))) return true;
+        });
+        walk.frame = frame;
+        if (try freshness.sdkCreateMayOwnHeap(cache, canonical, walk)) return true;
     }
     return false;
 }
@@ -5021,6 +5381,25 @@ test "inferHeapAllocatesSelf: allocation provenance distinguishes heap and backi
         \\        return try dev.allocator(use_pool).create(Self);
         \\    }
         \\    fn destroy(self: *Object) void { self.bytes = &.{}; }
+        \\    const Nested = struct {
+        \\        const Self = @This();
+        \\        fn heap(gpa: std.mem.Allocator) !*Self {
+        \\            return try gpa.create(Self);
+        \\        }
+        \\    };
+        \\    fn nestedHeap(gpa: std.mem.Allocator) !*Nested {
+        \\        return try gpa.create(Nested);
+        \\    }
+        \\    fn aliasedHeap(gpa: std.mem.Allocator) !*Object {
+        \\        const Allocated = Object;
+        \\        return try gpa.create(Allocated);
+        \\    }
+        \\};
+        \\const WrongOwner = struct {
+        \\    const Self = Object;
+        \\    fn heap(gpa: std.mem.Allocator) !*Object {
+        \\        return try gpa.create(Self);
+        \\    }
         \\};
         \\test "pool lifetime owns its objects" {
         \\    var pool = Pool.init(std.testing.allocator);
@@ -5046,10 +5425,12 @@ test "inferHeapAllocatesSelf: allocation provenance distinguishes heap and backi
     var cache = FileCache.init(testing.allocator, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     const model = try cache.fileModel();
     const object = model.findType("Object").?;
     const Case = struct { name: []const u8, owns_self: bool };
+    const wrong_owner = model.findType("WrongOwner").?;
+    const wrong_body = tokens.bodyOf(tree, wrong_owner.findMethod("heap").?.fn_decl).?;
+    try testing.expect(!try inferHeapAllocatesSelf(&cache, wrong_body, "WrongOwner"));
     for ([_]Case{
         .{ .name = "heap", .owns_self = true },
         .{ .name = "privateHeap", .owns_self = true },
@@ -5069,6 +5450,8 @@ test "inferHeapAllocatesSelf: allocation provenance distinguishes heap and backi
         .{ .name = "custom", .owns_self = false },
         .{ .name = "mixed", .owns_self = true },
         .{ .name = "mixedWrapped", .owns_self = true },
+        .{ .name = "nestedHeap", .owns_self = false },
+        .{ .name = "aliasedHeap", .owns_self = true },
     }) |case| {
         const body = tokens.bodyOf(tree, object.findMethod(case.name).?.fn_decl).?;
         const owns_self = try inferHeapAllocatesSelf(&cache, body, "Object");
@@ -5937,6 +6320,7 @@ const CleanupTestCache = struct {
     calls: []const Call,
     retained_at: ?Ast.Node.Index = null,
     fresh_nodes: []const Ast.Node.Index = &.{},
+    static_empty_slice: bool = false,
     allocator_path: ?ParamPath = .{ .param = 0, .path = "allocator" },
     resource_error: ?CleanupError = null,
     queries: u32 = 0,
@@ -6002,6 +6386,10 @@ const CleanupTestCache = struct {
     fn normalCleanupFresh(self: *@This(), node: Ast.Node.Index) CleanupError!bool {
         for (self.fresh_nodes) |fresh| if (fresh == node) return true;
         return false;
+    }
+
+    fn normalCleanupStaticEmpty(self: *@This(), _: Ast.Node.Index, rhs: Ast.Node.Index) CleanupError!bool {
+        return self.static_empty_slice and isStaticEmptyDescriptor(self.tree, rhs);
     }
 
     fn normalCleanupAllocator(self: *@This(), _: Ast.Node.Index) CleanupError!?ParamPath {
@@ -6412,8 +6800,7 @@ test "cleanup storage outcomes preserve replacement snapshots and empty exits" {
         },
         .{
             .source = "fn f(self: *Owner) void { const next = fresh(); release(next); self.inner.bytes = next; }",
-            .kinds = &.{},
-            .complete = false,
+            .kinds = &.{ .replace, .release_current },
             .released_store = true,
         },
         .{
@@ -6730,4 +7117,274 @@ test "cleanup child replacement retains the intermediate payload identity" {
     const trace = state.alternatives[0];
     try testing.expect(try trace.released(path, 1));
     try testing.expect(!try trace.released(path, 2));
+}
+
+test "physical allocation projection preserves pointer casts but not integer reconstruction" {
+    const cases = [_]struct { expression: []const u8, known: bool }{
+        .{ .expression = "@ptrCast(@alignCast(context))", .known = true },
+        .{ .expression = "@constCast(context)", .known = true },
+        .{ .expression = "@as(*Owner, @ptrCast(context))", .known = true },
+        .{ .expression = "@ptrFromInt(@intFromPtr(context))", .known = false },
+        .{ .expression = "arbitrary(context)", .known = false },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrintSentinel(testing.allocator, "fn destroy(context: *anyopaque) void {{ const state: *Owner = {s}; release(state); }}", .{case.expression}, 0);
+        defer testing.allocator.free(source);
+        var tree = try parse(source);
+        defer tree.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+        const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+        const call_node = cleanupTestCall(&tree, "release").?;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const argument = tree.fullCall(&call_buffer, call_node).?.ast.params[0];
+        const owner = try ownerOfExpr(arena.allocator(), &tree, proto, &bindings, tree.firstToken(argument), tree.lastToken(argument), 0);
+        try testing.expectEqual(case.known, owner == .param);
+        if (owner == .param) {
+            try testing.expectEqual(@as(u32, 0), owner.param.param);
+            try testing.expectEqualStrings("", owner.param.path);
+        }
+    }
+}
+
+test "cleanup static empty replacement keeps the saved entry generation distinct" {
+    const cases = [_]struct { source: [:0]const u8, version: usize }{
+        .{ .source = "fn f(self: *Owner) void { const old = self.bytes; self.bytes = &.{}; release(old); }", .version = 0 },
+        .{ .source = "fn f(self: *Owner) void { self.bytes = &.{}; release(self.bytes); }", .version = 1 },
+    };
+    for (cases) |case| {
+        var tree = try parse(case.source);
+        defer tree.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+        const bindings = try local_bindings.build(allocator, &tree, proto, body);
+        const release = cleanupTestCall(&tree, "release").?;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const argument = tree.fullCall(&call_buffer, release).?.ast.params[0];
+        const calls = [_]CleanupTestCache.Call{.{ .node = release, .effects = .{
+            .complete = true, .storage_complete = true, .can_normal = true,
+            .can_error = false, .returns_error = false, .release_argument = argument,
+        } }};
+        var cache = CleanupTestCache{ .tree = &tree, .calls = &calls, .static_empty_slice = true };
+        const effects = try inferNormalSuccessCleanup(&cache, allocator, proto, &bindings, body);
+        try testing.expect(effects.storage_effects_complete);
+        const operations = effects.storage_outcomes[0].operations;
+        try testing.expectEqual(@as(usize, 2), operations.len);
+        try testing.expectEqual(.static_empty, operations[0].replacement);
+        try testing.expect(operations[0].allocator == null);
+        try testing.expectEqual(case.version, operations[1].version.?);
+        try testing.expectEqual(case.version == 0, operations[1].kind == .release_entry);
+    }
+}
+
+test "cleanup static empty replacement requires a canonical slice destination" {
+    const source: [:0]const u8 =
+        \\const Owner = struct {
+        \\    bytes: []const u8,
+        \\    cell: *const struct {},
+        \\    fn reset(self: *Owner) void {
+        \\        self.bytes = &.{};
+        \\        self.cell = &.{};
+        \\    }
+        \\};
+    ;
+    const engine = @import("type_engine");
+    const FileCache = @import("../cache/file_cache.zig").FileCache;
+    var context: engine.TypeContext = undefined;
+    try context.init(testing.allocator, std.testing.io);
+    defer context.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{ cwd, "zbc-empty-destination-test.zig" });
+    defer testing.allocator.free(path);
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, testing.allocator, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = FileCache.init(testing.allocator, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const model = try cache.fileModel();
+    const declaration = model.findType("Owner").?.findMethod("reset").?.fn_decl;
+    cache.cleanup_frame = (try cleanupDeclarationFrame(&cache, declaration)).?;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(tree, &buffer, declaration).?;
+    const body = tokens.bodyOf(tree, declaration).?;
+    const bindings = (try cache.localBindings(proto, body)).*;
+    const effects = try inferNormalSuccessCleanup(&cache, arena.allocator(), proto, &bindings, body);
+    try testing.expectEqual(@as(usize, 1), effects.storage_outcomes.len);
+    const operations = effects.storage_outcomes[0].operations;
+    try testing.expectEqual(@as(usize, 1), operations.len);
+    try testing.expectEqual(.replace, operations[0].kind);
+    try testing.expectEqual(.static_empty, operations[0].replacement);
+    try testing.expectEqualStrings("bytes", operations[0].path.path);
+}
+
+const CallbackReleaseCase = struct { name: []const u8, known: bool, parent: bool = false, field: []const u8 = "base" };
+
+fn expectCallbackRelease(cases: []const CallbackReleaseCase) !void {
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Base = struct { tag: usize };
+        \\const Owner = struct {
+        \\    base: Base,
+        \\    other: Base,
+        \\    child: *u8,
+        \\    fn cast(context: *anyopaque) void {
+        \\        const state: *Owner = @ptrCast(@alignCast(context));
+        \\        std.testing.allocator.destroy(state);
+        \\    }
+        \\    fn castChild(context: *anyopaque) void {
+        \\        const state: *Owner = @ptrCast(@alignCast(context));
+        \\        std.testing.allocator.destroy(state.child);
+        \\    }
+        \\    fn embedded(base: *Base) void {
+        \\        const state: *Owner = @fieldParentPtr("base", base);
+        \\        std.testing.allocator.destroy(state);
+        \\    }
+        \\    fn embeddedSibling(base: *Base) void {
+        \\        const state: *Owner = @fieldParentPtr("other", base);
+        \\        std.testing.allocator.destroy(state);
+        \\    }
+        \\    fn embeddedChild(base: *Base) void {
+        \\        const state: *Owner = @fieldParentPtr("base", base);
+        \\        std.testing.allocator.destroy(state.child);
+        \\    }
+        \\    fn conditional(context: *anyopaque, yes: bool) void {
+        \\        const state: *Owner = @ptrCast(@alignCast(context));
+        \\        if (yes) std.testing.allocator.destroy(state);
+        \\    }
+        \\    fn header(context: *Owner) void {
+        \\        std.testing.allocator.destroy(&context);
+        \\    }
+        \\    fn redirect(selected: **Owner, replacement: *Owner) usize {
+        \\        selected.* = replacement;
+        \\        return 0;
+        \\    }
+        \\    fn redirected(context: *Owner, replacement: *Owner) void {
+        \\        var selected = context;
+        \\        const ignored = redirect(&selected, replacement);
+        \\        std.testing.allocator.destroy(selected);
+        \\    }
+        \\};
+    ;
+    const engine = @import("type_engine");
+    const FileCache = @import("../cache/file_cache.zig").FileCache;
+    var context: engine.TypeContext = undefined;
+    try context.init(testing.allocator, std.testing.io);
+    defer context.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{ cwd, "zbc-callback-owner-test.zig" });
+    defer testing.allocator.free(path);
+    var resolver: engine.TypeResolver = undefined;
+    try resolver.init(&context, testing.allocator, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = FileCache.init(testing.allocator, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const model = try cache.fileModel();
+    const owner = model.findType("Owner").?;
+    for (cases) |case| {
+        const certificate = try callbackAllocationRelease(&cache, arena.allocator(), owner.findMethod(case.name).?.fn_decl);
+        try testing.expectEqual(case.known, certificate != null);
+        if (certificate) |release| {
+            try testing.expectEqual(@as(u32, 0), release.parameter);
+            try testing.expectEqual(case.parent, release.relation == .parent_container);
+            if (release.relation == .parent_container) {
+                const selected = release.relation.parent_container;
+                try testing.expect(selected.field_tree == tree);
+                const field = tree.fullContainerField(selected.field_declaration).?;
+                try testing.expectEqualStrings(case.field, tree.tokenSlice(field.ast.main_token));
+            }
+        }
+    }
+}
+
+test "callback allocation release distinguishes recovered owner from its child" {
+    try expectCallbackRelease(&.{
+        .{ .name = "cast", .known = true },
+        .{ .name = "castChild", .known = false },
+        .{ .name = "embedded", .known = true, .parent = true },
+        .{ .name = "embeddedSibling", .known = true, .parent = true, .field = "other" },
+        .{ .name = "embeddedChild", .known = false },
+        .{ .name = "conditional", .known = false },
+    });
+}
+
+test "callback allocation release refuses a pointer header address" {
+    try expectCallbackRelease(&.{.{ .name = "header", .known = false }});
+}
+
+test "callback allocation release refuses an initializer redirected pointer" {
+    try expectCallbackRelease(&.{.{ .name = "redirected", .known = false }});
+}
+
+test "allocation address casts do not project destination payload field names" {
+    var tree = try parse(
+        \\const Original = extern struct { left: *Resource, right: *Resource };
+        \\const Swapped = extern struct { right: *Resource, left: *Resource };
+        \\fn release(self: *Original) void {
+        \\    const swapped: *Swapped = @ptrCast(self);
+        \\    consume(swapped.left);
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto, const body = firstFnProtoAndBody(&tree, &buffer);
+    const bindings = try local_bindings.build(arena.allocator(), &tree, proto, body);
+    const call_node = cleanupTestCall(&tree, "consume").?;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const argument = tree.fullCall(&call_buffer, call_node).?.ast.params[0];
+    const owner = try ownerOfExpr(arena.allocator(), &tree, proto, &bindings, tree.firstToken(argument), tree.lastToken(argument), 0);
+    try testing.expect(owner == .unknown);
+}
+
+test "entry empty SDK authority covers every exit and only generation zero" {
+    var tree = try parse("fn f() void {}");
+    defer tree.deinit(testing.allocator);
+    var cache = CleanupTestCache{ .tree = &tree, .calls = &.{} };
+    const at: Ast.Node.Index = @enumFromInt(1);
+    const path: ParamPath = .{ .param = 0, .path = "bytes" };
+    const entry: StorageOperation = .{
+        .path = path, .kind = .release_entry, .sdk_empty_slice_noop = true,
+    };
+    const current_zero: StorageOperation = .{
+        .path = path, .kind = .release_current, .version = 0, .sdk_empty_slice_noop = true,
+    };
+    const implicit_current: StorageOperation = .{
+        .path = path, .kind = .release_current, .sdk_empty_slice_noop = true,
+    };
+    const custom: StorageOperation = .{ .path = path, .kind = .release_entry };
+    const uncertain: StorageOperation = .{
+        .path = path, .kind = .release_entry, .identity_proved = false, .sdk_empty_slice_noop = true,
+    };
+    const replacement: StorageOperation = .{ .path = path, .kind = .replace };
+    const cases = [_]struct { outcomes: []const StorageOutcome, expected: bool }{
+        .{ .outcomes = &.{}, .expected = false },
+        .{ .outcomes = &.{.{}}, .expected = false },
+        .{ .outcomes = &.{.{ .operations = &.{entry} }}, .expected = true },
+        .{ .outcomes = &.{.{ .operations = &.{current_zero} }}, .expected = true },
+        .{ .outcomes = &.{.{ .operations = &.{implicit_current} }}, .expected = false },
+        .{ .outcomes = &.{ .{ .operations = &.{entry} }, .{} }, .expected = false },
+        .{ .outcomes = &.{.{ .operations = &.{ entry, custom } }}, .expected = false },
+        .{ .outcomes = &.{.{ .operations = &.{uncertain} }}, .expected = false },
+        .{ .outcomes = &.{.{ .operations = &.{ replacement, implicit_current } }}, .expected = false },
+        .{ .outcomes = &.{.{ .operations = &.{ replacement, current_zero } }}, .expected = true },
+        .{ .outcomes = &.{.{ .operations = &.{ entry, replacement, implicit_current } }}, .expected = false },
+    };
+    for (cases) |case|
+        try testing.expectEqual(case.expected, try entrySdkEmptyNoop(&cache, at, case.outcomes, path));
 }

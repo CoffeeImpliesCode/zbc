@@ -13,12 +13,11 @@
 //!      a. Method form: `period identifier(fn_name) l_paren`
 //!      b. Bare form: `identifier(fn_name) l_paren` where the preceding token
 //!         is NOT a `period` (not a method call on another receiver).
-//!   3. Check whether the fn body contains any of the stack-guard identifiers
-//!      `is_safe_to_recurse`, `isSafeToRecurse`, `isStackOverflow`,
-//!      `safeRecurse`, or `checkStack`.
-//!   4. Suppress if the fn has a parameter named `depth` or `max_depth` — the
-//!      caller is threading a depth counter and likely guards elsewhere.
-//!   5. Fire at the recursive call site.
+//!   3. Recognize entry increment/deferred decrement/refusal for one exact
+//!      counter. A fallible helper is read through its canonical source.
+//!   4. Retain explicit stack-check and older compatibility heuristics, but
+//!      do not treat a recursion meter label or observation as a depth cap.
+//!   5. Report a recursive call whose entry has no recognized guard.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -50,7 +49,7 @@ pub fn check(
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    _: *file_cache_mod.FileCache,
+    cache: *file_cache_mod.FileCache,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -96,26 +95,131 @@ fn checkFn(
     }
     const rec_tok = findRecursiveCall(tree, tags, first, last, fn_name, first_param_name) orelse return;
 
-    // Step 5: check for a stack guard anywhere in the body.
+    // Account for the exact counter before this recursive edge. A helper is
+    // read only through the canonical declaration and actual receiver.
+    if (try hasCheckedCounter(cache, tree, first, rec_tok)) return;
     if (hasStackGuard(tags, tree, first, last)) return;
-
-    // Step 5b (suppression): a visited-set cycle guard
-    // (`if (self.visited.isSet(i)) return;`) means the recursion traverses a
-    // finite, developer-controlled data structure (a module/import graph),
-    // not attacker-controlled syntactic nesting.  Each node is visited once,
-    // so the traversal terminates; this is bounded the same way a stack guard
-    // bounds it.  bun's LinkerGraph.visit / bundle_v2 graph walkers use this.
     if (hasVisitedSetGuard(tags, tree, first, last)) return;
+    if (hasRecursionGuardToken(tags, tree, first, rec_tok)) return;
 
-    // Step 5c (suppression): a recursion-depth guard idiom.  The body references
-    // a `recursion`-named token — a guard method (`self.enterRecursion()` /
-    // `leaveRecursion()`) or an inline depth cap (`if (self.recursion_depth >=
-    // max_recursion_depth) return error.ParseError;`).  Either way the
-    // self-recursion is bounded by a depth counter.  (es-parser's enter/leave-
-    // Recursion chokepoint, cap 400.)
-    if (hasRecursionGuardToken(tags, tree, first, last)) return;
 
     try report(gpa, problems, tree, rec_tok, fn_name);
+}
+
+/// Recognize straight-line entry accounting, not a depth-like spelling.
+fn hasCheckedCounter(cache: *file_cache_mod.FileCache, tree: *const Ast, first: Ast.TokenIndex, recursive_call: Ast.TokenIndex) !bool {
+    const tags = tree.tokens.items(.tag);
+    const start = first + 1;
+    const entry_end = tokens.findStmtSemicolon(tags, start, recursive_call) orelse return false;
+    const deferred = entry_end + 1;
+    if (deferred >= recursive_call or tags[deferred] != .keyword_defer) return false;
+    const end = tokens.findStmtSemicolon(tags, deferred + 1, recursive_call) orelse return false;
+    if (end < deferred + 4 or tags[end - 2] != .minus_equal or
+        tags[end - 1] != .number_literal or
+        !std.mem.eql(u8, tree.tokenSlice(end - 1), "1")) return false;
+    const counter_first = deferred + 1;
+    const counter_last = end - 3;
+    if (!isFieldPath(tree, counter_first, counter_last)) return false;
+    if (counterRebound(tree, end + 1, recursive_call, counter_first, counter_last)) return false;
+    if (sameTokens(tree, start, entry_end - 3, tree, counter_first, counter_last) and
+        tags[entry_end - 2] == .plus_equal and
+        std.mem.eql(u8, tree.tokenSlice(entry_end - 1), "1"))
+        return rejectsCounter(tree, end + 1, recursive_call, counter_first, counter_last);
+
+    // A fallible helper must precede the decrement on the same receiver.
+    if (tags[start] != .keyword_try or start + 6 != entry_end or
+        tags[start + 1] != .identifier or tags[start + 2] != .period or
+        tags[start + 4] != .l_paren or tags[start + 5] != .r_paren) return false;
+    if (!std.mem.eql(u8, tree.tokenSlice(start + 1), tree.tokenSlice(counter_first))) return false;
+    // Canonical calls are indexed by the dot, not the method-name token.
+    const call = (try cache.actualCallSummaryAt(start + 2, null)) orelse return false;
+    var actual_buffer: [2]Ast.Node.Index = undefined;
+    const actual = (try call.callArgumentFor(cache, &actual_buffer, 0)) orelse return false;
+    if (tree.nodeTag(actual) != .identifier or tree.nodeMainToken(actual) != start + 1) return false;
+    const callee = call.callee;
+    const body = tokens.bodyOf(callee.tree, callee.declaration) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tokens.fnProto(callee.tree, &buffer, callee.declaration) orelse return false;
+    var parameters = proto.iterate(callee.tree);
+    const receiver = (parameters.next() orelse return false).name_token orelse return false;
+    if (parameters.next() != null) return false;
+    const ct = callee.tree;
+    const begin = ct.firstToken(body) + 1;
+    const finish = ct.lastToken(body);
+    const increment_end = tokens.findStmtSemicolon(ct.tokens.items(.tag), begin, finish) orelse return false;
+    const width = counter_last - counter_first;
+    if (increment_end != begin + width + 3 or
+        ct.tokenTag(increment_end - 2) != .plus_equal or
+        !std.mem.eql(u8, ct.tokenSlice(increment_end - 1), "1") or
+        !std.mem.eql(u8, ct.tokenSlice(begin), ct.tokenSlice(receiver)) or
+        !sameTokens(ct, begin + 1, increment_end - 3, tree, counter_first + 1, counter_last)) return false;
+    if (!rejectsCounter(ct, increment_end + 1, finish, begin, increment_end - 3)) return false;
+    // A successful helper must leave the checked increment in place. Work
+    // after the refusal could reset it or replace the receiver.
+    const guard_first = increment_end + 1;
+    const guard_close = tokens.matchParen(ct.tokens.items(.tag), guard_first + 1, finish) orelse return false;
+    const refusal = guard_close + 1;
+    const guard_end = if (ct.tokenTag(refusal) == .l_brace)
+        (tokens.matchBrace(ct.tokens.items(.tag), refusal, finish) orelse return false) + 1
+    else
+        refusal + 5;
+    return guard_end == finish;
+}
+
+fn counterRebound(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex, cf: Ast.TokenIndex, cl: Ast.TokenIndex) bool {
+    const width = cl - cf;
+    var token = first;
+    while (token + width + 1 < last) : (token += 1) {
+        if (!sameTokens(tree, token, token + width, tree, cf, cl)) continue;
+        switch (tree.tokenTag(token + width + 1)) {
+            .equal, .minus_equal, .slash_equal, .asterisk_equal => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn isFieldPath(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
+    if (first > last) return false;
+    var token = first;
+    while (token <= last) : (token += 1) {
+        if (tree.tokenTag(token) != (if ((token - first) % 2 == 0)
+            std.zig.Token.Tag.identifier else std.zig.Token.Tag.period)) return false;
+    }
+    return (last - first) % 2 == 0;
+}
+
+fn sameTokens(a: *const Ast, af: Ast.TokenIndex, al: Ast.TokenIndex, b: *const Ast, bf: Ast.TokenIndex, bl: Ast.TokenIndex) bool {
+    if (af > al or bf > bl or al - af != bl - bf) return false;
+    var offset: Ast.TokenIndex = 0;
+    while (offset <= al - af) : (offset += 1) {
+        if (a.tokenTag(af + offset) != b.tokenTag(bf + offset) or
+            !std.mem.eql(u8, a.tokenSlice(af + offset), b.tokenSlice(bf + offset))) return false;
+    }
+    return true;
+}
+
+fn rejectsCounter(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex, cf: Ast.TokenIndex, cl: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (first + 2 >= last or tags[first] != .keyword_if or tags[first + 1] != .l_paren) return false;
+    const close = tokens.matchParen(tags, first + 1, last) orelse return false;
+    const comparison = first + 2 + (cl - cf + 1);
+    if (comparison >= close or !sameTokens(tree, first + 2, comparison - 1, tree, cf, cl) or
+        (tags[comparison] != .angle_bracket_right and tags[comparison] != .angle_bracket_right_equal)) return false;
+    if (comparison + 2 != close and !isFieldPath(tree, comparison + 1, close - 1)) return false;
+    if (comparison + 2 == close and tags[comparison + 1] != .number_literal and
+        tags[comparison + 1] != .identifier) return false;
+    var refusal = close + 1;
+    if (refusal >= last) return false;
+    if (tags[refusal] == .l_brace) {
+        const block_end = tokens.matchBrace(tags, refusal, last) orelse return false;
+        if (block_end < refusal + 6) return false;
+        refusal = block_end - 5;
+        if (tags[refusal - 1] != .semicolon and tags[refusal - 1] != .l_brace) return false;
+    }
+    return refusal + 4 < tags.len and tags[refusal] == .keyword_return and
+        tags[refusal + 1] == .keyword_error and tags[refusal + 2] == .period and
+        tags[refusal + 3] == .identifier and tags[refusal + 4] == .semicolon;
 }
 
 /// True iff `name` looks like a recursive parser/visitor/scanner fn name.
@@ -274,12 +378,8 @@ fn hasVisitedSetGuard(
     return false;
 }
 
-/// True iff `[first, last]` references any `recursion`-named identifier — a
-/// recursion-depth guard method (`enterRecursion`/`leaveRecursion`/
-/// `checkRecursion`) OR an inline depth-counter field (`recursion_depth` /
-/// `max_recursion_depth`).  Both forms bound the self-recursion by a depth cap.
-/// Catches the call form (`self.enterRecursion()`) and the field-check form
-/// (`if (self.recursion_depth >= MAX) return error.X;`) uniformly.
+/// Retain existing explicit recursion entry/exit compatibility, but a meter
+/// label or observation is not a recursion limit.
 fn hasRecursionGuardToken(
     tags: []const std.zig.Token.Tag,
     tree: *const Ast,
@@ -293,7 +393,13 @@ fn hasRecursionGuardToken(
             continue;
         }
         if (tags[t] != .identifier) continue;
-        if (std.ascii.findIgnoreCase(tree.tokenSlice(t), "recursion") != null) return true;
+        const name = tree.tokenSlice(t);
+        if (std.mem.eql(u8, name, "enterRecursion") and t + 1 <= last and tags[t + 1] == .l_paren) return true;
+        if (std.ascii.findIgnoreCase(name, "recursion") == null or t + 1 > last) continue;
+        if (tags[t + 1] != .angle_bracket_right and tags[t + 1] != .angle_bracket_right_equal) continue;
+        var end = t + 2;
+        while (end < last and tags[end] != .r_paren) : (end += 1) {}
+        if (end + 1 < last and tags[end + 1] == .keyword_return) return true;
     }
     return false;
 }
@@ -527,5 +633,193 @@ test "recursive-parse-fn-without-stack-check: visits.isSet guard does not fire" 
         \\    }
         \\};
         \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: checked field counter bounds declarator descent" {
+    try testing.expectNoFire(check,
+        \\const P = struct {
+        \\    fn parseDeclarator(self: *P) !void {
+        \\        self.depth += 1;
+        \\        defer self.depth -= 1;
+        \\        if (self.depth > self.limits.maximum) {
+        \\            try self.report();
+        \\            return error.TooDeep;
+        \\        }
+        \\        try self.parseDeclarator();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: counter without refusal remains visible" {
+    try testing.expectFires(check, R,
+        \\const P = struct {
+        \\    fn scanStatement(self: *P) !void {
+        \\        self.depth += 1;
+        \\        defer self.depth -= 1;
+        \\        try self.observe(.recursion_depth, self.depth);
+        \\        try self.scanStatement();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: exact helper checks same counter" {
+    try testing.expectNoFireTyped(check,
+        \\const P = struct {
+        \\    depth: u32 = 0,
+        \\    maximum: u32 = 64,
+        \\    fn enter(self: *P) !void {
+        \\        self.depth += 1;
+        \\        if (self.depth > self.maximum) return error.TooDeep;
+        \\    }
+        \\    fn parseUnary(self: *P) !void {
+        \\        try self.enter();
+        \\        defer self.depth -= 1;
+        \\        try self.parseUnary();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: byte bound does not bound variant depth" {
+    try testing.expectFires(check, R,
+        \\fn skipTypedValue(reader: *Reader, signature: []const u8) !void {
+        \\    if (reader.bytes.len > 4 * 1024 * 1024) return error.TooLarge;
+        \\    const nested = try reader.signature();
+        \\    try skipTypedValue(reader, nested);
+        \\    _ = signature;
+        \\}
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: unguarded entry helper is not a limit" {
+    try testing.expectFiresTyped(check, R,
+        \\const P = struct {
+        \\    depth: u32 = 0,
+        \\    fn enter(self: *P) !void { self.depth += 1; }
+        \\    fn parseUnary(self: *P) !void {
+        \\        try self.enter();
+        \\        defer self.depth -= 1;
+        \\        try self.parseUnary();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: fresh body counter and cycle check do not cap caller chain" {
+    try testing.expectFires(check, R,
+        \\const State = struct {
+        \\    fn scanStatement(self: *State, declaration: u32) !void {
+        \\        if (self.walking.contains(declaration)) return;
+        \\        var nested = State{ .depth = 0 };
+        \\        try self.meter.observe(.recursion_depth, nested.depth + 1);
+        \\        try self.scanStatement(declaration + 1);
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: larger frame does not cap nested portal variants" {
+    try testing.expectFires(check, R,
+        \\fn skipTypedValue(reader: *Reader, signature: []const u8) !void {
+        \\    if (reader.frameSize() > 8 * 1024 * 1024) return error.FrameTooLarge;
+        \\    switch (signature[0]) {
+        \\        'v' => {
+        \\            const nested = try reader.signature();
+        \\            return skipTypedValue(reader, nested);
+        \\        },
+        \\        else => return,
+        \\    }
+        \\}
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: reset counter invalidates entry limit" {
+    try testing.expectFires(check, R,
+        \\const P = struct {
+        \\    fn parseUnary(self: *P) !void {
+        \\        self.depth += 1;
+        \\        defer self.depth -= 1;
+        \\        if (self.depth > self.maximum) return error.TooDeep;
+        \\        self.depth = 0;
+        \\        try self.parseUnary();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: helper formal maps to caller receiver" {
+    try testing.expectNoFireTyped(check,
+        \\const P = struct {
+        \\    count: u32 = 0,
+        \\    maximum: u32 = 64,
+        \\    fn acquire(entry: *P) !void {
+        \\        entry.count += 1;
+        \\        if (entry.count > entry.maximum) return error.TooDeep;
+        \\    }
+        \\    fn parseUnary(parser: *P) !void {
+        \\        try parser.acquire();
+        \\        defer parser.count -= 1;
+        \\        try parser.parseUnary();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: helper checks another field" {
+    try testing.expectFiresTyped(check, R,
+        \\const P = struct {
+        \\    count: u32 = 0,
+        \\    other: u32 = 0,
+        \\    maximum: u32 = 64,
+        \\    fn acquire(entry: *P) !void {
+        \\        entry.other += 1;
+        \\        if (entry.other > entry.maximum) return error.TooDeep;
+        \\    }
+        \\    fn parseUnary(parser: *P) !void {
+        \\        try parser.acquire();
+        \\        defer parser.count -= 1;
+        \\        try parser.parseUnary();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: helper resets counter after checking" {
+    try testing.expectFiresTyped(check, R,
+        \\const P = struct {
+        \\    count: u32 = 0,
+        \\    maximum: u32 = 64,
+        \\    fn acquire(entry: *P) !void {
+        \\        entry.count += 1;
+        \\        if (entry.count > entry.maximum) return error.TooDeep;
+        \\        entry.count = 0;
+        \\    }
+        \\    fn parseUnary(parser: *P) !void {
+        \\        try parser.acquire();
+        \\        defer parser.count -= 1;
+        \\        try parser.parseUnary();
+        \\    }
+        \\};
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: checked helper on another receiver is not a guard" {
+    try testing.expectFiresTyped(check, R,
+        \\const P = struct {
+        \\    count: u32 = 0,
+        \\    maximum: u32 = 64,
+        \\    fn acquire(entry: *P) !void {
+        \\        entry.count += 1;
+        \\        if (entry.count > entry.maximum) return error.TooDeep;
+        \\    }
+        \\    fn parseUnary(parser: *P, other: *P) !void {
+        \\        try other.acquire();
+        \\        defer parser.count -= 1;
+        \\        try parser.parseUnary(other);
+        \\    }
+        \\};
     );
 }

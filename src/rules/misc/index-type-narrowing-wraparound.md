@@ -3,8 +3,13 @@
 **Severity:** warning
 **Analysis:** typed AST and shared numeric range analysis
 
-The rule checks runtime `@intCast` calls whose input reads a collection's `.len`.
-It reports when the input is not proved to fit the destination integer.
+The rule checks two runtime `@intCast` shapes:
+
+- The input reads a collection's `.len`.
+- The converted value reaches a collection subscript, directly or through a local binding.
+
+It reports when the input is not proved to fit the destination integer at the cast.
+A warning identifies a missing range proof, not a proved out-of-range input.
 Signed and unsigned destinations use the same range requirement.
 An out-of-range `@intCast` traps in Debug and ReleaseSafe.
 In unchecked builds it has undefined behavior, not defined wrapping.
@@ -19,7 +24,7 @@ while (i >= 0) : (i -= 1) {
     if (decoded_pathname[@intCast(i)] == '/') break;
 }
 
-// FIX: use usize (or at minimum i64 for 64-bit systems):
+// FIX: keep the length in usize; subtract only after a nonzero check.
 var i: usize = decoded_pathname.len;
 while (i > 0) {
     i -= 1;
@@ -32,19 +37,21 @@ The historical example is oven-sh/bun#31129: a `url_path` scanner used
 
 ## When this might be a false positive
 
-The rule fires on `@intCast` of a value that reads a collection's `.len`,
-when no range proved for that value is known to fit the destination integer.
-An out-of-range `@intCast` traps in Debug and ReleaseSafe; in an unchecked
-build it is undefined behaviour rather than defined wrapping.
+The rule reports either input shape when the analyzer cannot prove a sufficient destination range.
+An out-of-range `@intCast` traps in Debug and ReleaseSafe.
+In unchecked builds it has undefined behavior, not defined wrapping.
+
+A collection's capacity can bound the input through a guard before the cast.
+A subscript after the cast cannot prove that the earlier conversion was safe.
+The indexed collection's reported capacity is context, not a range proof.
 
 - **Bounded domain**: a fixed array length, a dominating guard, or a resolved
   clipping bound can prove that the cast fits. The analyzer uses the actual
   bound and destination range, not the name of a constant.
 
-- **Bit-manipulation usage**: a variable typed `i16` that is only ever ANDed
-  with a mask (`& 0xFF`) is not an index at all.  The rule fires only when the
-  `@intCast` argument reads a `.len`, so pure bit-manipulation patterns do not
-  trigger.
+- **Other integer uses**: a cast with no `.len` input and no collection
+  subscript use is outside this rule. A mask after conversion cannot prove
+  that the conversion itself was in range.
 
 ## Analysis boundary
 
@@ -62,6 +69,8 @@ build it is undefined behaviour rather than defined wrapping.
   result cannot alias pre-existing storage. Writes to that allocation still
   invalidate facts through its aliases. Unknown factories and unmodeled
   write targets remain conservative.
+  The analyzer checks each field separately.
+  A writable aggregate root does not erase a field bound when canonical call effects prove that field unchanged.
 - **Fresh storage does not imply a read-only allocation call.** An allocator
   can invoke caller-provided callbacks. If their targets are unresolved,
   the analyzer cannot prove they leave globally reachable collection headers

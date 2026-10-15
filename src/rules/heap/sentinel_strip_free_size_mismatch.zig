@@ -8,14 +8,14 @@
 //! free-size check trips with `Allocation size N+1 does not
 //! match free size N`.
 //!
-//! Even when there's no sentinel, the shape is redundant — you
-//! should just pass `<X>` to `free` directly.  Either
-//! interpretation is a bug.
+//! A plain many-item pointer has no sentinel extent to strip.
+//! Canonical pointer types, including loop captures and aliases, take
+//! precedence over the source-only declared-field model.
 //!
 //! Real-world: ghostty-org/ghostty#8886
 //! (`ghostty_string_free` in src/main_c.zig).
 //!
-//! Detection (purely syntactic, per-fn token walk):
+//! Detection (token shape, canonical pointer classification):
 //!   1. Skip comptime type-builder fns.
 //!   2. Find `.free(` calls preceded by `.` (allocator method).
 //!   3. Match the single argument against the pattern
@@ -83,7 +83,7 @@ pub fn check(
             const matches = try query.findAllInBody(inner_gpa, inner_tree, sentinel_strip, first, last);
             defer inner_gpa.free(matches);
             for (matches) |m| {
-                if (xPtrFieldIsNonSentinel(inner_tree, ctx.cache, m.captures[0].?)) continue;
+                if (try xPtrFieldIsNonSentinel(inner_tree, ctx.cache, m.captures[0].?)) continue;
                 try report(inner_gpa, inner_problems, inner_tree, m.captures[1].?);
             }
         }
@@ -99,16 +99,28 @@ pub fn check(
     }
 }
 
-/// True iff `<X>`'s type has a `ptr` field declared as a non-
-/// sentinel many-item pointer (`[*]T`).  Sentinel-terminated
-/// pointers (`[*:0]T`, `[*:S]T`) return false — the rule's
-/// warning applies to those.  Returns false when the type can't
-/// be resolved (conservatively keep the warning).
+/// Classify the actual `.ptr` expression, not the spelling of its binding.
+/// Unknown types retain the warning; query failures propagate.
 fn xPtrFieldIsNonSentinel(
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
     x_token: Ast.TokenIndex,
-) bool {
+) !bool {
+    if (cache.zls) |resolver| {
+        const ptr_node = cache.nodeForExactSpan(x_token, x_token + 2) orelse return false;
+        var ty = (try resolver.resolutionFrame().typeOfNode(ptr_node)) orelse return false;
+        if (resolver.typeTag(ty) == .optional)
+            ty = (try resolver.normalizedType(resolver.childType(ty) orelse return false)) orelse return false;
+        if (resolver.pointerSize(ty) != .many) return false;
+        return switch (ty.data) {
+            .pointer => |info| info.sentinel == .none,
+            .ip_index => switch (resolver.ctx.ip.indexToKey(ty.ipIndex() orelse return false)) {
+                .pointer_type => |info| info.sentinel == .none,
+                else => false,
+            },
+            else => false,
+        };
+    }
     // `<X>` is the capture's name token — its sliced text is the
     // local's identifier.
     const tags = tree.tokens.items(.tag);
@@ -118,7 +130,7 @@ fn xPtrFieldIsNonSentinel(
     // receivers (`this`, `self`), use the enclosing fn's containing
     // type as the type name.
     const fn_decl = enclosingFnDecl(tree, x_token) orelse return false;
-    const model = cache.fileModel() catch return false;
+    const model = try cache.fileModel();
     const type_name = bindingTypeName(tree, model, fn_decl, x_name) orelse return false;
     const resolved = cache.resolvedTypeAcrossImports(type_name) orelse return false;
     const ptr_field = resolved.info.findField("ptr") orelse return false;
@@ -158,6 +170,11 @@ fn bindingTypeName(
         const nt = p.name_token orelse continue;
         if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
         const type_node = p.type_expr orelse return null;
+        // A slice's own `.ptr` points at its elements. A field of the
+        // element type cannot describe this pointer's sentinel.
+        if (tree.fullPtrType(type_node)) |ptr| {
+            if (ptr.size == .slice) return null;
+        }
         return baseTypeNameOfNode(tree, model, type_node);
     }
     return null;
@@ -357,33 +374,18 @@ test "sentinel-strip-free-size-mismatch: nested sentinel type still fires" {
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
-test "sentinel-strip-free-size-mismatch: slice-wrapped nested type resolves through its element type" {
+test "sentinel-strip-free-size-mismatch: typed plain slice frees its allocation extent" {
     const gpa = std.testing.allocator;
-    var plain = try testing.runRule(gpa, check,
+    var problems = try testing.runRuleTyped(gpa, check,
         \\const std = @import("std");
-        \\const Outer = struct {
-        \\    pub const Str = struct { ptr: [*]u8, len: usize };
-        \\    pub fn release(items: []Str, alloc: std.mem.Allocator) void {
-        \\        alloc.free(items.ptr[0..items.len]);
-        \\    }
-        \\};
-        \\
+        \\const Entry = struct { ptr: [*:0]u8, len: usize };
+        \\fn release(gpa: std.mem.Allocator, count: usize) !void {
+        \\    const entries = try gpa.alloc(Entry, count);
+        \\    gpa.free(entries.ptr[0..entries.len]);
+        \\}
     );
-    defer freeProblems(gpa, &plain);
-    try std.testing.expectEqual(@as(usize, 0), plain.items.len);
-
-    var terminated = try testing.runRule(gpa, check,
-        \\const std = @import("std");
-        \\const Outer = struct {
-        \\    pub const Str = struct { ptr: [*:0]u8, len: usize };
-        \\    pub fn release(items: []Str, alloc: std.mem.Allocator) void {
-        \\        alloc.free(items.ptr[0..items.len]);
-        \\    }
-        \\};
-        \\
-    );
-    defer freeProblems(gpa, &terminated);
-    try std.testing.expectEqual(@as(usize, 1), terminated.items.len);
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "sentinel-strip-free-size-mismatch: imported type's ptr field is read from its own tree" {
@@ -440,4 +442,51 @@ test "sentinel-strip-free-size-mismatch: imported type's ptr field is read from 
         try check(gpa, &tree, &cache, &config_mod.Default, &problems);
         try std.testing.expectEqual(source.expected, problems.items.len);
     }
+}
+
+test "sentinel-strip-free-size-mismatch: typed loop captures preserve allocator extent" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const std = @import("std");
+        \\const Bytes = [*]u8;
+        \\const Span = struct { ptr: Bytes, len: usize };
+        \\const Harness = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    spans: std.ArrayList(Span) = .empty,
+        \\    fn add(self: *Harness, count: usize) !void {
+        \\        const block = try self.gpa.alignedAlloc(u8, .@"16", count);
+        \\        try self.spans.append(self.gpa, .{ .ptr = block.ptr, .len = count });
+        \\    }
+        \\    fn deinit(self: *Harness) void {
+        \\        for (self.spans.items) |span| self.gpa.free(span.ptr[0..span.len]);
+        \\    }
+        \\};
+        \\fn release(gpa: std.mem.Allocator, spans: []Span, base: [*]u8) void {
+        \\    for (spans, 0..) |span, index| {
+        \\        if (span.ptr != base) continue;
+        \\        gpa.free(span.ptr[0..span.len]);
+        \\        _ = index;
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "sentinel-strip-free-size-mismatch: typed aliases retain sentinel and unknown warnings" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRuleTyped(gpa, check,
+        \\const std = @import("std");
+        \\const Terminated = [*:0]u8;
+        \\const Span = struct { ptr: Terminated, len: usize };
+        \\fn release(gpa: std.mem.Allocator, spans: []Span, bytes: [:0]u8) void {
+        \\    for (spans) |span| gpa.free(span.ptr[0..span.len]);
+        \\    gpa.free(bytes.ptr[0..bytes.len]);
+        \\}
+        \\fn unknown(gpa: std.mem.Allocator, value: anytype) void {
+        \\    gpa.free(value.ptr[0..value.len]);
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 3), problems.items.len);
 }

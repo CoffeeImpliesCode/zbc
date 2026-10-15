@@ -30,6 +30,8 @@ const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const testing = @import("../../testing.zig");
+const tokens = @import("../../ast/tokens.zig");
+const value_range = @import("../../flow/value_range.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -43,7 +45,6 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .slice_write_at_len)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 7) return;
@@ -67,6 +68,7 @@ pub fn check(
             if (t > 0 and tags[t - 1] == .period) continue;
             // Suppress sentinel-terminated slices: buf[buf.len] = sentinel is valid.
             if (hasSentinelContext(tags, tree, t)) continue;
+            if (try unreachableAt(gpa, tree, cache, t)) continue;
             try reportA(gpa, problems, tree, t);
             continue;
         }
@@ -89,10 +91,24 @@ pub fn check(
             std.mem.eql(u8, tree.tokenSlice(t + 8), "len"))
         {
             if (hasSentinelContext(tags, tree, t)) continue;
+            if (try unreachableAt(gpa, tree, cache, t)) continue;
             try reportB(gpa, problems, tree, t);
             continue;
         }
     }
+}
+
+/// Do not assume a receiver field retains its constructor length. Only the
+/// canonical, closed all-path proof can establish that this write is unreachable.
+fn unreachableAt(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    token: Ast.TokenIndex,
+) !bool {
+    const declaration = tokens.enclosingFnDecl(tree, token) orelse return false;
+    const body = tokens.bodyOf(tree, declaration) orelse return false;
+    return value_range.provesUnreachable(gpa, tree, body, token, cache);
 }
 
 /// Returns true when the 80-token backward window from `anchor` contains either
@@ -251,5 +267,148 @@ test "slice-write-at-len: allocSentinel suppresses" {
         \\    buf[buf.len] = 0;
         \\}
         \\
+    );
+}
+
+test "slice-write-at-len: closed constructor full extent makes append unreachable" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    const capacity = 8;
+        \\    resources: []u8,
+        \\    fn init(allocator: std.mem.Allocator) !Store {
+        \\        return .{ .resources = try allocator.alloc(u8, capacity) };
+        \\    }
+        \\    fn charge(self: *Store, value: u8) !void {
+        \\        if (self.resources.len == capacity) return error.Full;
+        \\        self.resources[self.resources.len] = value;
+        \\        self.resources.len += 1;
+        \\    }
+        \\};
+        \\pub fn run(allocator: std.mem.Allocator) !void {
+        \\    var store = try Store.init(allocator);
+        \\    defer allocator.free(store.resources);
+        \\    try store.charge(1);
+        \\}
+    );
+}
+
+test "slice-write-at-len: full constructor does not excuse branch after write" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    const capacity = 8;
+        \\    resources: []u8,
+        \\    fn init(allocator: std.mem.Allocator) !Store {
+        \\        return .{ .resources = try allocator.alloc(u8, capacity) };
+        \\    }
+        \\    fn charge(self: *Store, value: u8) !void {
+        \\        self.resources[self.resources.len] = value;
+        \\        if (self.resources.len == capacity) return error.Full;
+        \\    }
+        \\};
+        \\pub fn run(allocator: std.mem.Allocator) !void {
+        \\    var store = try Store.init(allocator);
+        \\    defer allocator.free(store.resources);
+        \\    try store.charge(1);
+        \\}
+    );
+}
+
+test "slice-write-at-len: reachable shorter constructor remains off by one" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    const capacity = 8;
+        \\    resources: []u8,
+        \\    fn init(allocator: std.mem.Allocator) !Store {
+        \\        return .{ .resources = try allocator.alloc(u8, capacity - 1) };
+        \\    }
+        \\    fn charge(self: *Store, value: u8) !void {
+        \\        if (self.resources.len == capacity) return error.Full;
+        \\        self.resources[self.resources.len] = value;
+        \\    }
+        \\};
+        \\pub fn run(allocator: std.mem.Allocator) !void {
+        \\    var store = try Store.init(allocator);
+        \\    defer allocator.free(store.resources);
+        \\    try store.charge(1);
+        \\}
+    );
+}
+
+test "slice-write-at-len: header alias mutation defeats constructor invariant" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    const capacity = 8;
+        \\    resources: []u8,
+        \\    fn init(allocator: std.mem.Allocator) !Store {
+        \\        return .{ .resources = try allocator.alloc(u8, capacity) };
+        \\    }
+        \\    fn charge(self: *Store, value: u8) !void {
+        \\        const header = &self.resources;
+        \\        header.len = 0;
+        \\        if (self.resources.len == capacity) return error.Full;
+        \\        self.resources[self.resources.len] = value;
+        \\    }
+        \\};
+        \\pub fn run(allocator: std.mem.Allocator) !void {
+        \\    var store = try Store.init(allocator);
+        \\    defer allocator.free(store.resources);
+        \\    try store.charge(1);
+        \\}
+    );
+}
+
+test "slice-write-at-len: public arbitrary receiver has no closed construction proof" {
+    try testing.expectFiresTyped(check, R,
+        \\const Store = struct {
+        \\    resources: []u8,
+        \\    pub fn charge(self: *Store, value: u8) !void {
+        \\        if (self.resources.len == 8) return error.Full;
+        \\        self.resources[self.resources.len] = value;
+        \\    }
+        \\};
+    );
+}
+
+test "slice-write-at-len: missing class branch returns before unreachable append" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const ResourceUse = struct { class: u8, units: u32 };
+        \\const Store = struct {
+        \\    const max_resource_classes = 8;
+        \\    resources: []ResourceUse,
+        \\    fn init(allocator: std.mem.Allocator) !Store {
+        \\        const resources = try allocator.alloc(ResourceUse, max_resource_classes);
+        \\        return .{ .resources = resources };
+        \\    }
+        \\    fn charge(self: *Store, uses: []const ResourceUse) !void {
+        \\        for (uses) |use| {
+        \\            var found: ?usize = null;
+        \\            for (self.resources, 0..) |prior, index| {
+        \\                if (prior.class == use.class) {
+        \\                    found = index;
+        \\                    break;
+        \\                }
+        \\            }
+        \\            if (found) |index| {
+        \\                const sum = @addWithOverflow(@as(u64, self.resources[index].units), @as(u64, use.units));
+        \\                if (sum[1] != 0 or sum[0] > std.math.maxInt(u32)) return error.Full;
+        \\                self.resources[index].units = @intCast(sum[0]);
+        \\            } else {
+        \\                if (self.resources.len == max_resource_classes) return error.Full;
+        \\                self.resources[self.resources.len] = use;
+        \\                self.resources.len += 1;
+        \\            }
+        \\        }
+        \\    }
+        \\};
+        \\pub fn run(allocator: std.mem.Allocator, uses: []const ResourceUse) !void {
+        \\    var store = try Store.init(allocator);
+        \\    defer allocator.free(store.resources);
+        \\    try store.charge(uses);
+        \\}
     );
 }

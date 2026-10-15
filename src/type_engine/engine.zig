@@ -2390,6 +2390,22 @@ pub const TypeResolver = struct {
         };
     }
 
+    /// Whether this resolved pointer type permits address zero.
+    /// Reads only the root pointer, never its pointee. Null means non-pointer.
+    /// `ty` must be a type value borrowed from this resolver or its frames.
+    pub fn pointerAllowsZero(self: *TypeResolver, ty: ActualType) ?bool {
+        std.debug.assert(ty.is_type_val);
+        return switch (ty.data) {
+            .pointer => |info| info.size == .c or info.is_allowzero,
+            .ip_index => blk: {
+                const index = ty.ipIndex() orelse return null;
+                if (self.ctx.ip.indexToKey(index) != .pointer_type) return null;
+                break :blk self.ctx.ip.ptrAllowsZero(index);
+            },
+            else => null,
+        };
+    }
+
     pub fn containerOfNode(self: *TypeResolver, node: Ast.Node.Index) !?Analyser.Type.Data.Container {
         return self.resolutionFrame().containerOfNode(node);
     }
@@ -3981,6 +3997,176 @@ test "module wiring never reaches past the source policy" {
     } else return error.MissingFieldAccess;
     try std.testing.expectEqual(@as(?TypeResolver.IntInfo, null), try resolver.intInfo(field));
     try std.testing.expectEqual(@as(?[]const u8, null), try resolver.typeNameOfNode(field));
+}
+
+const MetadataWiringCase = enum {
+    authorized,
+    ungranted,
+    outside_target,
+    excluded_target,
+    excluded_build,
+    unrelated,
+    symlink_target,
+};
+
+/// Observe named fields through the public context with source-only roots.
+/// A visible temporary directory keeps hidden-ancestor exclusions meaningful.
+fn expectMetadataWiring(case: MetadataWiringCase) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var unique = std.testing.tmpDir(.{});
+    defer unique.cleanup();
+    const temporary_path = try std.fmt.allocPrint(gpa, "/tmp/zbc-metadata-{s}", .{unique.sub_path});
+    defer gpa.free(temporary_path);
+    try std.Io.Dir.cwd().createDir(io, temporary_path, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, temporary_path) catch {};
+    var dir = try std.Io.Dir.cwd().openDir(io, temporary_path, .{});
+    defer dir.close(io);
+    const directory = try dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory);
+    try dir.createDirPath(io, "src");
+    try dir.createDirPath(io, "src-peer");
+    try dir.createDirPath(io, "outside");
+    const values_source =
+        \\pub const Registry = struct { entries: []const u32, limit: u32 };
+    ;
+    try dir.writeFile(io, .{ .sub_path = "src/values.zig", .data = values_source });
+    try dir.writeFile(io, .{ .sub_path = "src-peer/values.zig", .data = values_source });
+    try dir.writeFile(io, .{ .sub_path = "outside/values.zig", .data = values_source });
+    if (case == .symlink_target) {
+        try dir.symLink(io, "../outside/values.zig", "src/linked.zig", .{});
+    }
+    const fixture_source =
+        \\const values = @import("values");
+        \\fn observe(registry: values.Registry) void {
+        \\    _ = registry.entries.len;
+        \\    _ = registry.limit;
+        \\}
+    ;
+    try dir.writeFile(io, .{ .sub_path = "src/main.zig", .data = fixture_source });
+    // If unrelated metadata were read, its module would reach this importer
+    // through a real relative edge, so candidate membership cannot hide it.
+    try dir.writeFile(io, .{ .sub_path = "src-peer/main.zig", .data =
+        \\const main = @import("../src/main.zig");
+        \\pub const observe = main.observe;
+    });
+    const target = switch (case) {
+        .outside_target => "outside/values.zig",
+        .symlink_target => "src/linked.zig",
+        .unrelated => "values.zig",
+        else => "src/values.zig",
+    };
+    const script = try std.fmt.allocPrint(gpa,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {{
+        \\    const values = b.createModule(.{{ .root_source_file = b.path("{s}") }});
+        \\    const main = b.addModule("main", .{{ .root_source_file = b.path("{s}") }});
+        \\    main.addImport("values", values);
+        \\    std.Io.Dir.cwd().writeFile(b.graph.io, .{{
+        \\        .sub_path = b.pathFromRoot("metadata-executed"),
+        \\        .data = "executed",
+        \\    }}) catch @panic("marker failed");
+        \\    @panic("metadata must never execute");
+        \\}}
+    , .{ target, if (case == .unrelated) "main.zig" else "src/main.zig" });
+    defer gpa.free(script);
+    const script_relative = if (case == .unrelated) "src-peer/build.zig" else "build.zig";
+    try dir.writeFile(io, .{ .sub_path = script_relative, .data = script });
+    const source_root = try std.fs.path.join(gpa, &.{ directory, "src" });
+    defer gpa.free(source_root);
+    const peer_root = try std.fs.path.join(gpa, &.{ directory, "src-peer" });
+    defer gpa.free(peer_root);
+    const path = try std.fs.path.join(gpa, &.{ source_root, "main.zig" });
+    defer gpa.free(path);
+    const build_path = try std.fs.path.join(gpa, &.{ directory, script_relative });
+    defer gpa.free(build_path);
+    const excluded_target = try std.fs.path.join(gpa, &.{ source_root, "values.zig" });
+    defer gpa.free(excluded_target);
+
+    var context: TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{
+        .roots = if (case == .unrelated) &.{ source_root, peer_root } else &.{source_root},
+        .build_files = if (case == .ungranted) &.{} else &.{build_path},
+        .excludes = switch (case) {
+            .excluded_target => &.{excluded_target},
+            .excluded_build => &.{build_path},
+            else => &.{},
+        },
+    };
+    // A metadata grant is not a document-load grant or a widened root.
+    try std.testing.expect(!context.store.source_policy.allowsAbsolutePath(directory));
+    if (case != .unrelated) {
+        try std.testing.expect(!context.store.source_policy.allowsAbsolutePath(build_path));
+    }
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, null);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var fields: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .field_access) continue;
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
+        if (!std.mem.eql(u8, name, "len") and !std.mem.eql(u8, name, "limit")) continue;
+        if (case == .symlink_target) {
+            // The lexical target is in-root, but the store refuses its
+            // canonical destination without changing it into an unknown type.
+            try std.testing.expectError(error.SourceExcluded, resolver.intInfo(node));
+            try std.testing.expectError(error.SourceExcluded, resolver.typeNameOfNode(node));
+            fields += 1;
+            continue;
+        }
+        const info = try resolver.intInfo(node);
+        if (case == .authorized) {
+            const known = info orelse return error.MissingAuthorizedMetadataField;
+            try std.testing.expect(!known.signed);
+            try std.testing.expectEqual(
+                if (std.mem.eql(u8, name, "len")) @as(u16, 64) else 32,
+                known.bits,
+            );
+        } else {
+            try std.testing.expectEqual(@as(?TypeResolver.IntInfo, null), info);
+            try std.testing.expectEqual(@as(?[]const u8, null), try resolver.typeNameOfNode(node));
+        }
+        fields += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), fields);
+    try std.testing.expectEqual(@as(?anyerror, null), context.store.failureSnapshot().source_failure);
+    try std.testing.expectError(error.FileNotFound, dir.access(io, "metadata-executed", .{}));
+    try std.testing.expectError(
+        error.FileNotFound,
+        dir.access(io, "src-peer/metadata-executed", .{}),
+    );
+}
+
+test "explicit build metadata resolves named fields through a source-only TypeContext" {
+    try expectMetadataWiring(.authorized);
+}
+
+test "source-only TypeContext leaves named fields unknown without a metadata grant" {
+    try expectMetadataWiring(.ungranted);
+}
+
+test "explicit build metadata cannot admit out-of-root module targets" {
+    try expectMetadataWiring(.outside_target);
+}
+
+test "explicit build metadata cannot admit excluded module targets" {
+    try expectMetadataWiring(.excluded_target);
+}
+
+test "explicit build metadata cannot override an excluded build file" {
+    try expectMetadataWiring(.excluded_build);
+}
+
+test "explicit build metadata does not scan unrelated prefix-sibling scripts" {
+    try expectMetadataWiring(.unrelated);
+}
+
+test "explicit build metadata cannot admit a symlink target outside source roots" {
+    try expectMetadataWiring(.symlink_target);
 }
 
 // ── Toolchain library identity ─────────────────────────────────
@@ -6574,4 +6760,229 @@ test "framed enclosing functions skip type prototypes and retain nested ownershi
         if (std.mem.eql(u8, name, "outside"))
             try std.testing.expect((try frame.enclosingFunctionAt(token)) == null);
     }
+}
+
+test "inline createModule imports preserve consumer integer identity" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try MembershipProject.build(gpa, io, &tmp,
+        \\const narrow = b.createModule(.{ .root_source_file = b.path("narrow.zig") });
+        \\const wide = b.createModule(.{ .root_source_file = b.path("wide.zig") });
+        \\_ = b.createModule(.{ .root_source_file = b.path("left.zig"), .imports = &.{.{ .name = "dep", .module = narrow }} });
+        \\_ = b.createModule(.{ .root_source_file = b.path("right.zig"), .imports = &.{.{ .name = "dep", .module = wide }} });
+    , &.{
+        .{ "left.zig", "const dep = @import(\"dep\"); pub fn read() u64 { return dep.tag; }\n" },
+        .{ "right.zig", "const dep = @import(\"dep\"); pub fn read() u64 { return dep.tag; }\n" },
+        .{ "narrow.zig", "pub const tag: u8 = 1;\n" },
+        .{ "wide.zig", "pub const tag: u32 = 1;\n" },
+    });
+    defer project.deinit(gpa);
+    for ([_][]const u8{ "left.zig", "right.zig" }, [_]u16{ 8, 32 }) |name, bits| {
+        const path = try project.path(gpa, name);
+        defer gpa.free(path);
+        var resolver: TypeResolver = undefined;
+        try resolver.init(project.context, gpa, path, null);
+        defer resolver.deinit();
+        const field = try testFieldAccess(&resolver.handle.document.tree, "dep");
+        const info = (try resolver.intInfo(field)) orelse return error.MissingInlineModuleField;
+        try std.testing.expectEqual(TypeResolver.IntInfo{ .signed = false, .bits = bits }, info);
+    }
+}
+
+test "optional authored module aliases retain their exact consumer field type" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try MembershipProject.build(gpa, io, &tmp,
+        \\const condition = b.option(bool, "with_value", "") orelse true;
+        \\const optional = if (condition) built: {
+        \\    const result = b.addModule("value", .{ .root_source_file = b.path("narrow.zig") });
+        \\    break :built result;
+        \\} else null;
+        \\const selected = optional.?;
+        \\_ = b.createModule(.{ .root_source_file = b.path("main.zig"), .imports = &.{.{ .name = "dep", .module = selected }} });
+    , &.{
+        .{ "main.zig", "const dep = @import(\"dep\"); pub fn read() u64 { return dep.tag; }\n" },
+        .{ "narrow.zig", "pub const tag: u8 = 1;\n" },
+    });
+    defer project.deinit(gpa);
+    const path = try project.path(gpa, "main.zig");
+    defer gpa.free(path);
+    var resolver: TypeResolver = undefined;
+    try resolver.init(project.context, gpa, path, null);
+    defer resolver.deinit();
+    const field = try testFieldAccess(&resolver.handle.document.tree, "dep");
+    try std.testing.expectEqual(TypeResolver.IntInfo{ .signed = false, .bits = 8 }, (try resolver.intInfo(field)) orelse return error.MissingOptionalModuleField);
+}
+
+test "authored module aliases refuse ambiguous mutable and early alternate results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const selections = [_][]const u8{
+        \\const selected = if (condition) narrow else wide;
+        ,
+        \\var selected = narrow;
+        \\selected = wide;
+        ,
+        \\const selected = if (condition) built: {
+        \\    if (condition) break :built wide;
+        \\    const result = narrow;
+        \\    break :built result;
+        \\} else null;
+        ,
+    };
+    for (selections) |selection| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const script = try std.fmt.allocPrint(gpa,
+            \\const condition = b.option(bool, "choice", "") orelse true;
+            \\const narrow = b.createModule(.{{ .root_source_file = b.path("narrow.zig") }});
+            \\const wide = b.createModule(.{{ .root_source_file = b.path("wide.zig") }});
+            \\{s}
+            \\_ = b.createModule(.{{ .root_source_file = b.path("main.zig"), .imports = &.{{.{{ .name = "dep", .module = selected }}}} }});
+        , .{selection});
+        defer gpa.free(script);
+        var project = try MembershipProject.build(gpa, io, &tmp, script, &.{
+            .{ "main.zig", "const dep = @import(\"dep\"); pub fn read() u64 { return dep.tag; }\n" },
+            .{ "narrow.zig", "pub const tag: u8 = 1;\n" },
+            .{ "wide.zig", "pub const tag: u32 = 1;\n" },
+        });
+        defer project.deinit(gpa);
+        const path = try project.path(gpa, "main.zig");
+        defer gpa.free(path);
+        var resolver: TypeResolver = undefined;
+        try resolver.init(project.context, gpa, path, null);
+        defer resolver.deinit();
+        const field = try testFieldAccess(&resolver.handle.document.tree, "dep");
+        try std.testing.expectEqual(@as(?TypeResolver.IntInfo, null), try resolver.intInfo(field));
+    }
+}
+
+test "pointer zero destination: interned qualifier survives alias resolution" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-pointer-zero-interned.zig",
+        \\const Allowed = *allowzero u8;
+        \\const Alias = Allowed;
+        \\const Required = *u8;
+        \\fn sentinel() Alias { return @ptrFromInt(0); }
+        \\fn required() Required { return undefined; }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const allowed = (try resolver.typeOfNode(try testIdentifier(tree, "Alias"))) orelse return error.MissingType;
+    const required = (try resolver.typeOfNode(try testIdentifier(tree, "Required"))) orelse return error.MissingType;
+    try std.testing.expect(!TypeResolver.ActualTypeID.eql(allowed, required));
+    const key = context.ip.indexToKey(allowed.ipIndex() orelse return error.MissingInternedPointer);
+    try std.testing.expect(key.pointer_type.flags.is_allowzero);
+    try std.testing.expectEqual(@as(?bool, true), resolver.pointerAllowsZero(allowed));
+    try std.testing.expectEqual(@as(?bool, false), resolver.pointerAllowsZero(required));
+    var buffer: [2]Ast.Node.Index = undefined;
+    for (tree.nodes.items(.tag), 0..) |_, raw_node| {
+        const node: Ast.Node.Index = @enumFromInt(raw_node);
+        const args = tree.builtinCallParams(&buffer, node) orelse continue;
+        _ = args;
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@ptrFromInt")) continue;
+        const destination = (try resolver.resolutionFrame().expectedTypeOfNode(node)) orelse return error.MissingDestination;
+        try std.testing.expect(TypeResolver.ActualTypeID.eql(allowed, destination));
+        return;
+    }
+    return error.MissingPointerBuiltin;
+}
+
+test "pointer zero destination: structural qualifier changes canonical identity" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-pointer-zero-structural.zig",
+        \\const Item = struct { byte: u8 };
+        \\const Allowed = *allowzero Item;
+        \\const Required = *Item;
+        \\fn sentinel() Allowed { return @ptrFromInt(0); }
+        \\fn required() Required { return undefined; }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const allowed = (try resolver.typeOfNode(try testIdentifier(tree, "Allowed"))) orelse return error.MissingType;
+    const required = (try resolver.typeOfNode(try testIdentifier(tree, "Required"))) orelse return error.MissingType;
+    try std.testing.expect(allowed.data == .pointer);
+    try std.testing.expect(required.data == .pointer);
+    try std.testing.expect(!TypeResolver.ActualTypeID.eql(allowed, required));
+    try std.testing.expect(allowed.hash64() != required.hash64());
+    try std.testing.expectEqual(@as(?bool, true), resolver.pointerAllowsZero(allowed));
+    try std.testing.expectEqual(@as(?bool, false), resolver.pointerAllowsZero(required));
+}
+
+test "pointer zero destination: generic substitution retains structural qualifier" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-pointer-zero-generic.zig",
+        \\const Item = struct { byte: u8 };
+        \\const Allowed = *allowzero Item;
+        \\const Required = *Item;
+        \\fn pass(comptime T: type, value: *allowzero T) *allowzero T { return value; }
+        \\fn caller(value: Allowed) Allowed { return pass(Item, value); }
+        \\fn required() Required { return undefined; }
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    const call = try testNthCallNamed(tree, "pass", 0);
+    const reached = switch (try resolver.functionReferenceOfCall(call)) {
+        .function => |reference| reference,
+        else => return error.MissingCallee,
+    };
+    const actual = reached.actual_type.data.function;
+    const parameter = (try resolver.normalizedType(actual.parameters[1].type)) orelse return error.MissingParameter;
+    const result = (try resolver.normalizedType(actual.return_value.*)) orelse return error.MissingResult;
+    const allowed = (try resolver.typeOfNode(try testIdentifier(tree, "Allowed"))) orelse return error.MissingType;
+    const required = (try resolver.typeOfNode(try testIdentifier(tree, "Required"))) orelse return error.MissingType;
+    try std.testing.expect(TypeResolver.ActualTypeID.eql(allowed, parameter));
+    try std.testing.expect(TypeResolver.ActualTypeID.eql(allowed, result));
+    try std.testing.expect(!TypeResolver.ActualTypeID.eql(required, parameter));
+    try std.testing.expectEqual(@as(?bool, true), resolver.pointerAllowsZero(parameter));
+    try std.testing.expectEqual(@as(?bool, true), resolver.pointerAllowsZero(result));
+    try std.testing.expectEqual(@as(?bool, false), resolver.pointerAllowsZero(required));
+}
+
+test "pointer zero destination: C and nested root semantics agree across representations" {
+    const gpa = std.testing.allocator;
+    var context: TypeContext = undefined;
+    try context.init(gpa, std.testing.io);
+    defer context.deinit();
+    var resolver: TypeResolver = undefined;
+    try resolver.init(&context, gpa, "/tmp/zbc-pointer-zero-root-semantics.zig",
+        \\const Item = struct { byte: u8 };
+        \\const C = [*c]u8;
+        \\const CStruct = [*c]Item;
+        \\const Nested = **allowzero u8;
+        \\const NestedStruct = **allowzero Item;
+        \\fn consume(a: C, b: CStruct, c: Nested, d: NestedStruct) void {
+        \\    _ = a; _ = b; _ = c; _ = d;
+        \\}
+    );
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    for ([_][]const u8{ "C", "CStruct" }) |name| {
+        const ty = (try resolver.typeOfNode(try testIdentifier(tree, name))) orelse return error.MissingType;
+        try std.testing.expectEqual(@as(?bool, true), resolver.pointerAllowsZero(ty));
+    }
+    for ([_][]const u8{ "Nested", "NestedStruct" }) |name| {
+        const ty = (try resolver.typeOfNode(try testIdentifier(tree, name))) orelse return error.MissingType;
+        try std.testing.expectEqual(@as(?bool, false), resolver.pointerAllowsZero(ty));
+        const child = resolver.childType(ty) orelse return error.MissingPointee;
+        try std.testing.expectEqual(@as(?bool, true), resolver.pointerAllowsZero(child));
+    }
+    const scalar = (try resolver.typeOfNode(try testIdentifier(tree, "u8"))) orelse return error.MissingType;
+    try std.testing.expectEqual(@as(?bool, null), resolver.pointerAllowsZero(scalar));
 }

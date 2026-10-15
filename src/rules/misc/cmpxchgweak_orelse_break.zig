@@ -2,10 +2,10 @@
 //! In Zig, `@cmpxchgWeak` (and `Atomic.cmpxchgWeak`) returns `?T` where:
 //!   - `null`   = **success** — the exchange was performed
 //!   - `Some(T)` = **failure** — the exchange was NOT performed (returns current value)
-//! An `orelse break/return/continue` exits when the result is `null`, i.e. on
-//! **success**, which is almost always the opposite of the intent.  The typical
-//! CAS loop retries on failure and proceeds (spawns a thread, does work) on
-//! success — using `orelse` to exit on success silently skips the success path.
+//! An `orelse break/return/continue` runs when the result is null: success.
+//! A bounded maximum-update loop can deliberately break there. It retries
+//! each non-null mismatch, including spurious failure, with the returned value.
+//! Other forms can skip required success work (for example thread creation).
 //!
 //! Real-world instance:
 //!   - oven-sh/bun#28940 (ThreadPool): `sync.cmpxchgWeak(...) orelse break` exited
@@ -18,6 +18,11 @@
 //!   — find `cmpxchgWeak` identifier followed by `(`, skip to matching `)`,
 //!   then check for `keyword_orelse` followed by `keyword_break`, `keyword_return`,
 //!   or `keyword_continue`.  Fire at `orelse`.
+//!
+//! The structural exception requires the entire body of `while (seen < value)`
+//! to be `seen = atomic.cmpxchgWeak(seen, value, ..., ...) orelse break`.
+//! It proves only this exit/retry relationship, not the atomic object's type,
+//! ordering validity, initialization, or safety of code outside that loop.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -26,6 +31,7 @@ const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 const testing = @import("../../testing.zig");
+const AstIterator = @import("type_engine").AstIterator;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -44,6 +50,7 @@ pub fn check(
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 6) return;
     const last_tok = tree.lastToken(.root);
+    var remaining: usize = 50_000;
 
     var t: Ast.TokenIndex = 0;
     while (t + 2 <= last_tok) : (t += 1) {
@@ -73,8 +80,76 @@ pub fn check(
             else => continue,
         }
 
+        if (tags[i + 1] == .keyword_break and try isMaximumRetry(tree, i, &remaining)) continue;
         try report(gpa, problems, tree, i, tags[i + 1]);
     }
+}
+
+/// All identifier uses are in one condition/assignment scope. The single
+/// statement body cannot shadow a binding, change the desired bound, perform
+/// skipped success work, or terminate after a spurious failure.
+fn isMaximumRetry(tree: *const Ast, orelse_token: Ast.TokenIndex, remaining: *usize) !bool {
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (remaining.* == 0) return error.AnalysisBudgetExceeded;
+        remaining.* -= 1;
+        switch (tag) {
+            .while_simple, .while_cont, .@"while" => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const loop = tree.fullWhile(node) orelse continue;
+        if (loop.label_token != null or loop.payload_token != null or
+            loop.ast.cont_expr != .none or loop.ast.else_expr != .none) continue;
+        if (tree.nodeTag(loop.ast.cond_expr) != .less_than) continue;
+        const seen, const target = tree.nodeData(loop.ast.cond_expr).node_and_node;
+        if (tree.nodeTag(seen) != .identifier or tree.nodeTag(target) != .identifier) continue;
+        const seen_name = tree.tokenSlice(tree.nodeMainToken(seen));
+        const target_name = tree.tokenSlice(tree.nodeMainToken(target));
+        if (std.mem.eql(u8, seen_name, target_name)) continue;
+        switch (tree.nodeTag(loop.ast.then_expr)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => continue,
+        }
+        var statements = AstIterator.init(tree, loop.ast.then_expr);
+        const assignment = statements.next(tree) orelse continue;
+        if (statements.next(tree) != null or tree.nodeTag(assignment) != .assign) continue;
+        const destination, const value = tree.nodeData(assignment).node_and_node;
+        if (!identifierIs(tree, destination, seen_name) or tree.nodeTag(value) != .@"orelse" or
+            tree.nodeMainToken(value) != orelse_token) continue;
+        const call_node, const exit = tree.nodeData(value).node_and_node;
+        if (tree.nodeTag(exit) != .@"break" or tree.firstToken(exit) != tree.lastToken(exit)) continue;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, call_node) orelse continue;
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 4) continue;
+        const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(method), "cmpxchgWeak")) continue;
+        // Only a stable identifier/field path is read as the atomic receiver.
+        // A call in this position could mutate either loop operand.
+        var path = receiver;
+        var stable_receiver = false;
+        for (0..64) |_| {
+            if (remaining.* == 0) return error.AnalysisBudgetExceeded;
+            remaining.* -= 1;
+            if (tree.nodeTag(path) == .identifier) {
+                stable_receiver = true;
+                break;
+            }
+            if (tree.nodeTag(path) != .field_access) break;
+            path = tree.nodeData(path).node_and_token[0];
+        } else return error.AnalysisBudgetExceeded;
+        if (!stable_receiver) continue;
+        if (!identifierIs(tree, call.ast.params[0], seen_name) or
+            !identifierIs(tree, call.ast.params[1], target_name)) continue;
+        if (tree.nodeTag(call.ast.params[2]) != .enum_literal or
+            tree.nodeTag(call.ast.params[3]) != .enum_literal) continue;
+        return true;
+    }
+    return false;
+}
+
+fn identifierIs(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    return tree.nodeTag(node) == .identifier and
+        std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name);
 }
 
 fn report(
@@ -167,5 +242,87 @@ test "cmpxchgweak-orelse-break: cmpxchgStrong orelse does not fire" {
         \\    return a.cmpxchgStrong(old, new, .seq_cst, .seq_cst) == null;
         \\}
         \\
+    );
+}
+
+test "cmpxchgweak-orelse-break: maximum retries mismatch and exits on success" {
+    try testing.expectNoFire(check,
+        \\fn enter(self: *Inside) void {
+        \\    const here = self.now.fetchAdd(1, .acq_rel) + 1;
+        \\    var seen = self.peak.load(.acquire);
+        \\    while (seen < here) {
+        \\        seen = self.peak.cmpxchgWeak(seen, here, .acq_rel, .acquire) orelse break;
+        \\    }
+        \\}
+    );
+}
+
+test "cmpxchgweak-orelse-break: maximum must store the returned current value" {
+    try testing.expectFires(check, R,
+        \\fn enter(self: *Inside, here: u32) void {
+        \\    var seen = self.peak.load(.acquire);
+        \\    while (seen < here) {
+        \\        _ = self.peak.cmpxchgWeak(seen, here, .acq_rel, .acquire) orelse break;
+        \\    }
+        \\}
+    );
+}
+
+test "cmpxchgweak-orelse-break: maximum desired value must match the bound" {
+    try testing.expectFires(check, R,
+        \\fn enter(self: *Inside, here: u32, other: u32) void {
+        \\    var seen = self.peak.load(.acquire);
+        \\    while (seen < here) {
+        \\        seen = self.peak.cmpxchgWeak(seen, other, .acq_rel, .acquire) orelse break;
+        \\    }
+        \\}
+    );
+}
+
+test "cmpxchgweak-orelse-break: maximum expected value must match retry storage" {
+    try testing.expectFires(check, R,
+        \\fn enter(self: *Inside, here: u32, other: u32) void {
+        \\    var seen = self.peak.load(.acquire);
+        \\    while (seen < here) {
+        \\        seen = self.peak.cmpxchgWeak(other, here, .acq_rel, .acquire) orelse break;
+        \\    }
+        \\}
+    );
+}
+
+test "cmpxchgweak-orelse-break: success must not skip work after the exchange" {
+    try testing.expectFires(check, R,
+        \\fn enter(self: *Inside, here: u32) void {
+        \\    var seen = self.peak.load(.acquire);
+        \\    while (seen < here) {
+        \\        seen = self.peak.cmpxchgWeak(seen, here, .acq_rel, .acquire) orelse break;
+        \\        self.startWorker();
+        \\    }
+        \\}
+    );
+}
+
+test "cmpxchgweak-orelse-break: labelled exit does not prove maximum-loop exit" {
+    try testing.expectFires(check, R,
+        \\fn enter(self: *Inside, here: u32) void {
+        \\    outer: while (true) {
+        \\        var seen = self.peak.load(.acquire);
+        \\        while (seen < here) {
+        \\            seen = self.peak.cmpxchgWeak(seen, here, .acq_rel, .acquire) orelse break :outer;
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "cmpxchgweak-orelse-break: failure must not terminate on a spurious mismatch" {
+    try testing.expectFires(check, R,
+        \\fn enter(self: *Inside, here: u32) void {
+        \\    var seen = self.peak.load(.acquire);
+        \\    while (seen < here) {
+        \\        seen = self.peak.cmpxchgWeak(seen, here, .acq_rel, .acquire) orelse break;
+        \\        break;
+        \\    }
+        \\}
     );
 }

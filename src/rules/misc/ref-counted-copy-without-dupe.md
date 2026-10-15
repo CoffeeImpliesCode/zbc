@@ -1,11 +1,9 @@
 # ref-counted-copy-without-dupe
 
-A struct literal field is initialised from the same-named field of
-another struct (`.field = recv.field`) and the field name suggests it
-holds a refcounted or heap-owned object (`name`, `str`, `string`, `ref`,
-`handle`, `buf`, `data`, `content`), but no ref-acquire method
-(`clone()`, `dupeRef()`, `ref()`, `retain()`, etc.) is called on the
-source field in the surrounding code.
+A struct literal copies an owning field from another struct
+(`.field = recv.field`) without acquiring another reference. The
+destination's declaration must establish the cleanup obligation; a field
+name or an unrelated lifecycle call is not ownership evidence.
 
 When both the source and the copy eventually call a destructor
 (`deinit()` / `deref()` / `release()`), the shared underlying allocation
@@ -48,7 +46,7 @@ property of one type, not of a field's spelling.
 | --- | --- |
 | runs an acquire/release on the field — `self.f.release(…)`, `self.f.?.release(…)`, or through a value it binds from the field (`if (self.f) \|snap\| snap.release(…)`) | **reported** — the copy is a second owner of one reference |
 | takes the field as a pointer (`*T`, `?*T`, `*const T`, `?*const T`) and runs no protocol on it at all | **quiet** — a borrowed view, so nothing is duplicated |
-| cannot be bound (an anonymous literal `.{ … }`, a pointer/slice type, a name the file cannot read), does not declare the field, or holds a non-pointer the file has already shown it owns | **reported** — the historical verdict |
+| cannot be bound, does not declare the field, or supplies no readable ownership evidence | **unknown, silent** — no second cleanup obligation is proved |
 
 So a `Plan` that really releases its `data` does not lend that verdict
 to a `View` in the same file that merely borrows the same pointer, and a
@@ -75,7 +73,7 @@ pub fn copy(source: Shared, gpa: std.mem.Allocator) Shared {
 }
 ```
 
-This pass runs before the field-spelling gate above, because its
+This pass runs before the field-copy pass because its
 evidence is the SOURCE DECLARATION and never a field's name: the
 type is an owning handle when one of its own methods **with a
 receiver** runs a reference protocol on a field it declares.  That is
@@ -93,19 +91,34 @@ because that is the fix.
 Zig has no automatic destructors. A bare `return source;` without another
 use of the source transfers ownership and is quiet. A local binding can
 also transfer ownership: `var usage = source; errdefer usage.deinit();`
-followed by a single handoff cleans up if the operation fails. Before
-another fallible operation, the local must be reset so that a later
-failure cannot release the transferred payload. The reset is checked
-through its declaration: a static constructor accepts only the standard
-allocator capability and returns a literal built from that capability
-and other proved constructors. Unknown methods, conditional resets,
-and resets after another fallible operation do not prove a transfer.
-This does not require an extra reference.
+followed by a single handoff cleans up if the operation fails. A resolved
+callee that stores the handle in an owning receiver field proves a
+handoff. If a later fallible operation can run the source's error
+cleanup, the two owners overlap. A conditional reset or a reset after
+that operation cannot prevent the overlap. A proved fresh reset before
+it can: its constructor accepts only the standard allocator capability
+and returns a literal built from that capability and other proved
+constructors. An unread reset or a nonfresh default is not, by itself,
+proof that the old allocation has two owners.
 
-Repeated cleanup or unconditional cleanup together with a handoff stays
-reported. An additional alias or an unresolved use cannot prove a
-single-owner transfer and also stays reported. The proof does not depend
-on type names or file paths.
+Repeated cleanup or unconditional cleanup together with a proved owning
+handoff stays reported. A mutable pointer argument is a loan, not another
+owning parameter. Unresolved methods, extra header aliases, and unknown
+mutation effects do not establish another destructor obligation. They
+remain unknown and silent, without certifying a single-owner transfer.
+A read-only callee whose positive returned-storage evidence carries the
+same owning handle does establish a second owner; a source-proved
+disarming method does not leave its old cleanup obligation live.
+The proof does not depend on type names or file paths.
+A helper's complete storage outcomes can also prove that it releases the
+copied handle's entry payload. A second local cleanup then overlaps,
+even when the helper is named `append`. A release of a different argument
+does not count. Calls and local uses are matched to their exact lexical
+bindings; cleanup in a later sibling scope cannot clean an earlier
+same-named local.
+
+For a local slice-header copy, the copy's actual uses must prove cleanup or
+owning publication before the source's cleanup/publication can prove overlap.
 
 The acquire has to be one the copy cannot be reached *without*: it runs
 on every path that makes the copy.  An acquire written inside a branch
@@ -153,10 +166,9 @@ either, since it runs when the scope exits rather than before the copy.
   refcounted object.  If neither side calls a destructor on the field,
   the bitwise copy is safe.
 
-- **An unrecognized ownership transfer**: a direct copy followed by clearing
-  the source is recognized as a move. A transfer hidden in a helper or a
-  different source shape can still be reported. Verify that only one owner
-  remains before suppressing it.
+- **An unrecognized ownership transfer**: an incomplete alias or helper
+  proof stays unknown. It cannot establish safety, and it cannot by itself
+  establish duplicate ownership.
 
 To suppress on a specific line:
 

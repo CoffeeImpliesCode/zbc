@@ -76,7 +76,7 @@ fn checkBody(
         if (tags[t + 5] != .r_paren) continue;
 
         if (pointer_proofs.nullRejectedBefore(tree, t, tree.tokenSlice(t + 2)) and
-            typedParameterMatchesTarget(tree, proto, t, tree.tokenSlice(t + 2))) continue;
+            try typedParameterMatchesTarget(cache, proto, t, tree.tokenSlice(t + 2))) continue;
         if (try callback_provenance.callbackParameterProven(cache, proto, t)) continue;
 
         try report(gpa, problems, tree, t);
@@ -85,44 +85,80 @@ fn checkBody(
 
 /// A null guard does not validate an opaque or explicitly underaligned
 /// address. Only the same ordinary typed pointee is known aligned here.
-fn typedParameterMatchesTarget(tree: *const Ast, proto: Ast.full.FnProto, cast: Ast.TokenIndex, name: []const u8) bool {
-    const tags = tree.tokens.items(.tag);
-    var source: ?[]const u8 = null;
-    var it = proto.iterate(tree);
-    while (it.next()) |param| {
-        const nt = param.name_token orelse continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
-        const node = param.type_expr orelse return false;
-        const first = tree.firstToken(node);
-        const last = tree.lastToken(node);
-        if (first + 2 != last or tags[first] != .question_mark or
-            tags[first + 1] != .asterisk or tags[last] != .identifier or
-            std.mem.eql(u8, tree.tokenSlice(last), "anyopaque")) return false;
-        source = tree.tokenSlice(last);
+fn typedParameterMatchesTarget(
+    cache: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
+    cast: Ast.TokenIndex,
+    name: []const u8,
+) !bool {
+    const resolver = cache.zls orelse return false;
+    const tree = cache.tree;
+    const frame = resolver.resolutionFrame();
+    var source_node: ?Ast.Node.Index = null;
+    var parameters = proto.iterate(tree);
+    while (parameters.next()) |parameter| {
+        const token = parameter.name_token orelse continue;
+        if (std.mem.eql(u8, tree.tokenSlice(token), name))
+            source_node = parameter.type_expr orelse return false;
     }
-    const pointee = source orelse return false;
-    for (tree.nodes.items(.tag), 0..) |tag, index| {
-        switch (tag) {
-            .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
-            else => continue,
+    const source_type_node = source_node orelse return false;
+    const optional = (try frame.typeOfNode(source_type_node)) orelse return false;
+    if (resolver.typeTag(optional) != .optional) return false;
+    const source = (try resolver.normalizedType(
+        resolver.childType(optional) orelse return false,
+    )) orelse return false;
+    if (resolver.pointerAllowsZero(source) != false) return false;
+    const source_syntax = (try callback_provenance.pointerTypeSource(
+        frame, source_type_node, 0,
+    )) orelse return false;
+    const source_pointer = source_syntax.frame.handle.document.tree.fullPtrType(source_syntax.node).?;
+    if (source_pointer.ast.align_node.unwrap() != null or
+        source_pointer.allowzero_token != null) return false;
+
+    var target_node: ?Ast.Node.Index = null;
+    for (1..tree.nodes.len) |raw| {
+        const node: Ast.Node.Index = @enumFromInt(raw);
+        if (tree.fullVarDecl(node)) |local| {
+            const init = local.ast.init_node.unwrap() orelse continue;
+            if (!isRecoveryExpression(tree, init, cast)) continue;
+            target_node = local.ast.type_node.unwrap() orelse return false;
+            break;
         }
-        const node: Ast.Node.Index = @enumFromInt(index);
-        const decl = tree.fullVarDecl(node) orelse continue;
-        const init = decl.ast.init_node.unwrap() orelse continue;
-        if (tree.firstToken(init) > cast or tree.lastToken(init) < cast) continue;
-        const target = decl.ast.type_node.unwrap() orelse return false;
-        const first = tree.firstToken(target);
-        const last = tree.lastToken(target);
-        return first + 1 == last and tags[first] == .asterisk and
-            std.mem.eql(u8, tree.tokenSlice(last), pointee);
+        if (tree.nodeTag(node) == .@"return") {
+            const expression = tree.nodeData(node).opt_node.unwrap() orelse continue;
+            if (!isRecoveryExpression(tree, expression, cast)) continue;
+            target_node = proto.ast.return_type.unwrap() orelse return false;
+            if (tree.nodeTag(target_node.?) == .error_union)
+                target_node = tree.nodeData(target_node.?).node_and_node[1];
+            break;
+        }
     }
-    // A direct return has the function's declared destination type.
-    if (cast == 0 or tags[cast - 1] != .keyword_return) return false;
-    const target = proto.ast.return_type.unwrap() orelse return false;
-    const first = tree.firstToken(target);
-    const last = tree.lastToken(target);
-    return last > first and tags[last - 1] == .asterisk and
-        std.mem.eql(u8, tree.tokenSlice(last), pointee);
+    const target_type_node = target_node orelse return false;
+    const target = (try frame.typeOfNode(target_type_node)) orelse return false;
+    if (resolver.pointerSize(source) != resolver.pointerSize(target)) return false;
+    const size = resolver.pointerSize(target) orelse return false;
+    if (size != .one and size != .many) return false;
+    const target_syntax = (try callback_provenance.pointerTypeSource(
+        frame, target_type_node, 0,
+    )) orelse return false;
+    const target_pointer = target_syntax.frame.handle.document.tree.fullPtrType(target_syntax.node).?;
+    if (target_pointer.ast.align_node.unwrap() != null or
+        target_pointer.allowzero_token != null) return false;
+    const source_child = (try resolver.normalizedType(
+        resolver.childType(source) orelse return false,
+    )) orelse return false;
+    const target_child = (try resolver.normalizedType(
+        resolver.childType(target) orelse return false,
+    )) orelse return false;
+    return @import("type_engine").TypeResolver.ActualType.eql(source_child, target_child);
+}
+
+fn isRecoveryExpression(tree: *const Ast, node: Ast.Node.Index, cast: Ast.TokenIndex) bool {
+    if (tree.nodeMainToken(node) == cast) return true;
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@ptrCast")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const arguments = tree.builtinCallParams(&buffer, node) orelse return false;
+    return arguments.len == 1 and tree.nodeMainToken(arguments[0]) == cast;
 }
 
 fn report(
@@ -209,7 +245,8 @@ test "aligncast-on-optional-unwrap: standalone .? not in alignCast does not fire
 }
 
 test "optional pointer: a dominating null rejection proves the unwrap" {
-    try testing.expectNoFire(check,
+    try testing.expectNoFireTyped(check,
+        \\const Foo = struct { value: u32 };
         \\fn recover(p: ?*Foo) !*Foo {
         \\    if (p == null) return error.Missing;
         \\    return @alignCast(p.?);
@@ -452,7 +489,9 @@ fn expectImportedCallback(source: [:0]const u8, expected: usize) !void {
         .data =
         \\pub const Callback = struct { context: ?*anyopaque, invoke: *const fn (?*anyopaque) void };
         \\pub fn dispatch(callback: Callback) void { callback.invoke(callback.context); }
-        ,
+        \\pub fn direct(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
     });
     const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(directory);
@@ -471,7 +510,6 @@ fn expectImportedCallback(source: [:0]const u8, expected: usize) !void {
     cache.* = file_cache_mod.FileCache.init(gpa, tree);
     defer cache.deinit();
     cache.setZls(&resolver);
-    cache.module_id = resolver.handle.module;
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer testing.freeProblems(gpa, &problems);
     try check(gpa, tree, cache, &config_mod.Default, &problems);
@@ -501,6 +539,14 @@ test "optional callback: cross file dispatcher preserves the registration pair" 
         \\pub fn safePath() void {
         \\    var state: State = .{};
         \\    api.dispatch(.{ .context = &state, .invoke = State.onEvent });
+        \\}
+    , 0);
+}
+test "optional callback: imported direct dispatcher preserves the registration pair" {
+    try expectImportedCallback(imported_fixture ++
+        \\pub fn safePath() void {
+        \\    var state: State = .{};
+        \\    api.direct(&state, State.onEvent);
         \\}
     , 0);
 }
@@ -591,6 +637,349 @@ test "optional callback: underaligned slice element pointer keeps the finding" {
         \\fn dispatch(callback: Callback) u32 { return callback.invoke(callback.context); }
         \\pub fn unsafePath(words: []align(1) const u32) u32 {
         \\    return dispatch(.{ .context = @constCast(words.ptr), .invoke = onWords });
+        \\}
+    );
+}
+test "optional callback: generic typed registration keeps callable paired with its receiver" {
+    try testing.expectNoFireTyped(check,
+        \\const Receiver = struct {
+        \\    calls: usize = 0,
+        \\    fn onEvent(context: ?*anyopaque) void {
+        \\        const self: *Receiver = @ptrCast(@alignCast(context.?));
+        \\        self.calls += 1;
+        \\    }
+        \\};
+        \\fn dispatch(comptime T: type, context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    _ = T;
+        \\    callback(context);
+        \\}
+        \\fn register(comptime T: type, receiver: *T) void {
+        \\    dispatch(T, receiver, T.onEvent);
+        \\}
+        \\pub fn safePath() void {
+        \\    var receiver: Receiver = .{};
+        \\    register(Receiver, &receiver);
+        \\}
+    );
+}
+
+test "optional callback: direct synchronous callback and typed local stay paired" {
+    try testing.expectNoFireTyped(check,
+        \\const Visit = struct {
+        \\    ordinals: [1]usize = undefined,
+        \\    len: usize = 0,
+        \\    fn visit(context: ?*anyopaque, ordinal: usize) void {
+        \\        const self: *@This() = @ptrCast(@alignCast(context.?));
+        \\        self.ordinals[self.len] = ordinal;
+        \\        self.len += 1;
+        \\    }
+        \\};
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque, usize) void, ordinal: usize) void {
+        \\    callback(context, ordinal);
+        \\}
+        \\pub fn safePath() void {
+        \\    var visit: Visit = .{};
+        \\    visitArtifacts(&visit, Visit.visit, 0);
+        \\}
+    );
+}
+test "optional callback: direct dispatcher rejects a wrong receiver type" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Visit = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\const Other = struct { value: usize = 0 };
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn unsafePath() void {
+        \\    var other: Other = .{};
+        \\    visitArtifacts(&other, Visit.visit);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatcher preserves underalignment findings" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Visit = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn unsafePath(visit: *align(1) Visit) void {
+        \\    visitArtifacts(visit, Visit.visit);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatcher rejects a mutated context" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Visit = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    var selected = context;
+        \\    selected = null;
+        \\    callback(selected);
+        \\}
+        \\pub fn unsafePath() void {
+        \\    var visit: Visit = .{};
+        \\    visitArtifacts(&visit, Visit.visit);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatcher does not close stored callbacks" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Visit = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\var stored: ?*const fn (?*anyopaque) void = null;
+        \\pub fn retain(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    _ = context;
+        \\    stored = callback;
+        \\}
+        \\pub fn unsafePath() void {
+        \\    var visit: Visit = .{};
+        \\    retain(&visit, Visit.visit);
+        \\}
+    );
+}
+test "optional callback: direct dispatcher keeps nullable context findings" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Visit = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn unsafePath() void {
+        \\    visitArtifacts(null, Visit.visit);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatcher does not pair a different callback" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct { value: usize = 0 };
+        \\const Other = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Other = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn unsafePath() void {
+        \\    var visit: Visit = .{};
+        \\    visitArtifacts(&visit, Other.visit);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatcher keeps pointer offset findings" {
+    try testing.expectFiresTyped(check, R,
+        \\const Visit = struct {
+        \\    fn visit(context: ?*anyopaque) void {
+        \\        const self: *Visit = @ptrCast(@alignCast(context.?));
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn visitArtifacts(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn unsafePath() void {
+        \\    var visit: Visit = .{};
+        \\    const displaced: *Visit = @ptrFromInt(@intFromPtr(&visit) + 1);
+        \\    visitArtifacts(displaced, Visit.visit);
+        \\}
+    );
+}
+
+test "optional callback: canonical source and destination pointer aliases preserve alignment" {
+    try testing.expectNoFireTyped(check,
+        \\const State = struct {
+        \\    calls: usize = 0,
+        \\    const Pointer = *State;
+        \\    fn onEvent(raw: ?*anyopaque) void {
+        \\        const self: Pointer = @ptrCast(@alignCast(raw.?));
+        \\        self.calls += 1;
+        \\    }
+        \\};
+        \\const Alias = State.Pointer;
+        \\const Callback = struct { context: ?*anyopaque, invoke: *const fn (?*anyopaque) void };
+        \\fn dispatch(callback: Callback) void { callback.invoke(callback.context); }
+        \\pub fn run(state: Alias) void {
+        \\    dispatch(.{ .context = state, .invoke = State.onEvent });
+        \\}
+    );
+}
+
+test "optional callback: pointer aliases do not conflate structurally equal pointees" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct {
+        \\    calls: usize = 0,
+        \\    const Pointer = *State;
+        \\    fn onEvent(raw: ?*anyopaque) void {
+        \\        const self: Pointer = @ptrCast(@alignCast(raw.?));
+        \\        self.calls += 1;
+        \\    }
+        \\};
+        \\const Other = struct {
+        \\    calls: usize = 0,
+        \\    const Pointer = *Other;
+        \\};
+        \\const Alias = Other.Pointer;
+        \\const Callback = struct { context: ?*anyopaque, invoke: *const fn (?*anyopaque) void };
+        \\fn dispatch(callback: Callback) void { callback.invoke(callback.context); }
+        \\pub fn run(state: Alias) void {
+        \\    dispatch(.{ .context = state, .invoke = State.onEvent });
+        \\}
+    );
+}
+
+test "optional callback: namespace aliases retain const pointee identity" {
+    try testing.expectNoFireTyped(check,
+        \\const State = struct {
+        \\    calls: usize = 0,
+        \\    const Pointer = *const State;
+        \\    fn onEvent(raw: ?*const anyopaque) void {
+        \\        const self: Pointer = @ptrCast(@alignCast(raw.?));
+        \\        _ = self.calls;
+        \\    }
+        \\};
+        \\const Namespace = struct { const Alias = State.Pointer; };
+        \\const Callback = struct { context: ?*const anyopaque, invoke: *const fn (?*const anyopaque) void };
+        \\fn dispatch(callback: Callback) void { callback.invoke(callback.context); }
+        \\pub fn run(state: Namespace.Alias) void {
+        \\    dispatch(.{ .context = state, .invoke = State.onEvent });
+        \\}
+    );
+}
+
+test "optional callback: canonical aliases retain underalignment and allowzero boundaries" {
+    try testing.expectFiresTyped(check, R, pointer_fixture ++
+        \\const Alias = *align(1) State;
+        \\pub fn run(state: Alias) void {
+        \\    dispatch(.{ .context = state, .invoke = State.onEvent });
+        \\}
+    );
+    try testing.expectFiresTyped(check, R, pointer_fixture ++
+        \\const Alias = *allowzero State;
+        \\pub fn run(state: Alias) void {
+        \\    dispatch(.{ .context = @ptrCast(state), .invoke = State.onEvent });
+        \\}
+    );
+}
+
+test "optional callback: destination aliases do not discard stronger explicit alignment" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct { calls: usize = 0 };
+        \\const Alias = *align(64) State;
+        \\const Callback = struct { context: ?*anyopaque, invoke: *const fn (?*anyopaque) void };
+        \\fn callback(raw: ?*anyopaque) void {
+        \\    const state: Alias = @ptrCast(@alignCast(raw.?));
+        \\    state.calls += 1;
+        \\}
+        \\fn dispatch(pair: Callback) void { pair.invoke(pair.context); }
+        \\pub fn run(state: *State) void {
+        \\    dispatch(.{ .context = state, .invoke = callback });
+        \\}
+    );
+}
+
+test "optional pointer: guarded canonical optional and pointer aliases match the target" {
+    try testing.expectNoFireTyped(check,
+        \\const State = struct { value: u32 };
+        \\const Pointer = *State;
+        \\const Optional = ?Pointer;
+        \\fn recover(raw: Optional) !Pointer {
+        \\    if (raw == null) return error.Missing;
+        \\    return @alignCast(raw.?);
+        \\}
+    );
+}
+
+test "optional pointer: guarded aliases do not conflate structurally equal pointees" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct { value: u32 };
+        \\const Other = struct { value: u32 };
+        \\const Pointer = *State;
+        \\const Optional = ?*Other;
+        \\fn recover(raw: Optional) !Pointer {
+        \\    if (raw == null) return error.Missing;
+        \\    return @ptrCast(@alignCast(raw.?));
+        \\}
+    );
+}
+
+test "optional pointer: null rejection cannot repair an underaligned pointer alias" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct { value: u32 };
+        \\const Pointer = *align(1) State;
+        \\const Optional = ?Pointer;
+        \\fn recover(raw: Optional) !*State {
+        \\    if (raw == null) return error.Missing;
+        \\    return @alignCast(raw.?);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatch retains a source proved typed allocation" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const State = struct {
+        \\    value: u32 = 0,
+        \\    fn callback(raw: ?*anyopaque) void {
+        \\        const self: *State = @ptrCast(@alignCast(raw.?));
+        \\        self.value += 1;
+        \\    }
+        \\};
+        \\fn visit(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn run(allocator: std.mem.Allocator) !void {
+        \\    const state = try allocator.create(State);
+        \\    defer allocator.destroy(state);
+        \\    state.* = .{};
+        \\    visit(state, State.callback);
+        \\}
+    );
+}
+
+test "optional callback: direct dispatch does not authenticate an opaque pointer factory" {
+    try testing.expectFiresTyped(check, R,
+        \\const State = struct {
+        \\    value: u32 = 0,
+        \\    fn callback(raw: ?*anyopaque) void {
+        \\        const self: *State = @ptrCast(@alignCast(raw.?));
+        \\        self.value += 1;
+        \\    }
+        \\};
+        \\extern fn acquire() *State;
+        \\fn visit(context: ?*anyopaque, callback: *const fn (?*anyopaque) void) void {
+        \\    callback(context);
+        \\}
+        \\pub fn run() void {
+        \\    const state = acquire();
+        \\    visit(state, State.callback);
         \\}
     );
 }

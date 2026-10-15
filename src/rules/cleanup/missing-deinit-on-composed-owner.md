@@ -63,10 +63,14 @@ pub fn deinit(it: *StackIterator) void {
 - **Type-name resolution** peels off `?`, `*`, `[...]` prefixes
   to get the underlying type name.  `?*Inner`, `[]Inner`,
   `?Inner` all resolve to `Inner`.
-- **Cleanup-call match** accepts any cleanup-method name on
-  the same receiver chain `<self>.<field>.<cleanup>(...)` —
-  the outer doesn't have to call literally `.deinit()`; calling
-  `.close()` or `.destroy()` on the field also counts.
+- **Cleanup-call identity** matches the field's own destructor and the current
+  receiver, not a wildcard object or a cleanup-like method name.
+- **Teardown wrappers** follow the exact actual argument into a same-source
+  helper, including a file-level helper. The helper must invoke the destructor
+  on that same owner field. A call on another argument does not count.
+- **Complete cleanup** is not established by a field read, a partial subfield
+  reset, or a cleanup call in an unrelated lifecycle method. Conditional calls,
+  early successful returns, cycles, and reset-before-cleanup remain diagnostic.
 
 ## Limitations (deliberate)
 
@@ -74,12 +78,9 @@ pub fn deinit(it: *StackIterator) void {
   aren't analyzed (would need cross-file resolution).  This
   means cross-module composition like `Outer.field: lib.Inner`
   is out of scope until zbc gets cross-file annotation support.
-- **Borrow vs own** — the rule can't distinguish a field that
-  OWNS its inner (must deinit) from one that BORROWS it (must
-  not).  Heuristic: pointer-typed fields (`*Inner`) are
-  TYPICALLY borrowed in Zig; non-pointer fields (`Inner`) are
-  typically owned.  The rule still fires on `?*Inner` etc. —
-  some FPs expected on actual borrows.
+- **Borrow vs own** — pointer and slice fields are excluded from the value-field
+  candidate set. A value field can still be a borrow; unresolved external
+  custody does not become a cleanup certificate.
 - **Conditional fields** — fields gated by `comptime` or
   build-flag may not need deinit on all platforms; the rule
   doesn't model this.

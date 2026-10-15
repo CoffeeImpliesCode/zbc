@@ -1631,3 +1631,363 @@ test "slice-from-fixed-offset-without-len-check: addressed entry header mutation
         \\}
     );
 }
+
+test "slice-from-fixed-offset-without-len-check: canonical fixed pointer array length" {
+    try testing.expectNoFireTyped(check,
+        \\const Registration = struct { const output_ports: usize = 3; };
+        \\pub fn output(contracts: *const [1 + Registration.output_ports]u8) []const u8 {
+        \\    return contracts[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: fresh allocation size guards and constants" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn scan(allocator: std.mem.Allocator, count: usize) !void {
+        \\    if (count < 2) return;
+        \\    const order = try allocator.alloc(u32, count);
+        \\    defer allocator.free(order);
+        \\    for (order[1..]) |entry| _ = entry;
+        \\}
+        \\pub fn split(allocator: std.mem.Allocator) !void {
+        \\    const size: usize = 8192;
+        \\    const window = allocator.alloc(u8, size) catch return error.OutOfMemory;
+        \\    defer allocator.free(window);
+        \\    _ = window[4096..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: zero allocation is not nonempty" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn scan(allocator: std.mem.Allocator, count: usize) !void {
+        \\    const order = try allocator.alloc(u32, count);
+        \\    defer allocator.free(order);
+        \\    _ = order[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: guarded private actual" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn classify(operand: []const u8) ![]const u8 {
+        \\    if (operand.len == 0) return error.Empty;
+        \\    return suffix(operand);
+        \\}
+        \\fn suffix(operand: []const u8) []const u8 {
+        \\    return operand[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: unguarded private actual poisons census" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn classify(operand: []const u8) ![]const u8 {
+        \\    if (operand.len == 0) return error.Empty;
+        \\    return suffix(operand);
+        \\}
+        \\pub fn unchecked(operand: []const u8) []const u8 { return suffix(operand); }
+        \\fn suffix(operand: []const u8) []const u8 { return operand[1..]; }
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: optional constant match outputs" {
+    try testing.expectNoFireTyped(check,
+        \\fn bitClassName(bits: u16) ?[]const u8 {
+        \\    return switch (bits) {
+        \\        8 => ".b8", 16 => ".b16", 32 => ".b32", 64 => ".b64",
+        \\        else => null,
+        \\    };
+        \\}
+        \\pub fn read(bits: u16) ?[]const u8 {
+        \\    const spelled = bitClassName(bits) orelse return null;
+        \\    return spelled[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: short constant match success stays unsafe" {
+    try testing.expectFiresTyped(check, R,
+        \\fn bitClassName(bits: u16) ?[]const u8 {
+        \\    return switch (bits) { 8 => "", else => ".b16" };
+        \\}
+        \\pub fn read(bits: u16) ?[]const u8 {
+        \\    const spelled = bitClassName(bits) orelse return null;
+        \\    return spelled[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: tokenizer nonempty token admits empty suffix" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\pub fn read(line: []const u8) ?[]const u8 {
+        \\    var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        \\    const command = fields.next() orelse return null;
+        \\    return command[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: split iterator may return empty" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn read(line: []const u8) ?[]const u8 {
+        \\    var fields = std.mem.splitScalar(u8, line, ' ');
+        \\    const command = fields.next() orelse return null;
+        \\    return command[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: argv zero remains unproven" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn read(allocator: std.mem.Allocator) !void {
+        \\    const args = try std.process.argsAlloc(allocator);
+        \\    defer std.process.argsFree(allocator, args);
+        \\    _ = args[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: enum helper result selects its length guard" {
+    try testing.expectNoFireTyped(check,
+        \\const Base = enum { decimal, octal, hex, binary };
+        \\fn integerBase(text: []const u8) ?Base {
+        \\    if (text.len == 0) return null;
+        \\    if (text[0] != '0') return .decimal;
+        \\    if (text.len < 2) return .octal;
+        \\    return switch (text[1]) {
+        \\        'x', 'X' => .hex, 'b', 'B' => .binary, else => .octal,
+        \\    };
+        \\}
+        \\pub fn digits(text: []const u8) ?[]const u8 {
+        \\    const base = integerBase(text) orelse return null;
+        \\    return switch (base) { .decimal, .octal => text, .hex, .binary => text[2..] };
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: enum helper one byte arm is insufficient" {
+    try testing.expectFiresTyped(check, R,
+        \\const Base = enum { decimal, octal, hex, binary };
+        \\fn integerBase(text: []const u8) ?Base {
+        \\    if (text.len == 0) return null;
+        \\    if (text[0] != '0') return .decimal;
+        \\    if (text.len < 2) return .octal;
+        \\    return switch (text[1]) { 'x' => .hex, 'b' => .binary, else => .octal };
+        \\}
+        \\pub fn digits(text: []const u8) ?[]const u8 {
+        \\    const base = integerBase(text) orelse return null;
+        \\    return switch (base) { .decimal => text, .octal, .hex, .binary => text[2..] };
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: successful dotted parser word" {
+    try testing.expectNoFireTyped(check,
+        \\const Parser = struct {
+        \\    bytes: []const u8,
+        \\    index: usize = 0,
+        \\    fn peek(self: *const Parser) ?u8 {
+        \\        return if (self.index < self.bytes.len) self.bytes[self.index] else null;
+        \\    }
+        \\    fn step(self: *Parser, count: usize) void { self.index += count; }
+        \\    fn word(self: *Parser) ![]const u8 {
+        \\        if (self.peek() != '.') return error.Invalid;
+        \\        const start = self.index;
+        \\        self.step(1);
+        \\        while (self.peek()) |byte| {
+        \\            if (byte < 'a' or byte > 'z') break;
+        \\            self.step(1);
+        \\        }
+        \\        if (self.index == start + 1) return error.Invalid;
+        \\        return self.bytes[start..self.index];
+        \\    }
+        \\    pub fn parse(self: *Parser) ![]const u8 {
+        \\        const type_word = try self.word();
+        \\        return type_word[1..];
+        \\    }
+        \\};
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: unknown word helper may return empty" {
+    try testing.expectFiresTyped(check, R,
+        \\const Parser = struct {
+        \\    bytes: []const u8,
+        \\    fn word(self: *Parser) ![]const u8 { return self.bytes; }
+        \\    pub fn parse(self: *Parser) ![]const u8 {
+        \\        const type_word = try self.word();
+        \\        return type_word[1..];
+        \\    }
+        \\};
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: fresh allocation header alias mutation" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\fn clear(header: *[]u8) void { header.* = header.*[0..0]; }
+        \\pub fn read(allocator: std.mem.Allocator) ![]const u8 {
+        \\    var window = try allocator.alloc(u8, 8192);
+        \\    defer allocator.free(window);
+        \\    clear(&window);
+        \\    return window[4096..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: allocation guard after use proves nothing" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn read(allocator: std.mem.Allocator, count: usize) !void {
+        \\    const order = try allocator.alloc(u8, count);
+        \\    defer allocator.free(order);
+        \\    _ = order[1..];
+        \\    if (count == 0) return error.Empty;
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: one element fixed array accepts equality" {
+    try testing.expectNoFireTyped(check,
+        \\pub fn suffix(bytes: *const [1]u8) []const u8 { return bytes[1..]; }
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: zero element fixed array rejects one" {
+    try testing.expectFiresTyped(check, R,
+        \\pub fn suffix(bytes: *const [0]u8) []const u8 { return bytes[1..]; }
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: tokenizer nonempty is not two bytes" {
+    try testing.expectFiresTyped(check, R,
+        \\const std = @import("std");
+        \\pub fn read(line: []const u8) ?[]const u8 {
+        \\    var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        \\    const command = fields.next() orelse return null;
+        \\    return command[2..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: tokenizer spelling is not identity" {
+    try testing.expectFiresTyped(check, R,
+        \\const Fields = struct {
+        \\    fn next(_: *Fields) ?[]const u8 { return ""; }
+        \\};
+        \\fn tokenizeScalar(_: type, _: []const u8, _: u8) Fields { return .{}; }
+        \\pub fn read(line: []const u8) ?[]const u8 {
+        \\    var fields = tokenizeScalar(u8, line, ' ');
+        \\    const command = fields.next() orelse return null;
+        \\    return command[1..];
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: custom allocation repeats guarded view count" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const View = struct {
+        \\    nodes: []const u32,
+        \\    fn nodeCount(self: *const View) usize { return self.nodes.len; }
+        \\};
+        \\const Exec = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    fn alloc(self: *const Exec, comptime T: type, count: usize) ![]T {
+        \\        return self.allocator.alloc(T, count);
+        \\    }
+        \\};
+        \\pub fn resolve(exec: *const Exec, view: *const View) !void {
+        \\    if (view.nodeCount() == 0) return error.Empty;
+        \\    const index = try exec.alloc(u32, view.nodeCount());
+        \\    defer exec.allocator.free(index);
+        \\    for (index, 0..) |*entry, ordinal| entry.* = @intCast(ordinal);
+        \\    std.mem.sort(u32, index, {}, std.sort.asc(u32));
+        \\    for (index[1..], index[0 .. index.len - 1]) |a, b| {
+        \\        if (a == b) return error.Duplicate;
+        \\    }
+        \\}
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: guarded field count survives element sorting" {
+    try testing.expectNoFireTyped(check,
+        \\const std = @import("std");
+        \\const Graph = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    string_count: usize,
+        \\    pub fn verify(self: *const Graph) !void {
+        \\        if (self.string_count < 2) return;
+        \\        const order = self.gpa.alloc(u32, self.string_count) catch return error.OutOfMemory;
+        \\        defer self.gpa.free(order);
+        \\        for (order, 0..) |*slot, index| slot.* = @intCast(index + 1);
+        \\        std.mem.sort(u32, order, {}, std.sort.asc(u32));
+        \\        for (order[1..], order[0 .. order.len - 1]) |later, earlier| {
+        \\            if (later == earlier) return error.Duplicate;
+        \\        }
+        \\    }
+        \\};
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: imported selector and literal output identity" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const resolver_mod = @import("../../type_resolver.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const helper =
+        \\pub const Base = enum { decimal, octal, hex, binary };
+        \\pub fn integerBase(text: []const u8) ?Base {
+        \\    if (text.len == 0) return null;
+        \\    if (text[0] != '0') return .decimal;
+        \\    if (text.len < 2) return .octal;
+        \\    return switch (text[1]) { 'x' => .hex, 'b' => .binary, else => .octal };
+        \\}
+        \\pub fn bitClassName(bits: u16) ?[]const u8 {
+        \\    return switch (bits) {
+        \\        8 => ".b8", 16 => ".b16", 32 => ".b32", 64 => ".b64",
+        \\        else => null,
+        \\    };
+        \\}
+    ;
+    const source =
+        \\const Owner = @import("owner.zig");
+        \\pub fn digits(text: []const u8) ?[]const u8 {
+        \\    const base = Owner.integerBase(text) orelse return null;
+        \\    return switch (base) { .decimal, .octal => text, .hex, .binary => text[2..] };
+        \\}
+        \\pub fn width(bits: u16) ?[]const u8 {
+        \\    const spelled = Owner.bitClassName(bits) orelse return null;
+        \\    return spelled[1..];
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "owner.zig", .data = helper });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = source });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "main.zig" });
+    defer gpa.free(path);
+    var context: resolver_mod.TypeContext = undefined;
+    try context.init(gpa, io);
+    defer context.deinit();
+    context.store.source_policy = .{ .roots = &.{root} };
+    var resolver: resolver_mod.TypeResolver = undefined;
+    try resolver.init(&context, gpa, path, source);
+    defer resolver.deinit();
+    const tree = &resolver.handle.document.tree;
+    var cache = file_cache_mod.FileCache.init(gpa, tree);
+    defer cache.deinit();
+    cache.setZls(&resolver);
+    cache.file_path = path;
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer testing.freeProblems(gpa, &problems);
+    try check(gpa, tree, &cache, &config_mod.Default, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
